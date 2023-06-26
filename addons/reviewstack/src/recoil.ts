@@ -35,7 +35,6 @@ import type {
   VersionCommit,
 } from './github/types';
 import type {LineToPosition} from './lineToPosition';
-import type {SaplingPullRequestBody} from './saplingStack';
 import type {RecoilValueReadOnly} from 'recoil';
 
 import {lineToPosition} from './diffServiceClient';
@@ -289,16 +288,6 @@ export const gitHubPullRequestCommitBaseParent = selectorFamily<
       return commitComparison?.baseParent;
     },
 });
-
-/**
- * If we are at the bottom PR in a Sapling stack, we can generally treat it
- * like any other pull request.
- */
-function isBottomOfSaplingStack(saplingStack: SaplingPullRequestBody): boolean {
-  const index = saplingStack.currentStackEntry;
-  // saplingStack.stack has the top of the stack at the front of the array.
-  return index === saplingStack.stack.length - 1;
-}
 
 export const gitHubPullRequestVersions = selector<Version[]>({
   key: 'gitHubPullRequestVersions',
