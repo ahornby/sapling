@@ -266,6 +266,7 @@ export const gitHubPullRequestVersionBaseAndCommits = selectorFamily<
           committedDate: commit.committer.date,
           title: commit.message.split('\n', 1)[0] ?? '',
           parents: parents.map(({sha}) => sha),
+          version: null,
         })),
       };
     },
@@ -366,6 +367,7 @@ export const gitHubPullRequestVersions = selector<Version[]>({
             committedDate: f.beforeCommittedDate,
             title: 'Version ' + (i + 1),
             parents: f.beforeParents,
+            version: i + 1,
           });
         }
 
@@ -376,6 +378,7 @@ export const gitHubPullRequestVersions = selector<Version[]>({
             committedDate: c.committedDate,
             title: c.messageHeadline,
             parents: c.parents,
+            version: versionCommits.length + 1,
           }),
         );
 
