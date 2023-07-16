@@ -19,6 +19,8 @@ def containing_repo_type(path):
             return ("git", path)
         if os.path.exists(os.path.join(path, ".hg")):
             return ("hg", path)
+        if os.path.exists(os.path.join(path, ".sl")):
+            return ("sl", path)
 
         parent = os.path.dirname(path)
         if parent == path:
