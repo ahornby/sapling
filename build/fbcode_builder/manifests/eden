@@ -5,7 +5,7 @@ shipit_project = eden
 shipit_fbcode_builder = true
 
 [git]
-repo_url = https://github.com/facebookexperimental/eden.git
+repo_url = https://github.com/facebook/sapling.git
 
 [github.actions]
 run_tests = off
@@ -30,6 +30,8 @@ pexpect
 python-toml
 python-filelock
 edencommon
+mvfst
+rust-shed
 
 [dependencies.fbsource=on]
 rust
@@ -52,7 +54,7 @@ libcurl
 # Added so that OSS doesn't see system "python" which is python 2 on darwin and some linux
 python
 
-[dependencies.all(fb=off)]
+[dependencies.all(test=on,fb=off)]
 # Outside Meta hg is not installed, or if it is, its not the one we want to test with
 sapling
 

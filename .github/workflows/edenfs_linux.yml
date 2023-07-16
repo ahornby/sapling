@@ -25,6 +25,8 @@ jobs:
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages fetch --no-tests ninja
     - name: Fetch cmake
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages fetch --no-tests cmake
+    - name: Fetch blake3
+      run: python3 build/fbcode_builder/getdeps.py --allow-system-packages fetch --no-tests blake3
     - name: Fetch cpptoml
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages fetch --no-tests cpptoml
     - name: Fetch gflags
@@ -79,12 +81,6 @@ jobs:
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages fetch --no-tests nghttp2
     - name: Fetch libcurl
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages fetch --no-tests libcurl
-    - name: Fetch libffi
-      run: python3 build/fbcode_builder/getdeps.py --allow-system-packages fetch --no-tests libffi
-    - name: Fetch ncurses
-      run: python3 build/fbcode_builder/getdeps.py --allow-system-packages fetch --no-tests ncurses
-    - name: Fetch python
-      run: python3 build/fbcode_builder/getdeps.py --allow-system-packages fetch --no-tests python
     - name: Fetch libsodium
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages fetch --no-tests libsodium
     - name: Fetch xz
@@ -93,6 +89,14 @@ jobs:
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages fetch --no-tests folly
     - name: Fetch fizz
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages fetch --no-tests fizz
+    - name: Fetch mvfst
+      run: python3 build/fbcode_builder/getdeps.py --allow-system-packages fetch --no-tests mvfst
+    - name: Fetch libffi
+      run: python3 build/fbcode_builder/getdeps.py --allow-system-packages fetch --no-tests libffi
+    - name: Fetch ncurses
+      run: python3 build/fbcode_builder/getdeps.py --allow-system-packages fetch --no-tests ncurses
+    - name: Fetch python
+      run: python3 build/fbcode_builder/getdeps.py --allow-system-packages fetch --no-tests python
     - name: Fetch wangle
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages fetch --no-tests wangle
     - name: Fetch fbthrift
@@ -101,14 +105,14 @@ jobs:
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages fetch --no-tests fb303
     - name: Fetch rust-shed
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages fetch --no-tests rust-shed
-    - name: Fetch sapling
-      run: python3 build/fbcode_builder/getdeps.py --allow-system-packages fetch --no-tests sapling
     - name: Fetch edencommon
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages fetch --no-tests edencommon
     - name: Build ninja
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages build --no-tests ninja
     - name: Build cmake
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages build --no-tests cmake
+    - name: Build blake3
+      run: python3 build/fbcode_builder/getdeps.py --allow-system-packages build --no-tests blake3
     - name: Build cpptoml
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages build --no-tests cpptoml
     - name: Build gflags
@@ -163,12 +167,6 @@ jobs:
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages build --no-tests nghttp2
     - name: Build libcurl
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages build --no-tests libcurl
-    - name: Build libffi
-      run: python3 build/fbcode_builder/getdeps.py --allow-system-packages build --no-tests libffi
-    - name: Build ncurses
-      run: python3 build/fbcode_builder/getdeps.py --allow-system-packages build --no-tests ncurses
-    - name: Build python
-      run: python3 build/fbcode_builder/getdeps.py --allow-system-packages build --no-tests python
     - name: Build libsodium
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages build --no-tests libsodium
     - name: Build xz
@@ -177,6 +175,14 @@ jobs:
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages build --no-tests folly
     - name: Build fizz
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages build --no-tests fizz
+    - name: Build mvfst
+      run: python3 build/fbcode_builder/getdeps.py --allow-system-packages build --no-tests mvfst
+    - name: Build libffi
+      run: python3 build/fbcode_builder/getdeps.py --allow-system-packages build --no-tests libffi
+    - name: Build ncurses
+      run: python3 build/fbcode_builder/getdeps.py --allow-system-packages build --no-tests ncurses
+    - name: Build python
+      run: python3 build/fbcode_builder/getdeps.py --allow-system-packages build --no-tests python
     - name: Build wangle
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages build --no-tests wangle
     - name: Build fbthrift
@@ -185,12 +191,10 @@ jobs:
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages build --no-tests fb303
     - name: Build rust-shed
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages build --no-tests rust-shed
-    - name: Build sapling
-      run: python3 build/fbcode_builder/getdeps.py --allow-system-packages build --no-tests sapling
     - name: Build edencommon
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages build --no-tests edencommon
     - name: Build eden
-      run: python3 build/fbcode_builder/getdeps.py --allow-system-packages build --src-dir=. eden  --project-install-prefix eden:/usr/local
+      run: python3 build/fbcode_builder/getdeps.py --allow-system-packages build --no-tests --src-dir=. eden  --project-install-prefix eden:/usr/local
     - name: Copy artifacts
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages fixup-dyn-deps --strip --src-dir=. eden _artifacts/linux  --project-install-prefix eden:/usr/local --final-install-prefix /usr/local
     - uses: actions/upload-artifact@v2

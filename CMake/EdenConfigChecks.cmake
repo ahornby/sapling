@@ -39,6 +39,9 @@ include_directories(${WANGLE_INCLUDE_DIR})
 find_package(FBThrift CONFIG REQUIRED COMPONENTS cpp2 py)
 include_directories(${FBTHRIFT_INCLUDE_DIR})
 
+find_package(mvfst CONFIG REQUIRED)
+include_directories(${MVFST_INCLUDE_DIR})
+
 find_package(GMock MODULE REQUIRED)
 include_directories(${GMOCK_INCLUDEDIR} ${LIBGMOCK_INCLUDE_DIR})
 include(GoogleTest)
