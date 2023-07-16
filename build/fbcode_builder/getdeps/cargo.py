@@ -89,6 +89,8 @@ class CargoBuilder(BuilderBase):
         if not os.path.isdir(cargo_config_dir):
             os.mkdir(cargo_config_dir)
 
+        dep_to_git = self._resolve_dep_to_git()
+
         if os.path.isfile(cargo_config_file):
             with open(cargo_config_file, "r") as f:
                 print(f"Reading {cargo_config_file}")
@@ -112,7 +114,6 @@ incremental = false
             )
 
         # Point to vendored sources from getdeps manifests
-        dep_to_git = self._resolve_dep_to_git()
         for _dep, git_conf in dep_to_git.items():
             if "cargo_vendored_sources" in git_conf:
                 vendored_dir = git_conf["cargo_vendored_sources"].replace(
