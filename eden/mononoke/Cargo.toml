@@ -41,7 +41,7 @@ name = "streaming_clone_warmup"
 path = "cmds/streaming_clone_warmup/main.rs"
 
 [dependencies]
-anyhow = "1.0.65"
+anyhow = "1.0.71"
 ascii = "1.0"
 blobrepo = { version = "0.1.0", path = "blobrepo" }
 blobrepo_utils = { version = "0.1.0", path = "blobrepo_utils" }
@@ -86,19 +86,20 @@ retry = { version = "0.1.0", path = "common/retry" }
 revset = { version = "0.1.0", path = "revset" }
 scuba_ext = { version = "0.1.0", path = "common/scuba_ext" }
 segmented_changelog = { version = "0.1.0", path = "segmented_changelog" }
-serde = { version = "1.0.136", features = ["derive", "rc"] }
-serde_derive = "1.0"
+serde = { version = "1.0.167", features = ["derive", "rc"] }
+serde_derive = "1.0.167"
 slog = { version = "2.7", features = ["max_level_trace", "nested-values"] }
 sql_construct = { version = "0.1.0", path = "common/sql_construct" }
 sql_ext = { version = "0.1.0", path = "common/rust/sql_ext" }
 sqlblob = { version = "0.1.0", path = "blobstore/sqlblob" }
 streaming_clone = { version = "0.1.0", path = "repo_client/streaming_clone" }
-tokio = { version = "1.25.0", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.29.1", features = ["full", "test-util", "tracing"] }
 toml = "0.7.3"
 
 [patch.crates-io]
 abomonation = { git = "https://github.com/markbt/abomonation", rev = "0f43346d2afa2aedc64d61f3f4273e8d1e454642" }
 curve25519-dalek = { git = "https://github.com/hariria/curve25519-dalek", rev = "1f39e7b369dc70f432370c9703229a45bfa9664e" }
+dachshund = { git = "https://github.com/facebookresearch/dachshund", rev = "ec4cc35bc5afb0db5f791ee9e3168e7586986c88" }
 graphql-parser = { git = "https://github.com/graphql-rust//graphql-parser", rev = "8d76425d83c40670570cc325f57c730262f07456" }
 lru-disk-cache = { git = "https://github.com/mozilla/sccache", rev = "fdbf843d174c6796d736b2b61dab0297670390f8" }
 mysql_async = { git = "https://github.com/mzr/mysql_async", rev = "76b6fa05d7bb3408402033e6f94042a756ab55ab" }
@@ -147,12 +148,14 @@ members = [
   "blobstore/factory",
   "blobstore/fileblob",
   "blobstore/if",
+  "blobstore/if/types",
   "blobstore/logblob",
   "blobstore/memblob",
   "blobstore/multiplexedblob",
   "blobstore/multiplexedblob_wal",
   "blobstore/packblob",
   "blobstore/packblob/if",
+  "blobstore/packblob/if/types",
   "blobstore/prefixblob",
   "blobstore/readonlyblob",
   "blobstore/redactedblobstore",
@@ -168,10 +171,13 @@ members = [
   "bonsai_globalrev_mapping",
   "bonsai_globalrev_mapping/globalrev_pushrebase_hook",
   "bonsai_globalrev_mapping/if",
+  "bonsai_globalrev_mapping/if/types",
   "bonsai_hg_mapping",
   "bonsai_hg_mapping/if",
+  "bonsai_hg_mapping/if/types",
   "bonsai_svnrev_mapping",
   "bonsai_svnrev_mapping/if",
+  "bonsai_svnrev_mapping/if/types",
   "bonsai_tag_mapping",
   "bookmarks",
   "bookmarks/bookmarks_movement",
@@ -185,6 +191,7 @@ members = [
   "changesets/changesets_creation",
   "changesets/changesets_impl",
   "changesets/if",
+  "changesets/if/types",
   "cmdlib",
   "cmdlib/base_app",
   "cmdlib/caching",
@@ -246,6 +253,7 @@ members = [
   "derived_data/blame",
   "derived_data/changeset_info",
   "derived_data/changeset_info/if",
+  "derived_data/changeset_info/if/types",
   "derived_data/constants",
   "derived_data/deleted_manifest",
   "derived_data/fastlog",
@@ -255,6 +263,7 @@ members = [
   "derived_data/mercurial_derivation",
   "derived_data/remote",
   "derived_data/remote/if",
+  "derived_data/remote/if/types",
   "derived_data/skeleton_manifest",
   "derived_data/test/generation_derivation",
   "derived_data/test_utils",
@@ -266,11 +275,13 @@ members = [
   "features/repo_update_logger",
   "filenodes",
   "filenodes/if",
+  "filenodes/if/types",
   "filestore",
   "git/check_git_wc",
   "git/git-pool",
   "git/git_types",
   "git/git_types/if",
+  "git/git_types/if/types",
   "git/gitimport",
   "git/import_direct",
   "git/import_tools",
@@ -288,6 +299,7 @@ members = [
   "megarepo_api/commit_transformation",
   "megarepo_api/configo_client",
   "megarepo_api/if",
+  "megarepo_api/if/types",
   "megarepo_api/mapping",
   "megarepo_api/megarepo_config",
   "megarepo_api/megarepo_error",
@@ -295,15 +307,18 @@ members = [
   "mercurial/bundles",
   "mercurial/mutation",
   "mercurial/mutation/if",
+  "mercurial/mutation/if/types",
   "mercurial/revlog",
   "mercurial/types",
   "mercurial/types/if",
+  "mercurial/types/if/types",
   "mercurial/types/mocks",
   "metaconfig/parser",
   "metaconfig/types",
   "microwave",
   "microwave/builder",
   "microwave/if",
+  "microwave/if/types",
   "mononoke_api",
   "mononoke_api/types",
   "mononoke_api_hg",
@@ -312,10 +327,12 @@ members = [
   "mononoke_repos",
   "mononoke_types",
   "mononoke_types/if",
+  "mononoke_types/if/types",
   "mononoke_types/mocks",
   "mutable_counters",
   "mutable_renames",
   "mutable_renames/if",
+  "mutable_renames/if/types",
   "newfilenodes",
   "observability",
   "permission_checker",
@@ -335,6 +352,7 @@ members = [
   "repo_attributes/commit_graph/commit_graph_testlib",
   "repo_attributes/commit_graph/commit_graph_types",
   "repo_attributes/commit_graph/commit_graph_types/if",
+  "repo_attributes/commit_graph/commit_graph_types/if/types",
   "repo_attributes/commit_graph/in_memory_commit_graph_storage",
   "repo_attributes/commit_graph/preloaded_commit_graph_storage",
   "repo_attributes/commit_graph/sql_commit_graph_storage",
@@ -362,6 +380,7 @@ members = [
   "revset",
   "revset/revset-test-helper",
   "scs/if",
+  "scs/if/types",
   "segmented_changelog",
   "segmented_changelog/bench/concurrent_idmap",
   "segmented_changelog/types",

@@ -10,9 +10,10 @@ license = "GPLv2+"
 [dependencies]
 abomonation = { version = "0.7", features = ["smallvec"] }
 abomonation_derive = "0.5"
-anyhow = "1.0.65"
-async-trait = "0.1.58"
+anyhow = "1.0.71"
+async-trait = "0.1.71"
 blobstore = { version = "0.1.0", path = "../../blobstore" }
+bytes = { version = "1.1", features = ["serde"] }
 cloned = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 context = { version = "0.1.0", path = "../../server/context" }
 derived_data = { version = "0.1.0", path = "../../derived_data" }
@@ -21,11 +22,14 @@ derived_data_service_if = { version = "0.1.0", path = "../../derived_data/remote
 digest = "0.10"
 filestore = { version = "0.1.0", path = "../../filestore" }
 futures = { version = "0.3.28", features = ["async-await", "compat"] }
+git-hash = "0.10"
+git-object = "0.23"
 git_types_thrift = { version = "0.1.0", path = "if" }
 manifest = { version = "0.1.0", path = "../../manifest" }
+megarepo_error = { version = "0.1.0", path = "../../megarepo_api/megarepo_error" }
 mononoke_types = { version = "0.1.0", path = "../../mononoke_types" }
 sha1 = "0.10.5"
-thiserror = "1.0.36"
+thiserror = "1.0.43"
 
 [dev-dependencies]
 bookmarks = { version = "0.1.0", path = "../../bookmarks" }
@@ -36,4 +40,4 @@ git2 = "0.14"
 repo_blobstore = { version = "0.1.0", path = "../../blobrepo/repo_blobstore" }
 repo_derived_data = { version = "0.1.0", path = "../../repo_attributes/repo_derived_data" }
 tempdir = "0.3"
-tokio = { version = "1.25.0", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.29.1", features = ["full", "test-util", "tracing"] }

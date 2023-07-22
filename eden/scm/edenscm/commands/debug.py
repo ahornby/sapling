@@ -4289,14 +4289,68 @@ def debugrevlogclone(ui, repo, source) -> None:
 )
 def debugcopytrace(ui, repo, *files, **opts) -> None:
     """trace the copy of the given files from source to dest commit"""
+
+    def format_trace_result(trace_result, src_path):
+        typ = trace_result["t"]
+        if typ == "NotFound":
+            return None
+        elif typ == "Renamed":
+            return trace_result["c"]
+        else:
+            node, path = trace_result["c"]
+            label = "being rebased" if typ == "Added" else "rebasing onto"
+            if path == src_path:
+                path_info = " "
+            else:
+                path_info = f" with name '{path}' "
+            return f"the missing file was {typ.lower()} by commit {short(node)}{path_info}in the branch {label}"
+
     csrc = scmutil.revsingle(repo, opts.get("source"))
     cdest = scmutil.revsingle(repo, opts.get("dest"))
 
     dag_copy_trace = repo._dagcopytrace
 
     res = {
-        src_path: dag_copy_trace.trace_rename(csrc.node(), cdest.node(), src_path)
+        src_path: format_trace_result(
+            dag_copy_trace.trace_rename_ex(csrc.node(), cdest.node(), src_path),
+            src_path,
+        )
         for src_path in files
     }
     ui.write(json.dumps(res))
     ui.write("\n")
+
+
+@command("debugcommitmessage", [], _("FORM"))
+def debugcommitmessage(ui, repo, *args):
+    """show commit template"""
+    form = None
+    if len(args) > 1:
+        raise error.Abort(_("provide at most one form"))
+    elif len(args) > 0:
+        form = args[0]
+
+    status = repo.status()
+    text = ""
+    user = None
+    date = None
+    extra = None
+
+    ctx = context.workingcommitctx(repo, status, text, user, date, extra)
+
+    editform = form or "commit.normal.normal"
+    extramsg = _("Leave message empty to abort commit.")
+
+    forms = [e for e in editform.split(".") if e]
+    forms.insert(0, "changeset")
+    while forms:
+        ref = ".".join(forms)
+        tmpl = repo.ui.config("committemplate", ref)
+        if tmpl:
+            committext = cmdutil.buildcommittemplate(repo, ctx, extramsg, ref)
+            break
+        forms.pop()
+    else:
+        committext = cmdutil.buildcommittext(repo, ctx, extramsg)
+
+    ui.status(committext)

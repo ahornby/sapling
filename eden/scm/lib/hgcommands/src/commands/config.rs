@@ -5,6 +5,7 @@
  * GNU General Public License version 2.
  */
 
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 
 use anyhow::bail;
@@ -16,6 +17,7 @@ use clidispatch::ReqCtx;
 use cliparser::define_flags;
 use configloader::Config;
 use configmodel::ConfigExt;
+use configmodel::ValueSource;
 use formatter::formatter::FormatOptions;
 use formatter::formatter::Formattable;
 use formatter::formatter::ListFormatter;
@@ -89,8 +91,7 @@ pub fn run(ctx: ReqCtx<ConfigOpts>, repo: &mut OptionalRepo) -> Result<u8> {
     ctx.maybe_start_pager(repo.config())?;
 
     formatter.begin_list()?;
-    let verbose = ctx.global_opts().verbose;
-    let exit_code = show_configs(ctx.opts.args, config, formatter.as_mut(), verbose)?;
+    let exit_code = show_configs(ctx, config, formatter.as_mut())?;
     formatter.end_list()?;
 
     Ok(exit_code)
@@ -98,9 +99,10 @@ pub fn run(ctx: ReqCtx<ConfigOpts>, repo: &mut OptionalRepo) -> Result<u8> {
 
 struct ConfigItem<'a> {
     source: String,
+    all_sources: Cow<'a, [ValueSource]>,
     section: &'a str,
     key: &'a str,
-    value: String,
+    value: Option<String>,
     single_item: bool,
     builtin: bool,
 }
@@ -114,7 +116,9 @@ impl<'a> Serialize for ConfigItem<'a> {
         let name = format!("{}.{}", self.section, self.key);
         item.serialize_field("name", name.as_str())?;
         item.serialize_field("source", &self.source)?;
+
         item.serialize_field("value", &self.value)?;
+
         item.end()
     }
 }
@@ -125,6 +129,12 @@ impl<'a> Formattable for ConfigItem<'a> {
         options: &FormatOptions,
         writer: &mut dyn formatter::StyleWrite,
     ) -> std::result::Result<(), anyhow::Error> {
+        let value: &str = match &self.value {
+            Some(value) => value.as_ref(),
+            None if options.debug => "<%unset>",
+            _ => return Ok(()),
+        };
+
         let source_section = if options.debug {
             format!("{}: ", self.source)
         } else {
@@ -140,8 +150,24 @@ impl<'a> Formattable for ConfigItem<'a> {
             "{}{}{}\n",
             source_section,
             kv_section,
-            self.value.replace('\n', "\\n")
+            value.replace('\n', "\\n")
         )?;
+
+        if options.debug && options.verbose {
+            for s in self.all_sources.iter().rev().skip(1) {
+                let value = match &s.value {
+                    None => Text::from_static("<%unset>"),
+                    Some(value) => value.clone(),
+                };
+                write!(
+                    writer,
+                    "  {}: {kv_section}{}\n",
+                    source_to_display_string(s),
+                    value.replace('\n', "\\n"),
+                )?;
+            }
+        }
+
         Ok(())
     }
 }
@@ -151,26 +177,39 @@ fn get_config_item<'a>(
     section: &'a str,
     key: &'a str,
     single_item: bool,
+    debug: bool,
 ) -> Option<ConfigItem<'a>> {
-    let sources_list = config.get_sources(section, key);
-    let config_value_source = match sources_list.last() {
+    let all_sources = config.get_sources(section, key);
+    let config_value_source = match all_sources.last() {
         None => {
             return None;
         }
-        Some(s) => s,
-    };
-    let value = match config_value_source.value() {
-        None => {
-            return None;
-        }
-        Some(v) => v.to_string(),
+        Some(last) => last,
     };
 
-    let builtin = config_value_source.source().starts_with("builtin:");
-    let source = config_value_source
+    let value = config_value_source.value();
+
+    // Don't expose %unset unless --debug was specified.
+    if value.is_none() && !debug {
+        return None;
+    }
+
+    Some(ConfigItem {
+        source: source_to_display_string(config_value_source),
+        section,
+        key,
+        value: value.as_ref().map(|v| v.to_string()),
+        single_item,
+        builtin: config_value_source.source().starts_with("builtin:"),
+        all_sources,
+    })
+}
+
+fn source_to_display_string(source: &ValueSource) -> String {
+    source
         .location()
         .and_then(|(location, range)| {
-            config_value_source.file_content().map(|file| {
+            source.file_content().map(|file| {
                 let line = 1 + file
                     .slice(0..range.start)
                     .chars()
@@ -179,35 +218,31 @@ fn get_config_item<'a>(
                 if !location.as_os_str().is_empty() {
                     format!("{}:{}", location.display(), line)
                 } else {
-                    let source = config_value_source.source();
-                    format!("{}:{}", source, line)
+                    format!("{}:{}", source.source(), line)
                 }
             })
         })
-        .unwrap_or_else(|| config_value_source.source().to_string());
-
-    Some(ConfigItem {
-        source,
-        section,
-        key,
-        value,
-        single_item,
-        builtin,
-    })
+        .unwrap_or_else(|| source.source().to_string())
 }
 
 fn show_configs(
-    requested_configs: Vec<String>,
+    ctx: ReqCtx<ConfigOpts>,
     config: &ConfigSet,
     formatter: &mut dyn ListFormatter,
-    verbose: bool,
 ) -> Result<u8> {
-    let requested_items: Vec<_> = requested_configs
+    let verbose = ctx.global_opts().verbose;
+    let debug = ctx.global_opts().debug;
+
+    let requested_items: Vec<_> = ctx
+        .opts
+        .args
         .iter()
         .filter(|a| a.contains('.'))
         .cloned()
         .collect();
-    let requested_sections: BTreeSet<_> = requested_configs
+    let requested_sections: BTreeSet<_> = ctx
+        .opts
+        .args
         .into_iter()
         .filter_map(|a| {
             if !a.contains('.') {
@@ -228,7 +263,7 @@ fn show_configs(
         let item = &requested_items[0];
         let parts: Vec<_> = item.splitn(2, '.').collect();
 
-        if let Some(item) = get_config_item(config, parts[0], parts[1], true) {
+        if let Some(item) = get_config_item(config, parts[0], parts[1], true, debug) {
             formatter.format_item(&item)?;
             return Ok(0);
         }
@@ -253,7 +288,7 @@ fn show_configs(
         let mut keys = config.keys(section);
         keys.sort();
         for key in keys {
-            if let Some(item) = get_config_item(config, section, &key, false) {
+            if let Some(item) = get_config_item(config, section, &key, false, debug) {
                 if empty_selection && item.builtin && !verbose {
                     continue;
                 }

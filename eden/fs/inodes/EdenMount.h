@@ -27,6 +27,7 @@
 #include "eden/fs/config/EdenConfig.h"
 #include "eden/fs/inodes/CacheHint.h"
 #include "eden/fs/inodes/FsChannel.h"
+#include "eden/fs/inodes/InodeCatalogType.h"
 #include "eden/fs/inodes/InodeNumber.h"
 #include "eden/fs/inodes/InodePtrFwd.h"
 #include "eden/fs/inodes/InodeTimestamps.h"
@@ -293,7 +294,7 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
       std::shared_ptr<ServerState> serverState,
       std::unique_ptr<Journal> journal,
       EdenStatsPtr stats,
-      std::optional<Overlay::InodeCatalogType> inodeCatalogType = std::nullopt);
+      std::optional<InodeCatalogType> inodeCatalogType = std::nullopt);
 
   /**
    * Asynchronous EdenMount initialization - post instantiation.
@@ -363,7 +364,7 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
    * function immediately returns a Future which will complete at the same time
    * the original call to unmount() completes.
    */
-  FOLLY_NODISCARD folly::Future<folly::Unit> unmount();
+  FOLLY_NODISCARD folly::SemiFuture<folly::Unit> unmount();
 
   /**
    * Get the current state of this mount.
@@ -709,7 +710,7 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
   folly::Future<CheckoutResult> checkout(
       TreeInodePtr rootInode,
       const RootId& snapshotHash,
-      std::optional<pid_t> clientPid,
+      OptionalProcessId clientPid,
       folly::StringPiece thriftMethodCaller,
       CheckoutMode checkoutMode = CheckoutMode::NORMAL);
 
@@ -1105,8 +1106,8 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
   /**
    * Returns overlay type based on settings.
    */
-  Overlay::InodeCatalogType getInodeCatalogType(
-      std::optional<Overlay::InodeCatalogType> inodeCatalogType);
+  InodeCatalogType getInodeCatalogType(
+      std::optional<InodeCatalogType> inodeCatalogType);
 
   EdenMount(
       std::unique_ptr<CheckoutConfig> checkoutConfig,
@@ -1115,7 +1116,7 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
       std::shared_ptr<ServerState> serverState,
       std::unique_ptr<Journal> journal,
       EdenStatsPtr stats,
-      std::optional<Overlay::InodeCatalogType> inodeCatalogType = std::nullopt);
+      std::optional<InodeCatalogType> inodeCatalogType = std::nullopt);
 
   // Forbidden copy constructor and assignment operator
   EdenMount(EdenMount const&) = delete;
@@ -1265,7 +1266,18 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
     // differ.
     RootId workingCopyParentRootId;
     bool checkoutInProgress = false;
+    /**
+     * When checkout was previously interruptd, this holds the RootId of the
+     * working copy prior to checkout, as well as the destination RootId.
+     */
     std::optional<std::tuple<RootId, RootId>> checkoutOriginalTrees;
+
+    /**
+     * pid of the EdenFS process that triggered the checkout.
+     *
+     * This is expected to be different from the current EdenFS process only
+     * when checkout was previously interrupted.
+     */
     std::optional<pid_t> checkoutPid;
   };
 

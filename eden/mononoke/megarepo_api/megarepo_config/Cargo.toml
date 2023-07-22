@@ -8,8 +8,8 @@ edition = "2021"
 license = "GPLv2+"
 
 [dependencies]
-anyhow = "1.0.65"
-async-trait = "0.1.58"
+anyhow = "1.0.71"
+async-trait = "0.1.71"
 cached_config = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 clap = { version = "4.3.5", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 configo_client = { version = "0.1.0", path = "../configo_client" }
@@ -23,5 +23,5 @@ megarepo_configs = { version = "0.1.0", path = "../../../../configerator/structs
 megarepo_error = { version = "0.1.0", path = "../megarepo_error" }
 sha1 = "0.10.5"
 slog = { version = "2.7", features = ["max_level_trace", "nested-values"] }
-tokio = { version = "1.25.0", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.29.1", features = ["full", "test-util", "tracing"] }
 version_cconf_index = { version = "0.1.0", path = "../../../../configerator/structs/scm/mononoke/megarepo/version_cconf_index" }

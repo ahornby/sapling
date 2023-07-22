@@ -230,7 +230,7 @@ std::shared_ptr<EdenMount> EdenMount::create(
     std::shared_ptr<ServerState> serverState,
     std::unique_ptr<Journal> journal,
     EdenStatsPtr stats,
-    std::optional<Overlay::InodeCatalogType> inodeCatalogType) {
+    std::optional<InodeCatalogType> inodeCatalogType) {
   return std::shared_ptr<EdenMount>{
       new EdenMount{
           std::move(config),
@@ -250,7 +250,7 @@ EdenMount::EdenMount(
     std::shared_ptr<ServerState> serverState,
     std::unique_ptr<Journal> journal,
     EdenStatsPtr stats,
-    std::optional<Overlay::InodeCatalogType> inodeCatalogType)
+    std::optional<InodeCatalogType> inodeCatalogType)
     : checkoutConfig_{std::move(checkoutConfig)},
       serverState_{std::move(serverState)},
 #ifdef _WIN32
@@ -288,8 +288,8 @@ EdenMount::EdenMount(
   subscribeInodeActivityBuffer();
 }
 
-Overlay::InodeCatalogType EdenMount::getInodeCatalogType(
-    std::optional<Overlay::InodeCatalogType> inodeCatalogType) {
+InodeCatalogType EdenMount::getInodeCatalogType(
+    std::optional<InodeCatalogType> inodeCatalogType) {
   if (inodeCatalogType.has_value()) {
     return inodeCatalogType.value();
   }
@@ -297,24 +297,24 @@ Overlay::InodeCatalogType EdenMount::getInodeCatalogType(
   if (checkoutConfig_->getEnableSqliteOverlay()) {
     if (getEdenConfig()->unsafeInMemoryOverlay.getValue()) {
       if (getEdenConfig()->overlayBuffered.getValue()) {
-        return Overlay::InodeCatalogType::SqliteInMemoryBuffered;
+        return InodeCatalogType::SqliteInMemoryBuffered;
       } else {
-        return Overlay::InodeCatalogType::SqliteInMemory;
+        return InodeCatalogType::SqliteInMemory;
       }
     }
     if (getEdenConfig()->overlaySynchronousMode.getValue() == "off") {
       if (getEdenConfig()->overlayBuffered.getValue()) {
-        return Overlay::InodeCatalogType::SqliteSynchronousOffBuffered;
+        return InodeCatalogType::SqliteSynchronousOffBuffered;
       } else {
-        return Overlay::InodeCatalogType::SqliteSynchronousOff;
+        return InodeCatalogType::SqliteSynchronousOff;
       }
     }
     if (getEdenConfig()->overlayBuffered.getValue()) {
-      return Overlay::InodeCatalogType::SqliteBuffered;
+      return InodeCatalogType::SqliteBuffered;
     }
-    return Overlay::InodeCatalogType::Sqlite;
+    return InodeCatalogType::Sqlite;
   } else {
-    return Overlay::InodeCatalogType::Legacy;
+    return InodeCatalogType::Legacy;
   }
 }
 
@@ -954,7 +954,7 @@ folly::SemiFuture<SerializedInodeMap> EdenMount::shutdown(
       !tryToTransitionState(State::INIT_ERROR, State::SHUTTING_DOWN) &&
       !tryToTransitionState(State::FUSE_ERROR, State::SHUTTING_DOWN)) {
     EDEN_BUG() << "attempted to call shutdown() on a non-running EdenMount: "
-               << "state was " << getState();
+               << "state was " << fmt::underlying(getState());
   }
 
   // The caller calls us with the EdenServer::mountPoints_ lock, make sure that
@@ -985,53 +985,48 @@ folly::SemiFuture<SerializedInodeMap> EdenMount::shutdownImpl(bool doTakeover) {
       });
 }
 
-folly::Future<folly::Unit> EdenMount::unmount() {
-  return folly::makeFutureWith([this] {
-    auto mountingUnmountingState = mountingUnmountingState_.wlock();
-    if (mountingUnmountingState->fsChannelUnmountStarted()) {
-      return mountingUnmountingState->fsChannelUnmountPromise->getFuture();
-    }
-    mountingUnmountingState->fsChannelUnmountPromise.emplace();
-    if (!mountingUnmountingState->fsChannelMountStarted()) {
-      return folly::makeFuture();
-    }
-    auto mountFuture =
-        mountingUnmountingState->fsChannelMountPromise->getFuture();
-    mountingUnmountingState.unlock();
+folly::SemiFuture<folly::Unit> EdenMount::unmount() {
+  auto mountingUnmountingState = mountingUnmountingState_.wlock();
+  if (mountingUnmountingState->fsChannelUnmountStarted()) {
+    return mountingUnmountingState->fsChannelUnmountPromise->getFuture();
+  }
+  mountingUnmountingState->fsChannelUnmountPromise.emplace();
+  if (!mountingUnmountingState->fsChannelMountStarted()) {
+    return folly::makeFuture();
+  }
+  auto mountFuture =
+      mountingUnmountingState->fsChannelMountPromise->getFuture();
+  mountingUnmountingState.unlock();
 
-    return std::move(mountFuture)
-        .thenTry([this](Try<Unit>&& mountResult) {
-          if (mountResult.hasException()) {
-            return folly::makeFuture();
-          }
-#ifdef _WIN32
-          if (auto* channel = getPrjfsChannel()) {
-            return channel->stop()
-                .via(getServerThreadPool().get())
-                .ensure([this] { channel_.reset(); });
-          } else {
-            return folly::makeFutureWith([]() { NOT_IMPLEMENTED(); });
-          }
-#else
-          // TODO: teach windows to unmount NFS
-          if (getNfsdChannel() != nullptr) {
-            return serverState_->getPrivHelper()->nfsUnmount(getPath().view());
-          } else {
-            return serverState_->getPrivHelper()->fuseUnmount(getPath().view());
-          }
-#endif
-        })
-        .thenTry([this](Try<Unit>&& result) noexcept -> folly::Future<Unit> {
-          auto mountingUnmountingState = mountingUnmountingState_.wlock();
-          XDCHECK(mountingUnmountingState->fsChannelUnmountPromise.has_value());
-          folly::SharedPromise<folly::Unit>* unsafeUnmountPromise =
-              &*mountingUnmountingState->fsChannelUnmountPromise;
-          mountingUnmountingState.unlock();
+  return std::move(mountFuture)
+      .thenTry([this](Try<Unit>&& mountResult) {
+        if (mountResult.hasException()) {
+          return folly::makeSemiFuture();
+        }
+        if (!channel_) {
+          throw std::runtime_error(
+              "attempting to unmount() an EdenMount without an FsChannel");
+        }
+        // If a Future then callback returns a SemiFuture, that SemiFuture is
+        // attached to the implied InlineExecutor.
+        // Therefore, the the following callback will be guaranteed to be fixup
+        // the mountingUnmountingState, even if the returned SemiFuture is
+        // dropped.
+        // TODO: Is it safe to call FsChannel::unmount if the FuseChannel
+        // is in the process of starting? Or can we assume that
+        // mountResult.hasException() above covers that case?
+        return channel_->unmount();
+      })
+      .thenTry([this](Try<Unit>&& result) noexcept -> folly::Future<Unit> {
+        auto mountingUnmountingState = mountingUnmountingState_.wlock();
+        XDCHECK(mountingUnmountingState->fsChannelUnmountPromise.has_value());
+        folly::SharedPromise<folly::Unit>* unsafeUnmountPromise =
+            &*mountingUnmountingState->fsChannelUnmountPromise;
+        mountingUnmountingState.unlock();
 
-          unsafeUnmountPromise->setTry(Try<Unit>{result});
-          return folly::makeFuture<folly::Unit>(std::move(result));
-        });
-  });
+        unsafeUnmountPromise->setTry(Try<Unit>{result});
+        return folly::makeFuture<folly::Unit>(std::move(result));
+      });
 }
 
 const shared_ptr<UnboundedQueueExecutor>& EdenMount::getServerThreadPool()
@@ -1328,7 +1323,7 @@ ImmediateFuture<folly::Unit> EdenMount::waitForPendingWrites() const {
 folly::Future<CheckoutResult> EdenMount::checkout(
     TreeInodePtr rootInode,
     const RootId& snapshotHash,
-    std::optional<pid_t> clientPid,
+    OptionalProcessId clientPid,
     folly::StringPiece thriftMethodCaller,
     CheckoutMode checkoutMode) {
   const folly::stop_watch<> stopWatch;
@@ -1339,10 +1334,9 @@ folly::Future<CheckoutResult> EdenMount::checkout(
   {
     auto parentLock = parentState_.wlock();
     if (parentLock->checkoutInProgress) {
-      auto allowResume = getEdenConfig()->allowResumeCheckout.getValue();
       auto optPid = parentLock->checkoutPid;
       auto optTrees = parentLock->checkoutOriginalTrees;
-      if (allowResume && optTrees.has_value() && optPid.has_value() &&
+      if (optTrees.has_value() && optPid.has_value() &&
           optPid.value() != folly::get_cached_pid()) {
         auto originalTrees = optTrees.value();
         auto [src, dest] = originalTrees;
@@ -1365,12 +1359,17 @@ folly::Future<CheckoutResult> EdenMount::checkout(
             "another checkout operation is still in progress"));
       }
     } else {
+      oldParent = parentLock->workingCopyParentRootId;
       // Set checkoutInProgress and release the lock. An alternative way of
       // achieving the same would be to hold the lock during the checkout
       // operation, but this might lead to deadlocks on Windows due to callbacks
       // needing to access the parent commit to service callbacks.
       parentLock->checkoutInProgress = true;
-      oldParent = parentLock->workingCopyParentRootId;
+    }
+    if (checkoutMode != CheckoutMode::DRY_RUN) {
+      // Also make sure that when checkout is resumed post checkout, a
+      // concurrent checkout will hit the CHECKOUT_IN_PROGRESS case.
+      parentLock->checkoutPid = folly::get_cached_pid();
     }
   }
 
@@ -1627,21 +1626,25 @@ ImmediateFuture<folly::Unit> EdenMount::flushInvalidations() {
 
 #ifndef _WIN32
 ImmediateFuture<folly::Unit> EdenMount::chown(uid_t uid, gid_t gid) {
-  // 1) Ensure we are running in a fuse mount
-  auto fuseChannel = getFuseChannel();
+  // 1) Ensure we are running in either a fuse or nfs mount
+  Nfsd3* nfsChannel = nullptr;
+  FuseChannel* fuseChannel = getFuseChannel();
   if (!fuseChannel) {
-    return makeFuture<Unit>(newEdenError(
-        EdenErrorType::GENERIC_ERROR,
-        "chown is not currently implemented for NFS mounts"));
+    nfsChannel = getNfsdChannel();
+    if (!nfsChannel) {
+      return makeFuture<Unit>(newEdenError(
+          EdenErrorType::GENERIC_ERROR,
+          "chown is currently implemented for FUSE and NFS mounts only"));
+    }
   }
 
   // 2) Ensure that all future opens will by default provide this owner
   setOwner(uid, gid);
 
   // 3) Modify all uids/gids of files stored in the overlay
-  auto metadata = getInodeMetadataTable();
-  XDCHECK(metadata) << "Unexpected null Metadata Table";
-  metadata->forEachModify([&](auto& /* unusued */, auto& record) {
+  auto metadataTable = getInodeMetadataTable();
+  XDCHECK(metadataTable) << "Unexpected null Metadata Table";
+  metadataTable->forEachModify([&](auto& /* unusued */, auto& record) {
     record.uid = uid;
     record.gid = gid;
   });
@@ -1651,10 +1654,48 @@ ImmediateFuture<folly::Unit> EdenMount::chown(uid_t uid, gid_t gid) {
   // consistent with the behavior of chown
 
   // 4) Invalidate all inodes that the kernel holds a reference to
-  auto inodesToInvalidate = getInodeMap()->getReferencedInodes();
-  fuseChannel->invalidateInodes(folly::range(inodesToInvalidate));
+  auto inodeMap = getInodeMap();
+  auto inodesToInvalidate = inodeMap->getReferencedInodes();
+  if (fuseChannel) {
+    fuseChannel->invalidateInodes(folly::range(inodesToInvalidate));
+    return fuseChannel->completeInvalidations();
+  } else {
+    // Load all Inodes - there should only be a few
+    // as chown is called primarily in Sandcastle workflows
+    // where the repo has just been cloned.
+    std::vector<ImmediateFuture<InodePtr>> futures;
+    futures.reserve(inodesToInvalidate.size());
+    for (const auto& ino : inodesToInvalidate) {
+      futures.emplace_back(inodeMap->lookupInode(ino));
+    }
 
-  return fuseChannel->completeInvalidations();
+    return collectAllSafe(std::move(futures))
+        .thenValue([this, nfsChannel, metadataTable](auto&& inodes) {
+          auto renameLock = acquireRenameLock();
+          auto root = getPath();
+
+          std::vector<std::pair<AbsolutePath, mode_t>> pathsAndModes;
+          for (auto& inode : inodes) {
+            auto metadata = metadataTable->getOptional(inode->getNodeId());
+            if (!metadata.has_value()) {
+              XLOGF(
+                  WARNING,
+                  "Inode ({}) not found in metadata table",
+                  inode->getNodeId());
+              continue;
+            }
+
+            auto path = inode->getPath();
+            if (path.has_value()) {
+              pathsAndModes.emplace_back(
+                  root + path.value(), metadata.value().mode);
+            }
+          }
+
+          nfsChannel->invalidateInodes(std::move(pathsAndModes));
+          return nfsChannel->completeInvalidations();
+        });
+  }
 }
 #endif
 
@@ -1667,6 +1708,7 @@ std::unique_ptr<DiffContext> EdenMount::createDiffContext(
       cancellation,
       listIgnored,
       getCheckoutConfig()->getCaseSensitive(),
+      getCheckoutConfig()->getEnableWindowsSymlinks(),
       getObjectStore(),
       serverState_->getTopLevelIgnores());
 }
@@ -1707,17 +1749,13 @@ ImmediateFuture<Unit> EdenMount::diff(
         return makeImmediateFuture<Unit>(newEdenError(
             EdenErrorType::CHECKOUT_IN_PROGRESS,
             "cannot compute status while a checkout is currently in progress"));
-      } else if (getEdenConfig()->allowResumeCheckout.getValue()) {
+      } else {
         auto [fromCommit, toCommit] = *parentInfo->checkoutOriginalTrees;
         return makeImmediateFuture<Unit>(newEdenError(
             EdenErrorType::CHECKOUT_IN_PROGRESS,
             fmt::format(
                 "cannot compute status while a checkout is in progress - please run 'hg update --clean {}' to resume it",
                 toCommit)));
-      } else {
-        return makeImmediateFuture<Unit>(newEdenError(
-            EdenErrorType::CHECKOUT_IN_PROGRESS,
-            "cannot compute status for an interrupted checkout operation"));
       }
     }
 
@@ -1856,6 +1894,7 @@ std::unique_ptr<FuseChannel, FsChannelDeleter> makeFuseChannel(
     folly::File fuseFd) {
   auto edenConfig = mount->getEdenConfig();
   return makeFuseChannel(
+      mount->getServerState()->getPrivHelper(),
       std::move(fuseFd),
       mount->getPath(),
       FLAGS_fuseNumThreads,
@@ -2012,6 +2051,7 @@ folly::Future<folly::Unit> EdenMount::fsChannelMount(bool readOnly) {
                          &getStraceLogger(),
                          serverState_->getProcessNameCache(),
                          getCheckoutConfig()->getRepoGuid(),
+                         getCheckoutConfig()->getEnableWindowsSymlinks(),
                          this->getServerState()->getNotifier()));
                  return FsChannelPtr{std::move(channel)};
                })

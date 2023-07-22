@@ -5,11 +5,11 @@
 
 from __future__ import absolute_import
 
-import base64, collections, functools
+import base64, collections, functools, stat
 
 from .. import context, hg, json, mutation, scmutil, smartset, visibility
 from ..i18n import _
-from ..node import bin, hex, wdirhex, wdirrev
+from ..node import bin, hex, nullid, wdirhex, wdirrev
 from .cmdtable import command
 
 
@@ -258,9 +258,11 @@ def debugimportstack(ui, repo, **opts):
 
         [["commit", commit_info],
          ["commit", commit_info],
+         ["amend", {"node": node, ..commit_info}],
          ["goto", {"mark": mark}],
          ["reset", {"mark": mark}],
-         ["hide", {"nodes": [node]}]]
+         ["hide", {"nodes": [node]}],
+         ["write", {path: file_info}]]
 
     "goto" performs a checkout that will overwrite conflicted files.
 
@@ -285,7 +287,9 @@ def debugimportstack(ui, repo, **opts):
 
          // Parent nodes or marks. They must be known already.
          // Do not refer to commits after this commit.
-         "parents": [node | mark],
+         // "." means the current working parent, before making any
+         // new commits.
+         "parents": [node | mark | "."],
 
          // Predecessors that will be obsoleted. Optional.
          "predecessors": [node | mark],
@@ -316,12 +320,25 @@ def debugimportstack(ui, repo, **opts):
          }
         }
 
+    "amend" is similar to commit, but it will reuse the old commit's
+    messages, parents, files by default. The "files" field will merge
+    with (not replace) the old commit's "files". The "node" field is
+    required to specify the old commit.
+
+    "write" can be used to write files to the working copy.
+    It will be executed after creating commits.
+
     The format of "commit_info" is similar to the output of
     ``debugexportstack``, with some differences:
 
     - No ``relevantFiles``.
     - No ``node``. Use ``mark`` instead. ``parents`` can refer to marks.
     - Has ``predecessors``.
+    - File can be ``.``, which means reading it from the working copy.
+    - ``copyFrom`` can be ``.``, which means reading from the working copy.
+    - ``flags`` can be ``.``, which means reading from the working copy,
+      or the parent of the working copy, if the file is in "R" or "!"
+      status.
 
     Bookmarks will be moved if they become obsoleted (referred by
     ``predecessors``).
@@ -349,8 +366,8 @@ def debugimportstack(ui, repo, **opts):
     There might be extra output caused by the "goto" operation after the first
     line. Those should be ignored by automation.
     """
-    marks = Marks()
     wnode = repo["."].node()
+    marks = Marks(wnode)
 
     try:
         try:
@@ -360,14 +377,18 @@ def debugimportstack(ui, repo, **opts):
 
         with repo.wlock(), repo.lock(), repo.transaction("importstack"):
             # Create commits.
-            commit_infos = [action[1] for action in actions if action[0] == "commit"]
+            commit_infos = [action[1] for action in actions if action[0] in "commit"]
             _create_commits(repo, commit_infos, marks)
+
+            # Handle "amend"
+            commit_infos = [action[1] for action in actions if action[0] in "amend"]
+            _create_commits(repo, commit_infos, marks, amend=True)
 
             # Handle "goto" or "reset".
             to_hide = []
             for action in actions:
                 action_name = action[0]
-                if action_name == "commit":
+                if action_name in {"commit", "amend"}:
                     # Handled by _create_commits already.
                     continue
                 elif action_name == "goto":
@@ -378,6 +399,8 @@ def debugimportstack(ui, repo, **opts):
                     _reset(repo, node)
                 elif action_name == "hide":
                     to_hide += [bin(n) for n in action[1]["nodes"]]
+                elif action_name == "write":
+                    _write_files(repo, action[1])
                 else:
                     raise ValueError(f"unsupported action: {action}")
 
@@ -397,8 +420,9 @@ def debugimportstack(ui, repo, **opts):
 class Marks:
     """Track marks (pending commit hashes)"""
 
-    def __init__(self):
+    def __init__(self, wnode):
         self._mark_to_node = {}  # {mark: node}
+        self._wnode = wnode
 
     def to_nodes(self, items):
         """Resolve hex or marks to (binary) nodes"""
@@ -409,6 +433,10 @@ class Marks:
                 if not node:
                     raise ValueError(f"cannot resolve mark {item} to node")
                 result.append(node)
+            elif item == ".":
+                node = self._wnode
+                if node != nullid:
+                    result.append(node)
             else:
                 node = bin(item)
                 result.append(node)
@@ -428,11 +456,33 @@ class Marks:
         return self._mark_to_node[mark]
 
 
-def _create_commits(repo, commit_infos, marks: Marks):
-    """Create commits based on commit_infos.
+def _create_commits(repo, commit_infos, marks: Marks, amend=False):
+    """Create or amend commits based on commit_infos.
     Do not change the working copy.
     Assumes inside a transaction.
     """
+    if amend:
+        # Merge commit_info with information from the original commit.
+        new_commit_infos = []
+        for commit_info in commit_infos:
+            node = commit_info["node"]
+            ctx = repo[node]
+            files = commit_info.get("files", {})
+            for path in ctx.files():
+                if path not in files:
+                    files[path] = _file_obj(ctx, path)
+            commit_info["files"] = files
+            new_commit_info = {
+                "author": ctx.user(),
+                "text": ctx.description(),
+                "parents": [p.hex() for p in ctx.parents()],
+                "predecessors": [node],
+                "operation": "amend",
+                **commit_info,
+            }
+            new_commit_infos.append(new_commit_info)
+        commit_infos = new_commit_infos
+
     # Split pre-processing.
     # When A is split into A1 and A2, both A1 and A2 have
     # the same predecessor A. The mutation information only
@@ -551,6 +601,19 @@ def _filectxfn(repo, mctx, path, files_dict):
             data = base64.b85decode(file_info["dataBase85"])
         copied = file_info.get("copyFrom")
         flags = file_info.get("flags", "")
+        if copied == ".":
+            # Read copied from dirstate.
+            renamed = repo[None][path].renamed()
+            if renamed:
+                copied = renamed[0]
+            else:
+                copied = None
+        if flags == ".":
+            # Read flags from wdir(), or ".".
+            if repo.wvfs.lexists(path):
+                flags = repo[None][path].flags()
+            else:
+                flags = repo["."][path].flags()
         return context.memfilectx(
             repo,
             mctx,
@@ -560,3 +623,61 @@ def _filectxfn(repo, mctx, path, files_dict):
             isexec="x" in flags,
             copied=copied,
         )
+
+
+def _write_files(repo, file_infos):
+    wvfs = repo.wvfs
+    unlinked = set()
+    for path, file_info in file_infos.items():
+        if file_info is None:
+            # Delete this file.
+            wvfs.tryunlink(path)
+            unlinked.add(path)
+        else:
+            if file_info == ".":
+                # Use the file from the working *parent*.
+                ctx = repo["."]
+                if path in ctx:
+                    fctx = ctx[path]
+                    data = fctx.data()
+                    flags = fctx.flags()
+                else:
+                    wvfs.tryunlink(path)
+                    unlinked.add(path)
+                    continue
+            else:
+                if "data" in file_info:
+                    data = file_info["data"].encode()
+                else:
+                    data = base64.b85decode(file_info["dataBase85"])
+                flags = file_infos.get("flags")
+                if flags is None or flags == ".":
+                    flags = _existing_flags(wvfs, path)
+            wvfs.write(path, data)
+            wvfs.setflags(path, l="l" in flags, x="x" in flags)
+
+    # Update dirstate. Forget deleted files, undelete written files.
+    with repo.wlock():
+        ds = repo.dirstate
+        for path in file_infos:
+            if path in unlinked:
+                # forget
+                if ds[path] == "a":
+                    ds.untrack(path)
+            else:
+                # undelete
+                if ds[path] == "r":
+                    ds.normallookup(path)
+
+
+def _existing_flags(wvfs, path):
+    flags = ""
+    try:
+        st = wvfs.lstat(path)
+        if stat.S_ISLNK(st.st_mode):
+            flags = "l"
+        elif (st.st_mode & 0o111) != 0:
+            flags = "x"
+    except FileNotFoundError:
+        pass
+    return flags

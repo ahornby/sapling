@@ -414,9 +414,9 @@ class localrepository(object):
         """Instantiate local repo object, optionally creating a new repo on disk if `create` is True.
         If specified, `initial_config` is added to the created repo's config."""
 
-        # Simplify things by keepning identity cache scoped at max to
+        # Simplify things by keeping identity cache scoped at max to
         # a single repo's lifetime. In particular this is necessary
-        # wrt git submodules.
+        # with respect to git submodules.
         identity.sniffdir.cache_clear()
 
         if create:
@@ -1175,8 +1175,6 @@ class localrepository(object):
 
             # Filter out heads that exist in the repo.
             if pullheads:
-                if fastpathheads:
-                    self.invalidatechangelog()
                 pullheads -= set(self.changelog.filternodes(list(pullheads)))
 
             self.ui.log(
@@ -1211,10 +1209,12 @@ class localrepository(object):
                 remotename = bookmarks.remotenameforurl(
                     self.ui, remote.url()
                 )  # ex. 'default' or 'remote'
+                # saveremotenames will invalidate self.heads by bumping
+                # _remotenames.changecount, and invalidate phase sets
+                # like `public()` by calling invalidatevolatilesets.
                 bookmarks.saveremotenames(
                     self, {remotename: remotenamechanges}, override=False
                 )
-                self.invalidate(True)
 
             # Update visibleheads:
             if heads:
@@ -1840,6 +1840,16 @@ class localrepository(object):
                     mainnodes.append(node)
             cl.inner.flush(mainnodes)
 
+            # flush(mainnodes) might reassign ids that makes the cached `public()`
+            # incompatible (force slow paths). Invalidate cached `public()` to
+            # avoid slow paths.
+            # Note: invalidation is not done in the phase cache. See D47478975
+            # and S353203.
+            new_version = cl.dag.version()
+            old_version = repo.dageval(lambda: public()).hints().get("dag_version")
+            if old_version is None or old_version.cmp(new_version) is None:
+                repo.invalidatevolatilesets()
+
         def writependingchangelog(tr):
             repo = reporef()
             _flushchangelog(repo)
@@ -1859,14 +1869,10 @@ class localrepository(object):
                 repo.dirstate.write(None)
                 repo._txnreleased = True
 
-                # Rust may use it's own copies of stores, so we need to
-                # invalidate those when a transaction commits successfully.
-                repo._rsrepo.invalidatestores()
-
                 # Don't invalidate Rust if Rust and Python are sharing the changelog object.
                 # Python's invalidation will cover it.
                 if not repo.ui.configbool("experimental", "use-rust-changelog"):
-                    self._rsrepo.invalidatechangelog()
+                    repo._rsrepo.invalidatechangelog()
             else:
                 # discard all changes (including ones already written
                 # out) in this transaction
@@ -2228,8 +2234,6 @@ class localrepository(object):
             # causes inconsistency. We should make in-memory store
             # changes detectable, and abort if changed.
             self.store.invalidatecaches()
-
-        self._rsrepo.invalidatestores()
 
     def invalidatechangelog(self):
         """Invalidates the changelog. Discard pending changes."""

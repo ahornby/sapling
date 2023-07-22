@@ -9,6 +9,7 @@
 
 #include <array>
 #include <fstream>
+#include <optional>
 #include <vector>
 
 #include <folly/Conv.h>
@@ -19,9 +20,11 @@
 #include "eden/fs/utils/FileUtils.h"
 
 #ifdef __APPLE__
+#include <libproc.h> // @manual
 #include <mach/mach_init.h> // @manual
 #include <mach/task.h> // @manual
 #include <mach/task_info.h> // @manual
+#include <sys/proc_info.h> // @manual
 #endif
 
 #ifdef _WIN32
@@ -233,4 +236,129 @@ std::optional<size_t> calculatePrivateBytes() {
   return std::nullopt;
 #endif
 }
+
+ProcessList readProcessIdsForPath(FOLLY_MAYBE_UNUSED const AbsolutePath& path) {
+  ProcessList pids;
+#ifdef __APPLE__
+  // Obtain the number of bytes to allocate for the pids buffer.
+  int32_t pids_size = proc_listpidspath(
+      PROC_ALL_PIDS,
+      0,
+      path.c_str(),
+      PROC_LISTPIDSPATH_PATH_IS_VOLUME,
+      nullptr,
+      0);
+
+  // There is a race-condition here, where processes could be started after the
+  // call above to compute the amount of storage required. The maximum number of
+  // processes for a given machine is based on both OS version and hardware
+  // constraints so there is not a known compile time value nor does there a
+  // known OS call to obtain. However, calling proc_listpidspath with less
+  // storage than required does not result in a buffer overflow or an error -
+  // rather it truncates the results to fit within the buffer provided. This is
+  // acceptable in most use cases as this is expected to be a rare occurance.
+  if (pids_size > 0) {
+    // Resize buffer and fetch pids.
+    pids.resize(pids_size / sizeof(pid_t));
+    pids_size = proc_listpidspath(
+        PROC_ALL_PIDS,
+        0,
+        path.c_str(),
+        PROC_LISTPIDSPATH_PATH_IS_VOLUME,
+        pids.data(),
+        pids_size);
+  }
+
+  // If anything went wrong, resize buffer to 0 size.
+  if (pids_size < 0) {
+    XLOGF(
+        INFO,
+        "proc_listpidspath failed: {} ()",
+        folly::errnoStr(pids_size),
+        pids_size);
+    pids.resize(0);
+  } else {
+    // Resize buffer to actual size.
+    pids.resize(pids_size / sizeof(pid_t));
+  }
+#endif
+
+  return pids;
+}
+
+std::optional<ProcessSimpleName> readProcessSimpleName(
+    FOLLY_MAYBE_UNUSED pid_t pid) {
+  std::optional<ProcessSimpleName> simpleName;
+#ifdef __APPLE__
+  // Max length of process name returned from proc_name
+  // https://opensource.apple.com/source/xnu/xnu-1228.0.2/bsd/sys/proc_info.h.auto.html
+  std::vector<char> name;
+  int32_t len = 2 * MAXCOMLEN + 1;
+  name.resize(len);
+  auto namePtr = name.data();
+
+  auto ret = proc_name(pid, namePtr, len);
+  if (ret > len) {
+    // This should never happen.
+    XLOGF(INFO, "proc_name return length greater than provided buffer.");
+    return std::nullopt;
+  }
+
+  if (ret != 0) {
+    name.resize(ret);
+    simpleName.emplace(std::string(name.begin(), name.end()));
+  } else {
+    XLOGF(DBG2, "proc_name failed: {} ({})", folly::errnoStr(errno), errno);
+  }
+#endif
+
+  return simpleName;
+}
+
+std::optional<pid_t> getParentProcessId(FOLLY_MAYBE_UNUSED pid_t pid) {
+  std::optional<pid_t> ppid;
+#ifdef __APPLE__
+  // Future improvements might include caching of parent pid lookups. However,
+  // as pids are recycled over time we would need some way to invalidate the
+  // cache when necessary.
+  proc_bsdinfo info;
+  int32_t size = sizeof(info);
+  auto ret = proc_pidinfo(
+      pid,
+      PROC_PIDTBSDINFO,
+      true, // find zombies
+      &info,
+      size);
+
+  if (ret == 0) {
+    XLOGF(DBG3, "proc_pidinfo failed: {} ({})", folly::errnoStr(errno), errno);
+  } else if (ret != size) {
+    XLOGF(WARN, "proc_pidinfo failed returned an invalid size");
+  } else if (info.pbi_ppid <= 0) {
+    XLOGF(WARN, "proc_pidinfo returned an invalid parent pid.");
+  } else {
+    ppid.emplace(info.pbi_ppid);
+  }
+#endif
+
+  return ppid;
+}
+
+std::stack<std::tuple<pid_t, std::string, ProcessName>> getProcessHierarchy(
+    std::shared_ptr<ProcessNameCache> processNameCache,
+    pid_t pid) {
+  std::stack<std::tuple<pid_t, std::string, ProcessName>> hierarchy;
+  do {
+    auto simpleName = proc_util::readProcessSimpleName(pid);
+    hierarchy.emplace(
+        pid,
+        simpleName.value_or("<unknown>"),
+        processNameCache->lookup(pid).get());
+    pid = proc_util::getParentProcessId(pid).value_or(0);
+    // Exit when reaching the root process (not included).
+  } while (pid > 1);
+
+  return hierarchy;
+}
+
 } // namespace facebook::eden::proc_util

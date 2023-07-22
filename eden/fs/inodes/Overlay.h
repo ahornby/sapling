@@ -16,6 +16,7 @@
 #include <condition_variable>
 #include <optional>
 #include <thread>
+#include "eden/fs/inodes/InodeCatalogType.h"
 #include "eden/fs/inodes/InodeNumber.h"
 #include "eden/fs/inodes/overlay/OverlayChecker.h"
 #include "eden/fs/inodes/overlay/gen-cpp2/overlay_types.h"
@@ -75,16 +76,6 @@ class OverlayFile;
  */
 class Overlay : public std::enable_shared_from_this<Overlay> {
  public:
-  enum class InodeCatalogType : uint8_t {
-    Legacy = 0,
-    Sqlite = 1,
-    SqliteInMemory = 2,
-    SqliteSynchronousOff = 3,
-    SqliteBuffered = 4,
-    SqliteInMemoryBuffered = 5,
-    SqliteSynchronousOffBuffered = 6,
-  };
-
   /**
    * Create a new Overlay object.
    *
@@ -128,9 +119,9 @@ class Overlay : public std::enable_shared_from_this<Overlay> {
       std::shared_ptr<const EdenConfig> config,
       std::optional<AbsolutePath> mountPath = std::nullopt,
       OverlayChecker::ProgressCallback&& progressCallback = [](auto) {},
-      OverlayChecker::LookupCallback&& lookupCallback =
+      InodeCatalog::LookupCallback&& lookupCallback =
           [](auto, auto) {
-            return makeImmediateFuture<OverlayChecker::LookupCallbackValue>(
+            return makeImmediateFuture<InodeCatalog::LookupCallbackValue>(
                 std::runtime_error("no lookup callback"));
           });
 
@@ -339,7 +330,7 @@ class Overlay : public std::enable_shared_from_this<Overlay> {
       std::shared_ptr<const EdenConfig> config,
       std::optional<AbsolutePath> mountPath,
       const OverlayChecker::ProgressCallback& progressCallback,
-      OverlayChecker::LookupCallback& lookupCallback);
+      InodeCatalog::LookupCallback& lookupCallback);
   void gcThread() noexcept;
   void handleGCRequest(GCRequest& request);
 
@@ -362,7 +353,7 @@ class Overlay : public std::enable_shared_from_this<Overlay> {
 
   std::unique_ptr<IFileContentStore> fileContentStore_;
   std::unique_ptr<InodeCatalog> inodeCatalog_;
-  Overlay::InodeCatalogType inodeCatalogType_;
+  InodeCatalogType inodeCatalogType_;
 
   /**
    * Indicates if the backing overlay supports semantic operations, see
@@ -419,9 +410,8 @@ class Overlay : public std::enable_shared_from_this<Overlay> {
   friend class IORequest;
 };
 
-constexpr Overlay::InodeCatalogType kDefaultInodeCatalogType = folly::kIsWindows
-    ? Overlay::InodeCatalogType::Sqlite
-    : Overlay::InodeCatalogType::Legacy;
+constexpr InodeCatalogType kDefaultInodeCatalogType =
+    folly::kIsWindows ? InodeCatalogType::Sqlite : InodeCatalogType::Legacy;
 
 /**
  * Used to reference count IO requests. In any place that there

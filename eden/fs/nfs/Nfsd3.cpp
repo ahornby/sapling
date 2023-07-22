@@ -17,7 +17,7 @@
 #include "eden/fs/nfs/NfsRequestContext.h"
 #include "eden/fs/nfs/NfsUtils.h"
 #include "eden/fs/nfs/NfsdRpc.h"
-#include "eden/fs/nfs/rpc/Server.h"
+#include "eden/fs/privhelper/PrivHelper.h"
 #include "eden/fs/store/ObjectFetchContext.h"
 #include "eden/fs/telemetry/FsEventLogger.h"
 #include "eden/fs/telemetry/LogEvent.h"
@@ -1966,6 +1966,8 @@ void Nfsd3ServerProcessor::clientConnected() {
 } // namespace
 
 Nfsd3::Nfsd3(
+    PrivHelper* privHelper,
+    AbsolutePath mountPath,
     folly::EventBase* evb,
     std::shared_ptr<folly::Executor> threadPool,
     std::unique_ptr<NfsDispatcher> dispatcher,
@@ -1978,7 +1980,9 @@ Nfsd3::Nfsd3(
     CaseSensitivity caseSensitive,
     uint32_t iosize,
     size_t traceBusCapacity)
-    : server_(RpcServer::create(
+    : privHelper_{privHelper},
+      mountPath_{std::move(mountPath)},
+      server_(RpcServer::create(
           std::make_shared<Nfsd3ServerProcessor>(
               std::move(dispatcher),
               straceLogger,
@@ -2056,6 +2060,10 @@ void Nfsd3::initialize(folly::File connectedSocket) {
   server_->initializeConnectedSocket(std::move(connectedSocket));
 }
 
+folly::SemiFuture<folly::Unit> Nfsd3::unmount() {
+  return privHelper_->nfsUnmount(mountPath_.view());
+}
+
 void Nfsd3::invalidate(AbsolutePath path, mode_t mode) {
   invalidationExecutor_->add([path = std::move(path), mode]() {
     try {
@@ -2082,6 +2090,13 @@ uint32_t Nfsd3::getProgramNumber() {
 
 uint32_t Nfsd3::getProgramVersion() {
   return kNfsd3ProgVersion;
+}
+
+void Nfsd3::invalidateInodes(
+    const std::vector<std::pair<AbsolutePath, mode_t>>& pathsAndModes) {
+  for (auto& pathAndMode : pathsAndModes) {
+    invalidate(pathAndMode.first, pathAndMode.second);
+  }
 }
 
 ImmediateFuture<folly::Unit> Nfsd3::completeInvalidations() {

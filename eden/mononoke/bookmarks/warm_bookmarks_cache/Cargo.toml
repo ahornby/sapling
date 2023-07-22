@@ -11,8 +11,8 @@ license = "GPLv2+"
 path = "lib.rs"
 
 [dependencies]
-anyhow = "1.0.65"
-async-trait = "0.1.58"
+anyhow = "1.0.71"
+async-trait = "0.1.71"
 basename_suffix_skeleton_manifest = { version = "0.1.0", path = "../../derived_data/basename_suffix_skeleton_manifest" }
 blame = { version = "0.1.0", path = "../../derived_data/blame" }
 bookmarks = { version = "0.1.0", path = ".." }
@@ -39,7 +39,7 @@ repo_identity = { version = "0.1.0", path = "../../repo_attributes/repo_identity
 skeleton_manifest = { version = "0.1.0", path = "../../derived_data/skeleton_manifest" }
 slog = { version = "2.7", features = ["max_level_trace", "nested-values"] }
 stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-tokio = { version = "1.25.0", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.29.1", features = ["full", "test-util", "tracing"] }
 tunables = { version = "0.1.0", path = "../../tunables" }
 unodes = { version = "0.1.0", path = "../../derived_data/unodes" }
 

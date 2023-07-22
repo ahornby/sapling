@@ -8,9 +8,9 @@ edition = "2021"
 license = "GPLv2+"
 
 [dependencies]
-anyhow = "1.0.65"
+anyhow = "1.0.71"
 arg_extensions = { version = "0.1.0", path = "../extensions" }
-async-trait = "0.1.58"
+async-trait = "0.1.71"
 base_app = { version = "0.1.0", path = "../base_app" }
 blobstore = { version = "0.1.0", path = "../../blobstore" }
 blobstore_factory = { version = "0.1.0", path = "../../blobstore/factory" }
@@ -29,6 +29,7 @@ futures = { version = "0.3.28", features = ["async-await", "compat"] }
 futures-util = "0.3.7"
 itertools = "0.10.3"
 megarepo_config = { version = "0.1.0", path = "../../megarepo_api/megarepo_config" }
+memcache = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 mercurial_types = { version = "0.1.0", path = "../../mercurial/types" }
 metaconfig_parser = { version = "0.1.0", path = "../../metaconfig/parser" }
 metaconfig_types = { version = "0.1.0", path = "../../metaconfig/types" }
@@ -52,5 +53,5 @@ slog_stats = { version = "0.1.0", git = "https://github.com/facebookexperimental
 sql_ext = { version = "0.1.0", path = "../../common/rust/sql_ext" }
 stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 tls = { version = "0.1.0", path = "tls" }
-tokio = { version = "1.25.0", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.29.1", features = ["full", "test-util", "tracing"] }
 tunables = { version = "0.1.0", path = "../../tunables" }

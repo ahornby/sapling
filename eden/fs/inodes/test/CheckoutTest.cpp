@@ -228,9 +228,9 @@ void loadInodes(
 CheckoutConflict
 makeConflict(ConflictType type, StringPiece path, StringPiece message = "") {
   CheckoutConflict conflict;
-  *conflict.type_ref() = type;
-  *conflict.path_ref() = path.str();
-  *conflict.message_ref() = message.str();
+  conflict.type_ref() = type;
+  conflict.path_ref() = path.str();
+  conflict.message_ref() = message.str();
   return conflict;
 }
 
@@ -1786,6 +1786,7 @@ class FakePrjfsChannel final : public PrjfsChannel {
             &mount->getStraceLogger(),
             mount->getServerState()->getProcessNameCache(),
             mount->getCheckoutConfig()->getRepoGuid(),
+            mount->getCheckoutConfig()->getEnableWindowsSymlinks(),
             nullptr),
         actions_{std::move(actions)} {}
 
@@ -1848,7 +1849,7 @@ TEST(Checkout, concurrent_crawl_during_checkout) {
   auto result = std::move(fut).get(0ms);
   EXPECT_THAT(result.conflicts, UnorderedElementsAre());
 
-  mount.getEdenMount()->getPrjfsChannel()->stop();
+  mount.getEdenMount()->getPrjfsChannel()->unmount().get();
 }
 
 TEST(Checkout, concurrent_file_to_directory_during_checkout) {
@@ -1899,7 +1900,7 @@ TEST(Checkout, concurrent_file_to_directory_during_checkout) {
       UnorderedElementsAre(
           makeConflict(ConflictType::MODIFIED_REMOVED, "b.txt")));
 
-  mount.getEdenMount()->getPrjfsChannel()->stop();
+  mount.getEdenMount()->getPrjfsChannel()->unmount().get();
 }
 
 TEST(Checkout, concurrent_new_file_during_checkout) {
@@ -1951,7 +1952,7 @@ TEST(Checkout, concurrent_new_file_during_checkout) {
       UnorderedElementsAre(
           makeConflict(ConflictType::UNTRACKED_ADDED, "a/2.txt")));
 
-  mount.getEdenMount()->getPrjfsChannel()->stop();
+  mount.getEdenMount()->getPrjfsChannel()->unmount().get();
 }
 
 TEST(Checkout, concurrent_recreation_during_checkout) {
@@ -2009,7 +2010,7 @@ TEST(Checkout, concurrent_recreation_during_checkout) {
           makeConflict(ConflictType::REMOVED_MODIFIED, "a/1.txt"),
           makeConflict(ConflictType::MODIFIED_MODIFIED, "a/1.txt")));
 
-  mount.getEdenMount()->getPrjfsChannel()->stop();
+  mount.getEdenMount()->getPrjfsChannel()->unmount().get();
 }
 
 #endif

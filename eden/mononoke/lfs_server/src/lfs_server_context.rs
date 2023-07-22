@@ -7,6 +7,7 @@
 
 use std::fmt::Arguments;
 use std::fmt::Write;
+use std::num::NonZeroU16;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -25,6 +26,7 @@ use gotham::state::FromState;
 use gotham::state::State;
 use gotham_derive::StateData;
 use gotham_ext::body_ext::BodyExt;
+use hostname::get_hostname;
 use http::header::HeaderMap;
 use http::uri::Authority;
 use http::uri::Parts;
@@ -42,9 +44,12 @@ use lfs_protocol::RequestObject;
 use lfs_protocol::ResponseBatch;
 use metaconfig_types::RepoConfigRef;
 use mononoke_types::ContentId;
+#[cfg(fbcode_build)]
+use network_util::get_device_network_speed_bits;
 use qps::Qps;
 use repo_authorization::AuthorizationContext;
 use repo_permission_checker::RepoPermissionCheckerRef;
+use slog::info;
 use slog::Logger;
 use tokio::runtime::Handle;
 
@@ -70,6 +75,8 @@ struct LfsServerContextInner {
     config_handle: ConfigHandle<ServerConfig>,
     logger: Logger,
     qps: Arc<Option<Qps>>,
+    server_hostname: Arc<String>,
+    bandwidth: Option<i64>,
 }
 
 #[derive(Clone, StateData)]
@@ -88,11 +95,14 @@ impl LfsServerContext {
         config_handle: ConfigHandle<ServerConfig>,
         logger: Logger,
         qps: Option<Qps>,
+        bandwidth: Option<i64>,
     ) -> Result<Self, Error> {
         let connector = HttpsConnector::new()
             .map_err(Error::from)
             .context(ErrorKind::HttpClientInitializationFailed)?;
         let client = Client::builder().build(connector);
+        let server_hostname =
+            Arc::new(get_hostname().unwrap_or_else(|_| "UNKNOWN_HOSTNAME".to_string()));
 
         let inner = LfsServerContextInner {
             repositories,
@@ -103,6 +113,8 @@ impl LfsServerContext {
             config_handle,
             logger,
             qps: Arc::new(qps),
+            server_hostname,
+            bandwidth,
         };
 
         Ok(LfsServerContext {
@@ -118,7 +130,16 @@ impl LfsServerContext {
         host: String,
         method: LfsMethod,
     ) -> Result<RepositoryRequestContext, LfsServerContextErrorKind> {
-        let (repo, client, server, always_wait_for_upstream, max_upload_size, config) = {
+        let (
+            repo,
+            client,
+            server,
+            always_wait_for_upstream,
+            max_upload_size,
+            config,
+            server_hostname,
+            bandwidth,
+        ) = {
             let inner = self.inner.lock().expect("poisoned lock");
 
             match inner.repositories.get(&repository) {
@@ -129,6 +150,8 @@ impl LfsServerContext {
                     inner.always_wait_for_upstream,
                     inner.max_upload_size,
                     inner.config_handle.get(),
+                    inner.server_hostname.clone(),
+                    inner.bandwidth,
                 ),
                 None => {
                     return Err(LfsServerContextErrorKind::RepositoryDoesNotExist(
@@ -150,11 +173,13 @@ impl LfsServerContext {
                 repository,
                 server,
                 host,
+                server_hostname,
             },
             client: HttpClient::Enabled(client),
             config,
             always_wait_for_upstream,
             max_upload_size,
+            bandwidth,
         })
     }
 
@@ -183,6 +208,23 @@ impl LfsServerContext {
     pub fn will_exit(&self) -> bool {
         self.will_exit.load(Ordering::Relaxed)
     }
+}
+#[cfg(fbcode_build)]
+pub fn get_bandwidth(logger: &Logger) -> Option<i64> {
+    // We want to return None on error because the ratelimit metric fails open
+    get_device_network_speed_bits("eth0").map_or_else(
+        |e| {
+            info!(logger, "Failed to get network speed {}", e);
+            None
+        },
+        Some,
+    )
+}
+
+#[cfg(not(fbcode_build))]
+pub fn get_bandwidth(logger: &Logger) -> Option<i64> {
+    info!(logger, "Could not determine network speed");
+    None
 }
 
 async fn acl_check(
@@ -221,6 +263,7 @@ pub struct RepositoryRequestContext {
     always_wait_for_upstream: bool,
     max_upload_size: Option<u64>,
     client: HttpClient,
+    bandwidth: Option<i64>,
 }
 
 pub struct HttpClientResponse<S: Stream<Item = Result<Bytes, Error>> + Send + 'static> {
@@ -308,6 +351,10 @@ impl RepositoryRequestContext {
 
     pub fn max_upload_size(&self) -> Option<u64> {
         self.max_upload_size
+    }
+
+    pub fn bandwidth(&self) -> Option<i64> {
+        self.bandwidth
     }
 
     pub async fn dispatch(
@@ -398,6 +445,7 @@ pub struct UriBuilder {
     pub repository: String,
     pub server: Arc<ServerUris>,
     pub host: String,
+    pub server_hostname: Arc<String>,
 }
 
 impl UriBuilder {
@@ -412,15 +460,18 @@ impl UriBuilder {
     pub fn upload_uri(&self, object: &RequestObject) -> Result<Uri, ErrorKind> {
         self.pick_uri()?
             .build(format_args!(
-                "{}/upload/{}/{}",
-                &self.repository, object.oid, object.size
+                "{}/upload/{}/{}?server_hostname={}",
+                &self.repository, object.oid, object.size, self.server_hostname,
             ))
             .map_err(|e| ErrorKind::UriBuilderFailed("upload_uri", e))
     }
 
     pub fn download_uri(&self, content_id: &ContentId) -> Result<Uri, ErrorKind> {
         self.pick_uri()?
-            .build(format_args!("{}/download/{}", &self.repository, content_id))
+            .build(format_args!(
+                "{}/download/{}?server_hostname={}",
+                &self.repository, content_id, self.server_hostname
+            ))
             .map_err(|e| ErrorKind::UriBuilderFailed("download_uri", e))
     }
 
@@ -428,11 +479,16 @@ impl UriBuilder {
         &self,
         content_id: &ContentId,
         routing_key: String,
+        tasks_per_content: NonZeroU16,
     ) -> Result<Uri, ErrorKind> {
         self.pick_uri()?
             .build(format_args!(
-                "{}/download/{}?routing={}",
-                &self.repository, content_id, routing_key
+                "{}/download/{}?routing={}&server_hostname={}&tpc={}",
+                &self.repository,
+                content_id,
+                routing_key,
+                self.server_hostname,
+                tasks_per_content.get(),
             ))
             .map_err(|e| ErrorKind::UriBuilderFailed("consistent_download_uri", e))
     }
@@ -533,6 +589,7 @@ mod test {
     const ONES_HASH: &str = "1111111111111111111111111111111111111111111111111111111111111111";
     const TWOS_HASH: &str = "2222222222222222222222222222222222222222222222222222222222222222";
     const SIZE: u64 = 123;
+    const SERVER_HOSTNAME: &str = "mzr.re";
 
     pub fn uri_builder(
         self_uris: Vec<&str>,
@@ -547,6 +604,7 @@ mod test {
             repository: "repo123".to_string(),
             server: Arc::new(server),
             host,
+            server_hostname: Arc::new(SERVER_HOSTNAME.to_string()),
         })
     }
 
@@ -595,6 +653,7 @@ mod test {
                 always_wait_for_upstream: false,
                 max_upload_size: None,
                 client: HttpClient::Disabled,
+                bandwidth: None,
             })
         }
     }
@@ -636,6 +695,14 @@ mod test {
         Sha256::from_str(TWOS_HASH)
     }
 
+    fn build_url(base: &str, hash: &str, size: Option<u64>) -> String {
+        if let Some(size) = size {
+            format!("{base}/{hash}/{size}?server_hostname={SERVER_HOSTNAME}")
+        } else {
+            format!("{base}/{hash}?server_hostname={SERVER_HOSTNAME}")
+        }
+    }
+
     #[test]
     fn test_basic_upload_uri() -> Result<(), Error> {
         let b = uri_builder(
@@ -645,7 +712,7 @@ mod test {
         )?;
         assert_eq!(
             b.upload_uri(&obj()?)?.to_string(),
-            format!("http://foo.com/repo123/upload/{}/{}", ONES_HASH, SIZE),
+            build_url("http://foo.com/repo123/upload", ONES_HASH, Some(SIZE)),
         );
         Ok(())
     }
@@ -659,7 +726,7 @@ mod test {
         )?;
         assert_eq!(
             b.upload_uri(&obj()?)?.to_string(),
-            format!("http://foo.com/repo123/upload/{}/{}", ONES_HASH, SIZE),
+            build_url("http://foo.com/repo123/upload", ONES_HASH, Some(SIZE)),
         );
         Ok(())
     }
@@ -673,7 +740,7 @@ mod test {
         )?;
         assert_eq!(
             b.upload_uri(&obj()?)?.to_string(),
-            format!("http://foo.com/bar/repo123/upload/{}/{}", ONES_HASH, SIZE),
+            build_url("http://foo.com/bar/repo123/upload", ONES_HASH, Some(SIZE)),
         );
         Ok(())
     }
@@ -687,7 +754,8 @@ mod test {
         )?;
         assert_eq!(
             b.upload_uri(&obj()?)?.to_string(),
-            format!("http://foo.com/bar/repo123/upload/{}/{}", ONES_HASH, SIZE),
+            //format!("http://foo.com/bar/repo123/upload/{}/{}", ONES_HASH, SIZE),
+            build_url("http://foo.com/bar/repo123/upload", ONES_HASH, Some(SIZE)),
         );
         Ok(())
     }
@@ -701,7 +769,7 @@ mod test {
         )?;
         assert_eq!(
             b.download_uri(&content_id()?)?.to_string(),
-            format!("http://foo.com/repo123/download/{}", ONES_HASH),
+            build_url("http://foo.com/repo123/download", ONES_HASH, None),
         );
         Ok(())
     }
@@ -715,7 +783,7 @@ mod test {
         )?;
         assert_eq!(
             b.download_uri(&content_id()?)?.to_string(),
-            format!("http://foo.com/repo123/download/{}", ONES_HASH),
+            build_url("http://foo.com/repo123/download", ONES_HASH, None),
         );
         Ok(())
     }
@@ -729,7 +797,7 @@ mod test {
         )?;
         assert_eq!(
             b.download_uri(&content_id()?)?.to_string(),
-            format!("http://foo.com/bar/repo123/download/{}", ONES_HASH),
+            build_url("http://foo.com/bar/repo123/download", ONES_HASH, None),
         );
         Ok(())
     }
@@ -743,7 +811,7 @@ mod test {
         )?;
         assert_eq!(
             b.download_uri(&content_id()?)?.to_string(),
-            format!("http://foo.com/bar/repo123/download/{}", ONES_HASH),
+            build_url("http://foo.com/bar/repo123/download", ONES_HASH, None),
         );
         Ok(())
     }
@@ -756,11 +824,15 @@ mod test {
             "foo.com".to_string(),
         )?;
         assert_eq!(
-            b.consistent_download_uri(&content_id()?, format!("{}", oid()?))?
-                .to_string(),
+            b.consistent_download_uri(
+                &content_id()?,
+                format!("{}", oid()?),
+                1.try_into().unwrap()
+            )?
+            .to_string(),
             format!(
-                "http://foo.com/repo123/download/{}?routing={}",
-                ONES_HASH, TWOS_HASH
+                "http://foo.com/repo123/download/{}?routing={}&server_hostname={}&tpc=1",
+                ONES_HASH, TWOS_HASH, SERVER_HOSTNAME
             ),
         );
         Ok(())

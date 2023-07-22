@@ -12,7 +12,7 @@
 
 #include "eden/fs/inodes/FsChannel.h"
 #include "eden/fs/nfs/NfsDispatcher.h"
-#include "eden/fs/nfs/rpc/Server.h"
+#include "eden/fs/nfs/rpc/RpcServer.h"
 #include "eden/fs/telemetry/TraceBus.h"
 #include "eden/fs/utils/CaseSensitivity.h"
 #include "eden/fs/utils/ProcessAccessLog.h"
@@ -24,6 +24,7 @@ class Executor;
 namespace facebook::eden {
 
 class Notifier;
+class PrivHelper;
 class ProcessNameCache;
 class FsEventLogger;
 class StructuredLogger;
@@ -126,6 +127,8 @@ class Nfsd3 final : public FsChannel {
    * is not necessary for a properly behaving EdenFS.
    */
   Nfsd3(
+      PrivHelper* privHelper,
+      AbsolutePath mountPath,
       folly::EventBase* evb,
       std::shared_ptr<folly::Executor> threadPool,
       std::unique_ptr<NfsDispatcher> dispatcher,
@@ -149,6 +152,16 @@ class Nfsd3 final : public FsChannel {
 
   void initialize(folly::SocketAddress addr, bool registerWithRpcbind);
   void initialize(folly::File connectedSocket);
+
+  /**
+   * Uses the configured PrivHelper to unmount this NFS mount from the
+   * filesystem.
+   *
+   * That causes Nfsd3's RpcServer to receive EOF from the NFS socket, which
+   * shuts down the Nfsd3. The future returned by initialize() will be fulfilled
+   * with a non-takeover StopData.
+   */
+  FOLLY_NODISCARD folly::SemiFuture<folly::Unit> unmount() override;
 
   /**
    * Trigger an invalidation for the given path.
@@ -191,6 +204,18 @@ class Nfsd3 final : public FsChannel {
   ImmediateFuture<folly::Unit> waitForPendingWrites() override {
     return folly::unit;
   }
+
+  /*
+   * Request that the kernel invalidate its cached data for the specified
+   * paths+modes.
+   *
+   * This operation is performed asynchronously.  flushInvalidations() can be
+   * called if you need to determine when this operation has completed.
+   *
+   * @param pathsAndModes a vector of each inodes path and mode to invalidate.
+   */
+  void invalidateInodes(
+      const std::vector<std::pair<AbsolutePath, mode_t>>& pathsAndModes);
 
   /**
    * Wait for all pending invalidation to complete.
@@ -259,6 +284,9 @@ class Nfsd3 final : public FsChannel {
    * when the privhelper or a user runs umount.
    */
   ~Nfsd3();
+
+  PrivHelper* const privHelper_;
+  AbsolutePath mountPath_;
 
   folly::Synchronized<TelemetryState> telemetryState_;
   std::vector<TraceSubscriptionHandle<NfsTraceEvent>> traceSubscriptionHandles_;

@@ -18,24 +18,21 @@ import {numPendingImageUploads} from '../ImageUpload';
 import {OperationDisabledButton} from '../OperationDisabledButton';
 import {Subtle} from '../Subtle';
 import {Tooltip} from '../Tooltip';
-import {
-  ChangedFiles,
-  deselectedUncommittedChanges,
-  UncommittedChanges,
-} from '../UncommittedChanges';
+import {ChangedFiles, UncommittedChanges} from '../UncommittedChanges';
 import {allDiffSummaries, codeReviewProvider} from '../codeReview/CodeReviewInfo';
 import {submitAsDraft, SubmitAsDraftCheckbox} from '../codeReview/DraftCheckbox';
 import {t, T} from '../i18n';
 import {AmendMessageOperation} from '../operations/AmendMessageOperation';
-import {AmendOperation} from '../operations/AmendOperation';
-import {CommitOperation} from '../operations/CommitOperation';
+import {getAmendOperation} from '../operations/AmendOperation';
+import {getCommitOperation} from '../operations/CommitOperation';
 import {GhStackSubmitOperation} from '../operations/GhStackSubmitOperation';
 import {PrSubmitOperation} from '../operations/PrSubmitOperation';
 import {SetConfigOperation} from '../operations/SetConfigOperation';
+import {useUncommittedSelection} from '../partialSelection';
 import platform from '../platform';
 import {CommitPreview, treeWithPreviews, uncommittedChangesWithPreviews} from '../previews';
 import {selectedCommitInfos, selectedCommits} from '../selection';
-import {repositoryInfo, useRunOperation} from '../serverAPIState';
+import {latestHeadCommit, repositoryInfo, useRunOperation} from '../serverAPIState';
 import {useModal} from '../useModal';
 import {assert, firstOfIterable} from '../utils';
 import {CommitInfoField} from './CommitInfoField';
@@ -224,35 +221,37 @@ export function CommitInfoDetails({commit}: {commit: CommitInfo}) {
         className="commit-info-view-main-content"
         // remount this if we change to commit mode
         key={mode}>
-        {schema.map(field => (
-          <CommitInfoField
-            key={field.key}
-            field={field}
-            content={parsedFields[field.key as keyof CommitMessageFields]}
-            autofocus={topmostEditedField === field.key}
-            readonly={editedMessage.type === 'optimistic' || isPublic}
-            isBeingEdited={fieldsBeingEdited[field.key]}
-            startEditingField={() => startEditingField(field.key)}
-            editedField={editedMessage.fields?.[field.key]}
-            setEditedField={(newVal: string) =>
-              setEditedCommitMesage(val =>
-                val.type === 'optimistic'
-                  ? val
-                  : {
-                      fields: {
-                        ...val.fields,
-                        [field.key]: field.type === 'field' ? [newVal] : newVal,
+        {schema
+          .filter(field => mode !== 'commit' || field.type !== 'read-only')
+          .map(field => (
+            <CommitInfoField
+              key={field.key}
+              field={field}
+              content={parsedFields[field.key as keyof CommitMessageFields]}
+              autofocus={topmostEditedField === field.key}
+              readonly={editedMessage.type === 'optimistic' || isPublic}
+              isBeingEdited={fieldsBeingEdited[field.key]}
+              startEditingField={() => startEditingField(field.key)}
+              editedField={editedMessage.fields?.[field.key]}
+              setEditedField={(newVal: string) =>
+                setEditedCommitMesage(val =>
+                  val.type === 'optimistic'
+                    ? val
+                    : {
+                        fields: {
+                          ...val.fields,
+                          [field.key]: field.type === 'field' ? [newVal] : newVal,
+                        },
                       },
-                    },
-              )
-            }
-            extra={
-              mode !== 'commit' && field.key === 'Title' ? (
-                <CommitTitleByline commit={commit} />
-              ) : undefined
-            }
-          />
-        ))}
+                )
+              }
+              extra={
+                mode !== 'commit' && field.key === 'Title' ? (
+                  <CommitTitleByline commit={commit} />
+                ) : undefined
+              }
+            />
+          ))}
         <VSCodeDivider />
         {commit.isHead && !isPublic ? (
           <Section data-testid="changes-to-amend">
@@ -327,9 +326,9 @@ function ActionsBar({
 }) {
   const isAnythingBeingEdited = Object.values(fieldsBeingEdited).some(Boolean);
   const uncommittedChanges = useRecoilValue(uncommittedChangesWithPreviews);
-  const deselected = useRecoilValue(deselectedUncommittedChanges);
+  const selection = useUncommittedSelection();
   const anythingToCommit =
-    !(deselected.size > 0 && deselected.size === uncommittedChanges.length) &&
+    !selection.isNothingSelected() &&
     ((!isCommitMode && isAnythingBeingEdited) || uncommittedChanges.length > 0);
 
   const provider = useRecoilValue(codeReviewProvider);
@@ -337,6 +336,7 @@ function ActionsBar({
   const diffSummaries = useRecoilValue(allDiffSummaries);
   const shouldSubmitAsDraft = useRecoilValue(submitAsDraft);
   const schema = useRecoilValue(commitMessageFieldsSchema);
+  const headCommit = useRecoilValue(latestHeadCommit);
 
   // after committing/amending, if you've previously selected the head commit,
   // we should show you the newly amended/committed commit instead of the old one.
@@ -375,16 +375,17 @@ function ActionsBar({
   );
   const doAmendOrCommit = () => {
     const message = commitMessageFieldsToString(schema, assertNonOptimistic(editedMessage).fields);
-    const filesToCommit =
-      deselected.size === 0
-        ? // all files
-          undefined
-        : // only files not unchecked
-          uncommittedChanges.filter(file => !deselected.has(file.path)).map(file => file.path);
+    const headHash = headCommit?.hash ?? '.';
+    const allFiles = uncommittedChanges.map(file => file.path);
 
     const operation = isCommitMode
-      ? new CommitOperation(message, commit.hash, filesToCommit)
-      : new AmendOperation(filesToCommit, message);
+      ? getCommitOperation(message, headHash, selection.selection, allFiles)
+      : getAmendOperation(message, headHash, selection.selection, allFiles);
+
+    // TODO(quark): We need better invalidation for chunk selected files.
+    if (selection.hasChunkSelection()) {
+      selection.clear();
+    }
 
     clearEditedCommitMessage(/* skip confirmation */ true);
     // reset to amend mode now that the commit has been made
@@ -425,10 +426,10 @@ function ActionsBar({
               areImageUploadsOngoing
                 ? t('Image uploads are still pending')
                 : isCommitMode
-                ? deselected.size === 0
+                ? selection.isEverythingSelected()
                   ? t('No changes to commit')
                   : t('No selected changes to commit')
-                : deselected.size === 0
+                : selection.isEverythingSelected()
                 ? t('No changes to amend')
                 : t('No selected changes to amend')
             }

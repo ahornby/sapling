@@ -14,6 +14,7 @@
 #include <atomic>
 #include <fstream>
 #include <functional>
+#include <iterator>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -346,6 +347,11 @@ class EdenServer::ThriftServerEventHandler
 };
 
 static constexpr folly::StringPiece kBlobCacheMemory{"blob_cache.memory"};
+static constexpr folly::StringPiece kNfsReadCount60{"nfs.read_us.count.60"};
+static constexpr folly::StringPiece kNfsReadDirCount60{
+    "nfs.readdir_us.count.60"};
+static constexpr folly::StringPiece kNfsReadDirPlusCount60{
+    "nfs.readdirplus_us.count.60"};
 
 EdenServer::EdenServer(
     std::vector<std::string> originalCommandLine,
@@ -555,14 +561,13 @@ size_t EdenServer::ProgressManager::registerEntry(
     std::string&& mountPath,
     std::string&& localDir) {
   auto progressIndex = progresses.size();
-  progresses.emplace_back(
-      ProgressState(std::move(mountPath), std::move(localDir)));
+  progresses.emplace_back(std::move(mountPath), std::move(localDir));
   totalInProgress++;
   return progressIndex;
 }
 
-Future<Unit> EdenServer::unmountAll() {
-  std::vector<Future<Unit>> futures;
+folly::SemiFuture<Unit> EdenServer::unmountAll() {
+  std::vector<folly::SemiFuture<Unit>> futures;
   {
     const auto mountPoints = mountPoints_->wlock();
     for (auto& entry : *mountPoints) {
@@ -572,7 +577,7 @@ Future<Unit> EdenServer::unmountAll() {
       // is important to ensure that the EdenMount object cannot be destroyed
       // before EdenMount::unmount() completes.
       auto mount = info.edenMount;
-      auto future = mount->unmount().thenTry(
+      auto future = mount->unmount().defer(
           [mount, unmountFuture = info.unmountPromise.getFuture()](
               auto&& result) mutable {
             if (result.hasValue()) {
@@ -589,7 +594,7 @@ Future<Unit> EdenServer::unmountAll() {
   }
   // Use collectAll() rather than collect() to wait for all of the unmounts
   // to complete, and only check for errors once everything has finished.
-  return folly::collectAll(futures).toUnsafeFuture().thenValue(
+  return folly::collectAll(futures).deferValue(
       [](std::vector<folly::Try<Unit>> results) {
         for (const auto& result : results) {
           result.throwUnlessValue();
@@ -746,6 +751,19 @@ void EdenServer::updatePeriodicTaskIntervals(const EdenConfig& config) {
     gcTask_.updateInterval(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             config.gcPeriod.getValue()));
+  }
+
+  if (config.enableNfsServer.getValue() &&
+      config.enableNfsCrawlDetection.getValue()) {
+    auto interval = config.nfsCrawlInterval.getValue();
+    XLOGF(
+        DBG2,
+        "NFS crawl detection enabled. Using interval = {}ns",
+        interval.count());
+    detectNfsCrawlTask_.updateInterval(
+        std::chrono::duration_cast<std::chrono::milliseconds>(interval));
+  } else {
+    detectNfsCrawlTask_.updateInterval(0s);
   }
 }
 
@@ -907,10 +925,8 @@ Future<Unit> EdenServer::prepareImpl(std::shared_ptr<StartupLogger> logger) {
     doingTakeover = true;
   }
   auto thriftRunningFuture = createThriftServer();
-#ifndef _WIN32
   // Start the PrivHelper client, using our main event base to drive its I/O
   serverState_->getPrivHelper()->attachEventBase(mainEventBase_);
-#endif
 
   startPeriodicTasks();
 
@@ -1236,7 +1252,8 @@ bool EdenServer::performCleanup() {
         DaemonStop{shutdownTimeInSeconds, takeover, shutdownSuccess});
   };
 
-  auto shutdownFuture = folly::Future<std::optional<TakeoverData>>::makeEmpty();
+  auto shutdownFuture =
+      folly::SemiFuture<std::optional<TakeoverData>>::makeEmpty();
   {
     auto state = runningState_.wlock();
     takeover = state->shutdownFuture.valid();
@@ -1247,8 +1264,8 @@ bool EdenServer::performCleanup() {
     state->state = RunState::SHUTTING_DOWN;
   }
   if (!takeover) {
-    shutdownFuture =
-        performNormalShutdown().thenValue([](auto&&) { return std::nullopt; });
+    shutdownFuture = performNormalShutdown().deferValue(
+        [](auto&&) -> std::optional<TakeoverData> { return std::nullopt; });
   }
 
   XCHECK(shutdownFuture.valid())
@@ -1256,7 +1273,8 @@ bool EdenServer::performCleanup() {
 
   // Drive the main event base until shutdownFuture completes
   XCHECK_EQ(mainEventBase_, folly::EventBaseManager::get()->getEventBase());
-  auto shutdownResult = std::move(shutdownFuture).getTryVia(mainEventBase_);
+  auto shutdownResult =
+      std::move(shutdownFuture).via(mainEventBase_).getTryVia(mainEventBase_);
 
 #ifndef _WIN32
   shutdownSuccess = !shutdownResult.hasException();
@@ -1286,7 +1304,7 @@ bool EdenServer::performCleanup() {
   return true;
 }
 
-Future<Unit> EdenServer::performNormalShutdown() {
+folly::SemiFuture<Unit> EdenServer::performNormalShutdown() {
 #ifndef _WIN32
   takeoverServer_.reset();
 #endif // !_WIN32
@@ -1296,7 +1314,6 @@ Future<Unit> EdenServer::performNormalShutdown() {
 }
 
 void EdenServer::shutdownPrivhelper() {
-#ifndef _WIN32
   // Explicitly stop the privhelper process so we can verify that it
   // exits normally.
   const auto privhelperExitCode = serverState_->getPrivHelper()->stop();
@@ -1309,7 +1326,6 @@ void EdenServer::shutdownPrivhelper() {
                 << privhelperExitCode;
     }
   }
-#endif
 }
 
 void EdenServer::addToMountPoints(std::shared_ptr<EdenMount> edenMount) {
@@ -1569,34 +1585,29 @@ folly::Future<std::shared_ptr<EdenMount>> EdenServer::mount(
 
   // Now actually begin starting the mount point
   return std::move(initFuture)
-      .thenTry([this,
-                doTakeover,
-                readOnly,
-                edenMount,
-                mountStopWatch,
-                optionalTakeover = std::move(optionalTakeover)](
-                   folly::Try<Unit>&& result) mutable {
-        if (result.hasException()) {
-          XLOG(ERR) << "error initializing " << edenMount->getPath() << ": "
-                    << result.exception().what();
-          mountFinished(edenMount.get(), std::nullopt);
-          return makeFuture<shared_ptr<EdenMount>>(
-              std::move(result).exception());
-        }
-
+      .thenError([this, edenMount](folly::exception_wrapper ew) {
+        XLOG(ERR) << "error initializing " << edenMount->getPath() << ": "
+                  << ew.what();
+        mountFinished(edenMount.get(), std::nullopt);
+        return makeFuture<folly::Unit>(std::move(ew));
+      })
+      .thenValue([this,
+                  doTakeover,
+                  readOnly,
+                  edenMount,
+                  mountStopWatch,
+                  optionalTakeover =
+                      std::move(optionalTakeover)](folly::Unit) mutable {
         return (optionalTakeover ? performTakeoverStart(
                                        edenMount, std::move(*optionalTakeover))
                                  : edenMount->startFsChannel(readOnly))
-            .thenTry([edenMount, doTakeover, this](
-                         folly::Try<Unit>&& result) mutable {
+            .thenError([this, edenMount](folly::exception_wrapper ew) {
               // Call mountFinished() if an error occurred during FUSE
               // initialization.
-              if (result.hasException()) {
-                mountFinished(edenMount.get(), std::nullopt);
-                return makeFuture<shared_ptr<EdenMount>>(
-                    std::move(result).exception());
-              }
-
+              mountFinished(edenMount.get(), std::nullopt);
+              return makeFuture<folly::Unit>(std::move(ew));
+            })
+            .thenValue([edenMount, doTakeover, this](folly::Unit) mutable {
               registerStats(edenMount);
 
               // Now that we've started the workers, arrange to call
@@ -1652,15 +1663,15 @@ folly::Future<std::shared_ptr<EdenMount>> EdenServer::mount(
       });
 }
 
-Future<Unit> EdenServer::unmount(AbsolutePathPiece mountPath) {
-  return makeFutureWith([&] {
+folly::SemiFuture<Unit> EdenServer::unmount(AbsolutePathPiece mountPath) {
+  return folly::makeSemiFutureWith([&] {
            auto future = Future<Unit>::makeEmpty();
            auto mount = std::shared_ptr<EdenMount>{};
            {
              const auto mountPoints = mountPoints_->wlock();
              const auto it = mountPoints->find(mountPath);
              if (it == mountPoints->end()) {
-               return makeFuture<Unit>(std::out_of_range(
+               return folly::makeSemiFuture<Unit>(std::out_of_range(
                    fmt::format("no such mount point {}", mountPath)));
              }
              future = it->second.unmountPromise.getFuture();
@@ -1669,15 +1680,15 @@ Future<Unit> EdenServer::unmount(AbsolutePathPiece mountPath) {
 
            // We capture the mount shared_ptr in the lambda to keep the
            // EdenMount object alive during the call to unmount.
-           return mount->unmount().thenValue(
+           return mount->unmount().deferValue(
                [mount, f = std::move(future)](auto&&) mutable {
                  return std::move(f);
                });
          })
-      .thenError([path = mountPath.copy()](folly::exception_wrapper&& ew) {
+      .deferError([path = mountPath.copy()](folly::exception_wrapper&& ew) {
         XLOG(ERR) << "Failed to perform unmount for \"" << path
                   << "\": " << folly::exceptionStr(ew);
-        return makeFuture<Unit>(std::move(ew));
+        return folly::makeSemiFuture<Unit>(std::move(ew));
       });
 }
 
@@ -1787,7 +1798,7 @@ Future<CheckoutResult> EdenServer::checkOutRevision(
     AbsolutePathPiece mountPath,
     std::string& rootHash,
     std::optional<folly::StringPiece> rootHgManifest,
-    std::optional<pid_t> clientPid,
+    OptionalProcessId clientPid,
     StringPiece callerName,
     CheckoutMode checkoutMode) {
   auto mountHandle = getMount(mountPath);
@@ -2307,6 +2318,98 @@ void EdenServer::garbageCollectAllMounts() {
               context);
         })
         .ensure([mountHandle] {});
+  }
+}
+
+void EdenServer::detectNfsCrawl() {
+  auto edenConfig = config_->getEdenConfig();
+  auto readThreshold = edenConfig->nfsCrawlReadThreshold.getValue();
+  auto readDirThreshold = edenConfig->nfsCrawlReadDirThreshold.getValue();
+  auto readCount = fb303::ServiceData::get()
+                       ->getCounterIfExists(kNfsReadCount60)
+                       .value_or(0);
+  // At runtime, use-readdirplus can change, but this does not change the state
+  // of the current mounts. Therefore, sum readdir and readdirplus counters and
+  // compare that to the readdir threshold.
+  auto readDirCount = fb303::ServiceData::get()
+                          ->getCounterIfExists(kNfsReadDirCount60)
+                          .value_or(0) +
+      fb303::ServiceData::get()
+          ->getCounterIfExists(kNfsReadDirPlusCount60)
+          .value_or(0);
+  if (readCount > readThreshold || readDirCount > readDirThreshold) {
+    XLOGF(
+        DBG2,
+        "NFS crawl detected, initiating process discovery and attribution: "
+        "[nfs.read_us.count.60 = {} > {} or nfs.readdir[plus]_us.count.60 = {} > {}]",
+        readCount,
+        readThreshold,
+        readDirCount,
+        readDirThreshold);
+
+    // Get list of excluded process names
+    auto exclusions = edenConfig->nfsCrawlExcludedProcessNames.getValue();
+
+    // Iterate over each mount
+    auto mountPoints = getMountPoints();
+    for (auto& mountPointHandle : mountPoints) {
+      if (mountPointHandle.getEdenMount().isNfsdChannel()) {
+        folly::via(
+            getServerState()->getThreadPool().get(),
+            [mountPointHandle,
+             exclusions,
+             serverState = serverState_,
+             readCount,
+             readThreshold,
+             readDirCount,
+             readDirThreshold]() {
+              const auto& mount = mountPointHandle.getEdenMount();
+
+              // Get list of pids that have open files/paths on the mount
+              auto pids = proc_util::readProcessIdsForPath(mount.getPath());
+              for (auto pid : pids) {
+                auto simpleName = proc_util::readProcessSimpleName(pid);
+                if (simpleName.has_value()) {
+                  if (exclusions.find(simpleName.value()) == exclusions.end()) {
+                    // Log process hierarchy
+                    auto hierarchy = proc_util::getProcessHierarchy(
+                        serverState->getProcessNameCache(), pid);
+                    XCHECK(
+                        !hierarchy.empty(),
+                        "proc_util::getProcessHierarchy returned an empty list.");
+                    auto [_pid, sname, pname] = std::move(hierarchy.top());
+                    hierarchy.pop();
+                    std::string output =
+                        fmt::format("[{}({}): {}]", sname, _pid, pname);
+                    while (!hierarchy.empty()) {
+                      fmt::format_to(std::back_inserter(output), " -> ");
+                      auto [_pid, sname, pname] = std::move(hierarchy.top());
+                      hierarchy.pop();
+                      fmt::format_to(
+                          std::back_inserter(output),
+                          "[{}({}): {}]",
+                          sname,
+                          _pid,
+                          pname);
+                    }
+                    XLOGF(
+                        DBG2,
+                        "NFS crawl detection found process with open files in mount point: {}\n  {}",
+                        mount.getPath(),
+                        output);
+                    serverState->getStructuredLogger()->logEvent(
+                        NfsCrawlDetected{
+                            readCount,
+                            readThreshold,
+                            readDirCount,
+                            readDirThreshold,
+                            output});
+                  }
+                }
+              }
+            });
+      }
+    }
   }
 }
 

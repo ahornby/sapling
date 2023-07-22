@@ -480,7 +480,9 @@ impl TreeManifest {
                         Leaf(_) | Ephemeral(_) => unreachable!(),
                         Durable(entry) => entry.hgid,
                     };
-                    parent_nodes.push(hgid);
+                    if !parent_nodes.contains(&hgid) {
+                        parent_nodes.push(hgid);
+                    }
                 }
                 Ok(parent_nodes)
             }
@@ -627,7 +629,7 @@ pub fn compat_subtree_diff(
     store: Arc<dyn TreeStore + Send + Sync>,
     path: &RepoPath,
     hgid: HgId,
-    other_nodes: Vec<HgId>,
+    mut other_nodes: Vec<HgId>,
     depth: i32,
 ) -> Result<Vec<(RepoPathBuf, HgId, Vec<HgId>, Bytes)>> {
     struct State {
@@ -686,6 +688,7 @@ pub fn compat_subtree_diff(
     if other_nodes.contains(&hgid) {
         return Ok(vec![]);
     }
+    other_nodes.dedup();
 
     let mut state = State {
         store: InnerStore::new(store),

@@ -6,7 +6,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-anyhow = { version = "1.0.65", features = ["backtrace"] }
+anyhow = { version = "1.0.71", features = ["backtrace"] }
 async-runtime = { version = "0.1.0", path = "../async-runtime" }
 atexit = { version = "0.1.0", path = "../util/atexit" }
 bindings = { path = "../../edenscmnative/bindings", default-features = false }
@@ -17,6 +17,7 @@ clidispatch = { version = "0.1.0", path = "../clidispatch" }
 cliparser = { version = "0.1.0", path = "../cliparser", features = ["python"] }
 clone = { version = "0.1.0", path = "../clone" }
 comfy-table = "6.1.4"
+commandserver = { version = "0.1.0", path = "../commandserver" }
 configloader = { version = "0.1.0", path = "../config/loader" }
 configmodel = { version = "0.1.0", path = "../config/model" }
 cpython = { version = "0.7.1", default-features = false }
@@ -61,8 +62,8 @@ revisionstore = { version = "0.1.0", path = "../revisionstore" }
 revsets = { version = "0.1.0", path = "../revsets" }
 runlog = { version = "0.1.0", path = "../runlog" }
 sampling = { version = "0.1.0", path = "../sampling" }
-serde = { version = "1.0.136", features = ["derive", "rc"] }
-serde_json = { version = "1.0.79", features = ["float_roundtrip", "unbounded_depth"] }
+serde = { version = "1.0.167", features = ["derive", "rc"] }
+serde_json = { version = "1.0.100", features = ["float_roundtrip", "unbounded_depth"] }
 status = { version = "0.1.0", path = "../status" }
 termstyle = { version = "0.1.0", path = "../io/term/style" }
 tracing = "0.1.35"

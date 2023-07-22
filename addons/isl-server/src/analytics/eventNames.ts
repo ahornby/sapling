@@ -21,6 +21,7 @@ export type TrackEventName =
   | 'AddRemoveOperation'
   | 'AmendMessageOperation'
   | 'AmendOperation'
+  | 'ArcPullOperation'
   | 'CommitOperation'
   | 'ContinueMergeOperation'
   | 'CreateEmptyInitialCommit'
@@ -34,8 +35,12 @@ export type TrackEventName =
   | 'GoBackToOldISLReason'
   | 'HideOperation'
   | 'ImportStackOperation'
+  | 'PartialCommitOperation'
+  | 'PartialAmendOperation'
+  | 'PartialDiscardOperation'
   | 'PrSubmitOperation'
   | 'PullOperation'
+  | 'PullRevOperation'
   | 'PurgeOperation'
   | 'RebaseOperation'
   | 'ResolveOperation'
@@ -44,7 +49,8 @@ export type TrackEventName =
   | 'ShowBugButtonNux'
   | 'StackEditMetrics'
   | 'UncommitOperation'
-  // @fb-only
+  | 'JfSubmitOperation'
+  | 'JfGetOperation'
   | 'OptimisticFilesStateForceResolved'
   | 'OptimisticCommitsStateForceResolved'
   | 'OptimisticConflictsStateForceResolved'
@@ -54,9 +60,11 @@ export type TrackEventName =
   | 'UploadImage'
   | 'RunVSCodeCommand'
   | 'UnsubmittedStarRating'
+  | 'BlameLoaded'
   | 'VSCodeExtensionActivated';
 
 export type TrackErrorName =
+  | 'BlameError'
   | 'DiffFetchFailed'
   | 'InvalidCwd'
   | 'InvalidCommand'

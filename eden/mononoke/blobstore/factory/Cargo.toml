@@ -8,7 +8,7 @@ edition = "2021"
 license = "GPLv2+"
 
 [dependencies]
-anyhow = "1.0.65"
+anyhow = "1.0.71"
 arg_extensions = { version = "0.1.0", path = "../../cmdlib/extensions" }
 blobstore = { version = "0.1.0", path = ".." }
 blobstore_stats = { version = "0.1.0", path = "../blobstore_stats" }
@@ -39,4 +39,4 @@ sql_construct = { version = "0.1.0", path = "../../common/sql_construct" }
 sql_ext = { version = "0.1.0", path = "../../common/rust/sql_ext" }
 sqlblob = { version = "0.1.0", path = "../sqlblob" }
 throttledblob = { version = "0.1.0", path = "../throttledblob" }
-tokio = { version = "1.25.0", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.29.1", features = ["full", "test-util", "tracing"] }

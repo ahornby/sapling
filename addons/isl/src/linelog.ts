@@ -33,10 +33,9 @@ import type {RecordOf, ValueObject} from 'immutable';
 import type {LRUWithStats} from 'shared/LRU';
 
 import {assert} from './utils';
-// Read D43857949 about the choice of the diff library.
-import diffSequences from 'diff-sequences';
-import {hash, List, Record} from 'immutable';
+import {hash, List, Record, Set as ImSet} from 'immutable';
 import {cached, LRU} from 'shared/LRU';
+import {diffLines, splitLines} from 'shared/diff';
 import {SelfUpdate} from 'shared/immutableExt';
 import {unwrap} from 'shared/utils';
 
@@ -152,12 +151,14 @@ interface LineInfo {
 }
 
 /** A "flatten" line. Result of `LineLog.flatten()`. */
-interface FlattenLine {
+type FlattenLineProps = {
   /** The line is present in the given revisions. */
-  revs: Readonly<Set<Rev>>;
+  revs: ImSet<Rev>;
   /** Content of the line, including `\n`. */
   data: string;
-}
+};
+const FlattenLine = Record<FlattenLineProps>({revs: ImSet(), data: ''});
+type FlattenLine = RecordOf<FlattenLineProps>;
 
 /**
  * List of instructions.
@@ -660,7 +661,7 @@ class LineLog extends SelfUpdate<LineLogRecord> {
    * a single view.
    */
   @cached({cacheSize: 1000})
-  public flatten(): Readonly<FlattenLine[]> {
+  public flatten(): List<FlattenLine> {
     const result: FlattenLine[] = [];
 
     // See the comments in calculateDepMap for what the stacks mean.
@@ -689,7 +690,7 @@ class LineLog extends SelfUpdate<LineLogRecord> {
     const insStack: Frame[] = [{rev: 0, endPc: -1}];
     const delStack: Frame[] = [];
     const maxDelRev = this.maxRev + 1;
-    const getCurrentRevs = (): Readonly<Set<Rev>> => {
+    const getCurrentRevs = (): ImSet<Rev> => {
       const insRev = insStack.at(-1)?.rev ?? 0;
       const delRev = delStack.at(-1)?.rev ?? maxDelRev;
       return revRangeToSet(insRev, delRev);
@@ -714,7 +715,7 @@ class LineLog extends SelfUpdate<LineLogRecord> {
           patience = -1;
           break;
         case Op.LINE:
-          result.push({data: code.data, revs: currentRevs});
+          result.push(FlattenLine({data: code.data, revs: currentRevs}));
           pc += 1;
           break;
         case Op.J:
@@ -739,7 +740,7 @@ class LineLog extends SelfUpdate<LineLogRecord> {
       assert(false, 'bug: code does not end in time');
     }
 
-    return result;
+    return List(result);
   }
 
   /**
@@ -813,111 +814,14 @@ class LineLog extends SelfUpdate<LineLogRecord> {
   }
 }
 
-/**
- * Calculate the line differences. For performance, this function only
- * returns the line indexes for different chunks. The line contents
- * are not returned.
- *
- * @param aLines lines on the "a" side.
- * @param bLines lines on the "b" side.
- * @returns A list of `(a1, a2, b1, b2)` tuples for the line ranges that
- * are different between "a" and "b".
- */
-function diffLines(aLines: string[], bLines: string[]): [LineIdx, LineIdx, LineIdx, LineIdx][] {
-  // Avoid O(string length) comparison.
-  const [aList, bList] = stringsToInts([aLines, bLines]);
-
-  // Skip common prefix and suffix.
-  let aLen = aList.length;
-  let bLen = bList.length;
-  const minLen = Math.min(aLen, bLen);
-  let commonPrefixLen = 0;
-  while (commonPrefixLen < minLen && aList[commonPrefixLen] === bList[commonPrefixLen]) {
-    commonPrefixLen += 1;
-  }
-  while (aLen > commonPrefixLen && bLen > commonPrefixLen && aList[aLen - 1] === bList[bLen - 1]) {
-    aLen -= 1;
-    bLen -= 1;
-  }
-  aLen -= commonPrefixLen;
-  bLen -= commonPrefixLen;
-
-  // Run the diff algorithm.
-  const blocks: [LineIdx, LineIdx, LineIdx, LineIdx][] = [];
-  let a1 = 0;
-  let b1 = 0;
-
-  function isCommon(aIndex: number, bIndex: number) {
-    return aList[aIndex + commonPrefixLen] === bList[bIndex + commonPrefixLen];
-  }
-
-  function foundSequence(n: LineIdx, a2: LineIdx, b2: LineIdx) {
-    if (a1 !== a2 || b1 !== b2) {
-      blocks.push([
-        a1 + commonPrefixLen,
-        a2 + commonPrefixLen,
-        b1 + commonPrefixLen,
-        b2 + commonPrefixLen,
-      ]);
-    }
-    a1 = a2 + n;
-    b1 = b2 + n;
-  }
-
-  diffSequences(aLen, bLen, isCommon, foundSequence);
-  foundSequence(0, aLen, bLen);
-
-  return blocks;
-}
-
-/**
- * Split lines by `\n`. Preserve the end of lines.
- */
-function splitLines(s: string): string[] {
-  let pos = 0;
-  let nextPos = 0;
-  const result = [];
-  while (pos < s.length) {
-    nextPos = s.indexOf('\n', pos);
-    if (nextPos === -1) {
-      nextPos = s.length - 1;
-    }
-    result.push(s.slice(pos, nextPos + 1));
-    pos = nextPos + 1;
-  }
-  return result;
-}
-
-/**
- * Make strings with the same content use the same integer
- * for fast comparison.
- */
-function stringsToInts(linesArray: string[][]): number[][] {
-  // This is similar to diff-match-patch's diff_linesToChars_ but is not
-  // limited to 65536 unique lines.
-  const lineMap = new Map<string, number>();
-  return linesArray.map(lines =>
-    lines.map(line => {
-      const existingId = lineMap.get(line);
-      if (existingId != null) {
-        return existingId;
-      } else {
-        const id = lineMap.size;
-        lineMap.set(line, id);
-        return id;
-      }
-    }),
-  );
-}
-
 /** Turn (3, 6) to Set([3, 4, 5]). */
 const revRangeToSet = cached(
-  (startRev, endRev: Rev): Readonly<Set<Rev>> => {
-    const result = new Set<Rev>();
+  (startRev, endRev: Rev): ImSet<Rev> => {
+    const result: Rev[] = [];
     for (let rev = startRev; rev < endRev; rev++) {
-      result.add(rev);
+      result.push(rev);
     }
-    return result;
+    return ImSet(result);
   },
   {cacheSize: 1000},
 );

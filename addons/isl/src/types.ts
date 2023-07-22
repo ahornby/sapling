@@ -203,6 +203,8 @@ export enum CommandRunner {
    * such as a non-sapling external submit command
    */
   CodeReviewProvider = 'codeReviewProvider',
+  /** Internal arcanist commands */
+  InternalArcanist = 'arc',
 }
 
 /**
@@ -366,6 +368,7 @@ export type ConfigName =
   | 'isl.changedFilesDisplayType'
   | 'isl.hasShownGettingStarted'
   // sapling config prefers foo-bar naming.
+  | 'isl.pull-button-choice'
   | 'isl.experimental-features';
 
 export type ClientToServerMessage =

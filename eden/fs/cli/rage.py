@@ -43,7 +43,9 @@ except ImportError:
     def setup_fb_env(env: Dict[str, str]) -> Dict[str, str]:
         return env
 
-    def get_host_dashboard_url(normalized_hostname: str) -> Optional[str]:
+    def get_host_dashboard_url(
+        normalized_hostname: str, period_end: datetime
+    ) -> Optional[str]:
         return None
 
 
@@ -140,7 +142,7 @@ def print_diagnostic_info(
     # TODO(T113845692)
     # print_eden_doctor_report(instance, out)
 
-    host_dashboard_url = get_host_dashboard_url(host)
+    host_dashboard_url = get_host_dashboard_url(host, datetime.now())
     if host_dashboard_url:
         section_title("Host dashboard:", out)
         out.write(b"%s\n" % host_dashboard_url.encode())
@@ -231,6 +233,8 @@ def print_diagnostic_info(
     print_system_mount_table(out)
 
     print_system_load(out)
+
+    print_ulimits(out)
 
 
 def report_edenfs_bug(instance: EdenInstance, reporter: str) -> None:
@@ -504,7 +508,7 @@ def print_system_load(out: IO[bytes]) -> None:
 
             # Limit to the first 16 lines of output because top on CentOS
             # doesn't seem to have a command-line flag for this.
-            output_lines = output.decode("utf-8").split(os.linesep)[:17]
+            output_lines = output.decode("utf-8").split(os.linesep)[:17] + [""]
         elif sys.platform == "darwin":
             output = subprocess.check_output(["top", "-l2", "-n10"])
 
@@ -710,10 +714,10 @@ def print_third_party_vscode_extensions(out: IO[bytes]) -> None:
 
     section_title("Visual Studio Code Extensions:", out)
 
-    out.write(b"Blocked extensions installed:\n")
-    for extension in problematic_extensions.blocked:
+    out.write(b"Harmful extensions installed:\n")
+    for extension in problematic_extensions.harmful:
         out.write(f"{extension}\n".encode())
-    if len(problematic_extensions.blocked) == 0:
+    if len(problematic_extensions.harmful) == 0:
         out.write(b"None\n")
 
     out.write(b"\nUnsupported extensions installed:\n")
@@ -721,3 +725,14 @@ def print_third_party_vscode_extensions(out: IO[bytes]) -> None:
         out.write(f"{extension}\n".encode())
     if len(problematic_extensions.unsupported) == 0:
         out.write(b"None\n")
+
+
+def print_ulimits(out: IO[bytes]) -> None:
+    if sys.platform == "win32":
+        return
+    try:
+        section_title("ulimit -a:", out)
+        output = subprocess.check_output(["ulimit", "-a"])
+        out.write(output)
+    except Exception as e:
+        out.write(f"Error retrieving ulimit values: {e}\n".encode())

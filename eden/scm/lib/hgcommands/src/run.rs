@@ -15,6 +15,7 @@ use std::ops::DerefMut;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::sync::atomic::Ordering::SeqCst;
 use std::sync::Arc;
 use std::sync::Weak;
@@ -31,6 +32,7 @@ use clidispatch::errors;
 use clidispatch::global_flags::HgGlobalOpts;
 use clidispatch::io::IsTty;
 use clidispatch::io::IO;
+use commandserver::ipc::Server;
 use configloader::config::ConfigSet;
 use configmodel::Config;
 use configmodel::ConfigExt;
@@ -59,10 +61,17 @@ use crate::HgPython;
 pub fn run_command(args: Vec<String>, io: &IO) -> i32 {
     let start_time = SystemTime::now();
 
-    // The pfcserver does not want tracing or blackbox or ctrlc setup,
+    // The pfcserver or commandserver do not want tracing or blackbox or ctrlc setup,
     // or going through the Rust command table. Bypass them.
-    if args.get(1).map(|s| s.as_ref()) == Some("start-pfc-server") {
-        return HgPython::new(&args).run_hg(args, io, &ConfigSet::new());
+    if let Some(arg1) = args.get(1).map(|s| s.as_ref()) {
+        match arg1 {
+            "start-pfc-server" => return HgPython::new(&args).run_hg(args, io, &ConfigSet::new()),
+            "start-commandserver" => {
+                commandserver_serve(&args, io);
+                return 0;
+            }
+            _ => {}
+        }
     }
 
     // Initialize NodeIpc:
@@ -188,6 +197,11 @@ fn dispatch_command(
 ) -> i32 {
     log_repo_path_and_exe_version(dispatcher.repo());
 
+    if let Some(repo) = dispatcher.repo() {
+        tracing::info!(target: "symlink_info",
+                       symlinks_enabled=cfg!(unix) || repo.requirements.contains("windowssymlinks"));
+    }
+
     let run_logger =
         match runlog::Logger::from_repo(dispatcher.repo(), dispatcher.args()[1..].to_vec()) {
             Ok(logger) => Some(logger),
@@ -218,7 +232,7 @@ fn dispatch_command(
         .map_err(|err| errors::triage_error(config, err, command.map(|c| c.main_alias())))
     {
         Ok(exit_code) => exit_code as i32,
-        Err(err) => {
+        Err(err) => 'fallback: {
             let should_fallback = err.is::<errors::FallbackToPython>() ||
                 // XXX: Right now the Rust command table does not have all Python
                 // commands. Therefore Rust "UnknownCommand" needs a fallback.
@@ -236,6 +250,20 @@ fn dispatch_command(
                 // Change the current dir back to the original so it is not surprising to the Python
                 // code.
                 let _ = env::set_current_dir(cwd);
+
+                if !IS_COMMANDSERVER.load(Ordering::Acquire)
+                    && config
+                        .get_or_default::<bool>("commandserver", "enabled")
+                        .unwrap_or_default()
+                {
+                    // Attempt to connect to an existing command server.
+                    let args = dispatcher.args();
+                    if let Ok(ret) =
+                        commandserver::client::run_via_commandserver(args.to_vec(), &config)
+                    {
+                        break 'fallback ret;
+                    }
+                }
 
                 let mut interp = HgPython::new(dispatcher.args());
                 if dispatcher.global_opts().trace {
@@ -330,20 +358,15 @@ fn current_dir(io: &IO) -> io::Result<PathBuf> {
     result
 }
 
-fn setup_tracing(global_opts: &Option<HgGlobalOpts>, io: &IO) -> Result<Arc<Mutex<TracingData>>> {
-    // Setup TracingData singleton (currently owned by pytracing).
-    {
-        let mut data = pytracing::DATA.lock();
-        // Only recreate TracingData if pid has changed (ex. chgserver's case
-        // where it forks and runs commands - we want to log to different
-        // blackbox trace events).  This makes it possible to use multiple
-        // `run()`s in a single process
-        if data.process_id() != unsafe { libc::getpid() } as u64 {
-            *data.deref_mut() = TracingData::new();
-        }
-    }
-    let data = pytracing::DATA.clone();
-
+/// Make tracing write logs to `io` if `LOG` environment is set.
+/// Return `true` if it is set, or `false` if nothing happens.
+///
+/// `collector` is used to integrate with the `TracingCollector`,
+/// which can integrate with Python via bindings.
+fn setup_tracing_io(
+    io: &IO,
+    collector: Option<tracing_collector::TracingCollector>,
+) -> Result<bool> {
     let is_test = is_inside_test();
     let mut env_filter_dirs: Option<String> = identity::debug_env_var("LOG").map(|v| v.1);
 
@@ -362,7 +385,6 @@ fn setup_tracing(global_opts: &Option<HgGlobalOpts>, io: &IO) -> Result<Arc<Mute
         // This might error out if called 2nd time per process.
         let env_filter = tracing_reload::reloadable_env_filter()?;
 
-        let collector = tracing_collector::TracingCollector::new(data.clone());
         let env_logger = FmtLayer::new()
             .with_span_events(FmtSpan::ACTIVE)
             .with_ansi(can_color)
@@ -370,17 +392,58 @@ fn setup_tracing(global_opts: &Option<HgGlobalOpts>, io: &IO) -> Result<Arc<Mute
         if is_test {
             // In tests, disable color and timestamps for cleaner output.
             let env_logger = env_logger.without_time().with_ansi(false);
-            let subscriber = tracing_subscriber::Registry::default()
-                .with(collector.and_then(env_logger).with_filter(env_filter))
-                .with(SamplingLayer::new());
-            tracing::subscriber::set_global_default(subscriber)?;
+            match collector {
+                None => {
+                    let subscriber = tracing_subscriber::Registry::default()
+                        .with(env_logger.with_filter(env_filter))
+                        .with(SamplingLayer::new());
+                    tracing::subscriber::set_global_default(subscriber)?;
+                }
+                Some(collector) => {
+                    let subscriber = tracing_subscriber::Registry::default()
+                        .with(collector.and_then(env_logger).with_filter(env_filter))
+                        .with(SamplingLayer::new());
+                    tracing::subscriber::set_global_default(subscriber)?;
+                }
+            };
         } else {
-            let subscriber = tracing_subscriber::Registry::default()
-                .with(collector.and_then(env_logger).with_filter(env_filter))
-                .with(SamplingLayer::new());
-            tracing::subscriber::set_global_default(subscriber)?;
+            match collector {
+                None => {
+                    let subscriber = tracing_subscriber::Registry::default()
+                        .with(env_logger.with_filter(env_filter))
+                        .with(SamplingLayer::new());
+                    tracing::subscriber::set_global_default(subscriber)?;
+                }
+                Some(collector) => {
+                    let subscriber = tracing_subscriber::Registry::default()
+                        .with(collector.and_then(env_logger).with_filter(env_filter))
+                        .with(SamplingLayer::new());
+                    tracing::subscriber::set_global_default(subscriber)?;
+                }
+            }
         }
+        Ok(true)
     } else {
+        Ok(false)
+    }
+}
+
+fn setup_tracing(global_opts: &Option<HgGlobalOpts>, io: &IO) -> Result<Arc<Mutex<TracingData>>> {
+    // Setup TracingData singleton (currently owned by pytracing).
+    {
+        let mut data = pytracing::DATA.lock();
+        // Only recreate TracingData if pid has changed (ex. chgserver's case
+        // where it forks and runs commands - we want to log to different
+        // blackbox trace events).  This makes it possible to use multiple
+        // `run()`s in a single process
+        if data.process_id() != unsafe { libc::getpid() } as u64 {
+            *data.deref_mut() = TracingData::new();
+        }
+    }
+    let data = pytracing::DATA.clone();
+
+    let collector = tracing_collector::TracingCollector::new(data.clone());
+    if !setup_tracing_io(io, Some(collector))? {
         let level = identity::debug_env_var("TRACE_LEVEL")
             .map(|v| v.1)
             .and_then(|s| Level::from_str(&s).ok())
@@ -851,4 +914,41 @@ fn setup_ctrlc() {
 fn setup_nodeipc() {
     // Trigger `Lazy` initialization.
     let _ = nodeipc::get_singleton();
+}
+
+// Useful to prevent a commandserver connecting to another commandserver.
+static IS_COMMANDSERVER: AtomicBool = AtomicBool::new(false);
+
+fn commandserver_serve(args: &[String], io: &IO) -> i32 {
+    IS_COMMANDSERVER.store(true, Ordering::Release);
+
+    #[cfg(unix)]
+    unsafe {
+        libc::setsid();
+    }
+
+    let _ = setup_tracing_io(io, None);
+    tracing::debug!("preparing commandserver");
+
+    let python = HgPython::new(args);
+    if let Err(e) = python.pre_import_modules() {
+        tracing::warn!("cannot pre-import modules:\n{:?}", &e);
+        return 1;
+    }
+
+    let run_func = |server: &Server, args: Vec<String>| -> i32 {
+        tracing::debug!("commandserver is about to run command: {:?}", &args);
+        if let Err(e) = python.setup_ui_system(&server) {
+            tracing::warn!("cannot setup ui.system:\n{:?}", &e);
+        }
+        run_command(args, io)
+    };
+
+    tracing::debug!("commandserver is about to serve");
+    if let Err(e) = commandserver::server::serve_one_client(&run_func) {
+        tracing::warn!("cannot serve:\n{:?}", &e);
+        return 1;
+    }
+    tracing::debug!("commandserver is about to exit cleanly");
+    0
 }

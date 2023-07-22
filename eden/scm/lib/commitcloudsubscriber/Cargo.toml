@@ -18,7 +18,7 @@ description = """
 """
 
 [dependencies]
-anyhow = "1.0.65"
+anyhow = "1.0.71"
 filetime = "0.2.9"
 futures = { version = "0.3.28", features = ["async-await", "compat"] }
 hostcaps = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
@@ -28,13 +28,13 @@ log = { version = "0.4.17", features = ["kv_unstable", "kv_unstable_std"] }
 mime = "0.3.14"
 parking_lot = { version = "0.12.1", features = ["send_guard"] }
 regex = "1.6.0"
-reqwest = { version = "0.11.18", features = ["blocking", "json", "multipart", "rustls-tls", "rustls-tls-native-roots", "stream"] }
+reqwest = { version = "0.11.18", features = ["blocking", "cookies", "json", "multipart", "native-tls", "rustls-tls", "rustls-tls-native-roots", "stream"] }
 reqwest-eventsource = "0.4.0"
 rust-ini = { version = "0.17", features = ["inline-comment"] }
-serde = { version = "1.0.136", features = ["derive", "rc"] }
-serde_json = { version = "1.0.79", features = ["float_roundtrip", "unbounded_depth"] }
-thiserror = "1.0.36"
-tokio = { version = "1.25.0", features = ["full", "test-util", "tracing"] }
+serde = { version = "1.0.167", features = ["derive", "rc"] }
+serde_json = { version = "1.0.100", features = ["float_roundtrip", "unbounded_depth"] }
+thiserror = "1.0.43"
+tokio = { version = "1.29.1", features = ["full", "test-util", "tracing"] }
 
 [dev-dependencies]
 tempfile = "3.5"
