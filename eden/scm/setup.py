@@ -815,7 +815,7 @@ class fetchbuilddeps(Command):
                 "thrift",
                 "../../thrift/lib/py"
                 if havefb
-                else f"{dep_build_dir}/fbthrift/thrift/lib/py/thrift_py.lib_install/thrift_py/thrift",
+                else f"{dep_install_dir}/fbthrift/lib/fb-py-libs/thrift_py/thrift",
                 excludes=[
                     "thrift/util/asyncio.py",
                     "thrift/util/inspect.py",
