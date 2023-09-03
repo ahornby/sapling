@@ -76,7 +76,7 @@ _otherchangedlocaldeletedmsg = _(
 )
 
 
-class absentfilectx(object):
+class absentfilectx:
     """Represents a file that's ostensibly in a context but is actually not
     present in it.
 
@@ -157,7 +157,7 @@ def _findexternaltoolwithreporoot(ui, repo, tool):
     return util.findexe(util.expandpath(exe))
 
 
-class merge_context(object):
+class merge_context:
     def __init__(self, local, other, ancestor):
         self.local = local
         self.other = other
@@ -483,6 +483,10 @@ def _hint_for_missing_file(repo, fcd, fco, fd):
         ctx = fctx.changectx()
         return ctx.node() if ctx.node() else ctx.p1().node()
 
+    def get_hex(fctx):
+        ctx = fctx.changectx()
+        return ctx.hex() if ctx.node() else ctx.p1().hex()
+
     default_hint = _(
         "if this is due to a renamed file, you can manually input the renamed path"
     )
@@ -491,7 +495,25 @@ def _hint_for_missing_file(repo, fcd, fco, fd):
         return default_hint
 
     dagcopytrace = repo._dagcopytrace
-    trace_result = dagcopytrace.trace_rename_ex(get_node(fco), get_node(fcd), fd)
+    copytrace_error = False
+    try:
+        trace_result = dagcopytrace.trace_rename_ex(get_node(fco), get_node(fcd), fd)
+    except Exception as e:
+        copytrace_error = True
+        if util.istest():
+            raise e
+        else:
+            return default_hint
+    finally:
+        repo.ui.log(
+            "merge_conflicts",
+            dest_hex=get_hex(fcd),
+            src_hex=get_hex(fco),
+            repo=repo.ui.config("remotefilelog", "reponame", "unknown"),
+            copytrace_missing_file=fd,
+            copytrace_error=int(copytrace_error),
+        )
+
     type_ = trace_result["t"].lower()
     if type_ in ("added", "deleted"):
         node, path = trace_result["c"]
@@ -560,7 +582,7 @@ def _premerge(repo, fcd, fco, fca, toolconf, files, labels=None):
 
     ui = repo.ui
 
-    validkeep = ["keep", "keep-merge3"]
+    validkeep = ["keep", "keep-merge3", "keep-mergediff"]
 
     # do we attempt to simplemerge first?
     try:
@@ -575,12 +597,19 @@ def _premerge(repo, fcd, fco, fca, toolconf, files, labels=None):
             )
 
     if premerge:
-        if premerge == "keep-merge3":
-            if not labels:
-                labels = _defaultconflictlabels
-            if len(labels) < 3:
-                labels.append("base")
-        r = simplemerge.simplemerge(ui, fcd, fca, fco, quiet=True, label=labels)
+        if not labels:
+            labels = _defaultconflictlabels
+        if len(labels) < 3:
+            labels.append("base")
+        mode = "merge"
+        if premerge == "keep-mergediff":
+            mode = "mergediff"
+        elif premerge == "keep-merge3":
+            mode = "merge3"
+
+        r = simplemerge.simplemerge(
+            ui, fcd, fca, fco, quiet=True, label=labels, mode=mode
+        )
         if not r:
             ui.debug(" premerge successful\n")
             return 0
@@ -734,7 +763,7 @@ def _imerge3(repo, mynode, orig, fcd, fco, fca, toolconf, files, labels=None):
         labels = _defaultconflictlabels
     if len(labels) < 3:
         labels.append("base")
-    return _imerge(repo, mynode, orig, fcd, fco, fca, toolconf, files, labels)
+    return _merge(repo, mynode, orig, fcd, fco, fca, toolconf, files, labels, "merge3")
 
 
 @internaltool(
@@ -762,36 +791,20 @@ def _imergediff(repo, mynode, orig, fcd, fco, fca, toolconf, files, labels=None)
     )
 
 
-def _imergeauto(
-    repo, mynode, orig, fcd, fco, fca, toolconf, files, labels=None, localorother=None
-):
-    """
-    Generic driver for _imergelocal and _imergeother
-    """
-    assert localorother is not None
-    tool, toolpath, binary, symlink = toolconf
-    r = simplemerge.simplemerge(
-        repo.ui, fcd, fca, fco, label=labels, localorother=localorother
-    )
-    return True, r
-
-
 @internaltool("merge-local", mergeonly, precheck=_mergecheck)
-def _imergelocal(*args, **kwargs):
+def _imergelocal(repo, mynode, orig, fcd, fco, fca, toolconf, files, labels=None):
     """
     Like :merge, but resolve all conflicts non-interactively in favor
     of the local `p1()` changes."""
-    success, status = _imergeauto(localorother="local", *args, **kwargs)
-    return success, status, False
+    return _merge(repo, mynode, orig, fcd, fco, fca, toolconf, files, labels, "local")
 
 
 @internaltool("merge-other", mergeonly, precheck=_mergecheck)
-def _imergeother(*args, **kwargs):
+def _imergeother(repo, mynode, orig, fcd, fco, fca, toolconf, files, labels=None):
     """
     Like :merge, but resolve all conflicts non-interactively in favor
     of the other `p2()` changes."""
-    success, status = _imergeauto(localorother="other", *args, **kwargs)
-    return success, status, False
+    return _merge(repo, mynode, orig, fcd, fco, fca, toolconf, files, labels, "other")
 
 
 @internaltool("dump", fullmerge)
@@ -819,7 +832,7 @@ def _idump(repo, mynode, orig, fcd, fco, fca, toolconf, files, labels=None):
             paths=[fcd.path()],
         )
 
-    util.writefile(a + ".local", fcd.decodeddata())
+    util.writefile(a + ".local", fcd.data())
     repo.wwrite(fd + ".other", fco.data(), fco.flags())
     repo.wwrite(fd + ".base", fca.data(), fca.flags())
     return False, 1, False
@@ -1021,7 +1034,7 @@ def _maketempfiles(repo, fco, fca):
         fullbase, ext = os.path.splitext(ctx.path())
         pre = "%s~%s." % (os.path.basename(fullbase), prefix)
         (fd, name) = tempfile.mkstemp(prefix=pre, suffix=ext)
-        data = repo.wwritedata(ctx.path(), ctx.data())
+        data = ctx.data()
         f = util.fdopen(fd, "wb")
         f.write(data)
         f.close()

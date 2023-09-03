@@ -7,6 +7,7 @@
 
 import type {CommitInfo, SuccessorInfo} from './types';
 import type {Snapshot} from 'recoil';
+import type {ContextMenuItem} from 'shared/ContextMenu';
 
 import {BranchIndicator} from './BranchIndicator';
 import {hasUnsavedEditedCommitMessage} from './CommitInfoView/CommitInfoState';
@@ -21,6 +22,7 @@ import {DiffInfo} from './codeReview/DiffBadge';
 import {islDrawerState} from './drawerState';
 import {isDescendant} from './getCommitTree';
 import {t, T} from './i18n';
+import {getAmendToOperation, isAmendToAllowedForCommit} from './operationUtils';
 import {GotoOperation} from './operations/GotoOperation';
 import {HideOperation} from './operations/HideOperation';
 import {RebaseOperation} from './operations/RebaseOperation';
@@ -139,13 +141,19 @@ export const Commit = memo(
       });
     });
 
-    const contextMenu = useContextMenu(() => {
-      const items = [
+    const makeContextMenuOptions = useRecoilCallback(({snapshot}) => () => {
+      const items: Array<ContextMenuItem> = [
         {
           label: <T replace={{$hash: short(commit?.hash)}}>Copy Commit Hash "$hash"</T>,
           onClick: () => platform.clipboardCopy(commit.hash),
         },
       ];
+      if (!isPublic && commit.diffId != null) {
+        items.push({
+          label: <T replace={{$number: commit.diffId}}>Copy Diff Number "$number"</T>,
+          onClick: () => platform.clipboardCopy(commit.diffId ?? ''),
+        });
+      }
       if (!isPublic) {
         items.push({
           label: <T>View Changes in Commit</T>,
@@ -153,13 +161,22 @@ export const Commit = memo(
         });
       }
       if (!isPublic && !actionsPrevented) {
+        items.push({type: 'divider'});
+        if (isAmendToAllowedForCommit(commit, snapshot)) {
+          items.push({
+            label: <T>Amend changes to here</T>,
+            onClick: () => runOperation(getAmendToOperation(commit, snapshot)),
+          });
+        }
         items.push({
-          label: <T>Hide Commit and Descendents</T>,
+          label: <T>Hide Commit and Descendants</T>,
           onClick: () => setOperationBeingPreviewed(new HideOperation(commit.hash)),
         });
       }
       return items;
     });
+
+    const contextMenu = useContextMenu(makeContextMenuOptions);
 
     const commitActions = [];
 
@@ -227,6 +244,7 @@ export const Commit = memo(
           (isHighlighted ? ' highlighted' : '') +
           (isPublic || hasChildren ? '' : ' topmost')
         }
+        onContextMenu={contextMenu}
         data-testid={`commit-${commit.hash}`}>
         {!isNonActionable &&
         (commit.isHead || previewType === CommitPreview.GOTO_PREVIOUS_LOCATION) ? (
@@ -246,7 +264,6 @@ export const Commit = memo(
             commit={commit}
             draggable={!isPublic && isDraggablePreview(previewType)}
             onClick={onClickToSelect}
-            onContextMenu={contextMenu}
             onDoubleClick={onDoubleClickToShowDrawer}>
             <div className="commit-avatar" />
             {isPublic ? null : (
@@ -507,6 +524,7 @@ function DraggableCommit({
       onContextMenu={onContextMenu}
       tabIndex={0}
       data-testid={'draggable-commit'}>
+      <div className="commit-wide-drag-target" onDragEnter={handleDragEnter} />
       {dragDisabledMessage != null ? (
         <Tooltip trigger="manual" shouldShow title={dragDisabledMessage}>
           {children}

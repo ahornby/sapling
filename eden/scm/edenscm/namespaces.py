@@ -10,7 +10,9 @@
 
 from __future__ import absolute_import
 
-from . import error, pycompat, registrar, templatekw, util
+import contextlib
+
+from . import error, hintutil, pycompat, registrar, templatekw, util
 from .i18n import _
 
 
@@ -99,7 +101,55 @@ def hoistednames(repo):
         return None
 
 
-class namespaces(object):
+# Example namespaces used by extensions:
+# - gitrev      priority=70
+# - globalrevs  priority=75
+# - phrevset    priority=70
+# - conduit     priority=70
+# - megarepo    priority=100
+
+
+@builtinnamespace("titles", priority=90)
+def titles(repo):
+    """Match the titles of draft commits."""
+    # Disable on PLAIN - potentially dangerous for automation.
+    if repo.ui.plain("titles-namespace") or not repo.ui.configbool(
+        "experimental", "titles-namespace"
+    ):
+        return None
+
+    def namemap(repo, name):
+        name = name.lower()
+        # PERF: This runs a linear string match scan of up to 1k commits.
+        # If called repetitively, it might need caching or indexing.
+        for node, title in repo.draft_titles():
+            start = title.find(name)
+            if start < 0:
+                # no match
+                continue
+            # check word boundary
+            if start > 0 and title[start - 1].isalnum():
+                continue
+            end = start + len(name)
+            if end < len(title) and title[end].isalnum():
+                continue
+            # matched - show a hint
+            hintutil.trigger("match-title", name)
+            return [node]
+
+    return namespace(
+        templatename="titles",
+        logname="titles",
+        colorname="titles",
+        listnames=lambda repo: [],
+        namemap=namemap,
+        nodemap=lambda repo, node: [],
+        builtin=True,
+        user_only=True,
+    )
+
+
+class namespaces:
     """provides an interface to register and operate on multiple namespaces. See
     the namespace class below for details on the namespace object.
 
@@ -120,6 +170,9 @@ class namespaces(object):
             ns = func(repo)
             if ns is not None:
                 self._addnamespace(name, ns)
+
+        # tweaked by revset layer that handles user input
+        self.include_user = False
 
     def __getitem__(self, namespace):
         """returns the namespace object"""
@@ -149,17 +202,26 @@ class namespaces(object):
 
             templatekw.keywords[name] = generatekw
 
-    def singlenode(self, repo, name):
+    def singlenode(self, repo, name, namespaces=None):
         """
         Return the 'best' node for the given name. Best means the first node
         in the first nonempty list returned by a name-to-nodes mapping function
         in the defined precedence order.
 
         Raises a KeyError if there is no such node.
+
+        'namespaces', if set, can be used to limit resolution in the specified
+        namespaces, otherwise, namespaces with 'user_only=False' will be used,
+        if 'self.included' is 'False'.
         """
         for ns, v in pycompat.iteritems(self._names):
             # Fast path: do not consider branches unless it's "default".
             if ns == "branches" and name != "default":
+                continue
+            if namespaces is not None:
+                if ns not in namespaces:
+                    continue
+            elif v.user_only and not self.include_user:
                 continue
             n = v.namemap(repo, name)
             if n:
@@ -171,8 +233,18 @@ class namespaces(object):
                 return n[0]
         raise KeyError(_("no such name: %s") % name)
 
+    @contextlib.contextmanager
+    def included_user(self):
+        """Include namespaces with 'user_only=True' for resolution"""
+        orig_value = self.include_user
+        self.include_user = True
+        try:
+            yield
+        finally:
+            self.include_user = orig_value
 
-class namespace(object):
+
+class namespace:
     """provides an interface to a namespace
 
     Namespaces are basically generic many-to-many mapping between some
@@ -198,6 +270,8 @@ class namespace(object):
       'deprecated': set of names to be masked for ordinary use
       'builtin': bool indicating if this namespace is supported by core
                  Mercurial.
+      'user_only': if True, only used by user provided symbols and strings
+                   passed via argv.
     """
 
     def __init__(
@@ -211,6 +285,7 @@ class namespace(object):
         nodemap=None,
         deprecated=None,
         builtin=False,
+        user_only=False,
     ):
         """create a namespace
 
@@ -235,6 +310,7 @@ class namespace(object):
         self.listnames = listnames
         self.namemap = namemap
         self.nodemap = nodemap
+        self.user_only = user_only
 
         # if logname is not specified, use the template name as backup
         if self.logname is None:

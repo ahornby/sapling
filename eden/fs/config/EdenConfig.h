@@ -279,9 +279,10 @@ class EdenConfig : private ConfigSettingManager {
       "ssl:client-certificate",
       kUnspecifiedDefault,
       this};
-  ConfigSetting<std::vector<AbsolutePath>> clientCertificateLocations{
+
+  ConfigSetting<std::vector<std::string>> clientCertificateLocations{
       "ssl:client-certificate-locations",
-      std::vector<AbsolutePath>{},
+      std::vector<std::string>{},
       this};
 
   ConfigSetting<bool> useMononoke{"mononoke:use-mononoke", false, this};
@@ -1226,14 +1227,6 @@ class EdenConfig : private ConfigSettingManager {
    * Should FSCK be run on multiple threads, or serialized.
    */
   ConfigSetting<bool> multiThreadedFsck{"fsck:multi-threaded", true, this};
-
-  /**
-   * Should `eden fsck` use the Python or C++ implementation
-   */
-  ConfigSetting<bool> useCppImplementation{
-      "fsck:use-cpp-implementation",
-      false,
-      this};
 
   // [glob]
 

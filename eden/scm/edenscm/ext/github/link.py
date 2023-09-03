@@ -22,7 +22,7 @@ def link(ui, repo, *args, **opts):
     pr_arg = args[0]
     pull_request = resolve_pr_arg(pr_arg, ui)
     if not pull_request:
-        raise error.Abort(_("could not resolve pull request: '%%s'") % pr_arg)
+        raise error.Abort(_("could not resolve pull request: '%s'") % pr_arg)
 
     ctx = scmutil.revsingle(repo, opts.get("rev"))
     pr_store = PullRequestStore(repo)
@@ -50,14 +50,14 @@ def resolve_pr_arg(pr_arg: str, ui) -> Optional[PullRequestId]:
 
 def try_parse_int(s: str) -> Optional[int]:
     """tries to parse s as a positive integer"""
-    pattern = r"^[1-9][0-9]+$"
+    pattern = r"^[1-9][0-9]*$"
     match = re.match(pattern, s)
     return int(match[0]) if match else None
 
 
 def try_parse_pull_request_url(url: str) -> Optional[PullRequestId]:
     """parses the url into a PullRequest if it is in the expected format"""
-    pattern = r"^https://([^/]*)/([^/]+)/([^/]+)/pull/([1-9][0-9]+)$"
+    pattern = r"^https://([^/]*)/([^/]+)/([^/]+)/pull/([1-9][0-9]*)$"
     match = re.match(pattern, url)
     if match:
         hostname, owner, name, number = match.groups()

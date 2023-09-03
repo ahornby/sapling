@@ -16,35 +16,29 @@ import {Commit} from './Commit';
 import {Center, FlexRow, LargeSpinner} from './ComponentUtils';
 import {ErrorNotice} from './ErrorNotice';
 import {HighlightCommitsWhileHovering} from './HighlightedCommits';
+import {OperationDisabledButton} from './OperationDisabledButton';
+import {StackEditConfirmButtons} from './StackEditConfirmButtons';
 import {StackEditIcon} from './StackEditIcon';
-import {StackEditSubTree, UndoDescription} from './StackEditSubTree';
+import {StackEditSubTree} from './StackEditSubTree';
 import {Tooltip, DOCUMENTATION_DELAY} from './Tooltip';
 import {allDiffSummaries, codeReviewProvider, pageVisibility} from './codeReview/CodeReviewInfo';
 import {isTreeLinear, walkTreePostorder} from './getCommitTree';
 import {T, t} from './i18n';
 import {CreateEmptyInitialCommitOperation} from './operations/CreateEmptyInitialCommitOperation';
 import {HideOperation} from './operations/HideOperation';
-import {ImportStackOperation} from './operations/ImportStackOperation';
 import {treeWithPreviews, useMarkOperationsCompleted} from './previews';
 import {useArrowKeysToChangeSelection} from './selection';
 import {
   commitFetchError,
   commitsShownRange,
   isFetchingAdditionalCommits,
-  latestHeadCommit,
   latestUncommittedChangesData,
   useRunOperation,
 } from './serverAPIState';
-import {
-  bumpStackEditMetric,
-  editingStackHashes,
-  loadingStackState,
-  sendStackEditMetrics,
-  useStackEditState,
-} from './stackEditState';
+import {editingStackHashes, loadingStackState} from './stackEditState';
 import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
 import {ErrorShortMessages} from 'isl-server/src/constants';
-import {useRecoilState, useRecoilValue, useSetRecoilState} from 'recoil';
+import {useRecoilState, useRecoilValue} from 'recoil';
 import {useContextMenu} from 'shared/ContextMenu';
 import {Icon} from 'shared/Icon';
 import {generatorContains, notEmpty, unwrap} from 'shared/utils';
@@ -98,6 +92,7 @@ export function CommitTreeList() {
  */
 function shouldShowPublicCommit(tree: CommitTree) {
   return (
+    tree.info.isHead ||
     tree.children.length > 0 ||
     tree.info.bookmarks.length > 0 ||
     tree.info.remoteBookmarks.length > 0 ||
@@ -304,17 +299,19 @@ function StackActions({tree}: {tree: CommitTreeWithPreviews}): React.ReactElemen
     ) {
       actions.push(
         <HighlightCommitsWhileHovering key="resubmit-stack" toHighlight={resubmittableStack}>
-          <VSCodeButton
+          <OperationDisabledButton
+            // Use the diffId in the key so that only this "resubmit stack" button shows the spinner.
+            contextKey={`resubmit-stack-on-${tree.info.diffId}`}
             appearance="icon"
-            onClick={() => {
-              runOperation(reviewProvider.submitOperation(resubmittableStack));
+            icon={<Icon icon="cloud-upload" slot="start" />}
+            runOperation={() => {
+              return reviewProvider.submitOperation(resubmittableStack);
             }}>
-            <Icon icon="cloud-upload" slot="start" />
             <T>Resubmit stack</T>
-          </VSCodeButton>
+          </OperationDisabledButton>
         </HighlightCommitsWhileHovering>,
       );
-      //     any non-submitted diffs -> "submit all commits this stack" in hidden group
+      // any non-submitted diffs -> "submit all commits this stack" in hidden group
       if (
         submittableStack != null &&
         submittableStack.length > 0 &&
@@ -336,22 +333,32 @@ function StackActions({tree}: {tree: CommitTreeWithPreviews}): React.ReactElemen
           },
         });
       }
-      //     NO non-submitted diffs -> nothing in hidden group
+      // NO non-submitted diffs -> nothing in hidden group
     } else if (
       submittableStack != null &&
       submittableStack.length >= MIN_STACK_SIZE_TO_SUGGEST_SUBMIT
     ) {
+      // We need to associate this operation with the stack we're submitting,
+      // but during submitting, we'll amend the original commit, so hash is not accurate.
+      // Parent is close, but if you had multiple stacks rebased to the same public commit,
+      // all those stacks would render the same key and show the same spinner.
+      // So parent hash + title heuristic lets us almost always show the spinner for only this stack.
+      const contextKey = `submit-stack-on-${tree.info.parents[0]}-${tree.info.title.replace(
+        / /g,
+        '_',
+      )}`;
       // NO existing diffs -> show submit stack ()
       actions.push(
         <HighlightCommitsWhileHovering key="submit-stack" toHighlight={submittableStack}>
-          <VSCodeButton
+          <OperationDisabledButton
+            contextKey={contextKey}
             appearance="icon"
-            onClick={() => {
-              runOperation(reviewProvider.submitOperation(submittableStack));
+            icon={<Icon icon="cloud-upload" slot="start" />}
+            runOperation={() => {
+              return reviewProvider.submitOperation(submittableStack);
             }}>
-            <Icon icon="cloud-upload" slot="start" />
             <T>Submit stack</T>
-          </VSCodeButton>
+          </OperationDisabledButton>
         </HighlightCommitsWhileHovering>,
       );
     }
@@ -377,7 +384,7 @@ function StackActions({tree}: {tree: CommitTreeWithPreviews}): React.ReactElemen
       </VSCodeButton>
     );
   return (
-    <div className="commit-tree-stack-actions">
+    <div className="commit-tree-stack-actions" data-testid="commit-tree-stack-actions">
       {actions}
       {moreActionsButton}
     </div>
@@ -403,101 +410,6 @@ function CleanupButton({commit, hasChildren}: {commit: CommitInfo; hasChildren: 
         {hasChildren ? <T>Clean up stack</T> : <T>Clean up</T>}
       </VSCodeButton>
     </Tooltip>
-  );
-}
-
-function StackEditConfirmButtons(): React.ReactElement {
-  const setStackHashes = useSetRecoilState(editingStackHashes);
-  const originalHead = useRecoilValue(latestHeadCommit);
-  const runOperation = useRunOperation();
-  const stackEdit = useStackEditState();
-
-  const canUndo = stackEdit.canUndo();
-  const canRedo = stackEdit.canRedo();
-
-  const handleUndo = () => {
-    stackEdit.undo();
-    bumpStackEditMetric('undo');
-  };
-
-  const handleRedo = () => {
-    stackEdit.redo();
-    bumpStackEditMetric('redo');
-  };
-
-  const handleSaveChanges = () => {
-    const importStack = stackEdit.commitStack.calculateImportStack({
-      goto: originalHead?.hash,
-      rewriteDate: Date.now() / 1000,
-    });
-    const op = new ImportStackOperation(importStack);
-    runOperation(op);
-    sendStackEditMetrics(true);
-    // Exit stack editing.
-    setStackHashes(new Set());
-  };
-
-  const handleCancel = () => {
-    sendStackEditMetrics(false);
-    setStackHashes(new Set<Hash>());
-  };
-
-  // Show [Cancel] [Save changes] [Undo] [Redo].
-  return (
-    <>
-      <Tooltip
-        title={t('Discard stack editing changes')}
-        delayMs={DOCUMENTATION_DELAY}
-        placement="bottom">
-        <VSCodeButton
-          className="cancel-edit-stack-button"
-          appearance="secondary"
-          onClick={handleCancel}>
-          <T>Cancel</T>
-        </VSCodeButton>
-      </Tooltip>
-      <Tooltip
-        title={t('Save stack editing changes')}
-        delayMs={DOCUMENTATION_DELAY}
-        placement="bottom">
-        <VSCodeButton
-          className="confirm-edit-stack-button"
-          appearance="primary"
-          onClick={handleSaveChanges}>
-          <T>Save changes</T>
-        </VSCodeButton>
-      </Tooltip>
-      <Tooltip
-        component={() =>
-          canUndo ? (
-            <T replace={{$op: <UndoDescription op={stackEdit.undoOperationDescription()} />}}>
-              Undo $op
-            </T>
-          ) : (
-            <T>No operations to undo</T>
-          )
-        }
-        placement="bottom">
-        <VSCodeButton appearance="icon" disabled={!canUndo} onClick={handleUndo}>
-          <Icon icon="discard" />
-        </VSCodeButton>
-      </Tooltip>
-      <Tooltip
-        component={() =>
-          canRedo ? (
-            <T replace={{$op: <UndoDescription op={stackEdit.redoOperationDescription()} />}}>
-              Redo $op
-            </T>
-          ) : (
-            <T>No operations to redo</T>
-          )
-        }
-        placement="bottom">
-        <VSCodeButton appearance="icon" disabled={!canRedo} onClick={handleRedo}>
-          <Icon icon="redo" />
-        </VSCodeButton>
-      </Tooltip>
-    </>
   );
 }
 

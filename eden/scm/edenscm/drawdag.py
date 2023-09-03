@@ -238,7 +238,7 @@ def _parseasciigraph(text: str):
     return bindings.drawdag.parse(text)
 
 
-class simplefilectx(object):
+class simplefilectx:
     def __init__(self, repo, path, data, renamed=None):
         assert isinstance(data, bytes)
         filenode = None
@@ -459,8 +459,10 @@ def _drawdagintransaction(repo, text: str, tr, **opts) -> None:
     for name, parents in edges.items():
         if len(parents) == 0:
             try:
-                committed[name] = scmutil.revsingle(repo, name).node()
-                existed.add(name)
+                rev = repo.anyrevs([name]).last()
+                if rev is not None:
+                    committed[name] = repo[rev].node()
+                    existed.add(name)
             except error.RepoLookupError:
                 pass
 

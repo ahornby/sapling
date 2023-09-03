@@ -26,7 +26,7 @@ from .repack import fulllocaldatarepack
 _maxentrysize = 0x7FFFFFFF
 
 
-class remotefilelognodemap(object):
+class remotefilelognodemap:
     def __init__(self, filename, store):
         self._filename = filename
         self._store = store
@@ -41,7 +41,7 @@ class remotefilelognodemap(object):
         return node
 
 
-class remotefilelog(object):
+class remotefilelog:
     def __init__(self, opener, path, repo):
         self.opener = opener
         self.filename = path
@@ -492,7 +492,6 @@ class remotefileslog(filelog.fileslog):
 
     def __init__(self, repo):
         super(remotefileslog, self).__init__(repo)
-        self._memcachestore = None
         self._edenapistore = None
 
         def needmaintenance(fname: str) -> bool:
@@ -542,13 +541,6 @@ class remotefileslog(filelog.fileslog):
 
         self.makeruststore(repo)
 
-    def memcachestore(self, repo):
-        if self._memcachestore is None:
-            if repo.ui.config("remotefilelog", "cachekey"):
-                self._memcachestore = revisionstore.memcachestore(repo.ui._rcfg)
-
-        return self._memcachestore
-
     def edenapistore(self, repo):
         if self._edenapistore is None:
             useedenapi = repo.ui.configbool("remotefilelog", "http")
@@ -573,7 +565,6 @@ class remotefileslog(filelog.fileslog):
         sharedonlyremotestore = revisionstore.pyremotestore(
             fileserverclient.getpackclient(repo)
         )
-        memcachestore = self.memcachestore(repo)
         edenapistore = self.edenapistore(repo)
 
         correlator = clienttelemetry.correlator(repo.ui)
@@ -584,7 +575,6 @@ class remotefileslog(filelog.fileslog):
                 None,
                 repo.ui._rcfg,
                 sharedonlyremotestore,
-                memcachestore,
                 edenapistore,
                 correlator=correlator,
             )
@@ -592,7 +582,6 @@ class remotefileslog(filelog.fileslog):
                 None,
                 repo.ui._rcfg,
                 sharedonlyremotestore,
-                memcachestore,
                 edenapistore,
             )
         finally:
@@ -603,7 +592,6 @@ class remotefileslog(filelog.fileslog):
     def makeruststore(self, repo):
         remotestore = revisionstore.pyremotestore(fileserverclient.getpackclient(repo))
 
-        memcachestore = self.memcachestore(repo)
         edenapistore = self.edenapistore(repo)
 
         mask = os.umask(0o002)
@@ -614,7 +602,6 @@ class remotefileslog(filelog.fileslog):
                 repo.svfs.vfs.base,
                 repo.ui._rcfg,
                 remotestore,
-                memcachestore,
                 edenapistore,
             )
         finally:
@@ -656,7 +643,6 @@ class remotefileslog(filelog.fileslog):
         self.filescmstore = None
         self.contentstore = None
         self.metadatastore = None
-        self._memcachestore = None
 
     def logfetches(self):
         # TODO(meyer): Rename this function

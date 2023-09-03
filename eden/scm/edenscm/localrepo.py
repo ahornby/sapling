@@ -136,6 +136,30 @@ class storecache(_basefilecache):
         return obj.sjoin(fname)
 
 
+class metalogcache(scmutil.keyedcache):
+    """property cache based on given metalog keys"""
+
+    def __init__(self, *metalog_keys):
+        if metalog_keys:
+            key = lambda repo: tuple(repo.metalog().get_hash(k) for k in metalog_keys)
+        else:
+            key = lambda repo: repo.metalog().root()
+        super().__init__(key)
+
+
+class dagcache(scmutil.keyedcache):
+    """property cache based on dag version
+
+    Side effect: creates changelog.
+
+    Note: dag only tracks commits, not bookmarks, or remote names, or
+    visibility.
+    """
+
+    def __init__(self):
+        super().__init__(lambda repo: repo.changelog.dag.version())
+
+
 def isfilecached(repo, name):
     """check if a repo has already cached "name" filecache-ed property
 
@@ -318,7 +342,7 @@ class locallegacypeer(repository.legacypeer, localpeer):
     # End of baselegacywirecommands interface.
 
 
-class localrepository(object):
+class localrepository:
     """local repository object
 
     ``unsafe.wvfsauditorcache`` config option allows the user to enable
@@ -572,8 +596,6 @@ class localrepository(object):
         self._dirstatevalidatewarned = False
 
         self._branchcaches = {}
-        self.filterpats = {}
-        self._datafilters = {}
         self._transref = self._lockref = self._wlockref = None
 
         # headcache might belong to the changelog object for easier
@@ -1255,11 +1277,12 @@ class localrepository(object):
                 raise
             return set()
 
-    @repofilecache(sharedpaths=["store/bookmarks"], localpaths=["bookmarks.current"])
+    # not checking bookmarks.current - is it necessary?
+    @metalogcache("bookmarks")
     def _bookmarks(self):
         return bookmarks.bmstore(self)
 
-    @repofilecache(sharedpaths=["store/remotenames"])
+    @metalogcache("remotenames")
     def _remotenames(self):
         return bookmarks.remotenames(self)
 
@@ -1299,7 +1322,7 @@ class localrepository(object):
     def nullableedenapi(self):
         return self._getedenapi(nullable=True)
 
-    @util.propertycache
+    @dagcache()
     def _dagcopytrace(self):
         return bindings.copytrace.dagcopytrace(
             self.changelog.inner,
@@ -1612,6 +1635,33 @@ class localrepository(object):
             return True
         return True
 
+    def draft_titles(self):
+        """return a stream of (draft_node, title), used by namespace"""
+        rgen = self._draft_titles_gen
+        return rgen.iter()
+
+    @metalogcache("visibleheads", "remotenames")
+    def _draft_titles_gen(self):
+        """cached generator that yields (draft_node, title).
+
+        Lazily load and cached content:
+        - Only titles of the iterated commits are read.
+        - Already read commit titles are cached (by metalogcache and
+          RGenerator) so they won't be read again by the next iteration
+          via `draft_titles`.
+        """
+        limit = self.ui.configint("experimental", "draft-title-limit") or 1000
+        draftrevs = self.revs("limit(reverse(draft()),%z)", limit).prefetch("text")
+
+        def gen():
+            for c in draftrevs.iterctx():
+                yield c.node(), c.description().split("\n", 1)[0].lower()
+
+        # Wrap in the RGenerator so it can be iterated through multiple times
+        # and be cached.
+        rgen = bindings.threading.RGenerator(gen())
+        return rgen
+
     def shared(self):
         """the type of shared repository (None if not shared)"""
         if self.sharedpath != self.path:
@@ -1660,52 +1710,11 @@ class localrepository(object):
     def pathto(self, f, cwd=None):
         return self.dirstate.pathto(f, cwd)
 
-    def _loadfilter(self, filter):
-        if filter not in self.filterpats:
-            l = []
-            for pat, cmd in self.ui.configitems(filter):
-                if cmd == "!":
-                    continue
-                mf = matchmod.match(self.root, "", [pat])
-                fn = None
-                params = cmd
-                for name, filterfn in pycompat.iteritems(self._datafilters):
-                    if cmd.startswith(name):
-                        fn = filterfn
-                        params = cmd[len(name) :].lstrip()
-                        break
-                if not fn:
-                    fn = lambda s, c, **kwargs: util.filter(s, c)
-                l.append((mf, fn, params))
-            self.filterpats[filter] = l
-        return self.filterpats[filter]
-
-    def _filter(self, filterpats, filename, data):
-        for mf, fn, cmd in filterpats:
-            if mf(filename):
-                self.ui.debug("filtering %s through %s\n" % (filename, cmd))
-                data = fn(data, cmd, ui=self.ui, repo=self, filename=filename)
-                break
-
-        return data
-
-    @util.propertycache
-    def _encodefilterpats(self):
-        return self._loadfilter("encode")
-
-    @util.propertycache
-    def _decodefilterpats(self):
-        return self._loadfilter("decode")
-
-    def adddatafilter(self, name, filter):
-        self._datafilters[name] = filter
-
     def wread(self, filename):
         if self.wvfs.islink(filename):
-            data = pycompat.encodeutf8(self.wvfs.readlink(filename))
+            return pycompat.encodeutf8(self.wvfs.readlink(filename))
         else:
-            data = self.wvfs.read(filename)
-        return self._filter(self._encodefilterpats, filename, data)
+            return self.wvfs.read(filename)
 
     def wwrite(
         self, filename: str, data: bytes, flags: str, backgroundclose: bool = False
@@ -1714,7 +1723,6 @@ class localrepository(object):
 
         This returns length of written (maybe decoded) data.
         """
-        data = self._filter(self._decodefilterpats, filename, data)
         if "l" in flags:
             self.wvfs.symlink(data, filename)
         else:
@@ -1722,9 +1730,6 @@ class localrepository(object):
             if "x" in flags:
                 self.wvfs.setflags(filename, False, True)
         return len(data)
-
-    def wwritedata(self, filename, data):
-        return self._filter(self._decodefilterpats, filename, data)
 
     def currenttransaction(self):
         """return the current transaction or None if non exists"""
@@ -1842,12 +1847,21 @@ class localrepository(object):
             # Flush changelog. At this time remotenames should be up-to-date.
             # We need to write out changelog before remotenames so remotenames
             # do not have dangling pointers.
-            main = bookmarks.mainbookmark(repo)
             mainnodes = []
-            if main in repo:
-                node = repo[main].node()
-                if node != nullid:
-                    mainnodes.append(node)
+            main = bookmarks.mainbookmark(repo)
+            if main:
+                # Explicitly resolve 'main' in the 'hoistednames' and
+                # 'bookmarks' namespace only. The "bookmarks" namespace is
+                # needed by some tests and paths, unfortunately.
+                try:
+                    main_node = repo.names.singlenode(
+                        repo, main, {"hoistednames", "bookmarks"}
+                    )
+                    if main_node != nullid:
+                        mainnodes.append(main_node)
+                except KeyError:
+                    # no such namespace, or not resolved in namespace
+                    pass
             cl.inner.flush(mainnodes)
 
             # flush(mainnodes) might reassign ids that makes the cached `public()`
@@ -2251,6 +2265,9 @@ class localrepository(object):
         # different form).
         self._headcache.clear()
         self._phasecache.invalidate()
+        self.invalidatedagcopytrace()
+
+    def invalidatedagcopytrace(self):
         self.__dict__.pop("_dagcopytrace", None)
 
     def invalidatemetalog(self):
@@ -2926,6 +2943,7 @@ class localrepository(object):
                 repo=self.ui.config("remotefilelog", "reponame"),
                 **loginfo,
             )
+
             return n
         finally:
             if tr:

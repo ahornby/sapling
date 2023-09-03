@@ -21,7 +21,6 @@ import os
 import random
 import socket
 import ssl
-import string
 import struct
 import subprocess
 import sys
@@ -317,9 +316,8 @@ def debugbuilddag(
                             pa = p1.ancestor(p2)
                             base, local, other = [x[fn].data() for x in (pa, p1, p2)]
                             m3 = simplemerge.Merge3Text(base, local, other)
-                            ml = [
-                                pycompat.decodeutf8(l.strip()) for l in m3.merge_lines()
-                            ]
+                            merged_lines = simplemerge.render_minimized(m3)[0]
+                            ml = [pycompat.decodeutf8(l.strip()) for l in merged_lines]
                             ml.append("")
                         elif at > 0:
                             datastr = pycompat.decodeutf8(p1[fn].data())
@@ -2325,7 +2323,7 @@ def debugpreviewbindag(ui, repo, path):
         for rev in reversed(revs):
             yield (rev, "C", dummyctx(rev), [("P", p) for p in parentrevs(rev)])
 
-    class dummyctx(object):
+    class dummyctx:
         """A dummy changeset object"""
 
         def __init__(self, id):

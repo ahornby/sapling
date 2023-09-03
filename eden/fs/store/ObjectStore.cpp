@@ -166,21 +166,20 @@ std::shared_ptr<const Tree> changeCaseSensitivity(
 
 } // namespace
 
-ImmediateFuture<shared_ptr<const Tree>> ObjectStore::getRootTree(
+ImmediateFuture<ObjectStore::GetRootTreeResult> ObjectStore::getRootTree(
     const RootId& rootId,
     const ObjectFetchContextPtr& context) const {
   XLOG(DBG3) << "getRootTree(" << rootId << ")";
   return backingStore_->getRootTree(rootId, context)
       .thenValue(
           [treeCache = treeCache_, rootId, caseSensitive = caseSensitive_](
-              std::shared_ptr<const Tree> tree) {
-            if (!tree) {
-              throw_<std::domain_error>("unable to import root ", rootId);
-            }
+              BackingStore::GetRootTreeResult result) {
+            treeCache->insert(result.treeId, result.tree);
 
-            treeCache->insert(tree);
-
-            return changeCaseSensitivity(std::move(tree), caseSensitive);
+            return GetRootTreeResult{
+                changeCaseSensitivity(std::move(result.tree), caseSensitive),
+                result.treeId,
+            };
           });
 }
 
@@ -240,7 +239,7 @@ ImmediateFuture<shared_ptr<const Tree>> ObjectStore::getTree(
           throwf<std::domain_error>("tree {} not found", id);
         }
 
-        self->treeCache_->insert(result.tree);
+        self->treeCache_->insert(result.tree->getHash(), result.tree);
         fetchContext->didFetch(ObjectFetchContext::Tree, id, result.origin);
         self->updateProcessFetch(*fetchContext);
         return changeCaseSensitivity(

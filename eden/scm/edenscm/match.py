@@ -19,7 +19,7 @@ from typing import List, Optional, Pattern, Sized, Tuple
 
 from bindings import pathmatcher
 
-from . import error, pathutil, pycompat, util
+from . import error, identity, pathutil, pycompat, util
 from .i18n import _
 from .pycompat import decodeutf8
 
@@ -128,6 +128,32 @@ def match(
     'set:<fileset>' - a fileset expression
     '<something>' - a pattern of the specified default type
     """
+
+    if _userustmatcher:
+        try:
+            hm = hintedmatcher(
+                root,
+                cwd,
+                patterns or [],
+                include or [],
+                exclude or [],
+                default,
+                ctx,
+                casesensitive=not icasefs,
+                badfn=badfn,
+            )
+        except (error.UncategorizedNativeError, ValueError) as ex:
+            if util.istest():
+                raise
+            if ctx:
+                ctx.repo().ui.log("pathmatcher_info", hinted_matcher_error=str(ex))
+            pass
+        else:
+            if warn:
+                for warning in hm.warnings():
+                    warn("warning: " + identity.replace(warning) + "\n")
+            return hm
+
     normalize = _donormalize
     if icasefs:
         dirstate = ctx.repo().dirstate
@@ -642,7 +668,7 @@ def _buildvisitdir(kindpats):
     return tree.visitdir
 
 
-class basematcher(object):
+class basematcher:
     def __init__(self, root, cwd, badfn=None, relativeuipath=True):
         self._root = root
         self._cwd = cwd
@@ -720,24 +746,40 @@ class basematcher(object):
         return True
 
     def always(self):
-        """Matcher will match everything and .files() will be empty --
-        optimization might be possible."""
+        """Matcher will match everything and .files() will be empty.
+        Optimization might be possible."""
         return False
 
     def isexact(self):
-        """Matcher will match exactly the list of files in .files() --
-        optimization might be possible."""
+        """Matcher matches exactly the list of files in .files(), and nothing else.
+        Optimization might be possible."""
         return False
 
     def prefix(self):
-        """Matcher will match the paths in .files() recursively --
-        optimization might be possible."""
+        """Matcher matches the paths in .files() recursively, and nothing else.
+        Optimization might be possible."""
         return False
 
     def anypats(self):
-        """None of .always(), .isexact(), and .prefix() is true --
-        optimizations will be difficult."""
-        return not self.always() and not self.isexact() and not self.prefix()
+        """Matcher contains a non-trivial pattern (i.e. non-path and non-always).
+        If this returns False, code assumes files() is all that matters.
+        Optimizations will be difficult."""
+        if self.always():
+            # This is confusing since, conceptually, we are saying
+            # there aren't patterns when we have a pattern like "**".
+            # But since always() implies files() is empty, it is safe
+            # for code to assume files() is all that's important.
+            return False
+
+        if self.isexact():
+            # Only exacty files - no patterns.
+            return False
+
+        if self.prefix():
+            # Only recursive paths - no patterns.
+            return False
+
+        return True
 
 
 class alwaysmatcher(basematcher):
@@ -920,6 +962,82 @@ class regexmatcher(basematcher):
 
     def __repr__(self):
         return f"<regexmatcher pattern={self._pattern!r}>"
+
+
+class hintedmatcher(basematcher):
+    """Rust matcher fully implementing Python API."""
+
+    def __init__(
+        self,
+        root,
+        cwd,
+        patterns: List[str],
+        include: List[str],
+        exclude: List[str],
+        default: str,
+        ctx,
+        casesensitive: bool,
+        badfn=None,
+    ):
+        super(hintedmatcher, self).__init__(
+            root, cwd, badfn, relativeuipath=bool(patterns or include or exclude)
+        )
+
+        def expandsets(pats, default):
+            fset, nonsets = set(), []
+            for pat in pats:
+                k, p = _patsplit(pat, default)
+                if k == "set":
+                    if not ctx:
+                        raise error.ProgrammingError(
+                            "fileset expression with no " "context"
+                        )
+                    fset.update(ctx.getfileset(p))
+                else:
+                    nonsets.append(pat)
+
+            if len(nonsets) == len(pats):
+                return nonsets, None
+            else:
+                return nonsets, list(fset)
+
+        self._matcher = pathmatcher.hintedmatcher(
+            *expandsets(patterns, default),
+            *expandsets(include, "glob"),
+            *expandsets(exclude, "glob"),
+            default,
+            casesensitive,
+            root,
+            cwd,
+        )
+        self._files = self._matcher.exact_files()
+
+    def matchfn(self, f):
+        return self._matcher.matches_file(f)
+
+    def visitdir(self, dir):
+        matched = self._matcher.matches_directory(dir)
+        if matched is None:
+            return True
+        elif matched is True:
+            return "all"
+        else:
+            assert matched is False, f"expected False, but got {matched}"
+            return False
+
+    def always(self):
+        return self._matcher.always_matches()
+
+    def prefix(self):
+        return self._matcher.all_recursive_paths()
+
+    def isexact(self):
+        # Similar to nevermatcher, let the knowledge that we never match
+        # allow isexact() fast paths.
+        return self._matcher.never_matches()
+
+    def warnings(self):
+        return self._matcher.warnings()
 
 
 class dynmatcher(basematcher):
@@ -1777,6 +1895,7 @@ _usetreematcher = True
 _useregexmatcher = True
 _usedynmatcher = True
 _emptyglobalwaysmatches = False
+_userustmatcher = False
 
 
 def init(ui) -> None:
@@ -1788,3 +1907,5 @@ def init(ui) -> None:
     _usedynmatcher = ui.configbool("experimental", "dynmatcher")
     global _emptyglobalwaysmatches
     _emptyglobalwaysmatches = ui.configbool("experimental", "empty-glob-always-matches")
+    global _userustmatcher
+    _userustmatcher = ui.configbool("experimental", "rustmatcher")

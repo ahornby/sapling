@@ -14,6 +14,7 @@ from __future__ import absolute_import
 
 import errno
 import hashlib
+import posixpath
 import shutil
 import struct
 
@@ -51,7 +52,7 @@ _pack = struct.pack
 _unpack = struct.unpack
 
 
-class mergestate(object):
+class mergestate:
     """track 3-way merge state of individual files
 
     The merge state is stored on disk when needed. For more about the format,
@@ -644,7 +645,7 @@ def _checkunknownfile(repo, wctx, mctx, f, f2=None):
     )
 
 
-class _unknowndirschecker(object):
+class _unknowndirschecker:
     """
     Look for any unknown files or directories that may have a path conflict
     with a file.  If any path prefix of the file exists as a file or link,
@@ -693,7 +694,7 @@ class _unknowndirschecker(object):
             # Does the directory contain any files that are not in the dirstate?
             for p, dirs, files in repo.wvfs.walk(f):
                 for fn in files:
-                    relf = repo.dirstate.normalize(repo.wvfs.reljoin(p, fn))
+                    relf = repo.dirstate.normalize(posixpath.join(p, fn))
                     if relf not in repo.dirstate:
                         return f
         return None
@@ -1144,9 +1145,7 @@ def manifestmerge(
                 if n2 == a and fl2 == fla:
                     actions[f] = ("k", (), "remote unchanged")
                 elif n1 == a and fl1 == fla:  # local unchanged - use remote
-                    if n1 == n2:  # optimization: keep local content
-                        actions[f] = ("e", (fl2,), "update permissions")
-                    elif fl1 == fl2:
+                    if fl1 == fl2:
                         actions[f] = ("g", (fl2, False), "remote is newer")
                     else:
                         actions[f] = ("rg", (fl2, False), "flag differ")
@@ -1690,7 +1689,11 @@ def applyupdates(repo, actions, wctx, mctx, overwrite, labels=None, ancestors=No
                 repo.fileslog.contentstore, repo.wvfs.base, numworkers
             )
             fctx = mctx.filectx
+            slinkfix = pycompat.iswindows and repo.wvfs._cansymlink
+            slinks = []
             for f, (flags, backup), msg in actions["g"] + actions["rg"]:
+                if slinkfix and "l" in flags:
+                    slinks.append(f)
                 fnode = fctx(f).filenode()
                 # The write method will either return immediately or block if
                 # the internal worker queue is full.
@@ -1703,6 +1706,8 @@ def applyupdates(repo, actions, wctx, mctx, overwrite, labels=None, ancestors=No
             for f, flag in retry:
                 repo.ui.debug("retrying %s\n" % f)
                 writesize += updateone(repo, fctx, wctx, f, flag)
+            if slinkfix:
+                nativecheckout.fixsymlinks(slinks, repo.wvfs.base)
         else:
             for i, size, item in batchget(
                 repo, mctx, wctx, actions["g"] + actions["rg"]
@@ -1870,6 +1875,7 @@ def applyupdates(repo, actions, wctx, mctx, overwrite, labels=None, ancestors=No
                     src_hex=_gethex(mctx),
                     repo=reponame,
                     manual_merge_files_count=len(files),
+                    manual_merge_files=",".join(files),
                 )
         finally:
             ms.commit()
@@ -2401,13 +2407,15 @@ def update(
                 dirty = wc.dirty(missing=True)
                 if dirty:
                     # Branching is a bit strange to ensure we do the minimal
-                    # amount of call to mutation.foreground.
+                    # amount of call to mutation.foreground_contains.
                     if mutation.enabled(repo):
-                        foreground = mutation.foreground(repo, [p1.node()])
+                        in_foreground = mutation.foreground_contains(
+                            repo, [p1.node()], repo[node].node()
+                        )
                     else:
-                        foreground = set()
+                        in_foreground = False
                     # note: the <node> variable contains a random identifier
-                    if repo[node].node() in foreground:
+                    if in_foreground:
                         pass  # allow updating to successors
                     else:
                         msg = _("uncommitted changes")

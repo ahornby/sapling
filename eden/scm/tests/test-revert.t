@@ -102,7 +102,7 @@
   $ hg revert -v b
   forgetting b
   $ hg status b
-  b: * (glob)
+  b: $ENOENT$
 
   $ ls
   a
@@ -1472,6 +1472,8 @@
   removing B
   $ hg status --rev 1
 
+#if symlink
+
 # Don't backup symlink reverts
 
   $ ln -s foo bar
@@ -1484,3 +1486,5 @@
   $ hg revert --all --config 'ui.origbackuppath=.hg/origbackups'
   reverting bar
   $ ls .hg/origbackups
+
+#endif

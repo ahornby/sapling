@@ -13,7 +13,6 @@ import type {ParsedDiff} from 'shared/patch/parse';
 
 import {FileHeader} from './SplitDiffFileHeader';
 import {SplitDiffTable} from './SplitDiffHunk';
-import {useState} from 'react';
 import {DiffType} from 'shared/patch/parse';
 
 export function SplitDiffView<Id>({
@@ -25,9 +24,8 @@ export function SplitDiffView<Id>({
   path: string;
   patch: ParsedDiff;
 }) {
-  const [open, setOpen] = useState(true);
-
   const fileName = patch.newFileName ?? patch.oldFileName ?? '/dev/null';
+  const collapsed = ctx.collapsed;
 
   // Type hack to get a templatized version of a React.memo-ized component
   const TypedSplitDiffTable = SplitDiffTable as unknown as React.FC<SplitDiffTableProps<Id>>;
@@ -36,21 +34,29 @@ export function SplitDiffView<Id>({
 
   const preamble = [];
   if (patch.type === DiffType.Added) {
-    preamble.push(<FileStatusBanner key="added">{t('This file was added')}</FileStatusBanner>);
+    preamble.push(
+      <FileStatusBanner key="added" color="added">
+        {t('This file was added')}
+      </FileStatusBanner>,
+    );
   }
   if (patch.type === DiffType.Removed) {
-    preamble.push(<FileStatusBanner key="deleted">{t('This file was removed')}</FileStatusBanner>);
+    preamble.push(
+      <FileStatusBanner key="deleted" color="removed">
+        {t('This file was removed')}
+      </FileStatusBanner>,
+    );
   }
   if (patch.type === DiffType.Renamed) {
     preamble.push(
-      <FileStatusBanner key="renamed">
+      <FileStatusBanner key="renamed" color="modified">
         {t('This file was renamed from')} {patch.oldFileName ?? ''}
       </FileStatusBanner>,
     );
   }
   if (patch.type === DiffType.Copied) {
     preamble.push(
-      <FileStatusBanner key="copied">
+      <FileStatusBanner key="copied" color="added">
         {t('This file was copied from')} {patch.oldFileName ?? ''}
       </FileStatusBanner>,
     );
@@ -62,17 +68,25 @@ export function SplitDiffView<Id>({
         ctx={ctx}
         path={fileName}
         diffType={patch.type}
-        open={open}
-        onChangeOpen={open => setOpen(open)}
+        open={!collapsed}
+        onChangeOpen={open => ctx.setCollapsed(!open)}
       />
-      {open && <TypedSplitDiffTable ctx={ctx} path={path} patch={patch} preamble={preamble} />}
+      {!collapsed && (
+        <TypedSplitDiffTable ctx={ctx} path={path} patch={patch} preamble={preamble} />
+      )}
     </div>
   );
 }
 
-function FileStatusBanner({children}: {children: React.ReactNode}): React.ReactElement {
+function FileStatusBanner({
+  children,
+  color,
+}: {
+  children: React.ReactNode;
+  color: 'added' | 'removed' | 'modified';
+}): React.ReactElement {
   return (
-    <tr className="split-diff-view-file-status-banner">
+    <tr className={`split-diff-view-file-status-banner split-diff-view-banner-${color}`}>
       <td colSpan={4} className="separator">
         <div className="split-diff-view-">{children}</div>
       </td>

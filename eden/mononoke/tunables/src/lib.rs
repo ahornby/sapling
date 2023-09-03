@@ -89,8 +89,6 @@ pub struct MononokeTunables {
     bookmark_subscription_max_age_ms: TunableI64,
     bookmark_subscription_protect_master: TunableBool,
     max_scuba_msg_length: TunableI64,
-    wishlist_read_qps: TunableI64,
-    wishlist_write_qps: TunableI64,
     edenapi_large_tree_metadata_limit: TunableI64,
     edenapi_req_dumper_sample_ratio: TunableI64,
     command_monitor_interval: TunableI64,
@@ -130,7 +128,6 @@ pub struct MononokeTunables {
     disable_running_hooks_in_pushredirected_repo: TunableBool,
     scs_request_read_qps: TunableI64,
     scs_request_write_qps: TunableI64,
-    enable_logging_commit_rewrite_data: TunableBool,
     // All blobstore read request with size bigger than
     // this threshold will be logged to scuba
     blobstore_read_size_logging_threshold: TunableI64,
@@ -155,9 +152,6 @@ pub struct MononokeTunables {
 
     // Disable EdenAPI in http_service.
     disable_http_service_edenapi: TunableBool,
-
-    // Disable putting hydrating manifests in .hg
-    disable_hydrating_manifests_in_dot_hg: TunableBool,
 
     // Rendez vous configuration.
     rendezvous_dispatch_delay_ms: TunableI64,
@@ -223,20 +217,10 @@ pub struct MononokeTunables {
     // Disable the parallel derivation for DM and default to serial
     deleted_manifest_disable_new_parallel_derivation: TunableBool,
 
-    // multiplexed blobstore is_present/get new semantics rollout
-    multiplex_blobstore_get_do_queue_lookup: TunableBool,
-    multiplex_blobstore_is_present_do_queue_lookup: TunableBool,
-
-    // Not in use.
-    // TODO(mitrandir): clean it up
-    fastlog_use_mutable_renames: TunableBoolByRepo,
     // Disable mutable renames for fastlog in case they cause problems.
     fastlog_disable_mutable_renames: TunableBoolByRepo,
     megarepo_api_dont_set_file_mutable_renames: TunableBool,
     megarepo_api_dont_set_directory_mutable_renames: TunableBool,
-
-    force_unode_v2: TunableBool,
-    fastlog_use_gen_num_traversal: TunableBool,
 
     // Changing the value of this tunable forces all mononoke instances
     // to reload segmented changelog. One can also specify jitter (or use default)
@@ -398,6 +382,11 @@ pub struct MononokeTunables {
 
     // Assigning global revs with small gaps
     global_rev_increment_with_gaps: TunableBool,
+
+    // During cross-repo sync, mark a generated changeset as created by lossy conversion if it is
+    // See [this post](https://fburl.com/workplace/l5job9po) for context
+    // The repo it is tuned by refers to the source repo in the sync
+    cross_repo_mark_changesets_as_created_by_lossy_conversion: TunableBoolByRepo,
 }
 
 fn log_tunables(tunables: &TunablesStruct) -> String {
@@ -587,18 +576,22 @@ mod test {
 
     #[test]
     fn test_override_tunables() {
-        assert!(tunables().wishlist_write_qps().is_none());
+        assert!(tunables().warm_bookmark_cache_poll_interval_ms().is_none());
 
         let res = with_tunables(
             MononokeTunables {
-                wishlist_write_qps: ArcSwapOption::from(Some(Arc::new(2))),
+                warm_bookmark_cache_poll_interval_ms: ArcSwapOption::from(Some(Arc::new(2))),
                 ..MononokeTunables::default()
             },
-            || tunables().wishlist_write_qps().unwrap_or_default(),
+            || {
+                tunables()
+                    .warm_bookmark_cache_poll_interval_ms()
+                    .unwrap_or_default()
+            },
         );
 
         assert_eq!(res, 2);
-        assert!(tunables().wishlist_write_qps().is_none());
+        assert!(tunables().warm_bookmark_cache_poll_interval_ms().is_none());
     }
 
     #[test]
@@ -1081,10 +1074,15 @@ mod test {
     async fn test_with_tunables_async(_fb: fbinit::FacebookInit) {
         let res = with_tunables_async(
             MononokeTunables {
-                wishlist_write_qps: ArcSwapOption::from(Some(Arc::new(2))),
+                warm_bookmark_cache_poll_interval_ms: ArcSwapOption::from(Some(Arc::new(2))),
                 ..MononokeTunables::default()
             },
-            async { tunables().wishlist_write_qps().unwrap_or_default() }.boxed(),
+            async {
+                tunables()
+                    .warm_bookmark_cache_poll_interval_ms()
+                    .unwrap_or_default()
+            }
+            .boxed(),
         )
         .await;
 

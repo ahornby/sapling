@@ -27,6 +27,7 @@ pub use crate::gitignore_matcher::GitignoreMatcher;
 pub use crate::hinted_matcher::HintedMatcher;
 pub use crate::matcher::build_matcher;
 pub use crate::matcher::cli_matcher;
+pub use crate::matcher::cli_matcher_with_filesets;
 pub use crate::pattern::build_patterns;
 pub use crate::pattern::split_pattern;
 pub use crate::pattern::PatternKind;
@@ -178,12 +179,20 @@ impl<A: Matcher, B: Matcher> Matcher for DifferenceMatcher<A, B> {
 }
 
 pub struct UnionMatcher {
-    matchers: Vec<Arc<dyn 'static + Matcher + Send + Sync>>,
+    matchers: Vec<DynMatcher>,
 }
 
 impl UnionMatcher {
-    pub fn new(matchers: Vec<Arc<dyn 'static + Matcher + Send + Sync>>) -> Self {
+    pub fn new(matchers: Vec<DynMatcher>) -> Self {
         UnionMatcher { matchers }
+    }
+
+    pub fn new_or_single(mut matchers: Vec<DynMatcher>) -> DynMatcher {
+        if matchers.len() == 1 {
+            matchers.remove(0)
+        } else {
+            Arc::new(Self::new(matchers))
+        }
     }
 
     pub fn matches_directory<M: Matcher, I: Iterator<Item = M>>(
@@ -227,11 +236,11 @@ impl Matcher for UnionMatcher {
 }
 
 pub struct IntersectMatcher {
-    matchers: Vec<Arc<dyn 'static + Matcher + Send + Sync>>,
+    matchers: Vec<DynMatcher>,
 }
 
 impl IntersectMatcher {
-    pub fn new(matchers: Vec<Arc<dyn 'static + Matcher + Send + Sync>>) -> Self {
+    pub fn new(matchers: Vec<DynMatcher>) -> Self {
         Self { matchers }
     }
 }
@@ -267,6 +276,30 @@ impl Matcher for IntersectMatcher {
             matched = true;
         }
         Ok(matched)
+    }
+}
+
+pub struct NegateMatcher {
+    matcher: DynMatcher,
+}
+
+impl NegateMatcher {
+    pub fn new(matcher: DynMatcher) -> Self {
+        Self { matcher }
+    }
+}
+
+impl Matcher for NegateMatcher {
+    fn matches_directory(&self, path: &RepoPath) -> Result<DirectoryMatch> {
+        self.matcher.matches_directory(path).map(|m| match m {
+            DirectoryMatch::Everything => DirectoryMatch::Nothing,
+            DirectoryMatch::Nothing => DirectoryMatch::Everything,
+            DirectoryMatch::ShouldTraverse => DirectoryMatch::ShouldTraverse,
+        })
+    }
+
+    fn matches_file(&self, path: &RepoPath) -> Result<bool> {
+        self.matcher.matches_file(path).map(|b| !b)
     }
 }
 

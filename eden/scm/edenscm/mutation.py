@@ -8,7 +8,7 @@
 from __future__ import absolute_import
 
 from collections import defaultdict
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from bindings import mutationstore
 
@@ -62,7 +62,7 @@ def makemutationstore(repo):
     return mutationstore.mutationstore(repo.svfs.join("mutation"))
 
 
-class bundlemutationstore(object):
+class bundlemutationstore:
     def __init__(self, bundlerepo):
         self._entries = {}
         self._splitheads = {}
@@ -105,11 +105,12 @@ class bundlemutationstore(object):
         pass
 
 
-def createentry(node, mutinfo):
-    def nodesfrominfo(info):
-        if info is not None:
-            return [nodefromident(x) for x in info.split(",")]
+def nodesfrominfo(info):
+    if info is not None:
+        return [nodefromident(x) for x in info.split(",")]
 
+
+def createentry(node, mutinfo):
     if mutinfo is not None:
         try:
             time, tz = mutinfo["mutdate"].split()
@@ -255,7 +256,7 @@ def allsuccessors(repo, nodes, startdepth=None, stopdepth=None):
         nextlevel = set()
 
 
-class obsoletecache(object):
+class obsoletecache:
     def __init__(self):
         # Set of commits that are known to be obsolete for each filter level.
         self.obsolete = defaultdict(set)
@@ -469,6 +470,15 @@ def predecessorsset(repo, startnode, closest: bool = False):
     return preds
 
 
+def local_closest_predecessors(repo, node) -> List[bytes]:
+    entry = repo._mutationstore.get(node)
+    preds = entry and entry.preds() or []
+    # Filter preds by "locally known"
+    if preds:
+        preds = repo.changelog.filternodes(preds, local=True)
+    return list(preds)
+
+
 def _succproduct(succsetlist):
     """Takes a list of successorsset lists and returns a single successorsset
     list representing the cartesian product of those successorsset lists.
@@ -611,22 +621,19 @@ def successorssets(repo, startnode, closest: bool = False, cache=None):
     return succsets
 
 
-def foreground(repo, nodes):
-    """Returns all nodes in the "foreground" of the given nodes.
+def foreground_contains(repo, old_nodes, new_node):
+    """Test if `ancestors(new_node)` overlap with `old_nodes`.
 
-    The foreground of a commit is the transitive closure of all descendants
-    and successors of the commit.
+    This is not quite as the same as the original 'foreground', but is much
+    faster since we avoid passing a large set to `predecessors` or
+    `successors` (or, a large `predecessors` set to `ancestors`).
     """
-    unfi = repo
-    nm = unfi.changelog.nodemap
-    foreground = set(nodes)
-    newnodes = set(nodes)
-    while newnodes:
-        newnodes.update(n for n in allsuccessors(repo, newnodes) if n in nm)
-        newnodes.update(unfi.nodes("%ln::", newnodes))
-        newnodes.difference_update(foreground)
-        foreground.update(newnodes)
-    return foreground
+    # First, check without calculating `predecessors`.
+    ancestor_nodes = repo.dageval(lambda: ancestors([new_node]))
+    if any(n in ancestor_nodes for n in old_nodes):
+        return True
+    # For performance we don't check `predecessors` at all.
+    return False
 
 
 def toposortrevs(repo, revs, predmap):

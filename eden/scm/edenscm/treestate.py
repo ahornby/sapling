@@ -62,7 +62,7 @@ def _unpackmetadata(data):
     return dict(entry.split("=", 1) for entry in data.split("\0") if "=" in entry)
 
 
-class treestatemap(object):
+class treestatemap:
     """a drop-in replacement for dirstate._map, with more abilities like also
     track fsmonitor state.
 
@@ -132,6 +132,13 @@ class treestatemap(object):
         if entry is None or len(entry) != 5:
             return default
         flags, mode, size, mtime, _copied = entry
+
+        # Python depends on size=-2 to infer P2 activity. Treestate
+        # tracks P2 separate from size, so the size could be set to a
+        # value other than -2.
+        if flags & treestate.EXIST_P2:
+            size = -2
+
         # convert flags to Mercurial dirstate state
         state = treestate.tohgstate(flags)
         return (state, mode, size, mtime)

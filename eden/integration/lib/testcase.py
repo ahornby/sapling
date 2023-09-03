@@ -314,6 +314,11 @@ class EdenTestCase(EdenTestCaseBase):
             f.write(contents.encode())
         os.chmod(fullpath, mode)
 
+    def chmod(self, path: str, mode: int = 0o644) -> None:
+        """Create or overwrite a file with the given contents."""
+        fullpath = self.get_path(path)
+        os.chmod(fullpath, mode)
+
     def rename(self, from_path: str, to_path: str) -> None:
         """Rename a file/directory at the specified paths relative to the
         clone.
@@ -401,6 +406,7 @@ class EdenRepoTest(EdenTestCase):
     repo: repobase.Repository
     repo_name: str
     repo_type: str
+    inode_catalog_type: str
 
     enable_logview: bool = False
 
@@ -424,6 +430,7 @@ class EdenRepoTest(EdenTestCase):
         super().setup_eden_test()
 
         self.repo_name = "main"
+        self.inode_catalog_type = "sqlite" if sys.platform == "win32" else "legacy"
         self.repo = self.create_repo(self.repo_name)
         self.populate_repo()
         self.report_time("repository setup done")

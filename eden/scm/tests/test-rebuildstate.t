@@ -1,6 +1,5 @@
-#debugruntest-compatible
-
-  $ setconfig workingcopy.ruststatus=false
+(debugruntest hits IO deadlock w/ tracing output)
+#chg-compatible
 
   $ eagerepo
   $ newext adddrop <<EOF
@@ -67,6 +66,10 @@ status
   ! bar
   ? baz
   C foo
+
+Make sure the second status call doesn't need to compare file contents anymore.
+  $ LOG=workingcopy::filechangedetector=trace hg status 2>&1 | grep read_file_contents | grep enter
+  *compare contents{keys=0}* (glob)
 
 Test debugdirstate --minimal where a file is not in parent manifest
 but in the dirstate

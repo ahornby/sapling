@@ -96,29 +96,62 @@
   line-height: 30px;
 }
 
+.changed-files-list .changed-file:nth-child(n + 15):last-child {
+  margin-bottom: 10px;
+}
+
+.changed-files .banner {
+  padding: var(--pad);
+  margin: var(--pad) 0;
+  max-width: 500px;
+}
+
+.changed-files-list-container {
+  display: flex;
+  flex-direction: column;
+  position: relative;
+  overflow-y: hidden;
+}
+
+.changed-files-list {
+  --changed-files-list-height: 500px;
+  overflow-y: scroll;
+  max-height: var(--changed-files-list-height);
+}
+
+.changed-files-list:after {
+  --overflow-gradient-height: 20px;
+  display: block;
+  content: ' ';
+  width: 100%;
+  height: var(--overflow-gradient-height);
+  background: linear-gradient(transparent, var(--background));
+  z-index: 10;
+  position: absolute;
+  bottom: 0px;
+  left: 0;
+  top: calc(var(--changed-files-list-height) - var(--overflow-gradient-height));
+  pointer-events: none;
+}
+
 .changed-file-path {
   display: flex;
   align-items: center;
   gap: var(--halfpad);
   cursor: pointer;
+  overflow: hidden;
 }
 
-.changed-file-path {
-  max-width: calc(100% - 2 * var(--pad));
-  position: relative;
-  overflow: hidden;
-}
 .changed-file-path-text {
-  float: right;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  /* ellipsis dots on the start of the file path rather than the end */
+  direction: rtl;
+  text-align: left;
 }
 .changed-file-path .tooltip-creator {
-  width: 100%;
-  text-align: right;
   overflow: hidden;
-  white-space: nowrap;
-  margin-left: auto;
-  margin-right: auto;
-  display: block;
 }
 
 .changed-file-path:hover {

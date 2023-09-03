@@ -1,7 +1,7 @@
-#debugruntest-compatible
+(debugruntest fails under buck for some reason)
+#chg-compatible
 
   $ eagerepo
-  $ setconfig workingcopy.ruststatus=false
 
 Set up test environment.
   $ configure mutation

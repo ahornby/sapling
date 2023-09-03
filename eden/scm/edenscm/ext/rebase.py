@@ -245,7 +245,7 @@ class RevCompatSet(MutableSet):
         self.__dict__.pop("_revs", None)
 
 
-class rebaseruntime(object):
+class rebaseruntime:
     """This class is a container for rebase runtime state"""
 
     def __init__(self, repo, ui, templ, inmemory=False, opts=None):
@@ -1031,7 +1031,7 @@ class rebaseruntime(object):
 
 
 def _simplemerge(ui, basectx, ctx, p1ctx, manifestbuilder):
-    from ..simplemerge import Merge3Text, wordmergemode
+    from ..simplemerge import Merge3Text, render_minimized, wordmergemode
 
     conflicts = []
     resolved = {}
@@ -1043,14 +1043,14 @@ def _simplemerge(ui, basectx, ctx, p1ctx, manifestbuilder):
         wordmerge = wordmergemode.fromui(ui)
         m3 = Merge3Text(basetext, localtext, othertext, wordmerge=wordmerge)
 
-        # merge_lines() has side effect setting conflicts
-        merged = b"".join(m3.merge_lines())
+        merged_lines, conflictscount = render_minimized(m3)
+        merged = b"".join(merged_lines)
 
         # Suppress message if merged result is the same as local contents.
         if merged != localtext:
             ui.status(_("merging %s\n") % file)
 
-        if m3.conflictscount:
+        if conflictscount:
             conflicts.append(file)
         else:
             resolved[file] = merged

@@ -17,6 +17,7 @@ import type {
   ImportAction,
 } from 'shared/types/stack';
 
+import {t} from '../i18n';
 import {assert} from '../utils';
 import {FileStackState} from './fileStackState';
 import deepEqual from 'fast-deep-equal';
@@ -621,6 +622,57 @@ export class CommitStackState extends SelfUpdate<CommitStackRecord> {
       .toArray();
   }
 
+  /** File name for `fileStacks[index]`. If the file is renamed, return  */
+  getFileStackDescription(fileIdx: number): string {
+    const fileStack = unwrap(this.fileStacks.get(fileIdx));
+    const revLength = fileStack.revLength - 1;
+    const nameAtFirstRev = this.getFileStackPath(fileIdx, 0);
+    const nameAtLastRev = this.getFileStackPath(fileIdx, revLength - 1);
+    const words = [];
+    if (nameAtFirstRev) {
+      words.push(nameAtFirstRev);
+    }
+    if (nameAtLastRev && nameAtLastRev !== nameAtFirstRev) {
+      // U+2192. Rightwards Arrow (Unicode 1.1).
+      words.push('→');
+      words.push(nameAtLastRev);
+    }
+    if (revLength > 1) {
+      words.push(t('(edited by $n commits)', {replace: {$n: revLength.toString()}}));
+    }
+    return words.join(' ');
+  }
+
+  /** Get the path name for a specific revision in the given file stack. */
+  getFileStackPath(fileIdx: number, fileRev: number): string | undefined {
+    return this.fileToCommit.get(FileIdx({fileIdx, fileRev}))?.path;
+  }
+
+  /**
+   * Get the commit from a file stack revision.
+   * Returns undefined when rev is out of range, or the commit is "public" (ex. fileRev is 0).
+   */
+  getCommitFromFileStackRev(fileIdx: number, fileRev: Rev): CommitState | undefined {
+    const commitRev = this.fileToCommit.get(FileIdx({fileIdx, fileRev}))?.rev;
+    if (commitRev == null || commitRev < 0) {
+      return undefined;
+    }
+    return unwrap(this.stack.get(commitRev));
+  }
+
+  /**
+   * Test if a file rev is "absent". An absent file is different from an empty file.
+   */
+  isAbsentFromFileStackRev(fileIdx: number, fileRev: Rev): boolean {
+    const commitIdx = this.fileToCommit.get(FileIdx({fileIdx, fileRev}));
+    if (commitIdx == null) {
+      return true;
+    }
+    const {rev, path} = commitIdx;
+    const file = rev < 0 ? this.bottomFiles.get(path) : this.getFile(rev, path);
+    return file == null || isAbsent(file);
+  }
+
   /** Extract utf-8 data from a file. */
   getUtf8Data(file: FileState): string {
     if (typeof file.data === 'string') {
@@ -988,6 +1040,15 @@ export class CommitStackState extends SelfUpdate<CommitStackRecord> {
 
     return state.buildFileStacks();
   }
+
+  /** Replace a file stack. */
+  setFileStack(fileIdx: number, stack: FileStackState): CommitStackState {
+    const oldStack = this.fileStacks.get(fileIdx);
+    assert(oldStack != null, 'fileIdx out of range');
+    assert(oldStack.revLength === stack.revLength, 'fileStack length mismatch');
+    const newInner = this.inner.setIn(['fileStacks', fileIdx], stack);
+    return new CommitStackState(undefined, newInner);
+  }
 }
 
 function getBottomFilesFromExportStack(stack: Readonly<ExportStack>): Map<RepoPath, FileState> {
@@ -1261,11 +1322,11 @@ type CommitIdxProps = {
   path: RepoPath;
 };
 
-const FileIdx = Record<FileIdxProps>({fileIdx: 0, fileRev: 0});
-type FileIdx = RecordOf<FileIdxProps>;
+export const FileIdx = Record<FileIdxProps>({fileIdx: 0, fileRev: 0});
+export type FileIdx = RecordOf<FileIdxProps>;
 
-const CommitIdx = Record<CommitIdxProps>({rev: -1, path: ''});
-type CommitIdx = RecordOf<CommitIdxProps>;
+export const CommitIdx = Record<CommitIdxProps>({rev: -1, path: ''});
+export type CommitIdx = RecordOf<CommitIdxProps>;
 
 const ABSENT_FLAG = 'a';
 

@@ -1925,15 +1925,6 @@ CONFIG
 
 }
 
-function get_bonsai_bookmark() {
-  local bookmark repoid_backup
-  repoid_backup="$REPOID"
-  export REPOID="$1"
-  bookmark="$2"
-  mononoke_admin bookmarks get -c bonsai "$bookmark" 2>/dev/null | cut -d' ' -f2
-  export REPOID="$repoid_backup"
-}
-
 function add_synced_commit_mapping_entry() {
   local small_repo_id large_repo_id small_bcs_id large_bcs_id version
   small_repo_id="$1"
@@ -2033,6 +2024,16 @@ function default_setup() {
 pushrebase =
 remotenames =
 EOF
+}
+
+function gitexport() {
+  log="$TESTTMP/gitexport.out"
+
+  "$MONONOKE_GITEXPORT" \
+    "${CACHE_ARGS[@]}" \
+    "${COMMON_ARGS[@]}" \
+    --mononoke-config-path "${TESTTMP}/mononoke-config" \
+    "$@"
 }
 
 function gitimport() {
@@ -2292,7 +2293,6 @@ function packer() {
   "$MONONOKE_PACKER" \
     "${CACHE_ARGS[@]}" \
     "${COMMON_ARGS[@]}" \
-    --repo-id "$REPOID" \
     --mononoke-config-path "${TESTTMP}/mononoke-config" \
     "$@"
 }

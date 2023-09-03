@@ -8,6 +8,7 @@
 import type {CodeReviewProvider} from './CodeReviewProvider';
 import type {ServerSideTracker} from './analytics/serverSideTracker';
 import type {Logger} from './logger';
+import type {ExecaError} from 'execa';
 import type {
   CommitInfo,
   CommitPhaseType,
@@ -62,6 +63,9 @@ const ESCAPED_NULL_CHAR = '\\0';
 const HEAD_MARKER = '@';
 const MAX_FETCHED_FILES_PER_COMMIT = 25;
 const MAX_SIMULTANEOUS_CAT_CALLS = 4;
+/** Timeout for non-operation commands. Operations like goto and rebase are expected to take longer,
+ * but status, log, cat, etc should typically take <10s. */
+const READ_COMMAND_TIMEOUT_MS = 40_000;
 
 const FIELDS = {
   hash: '{node}',
@@ -545,7 +549,7 @@ export class Repository {
       this.uncommittedChangesEmitter.emit('change', this.uncommittedChanges);
     } catch (err) {
       this.logger.error('Error fetching files: ', err);
-      if (isProcessError(err)) {
+      if (isExecaError(err)) {
         if (err.stderr.includes('checkout is currently in progress')) {
           this.logger.info('Ignoring `hg status` error caused by in-progress checkout');
           return;
@@ -615,11 +619,19 @@ export class Repository {
       };
       this.smartlogCommitsChangesEmitter.emit('change', this.smartlogCommits);
     } catch (err) {
-      this.logger.error('Error fetching commits: ', err);
+      let error = err;
+      const internalError = Internal.checkInternalError?.(err);
+      if (internalError) {
+        error = internalError;
+      }
+      if (isExecaError(error) && error.stderr.includes('Please check your internet connection')) {
+        error = Error('Network request failed. Please check your internet connection.');
+      }
+      this.logger.error('Error fetching commits: ', error);
       this.smartlogCommitsChangesEmitter.emit('change', {
         fetchStartTimestamp,
         fetchCompletedTimestamp: Date.now(),
-        commits: {error: err instanceof Error ? err : new Error(err as string)},
+        commits: {error: error instanceof Error ? error : new Error(error as string)},
       });
     }
   });
@@ -668,7 +680,12 @@ export class Repository {
     hash: string,
   ): Promise<Array<[line: string, info: CommitInfo | undefined]>> {
     const t1 = Date.now();
-    const output = await this.runCommand(['blame', filePath, '-Tjson', '--change', '--rev', hash]);
+    const output = await this.runCommand(
+      ['blame', filePath, '-Tjson', '--change', '--rev', hash],
+      undefined,
+      undefined,
+      /* don't timeout */ 0,
+    );
     const blame = JSON.parse(output.stdout) as Array<{lines: Array<{line: string; node: string}>}>;
     const t2 = Date.now();
 
@@ -751,13 +768,19 @@ export class Repository {
     return output.stdout;
   }
 
-  public runCommand(args: Array<string>, cwd?: string, options?: execa.Options) {
+  public runCommand(
+    args: Array<string>,
+    cwd?: string,
+    options?: execa.Options,
+    timeout: number = READ_COMMAND_TIMEOUT_MS,
+  ) {
     return runCommand(
       this.info.command,
       args,
       this.logger,
       unwrap(cwd ?? this.info.repoRoot),
       options,
+      timeout,
     );
   }
 
@@ -776,16 +799,48 @@ export class Repository {
   }
 }
 
-function runCommand(
+async function runCommand(
   command_: string,
   args_: Array<string>,
   logger: Logger,
   cwd: string,
   options_?: execa.Options,
-): execa.ExecaChildProcess {
+  timeout: number = READ_COMMAND_TIMEOUT_MS,
+): Promise<execa.ExecaReturnValue<string>> {
   const {command, args, options} = getExecParams(command_, args_, cwd, options_);
   logger.log('run command: ', command, args[0]);
-  return execa(command, args, options);
+  const result = execa(command, args, options);
+
+  let timedOut = false;
+  if (timeout > 0) {
+    const timeoutId = setTimeout(() => {
+      result.kill('SIGTERM', {forceKillAfterTimeout: 5_000});
+      logger.error(`Timed out waiting for ${command} ${args[0]} to finish`);
+      timedOut = true;
+    }, timeout);
+    result.on('exit', () => {
+      clearTimeout(timeoutId);
+    });
+  }
+
+  try {
+    const val = await result;
+    return val;
+  } catch (err: unknown) {
+    if (isExecaError(err)) {
+      if (err.killed) {
+        if (timedOut) {
+          throw new Error('Timed out');
+        }
+        throw new Error('Killed');
+      }
+    }
+    throw err;
+  }
+}
+
+function isExecaError(err: unknown): err is ExecaError {
+  return typeof err === 'object' && err != null && 'exitCode' in err;
 }
 
 export const __TEST__ = {
@@ -1037,10 +1092,6 @@ export function repoRelativePathForAbsolutePath(
   pathMod = path,
 ): RepoRelativePath {
   return pathMod.relative(repo.info.repoRoot, absolutePath);
-}
-
-function isProcessError(s: unknown): s is {stderr: string} {
-  return s != null && typeof s === 'object' && 'stderr' in s;
 }
 
 function computeNewConflicts(

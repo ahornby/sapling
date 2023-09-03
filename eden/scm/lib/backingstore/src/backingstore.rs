@@ -24,7 +24,6 @@ use revisionstore::scmstore::StoreFile;
 use revisionstore::scmstore::TreeStore;
 use revisionstore::scmstore::TreeStoreBuilder;
 use revisionstore::HgIdDataStore;
-use revisionstore::MemcacheStore;
 use tracing::event;
 use tracing::instrument;
 use tracing::Level;
@@ -49,29 +48,20 @@ impl BackingStore {
             config.set("edenapi", "max-retry-per-request", Some("0"), &source);
         }
 
+        // Apply indexed log configs, which can affect edenfs behavior.
+        indexedlog::config::configure(&config)?;
+
         let ident = identity::must_sniff_dir(root)?;
         let hg = root.join(ident.dot_dir());
         let store_path = hg.join("store");
 
-        let mut filestore = FileStoreBuilder::new(&config)
+        let filestore = FileStoreBuilder::new(&config)
             .local_path(&store_path)
             .store_aux_data();
 
         let treestore = TreeStoreBuilder::new(&config)
             .local_path(&store_path)
             .suffix(Path::new("manifests"));
-
-        // Memcache takes 30s to initialize on debug builds slowing down tests significantly, let's
-        // not even try to initialize it then.
-        if !cfg!(debug_assertions) {
-            match MemcacheStore::new(&config) {
-                Ok(memcache) => {
-                    // XXX: Add the memcachestore for the treestore.
-                    filestore = filestore.memcache(Arc::new(memcache));
-                }
-                Err(e) => warn!("couldn't initialize Memcache: {}", e),
-            }
-        }
 
         let filestore = Arc::new(filestore.build()?);
         let treestore = treestore.filestore(filestore.clone());

@@ -131,7 +131,7 @@ def fastreadp1(repopath) -> Optional[bytes]:
         return None
 
 
-class dirstate(object):
+class dirstate:
     def __init__(
         self,
         opener: "vfs.abstractvfs",
@@ -620,7 +620,9 @@ class dirstate(object):
             raise error.Abort(
                 _("setting %r to other parent " "only allowed in merges") % f
             )
-        if f in self and self[f] == "n":
+
+        entry = self._map.get(f)
+        if entry is not None and entry[0] == "n" and entry[2] != -2:
             # merge-like
             self._addpath(f, "m", 0, -2, -1)
         else:
@@ -948,15 +950,9 @@ class dirstate(object):
                 files.append(fullpath)
         return files
 
-    class FallbackToPythonStatus(Exception):
-        pass
-
     def _ruststatus(
         self, match: matchmod.basematcher, ignored: bool, clean: bool, unknown: bool
     ) -> "scmutil.status":
-        if ignored and not self._ui.configbool("devel", "rust-status-ignored"):
-            raise self.FallbackToPythonStatus
-
         status = self._repo._rsrepo.workingcopy().status(
             match, self._lastnormaltime, bool(ignored), self._ui._rcfg
         )
@@ -984,11 +980,12 @@ class dirstate(object):
         """Determine the status of the working copy relative to the
         dirstate and return a scmutil.status.
         """
+
         if self._ui.configbool("workingcopy", "ruststatus"):
-            try:
-                return self._ruststatus(match, ignored, clean, unknown)
-            except self.FallbackToPythonStatus:
-                pass
+            self._ui.log("status_info", internal_status_mode="rust")
+            return self._ruststatus(match, ignored, clean, unknown)
+
+        self._ui.log("status_info", internal_status_mode="python")
 
         wctx = self._repo[None]
         # Prime the wctx._parents cache so the parent doesn't change out from
@@ -1443,7 +1440,7 @@ class dirstate(object):
         ui.log("dirstate_info", **data)
 
 
-class dirstatemap(object):
+class dirstatemap:
     """Map encapsulating the dirstate's contents.
 
     The dirstate contains the following state:

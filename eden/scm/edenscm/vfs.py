@@ -335,8 +335,7 @@ class abstractvfs(pycompat.ABC):
         """Yield (dirpath, dirs, files) tuple for each directories under path
 
         ``dirpath`` is relative one from the root of this vfs. This
-        uses ``os.sep`` as path separator, even you specify POSIX
-        style ``path``.
+        uses ``/`` as path separator.
 
         "The root of this vfs" is represented as empty ``dirpath``.
         """
@@ -345,7 +344,7 @@ class abstractvfs(pycompat.ABC):
         # because len(dirpath) < prefixlen.
         prefixlen = len(pathutil.normasprefix(root))
         for dirpath, dirs, files in os.walk(self.join(path), onerror=onerror):
-            yield (dirpath[prefixlen:], dirs, files)
+            yield (util.pconvert(dirpath[prefixlen:]), dirs, files)
 
     @contextlib.contextmanager
     def backgroundclosing(
@@ -590,7 +589,7 @@ class vfs(abstractvfs):
 opener = vfs
 
 
-class proxyvfs(object):
+class proxyvfs:
     def __init__(self, vfs: "abstractvfs") -> None:
         self.vfs = vfs
 
@@ -640,7 +639,7 @@ class readonlyvfs(abstractvfs, proxyvfs):
         return self.vfs.join(path, *insidef)
 
 
-class closewrapbase(object):
+class closewrapbase:
     """Base class of wrapper, which hooks closing
 
     Do not instantiate outside of the vfs layer.
@@ -685,7 +684,7 @@ class delayclosedfile(closewrapbase):
         self._closer.close(self._origfh)
 
 
-class backgroundfilecloser(object):
+class backgroundfilecloser:
     """Coordinates background closing of file handles on multiple threads."""
 
     def __init__(self, ui, expectedcount=-1):

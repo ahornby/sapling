@@ -9,8 +9,9 @@ import type {RangeInfo} from './TextEditable';
 import type {ChunkSelectState, LineRegion, SelectLine} from './stackEdit/chunkSelectState';
 
 import {TextEditable} from './TextEditable';
+import {VSCodeCheckbox} from './VSCodeCheckbox';
 import {T, t} from './i18n';
-import {VSCodeCheckbox, VSCodeRadio} from '@vscode/webview-ui-toolkit/react';
+import {VSCodeRadio, VSCodeRadioGroup} from '@vscode/webview-ui-toolkit/react';
 import {Set as ImSet} from 'immutable';
 import {useRef, useState} from 'react';
 import {notEmpty} from 'shared/utils';
@@ -27,23 +28,25 @@ export type PartialFileEditMode = 'unified' | 'side-by-side' | 'free-edit';
 export function PartialFileSelection(props: Props) {
   const [editMode, setEditMode] = useState<PartialFileEditMode>('unified');
 
+  // vscode-webview-ui-toolkit has poor typescript definitions on events.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const handleChange = (e: any) => {
+    setEditMode(e.target.value);
+  };
+
   return (
     <div>
-      {/* Cannot use VSCodeRadioGroup. See https://github.com/microsoft/vscode-webview-ui-toolkit/issues/404 */}
-      {/* FIXME: VSCodeRadio onClick does not fire on keyboard events (ex. tab, then space) */}
-      <div>
-        <VSCodeRadio checked={editMode === 'unified'} onClick={() => setEditMode('unified')}>
+      <VSCodeRadioGroup value={editMode} onChange={handleChange}>
+        <VSCodeRadio value="unified">
           <T>Unified</T>
         </VSCodeRadio>
-        <VSCodeRadio
-          checked={editMode === 'side-by-side'}
-          onClick={() => setEditMode('side-by-side')}>
+        <VSCodeRadio value="side-by-side">
           <T>Side-by-side</T>
         </VSCodeRadio>
-        <VSCodeRadio checked={editMode === 'free-edit'} onClick={() => setEditMode('free-edit')}>
+        <VSCodeRadio value="free-edit">
           <T>Freeform edit</T>
         </VSCodeRadio>
-      </div>
+      </VSCodeRadioGroup>
       <PartialFileSelectionWithMode {...props} mode={editMode} />
     </div>
   );
@@ -135,18 +138,16 @@ function PartialFileSelectionWithCheckbox(props: Props & {unified?: boolean}) {
         const selectedCount = region.lines.reduce((acc, line) => acc + (line.selected ? 1 : 0), 0);
         const indeterminate = selectedCount > 0 && selectedCount < selectableCount;
         const checked = selectedCount === selectableCount;
-        // Note: VSCodeCheckbox's onClick or onChange are not really React events
-        // and are hard to get right (ex. onChange can be triggered by re-rendering
-        // with a different `checked` state without events on the checkbox itself).
-        // So we use onClick on the parent element.
-        // FIXME: This does not work for keyboard checkbox events.
         lineCheckbox.push(
-          <div className="checkbox-anchor">
-            <div
-              key={`${key}c`}
-              className="checkbox-container"
-              onClick={_e => toogleLineOrRegion(region.lines[0], region)}>
-              <VSCodeCheckbox checked={checked} indeterminate={indeterminate} />
+          <div className="checkbox-anchor" key={`${key}c`}>
+            <div className="checkbox-container">
+              <VSCodeCheckbox
+                checked={checked}
+                indeterminate={indeterminate}
+                onChange={() => {
+                  toogleLineOrRegion(region.lines[0], region);
+                }}
+              />
             </div>
           </div>,
         );
@@ -455,15 +456,13 @@ function PartialFileSelectionWithFreeEdit(props: Props) {
           </div>
           <pre className="column-m-number">{lineMNumber}</pre>
           <div className="partial-file-selection-scroll-x">
-            <pre className="column-m">
-              <TextEditable
-                value={textValue}
-                rangeInfos={rangeInfos}
-                onTextChange={handleTextChange}
-                onSelectChange={handleSelChange}>
-                <pre className="column-m">{lineMContent}</pre>
-              </TextEditable>
-            </pre>
+            <TextEditable
+              value={textValue}
+              rangeInfos={rangeInfos}
+              onTextChange={handleTextChange}
+              onSelectChange={handleSelChange}>
+              <pre className="column-m">{lineMContent}</pre>
+            </TextEditable>
           </div>
           <pre className="column-b-number readonly">{lineBNumber}</pre>
           <div className="partial-file-selection-scroll-x readonly">

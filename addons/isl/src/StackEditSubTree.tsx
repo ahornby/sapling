@@ -272,12 +272,14 @@ function calculateReorderOffset(
   invisibleRevCount = 1,
 ): number {
   let belowCount = 0;
+  const parentY: number = unwrap(container).getBoundingClientRect().y;
   container.querySelectorAll('.commit').forEach(element => {
     const commitDiv = element as HTMLDivElement;
     // commitDiv.getBoundingClientRect() will consider the animation transform.
-    // We don't want to be affected by animation, so we use offsetParent here,
-    // assuming offsetParent is not animated.
-    const commitY = unwrap(commitDiv.offsetParent).getBoundingClientRect().y + commitDiv.offsetTop;
+    // We don't want to be affected by animation, so we use 'container' here,
+    // assuming 'container' is not animated. The 'container' can be in <ScrollY>,
+    // and should have a 'relative' position.
+    const commitY = parentY + commitDiv.offsetTop;
     if (commitY > y) {
       belowCount += 1;
     }
@@ -324,6 +326,8 @@ export function UndoDescription({op}: {op?: StackEditOpDescription}): React.Reac
     return <T replace={replace}>dropping $commit</T>;
   } else if (op.name === 'import') {
     return <T>import</T>;
+  } else if (op.name === 'fileStack') {
+    return <T replace={{$file: op.fileDesc}}>editing file stack: $file</T>;
   }
   return <T>unknown</T>;
 }
