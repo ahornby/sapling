@@ -77,7 +77,6 @@ oss:
 	  build_clib $(COMPILERFLAG) \
 	  build_ext $(COMPILERFLAG) -i \
 	  build_rust_ext -i -l $(RUST_FLAG) \
-	  build_pyzip -i \
 	  build_mo
 ifeq ($(OS),Windows_NT)
 	cp build/scripts-3*/$(SL_NAME).exe $(SL_NAME).exe
@@ -99,7 +98,6 @@ local:
 	  build_clib $(COMPILERFLAG) \
 	  build_ext $(COMPILERFLAG) -i \
 	  build_rust_ext -i -l $(RUST_FLAG) \
-	  build_pyzip -i \
 	  build_mo
 ifeq ($(OS),Windows_NT)
 	cp build/scripts-3*/$(HGNAME).exe $(HGNAME).exe
@@ -134,7 +132,7 @@ getdepsbuild:
 
 cleanbutpackages:
 	-$(PYTHON3) setup.py clean --all # ignore errors from this command
-	find contrib doc i18n edenscm edenscmnative tests \
+	find contrib doc i18n edenscm tests \
 		\( -name '*.py[cdo]' -o -name '*.so' \) -exec rm -f '{}' ';'
 	rm -f MANIFEST MANIFEST.in edenscm/ext/__index__.py tests/*.err
 	rm -f edenscm/__modulepolicy__.py

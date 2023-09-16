@@ -56,7 +56,6 @@ from . import (
     mergeutil,
     mutation,
     namespaces,
-    pathutil,
     peer,
     phases,
     progress,
@@ -69,7 +68,6 @@ from . import (
     smallcommitmetadata,
     store,
     transaction,
-    treestate,
     util,
     vfs as vfsmod,
     visibility,
@@ -641,7 +639,6 @@ class localrepository:
             self.svfs._reporef = weakref.ref(self)
 
         try:
-            self._treestatemigration()
             self._visibilitymigration()
             self._svfsmigration()
             self._narrowheadsmigration()
@@ -686,11 +683,6 @@ class localrepository:
             raise errormod.ProgrammingError(
                 f"conflicting repo types: {repo_types}\n{hint}"
             )
-
-    def _treestatemigration(self):
-        if treestate.currentversion(self) != self.ui.configint("format", "dirstate"):
-            with self.wlock(wait=False), self.lock(wait=False):
-                treestate.automigrate(self)
 
     def _visibilitymigration(self):
         if (
@@ -1332,6 +1324,11 @@ class localrepository:
             self.ui._rcfg,
         )
 
+    @util.propertycache
+    def _gitcopytrace(self):
+        gitdir = git.readgitdir(self)
+        return bindings.copytrace.gitcopytrace(gitdir)
+
     def _constructmanifest(self):
         # This is a temporary function while we migrate from manifest to
         # manifestlog. It allows bundlerepo to intercept the manifest creation.
@@ -1350,10 +1347,7 @@ class localrepository:
         if edenfs.requirement in self.requirements:
             return self._eden_dirstate
 
-        istreestate = "treestate" in self.requirements
-        # Block nontreestate repos entirely. Add a config to bypass in case we
-        # break something.
-        if not istreestate and self.ui.configbool("treestate", "required", True):
+        if not "treestate" in self.requirements:
             raise errormod.RequirementError(
                 "legacy dirstate implementations are no longer supported"
             )
@@ -1364,7 +1358,6 @@ class localrepository:
             self.root,
             self._dirstatevalidate,
             self,
-            istreestate=istreestate,
         )
 
         try:

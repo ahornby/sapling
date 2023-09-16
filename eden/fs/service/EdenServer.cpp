@@ -39,7 +39,7 @@
 #include <thrift/lib/cpp2/server/ThriftProcessor.h>
 #include <thrift/lib/cpp2/server/ThriftServer.h>
 
-#include "eden/common/utils/ProcessNameCache.h"
+#include "eden/common/utils/ProcessInfoCache.h"
 #include "eden/fs/config/CheckoutConfig.h"
 #include "eden/fs/config/MountProtocol.h"
 #include "eden/fs/config/TomlConfig.h"
@@ -387,7 +387,7 @@ EdenServer::EdenServer(
           std::move(privHelper),
           std::make_shared<EdenCPUThreadPool>(),
           std::make_shared<UnixClock>(),
-          std::make_shared<ProcessNameCache>(),
+          std::make_shared<ProcessInfoCache>(),
           structuredLogger_,
           std::move(hiveLogger),
           config_,
@@ -1557,7 +1557,7 @@ folly::Future<std::shared_ptr<EdenMount>> EdenServer::mount(
       backingStore,
       treeCache_,
       getStats().copy(),
-      serverState_->getProcessNameCache(),
+      serverState_->getProcessInfoCache(),
       serverState_->getStructuredLogger(),
       serverState_->getReloadableConfig()->getEdenConfig(),
       initialConfig->getEnableWindowsSymlinks(),
@@ -2374,19 +2374,12 @@ void EdenServer::detectNfsCrawl() {
              readDirThreshold]() {
               const auto& mount = mountPointHandle.getEdenMount();
 
-              struct ProcessHierarchyRecord {
-                pid_t pid;
-                pid_t ppid;
-                proc_util::ProcessSimpleName simpleName;
-                ProcessName processName;
-              };
-
               // Information about the processes we've observed accessing the
               // mount and their parents. This represents a subtree of the
               // processes running at the time of crawl detection with edges
               // indicated by the ppid field. The init process (PID 1) is the
               // implicit root of the tree.
-              std::unordered_map<pid_t, ProcessHierarchyRecord> processRecords;
+              std::unordered_map<pid_t, ProcessInfo> processRecords;
 
               // We'll keep track of PIDs known not to be leaves in our tree to
               // simplify traversal below.
@@ -2402,21 +2395,11 @@ void EdenServer::detectNfsCrawl() {
                 // recorded.
                 while (pid > 1 &&
                        processRecords.find(pid) == processRecords.end()) {
-                  auto processName =
-                      serverState->getProcessNameCache()->lookup(pid).get();
-                  auto ppid = proc_util::getParentProcessId(pid).value_or(0);
-                  nonLeafPids.insert(ppid);
-                  processRecords.insert(
-                      {pid,
-                       ProcessHierarchyRecord{
-                           .pid = pid,
-                           .ppid = ppid,
-                           .simpleName =
-                               proc_util::readProcessSimpleName(pid).value_or(
-                                   "<unknown>"),
-                           .processName = processName}});
-
-                  pid = ppid;
+                  auto processInfo =
+                      serverState->getProcessInfoCache()->lookup(pid).get();
+                  nonLeafPids.insert(processInfo.ppid);
+                  processRecords.insert({pid, processInfo});
+                  pid = processInfo.ppid;
                 }
               }
 
@@ -2432,30 +2415,31 @@ void EdenServer::detectNfsCrawl() {
 
                 // Gather hierarchy into a stack so we can log in the order of
                 // "parent -> child -> grandchild".
-                std::vector<ProcessHierarchyRecord> hierarchy;
+                std::vector<std::pair<pid_t, ProcessInfo>> hierarchy;
                 decltype(processRecords)::iterator itr;
                 while (pid > 1 &&
                        (itr = processRecords.find(pid)) !=
                            processRecords.end()) {
                   pid = itr->second.ppid;
-                  hierarchy.push_back(std::move(itr->second));
+                  hierarchy.push_back(
+                      std::make_pair(pid, std::move(itr->second)));
                 }
 
                 // Log process hierarchies
-                auto r = std::move(hierarchy.back());
+                auto [p, pi] = std::move(hierarchy.back());
                 hierarchy.pop_back();
-                std::string output = fmt::format(
-                    "[{}({}): {}]", r.simpleName, r.pid, r.processName);
+                std::string output =
+                    fmt::format("[{}({}): {}]", pi.simpleName, p, pi.name);
                 while (!hierarchy.empty()) {
                   fmt::format_to(std::back_inserter(output), " -> ");
-                  r = std::move(hierarchy.back());
+                  auto [p, pi] = std::move(hierarchy.back());
                   hierarchy.pop_back();
                   fmt::format_to(
                       std::back_inserter(output),
                       "[{}({}): {}]",
-                      r.simpleName,
-                      r.pid,
-                      r.processName);
+                      pi.simpleName,
+                      p,
+                      pi.name);
                 }
                 XLOGF(
                     DBG2,

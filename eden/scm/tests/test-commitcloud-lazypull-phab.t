@@ -103,14 +103,9 @@ Test for `hg diff --since-last-submit`
   > [{"data": {"query": [{"results": {"nodes": [{
   >   "number": 1,
   >   "diff_status_name": "Needs Review",
-  >   "latest_active_diff": {
-  >     "local_commit_info": {
-  >       "nodes": [
-  >         {"property_value": "{\"lolwut\": {\"time\": 0, \"commit\": \"162e0a8b5732f1fa168b0a6d8cf9809053ae272a\"}}"}
-  >       ]
-  >     }
+  >   "latest_active_phabricator_version": {
+  >      "commit_hash_best_effort": "162e0a8b5732f1fa168b0a6d8cf9809053ae272a"
   >   },
-  >   "differential_diffs": {"count": 1},
   >   "is_landing": false,
   >   "land_job_status": "NO_LAND_RUNNING",
   >   "needs_final_review_status": "NOT_NEEDED",

@@ -38,10 +38,10 @@ use mononoke_types::ChangesetId;
 use mononoke_types::ContentId;
 use mononoke_types::FileType;
 use mononoke_types::FileUnodeId;
-use mononoke_types::MPath;
 use mononoke_types::MPathElement;
 use mononoke_types::MPathHash;
 use mononoke_types::ManifestUnodeId;
+use mononoke_types::NonRootMPath;
 use sorted_vector_map::SortedVectorMap;
 
 use crate::ErrorKind;
@@ -49,7 +49,10 @@ use crate::ErrorKind;
 pub(crate) async fn derive_unode_manifest_stack(
     ctx: &CoreContext,
     derivation_ctx: &DerivationContext,
-    file_changes: Vec<(ChangesetId, BTreeMap<MPath, Option<(ContentId, FileType)>>)>,
+    file_changes: Vec<(
+        ChangesetId,
+        BTreeMap<NonRootMPath, Option<(ContentId, FileType)>>,
+    )>,
     parent: Option<ManifestUnodeId>,
 ) -> Result<HashMap<ChangesetId, ManifestUnodeId>, Error> {
     let blobstore = derivation_ctx.blobstore();
@@ -94,7 +97,7 @@ pub(crate) async fn derive_unode_manifest(
     derivation_ctx: &DerivationContext,
     cs_id: ChangesetId,
     parents: Vec<ManifestUnodeId>,
-    changes: Vec<(MPath, Option<(ContentId, FileType)>)>,
+    changes: Vec<(NonRootMPath, Option<(ContentId, FileType)>)>,
 ) -> Result<ManifestUnodeId, Error> {
     let parents: Vec<_> = parents.into_iter().collect();
     let blobstore = derivation_ctx.blobstore();
@@ -453,6 +456,7 @@ mod tests {
     use mercurial_types::blobs::HgBlobManifest;
     use mercurial_types::HgFileNodeId;
     use mercurial_types::HgManifestId;
+    use mononoke_types::path::MPath;
     use mononoke_types::BlobstoreValue;
     use mononoke_types::BonsaiChangeset;
     use mononoke_types::BonsaiChangesetMut;
@@ -504,8 +508,8 @@ mod tests {
                 paths,
                 vec![
                     None,
-                    Some(MPath::new("1").unwrap()),
-                    Some(MPath::new("files").unwrap())
+                    Some(NonRootMPath::new("1").unwrap()),
+                    Some(NonRootMPath::new("files").unwrap())
                 ]
             );
             unode_id
@@ -544,9 +548,9 @@ mod tests {
                 paths,
                 vec![
                     None,
-                    Some(MPath::new("1").unwrap()),
-                    Some(MPath::new("2").unwrap()),
-                    Some(MPath::new("files").unwrap())
+                    Some(NonRootMPath::new("1").unwrap()),
+                    Some(NonRootMPath::new("2").unwrap()),
+                    Some(NonRootMPath::new("files").unwrap())
                 ]
             );
         }
@@ -561,7 +565,7 @@ mod tests {
         async fn check_unode_uniqeness(
             ctx: CoreContext,
             repo: TestRepo,
-            file_changes: BTreeMap<MPath, FileChange>,
+            file_changes: BTreeMap<NonRootMPath, FileChange>,
         ) -> Result<(), Error> {
             let derivation_ctx = repo.repo_derived_data().manager().derivation_context(None);
             let bcs = create_bonsai_changeset(ctx.fb, repo.clone(), file_changes).await?;
@@ -681,8 +685,8 @@ mod tests {
                     .find_entries(
                         ctx.clone(),
                         repo.repo_blobstore.clone(),
-                        vec![Some(MPath::new(merged_files)?), Some(MPath::new("dir")?)],
-                        // Some(MPath::new(&merged_files)?),
+                        vec![MPath::new(merged_files)?, MPath::new("dir")?],
+                        // Some(NonRootMPath::new(&merged_files)?),
                     )
                     .try_collect()
                     .await?;
@@ -696,7 +700,7 @@ mod tests {
                     .find_entries(
                         ctx.clone(),
                         repo.repo_blobstore.clone(),
-                        vec![Some(MPath::new(merged_files)?), Some(MPath::new("dir")?)],
+                        vec![MPath::new(merged_files)?, MPath::new("dir")?],
                     )
                     .try_collect()
                     .await?;
@@ -894,7 +898,7 @@ mod tests {
     async fn create_bonsai_changeset(
         fb: FacebookInit,
         repo: TestRepo,
-        file_changes: BTreeMap<MPath, FileChange>,
+        file_changes: BTreeMap<NonRootMPath, FileChange>,
     ) -> Result<BonsaiChangeset, Error> {
         create_bonsai_changeset_with_params(fb, repo, file_changes, "message", vec![]).await
     }
@@ -902,7 +906,7 @@ mod tests {
     async fn create_bonsai_changeset_with_params(
         fb: FacebookInit,
         repo: TestRepo,
-        file_changes: BTreeMap<MPath, FileChange>,
+        file_changes: BTreeMap<NonRootMPath, FileChange>,
         message: &str,
         parents: Vec<ChangesetId>,
     ) -> Result<BonsaiChangeset, Error> {
@@ -931,11 +935,11 @@ mod tests {
         ctx: CoreContext,
         files: BTreeMap<&str, Option<(&str, FileType)>>,
         repo: TestRepo,
-    ) -> Result<BTreeMap<MPath, FileChange>, Error> {
+    ) -> Result<BTreeMap<NonRootMPath, FileChange>, Error> {
         let mut res = btreemap! {};
 
         for (path, content) in files {
-            let path = MPath::new(path).unwrap();
+            let path = NonRootMPath::new(path).unwrap();
             match content {
                 Some((content, file_type)) => {
                     let size = content.len();

@@ -517,10 +517,8 @@ filechangesplain={
 filechangesdetailed={ifeq(verbosity,"verbose",diff()|hgprefix,stat("status")|hgprefix)}\n
 
 [copytrace]
-maxmovescandidatestocheck=0
-
-[perftweaks]
-disablecasecheck=True
+dagcopytrace=True
+hint-with-commit=True
 
 [profiling:background]
 enabled=1

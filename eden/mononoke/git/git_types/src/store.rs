@@ -5,13 +5,28 @@
  * GNU General Public License version 2.
  */
 
+use anyhow::Context;
+use async_trait::async_trait;
 use blobstore::impl_loadable_storable;
 use blobstore::Blobstore;
+use blobstore::Loadable;
+use blobstore::LoadableError;
+use bytes::Bytes;
 use context::CoreContext;
 use filestore::hash_bytes;
+use filestore::ExpectedSize;
 use filestore::Sha1IncrementalHasher;
+use futures::future;
+use futures::stream;
+use futures::StreamExt;
+use futures::TryStreamExt;
 use mononoke_types::BlobstoreBytes;
+use mononoke_types::BlobstoreKey;
 
+use crate::delta::DeltaInstructionChunk;
+use crate::delta::DeltaInstructionChunkId;
+use crate::delta::DeltaInstructionChunkIdPrefix;
+use crate::delta::DeltaInstructions;
 use crate::errors::GitError;
 use crate::thrift::Tree as ThriftTree;
 use crate::thrift::TreeHandle as ThriftTreeHandle;
@@ -71,12 +86,12 @@ where
         .map_err(|e| GitError::StorageFailure(git_hash.to_hex().to_string(), e.into()))
 }
 
-/// Free function for fetching stored git objects
-pub async fn fetch_git_object<B>(
+/// Free function for fetching the raw bytes of stored git objects
+pub(crate) async fn fetch_git_object_bytes<B>(
     ctx: &CoreContext,
     blobstore: &B,
     git_hash: &gix_hash::oid,
-) -> anyhow::Result<gix_object::Object, GitError>
+) -> anyhow::Result<Bytes, GitError>
 where
     B: Blobstore + Clone,
 {
@@ -86,12 +101,126 @@ where
         .await
         .map_err(|e| GitError::StorageFailure(git_hash.to_hex().to_string(), e.into()))?
         .ok_or_else(|| GitError::NonExistentObject(git_hash.to_hex().to_string()))?;
-    let object =
-        gix_object::ObjectRef::from_loose(object_bytes.as_raw_bytes().as_ref()).map_err(|e| {
-            GitError::InvalidContent(
-                git_hash.to_hex().to_string(),
-                anyhow::anyhow!(e.to_string()).into(),
-            )
-        })?;
+    Ok(object_bytes.into_raw_bytes())
+}
+
+/// Free function for fetching stored git objects
+pub async fn fetch_git_object<B>(
+    ctx: &CoreContext,
+    blobstore: &B,
+    git_hash: &gix_hash::oid,
+) -> anyhow::Result<gix_object::Object, GitError>
+where
+    B: Blobstore + Clone,
+{
+    let raw_bytes = fetch_git_object_bytes(ctx, blobstore, git_hash).await?;
+    let object = gix_object::ObjectRef::from_loose(raw_bytes.as_ref()).map_err(|e| {
+        GitError::InvalidContent(
+            git_hash.to_hex().to_string(),
+            anyhow::anyhow!(e.to_string()).into(),
+        )
+    })?;
     Ok(object.into())
+}
+
+/// Store delta instructions in blobstore by chunking the incoming byte stream and returning the total
+/// number of chunk_size chunks stored to represent the delta instructions. This method can partially fail
+/// and store a subset of the chunks. However, it is perfectly safe to retry until all the chunks are stored
+/// successfully
+#[allow(dead_code)]
+pub async fn store_delta_instructions<B>(
+    ctx: &CoreContext,
+    blobstore: &B,
+    instructions: DeltaInstructions,
+    chunk_prefix: DeltaInstructionChunkIdPrefix,
+    chunk_size: Option<u64>,
+) -> anyhow::Result<u64>
+where
+    B: Blobstore + Clone,
+{
+    let mut raw_instruction_bytes = Vec::new();
+    instructions
+        .write(&mut raw_instruction_bytes)
+        .await
+        .context("Error in converting DeltaInstructions to raw bytes")?;
+    let size = ExpectedSize::new(raw_instruction_bytes.len() as u64);
+    let raw_instructions_stream = stream::once(future::ok(Bytes::from(raw_instruction_bytes)));
+    let chunk_stream = filestore::make_chunks(raw_instructions_stream, size, chunk_size);
+    match chunk_stream {
+        filestore::Chunks::Inline(fallible_bytes) => {
+            let instruction_bytes = fallible_bytes
+                .await
+                .context("Error in getting inlined bytes from chunk stream")?;
+            store_delta_instruction_chunk(ctx, blobstore, chunk_prefix.as_id(0), instruction_bytes)
+                .await
+                .context("Failure in storing inlined instruction chunk to blobstore")?;
+            Ok(1)
+        }
+        filestore::Chunks::Chunked(_, bytes_stream) => bytes_stream
+            .enumerate()
+            .map(|(idx, fallible_bytes)| {
+                let chunk_prefix = &chunk_prefix;
+                async move {
+                    let instruction_bytes = fallible_bytes.with_context(|| {
+                        format!(
+                            "Error in getting bytes from chunk {} in chunked stream",
+                            idx
+                        )
+                    })?;
+                    store_delta_instruction_chunk(
+                        ctx,
+                        blobstore,
+                        chunk_prefix.as_id(idx),
+                        instruction_bytes,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("Failure in storing instruction chunk {} to blobstore", idx)
+                    })?;
+                    anyhow::Ok(())
+                }
+            })
+            .buffer_unordered(24) // Same as the concurrency used for filestore
+            .try_collect::<Vec<_>>()
+            .await
+            .map(|result| result.len() as u64),
+    }
+}
+
+async fn store_delta_instruction_chunk<B>(
+    ctx: &CoreContext,
+    blobstore: &B,
+    id: DeltaInstructionChunkId,
+    instruction_bytes: Bytes,
+) -> anyhow::Result<()>
+where
+    B: Blobstore + Clone,
+{
+    let blobstore_key = id.blobstore_key();
+    blobstore
+        .put(
+            ctx,
+            blobstore_key,
+            DeltaInstructionChunk::new_bytes(instruction_bytes).into_blobstore_bytes(),
+        )
+        .await
+}
+
+#[async_trait]
+impl Loadable for DeltaInstructionChunkId {
+    type Value = DeltaInstructionChunk;
+
+    async fn load<'a, B: Blobstore>(
+        &'a self,
+        ctx: &'a CoreContext,
+        blobstore: &'a B,
+    ) -> Result<Self::Value, LoadableError> {
+        let id = *self;
+        let blobstore_key = id.blobstore_key();
+        let get = blobstore.get(ctx, &blobstore_key);
+
+        let bytes = get.await?.ok_or(LoadableError::Missing(blobstore_key))?;
+        DeltaInstructionChunk::from_encoded_bytes(bytes.into_raw_bytes())
+            .map_err(LoadableError::Error)
+    }
 }

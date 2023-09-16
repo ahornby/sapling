@@ -11,10 +11,8 @@ from typing import BinaryIO, Dict
 
 import bindings
 
-import eden.dirstate as eden_dirstate_serializer
-from edenscmnative import parsers
-
 from . import (
+    eden_dirstate_serializer,
     EdenThriftClient,
     localrepo,
     node,
@@ -24,6 +22,8 @@ from . import (
     util,
     vfs,
 )
+
+parsers = bindings.cext.parsers
 
 
 MERGE_STATE_NOT_APPLICABLE: int = eden_dirstate_serializer.MERGE_STATE_NOT_APPLICABLE
@@ -104,8 +104,6 @@ class eden_dirstate_map(treestate.treestatemap):
         self._thrift_client.setHgParents(
             parents[0],
             parents[1],
-            need_flush=False,
-            p1manifest=self._repo[parents[0]].manifestnode(),
         )
 
     def _read(self, tree):  # override

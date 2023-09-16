@@ -173,9 +173,11 @@ elif sys.platform.startswith("darwin"):
         "test_status_thrift_apis",
     ]
 
-    # update fails because new file created while checkout operation in progress
     TEST_DISABLED["hg.update_test.UpdateTestTreeOnly"] = [
+        # update fails because new file created while checkout operation in progress
         "test_change_casing_with_untracked",
+        # TODO(T163970408)
+        "test_mount_state_during_unmount_with_in_progress_checkout",
     ]
 
     # Assertion error and invalid argument
@@ -275,6 +277,11 @@ elif sys.platform.startswith("darwin"):
 
     # flakey (actual timing doesn't match expected timing)
     TEST_DISABLED["config_test.ConfigTest"] = True
+
+    if "SANDCASTLE" in os.environ:
+        # S362020: Redirect tests leave behind garbage on macOS Sandcastle hosts
+        TEST_DISABLED["redirect_test.RedirectTest"] = True
+
 
 # Windows specific tests
 if sys.platform != "win32":
@@ -407,9 +414,6 @@ except ImportError:
 
 
 def is_class_disabled(class_name: str) -> bool:
-    # S362020
-    if "SANDCASTLE" in os.environ and sys.platform == "darwin":
-        return True
     class_skipped = TEST_DISABLED.get(class_name)
     if class_skipped is None:
         return False
@@ -421,9 +425,6 @@ def is_class_disabled(class_name: str) -> bool:
 
 
 def is_method_disabled(class_name: str, method_name: str) -> bool:
-    # S362020
-    if "SANDCASTLE" in os.environ and sys.platform == "darwin":
-        return True
     method_skipped = TEST_DISABLED.get(class_name)
     if method_skipped is None:
         return False

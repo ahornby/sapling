@@ -464,7 +464,7 @@ impl IO {
             }
         };
 
-        if let Some(inner) = Weak::upgrade(&*main_io) {
+        if let Some(inner) = Weak::upgrade(main_io) {
             Ok(Self { inner })
         } else {
             Err(io::Error::new(
@@ -472,6 +472,14 @@ impl IO {
                 "IO::main() is not available (dropped)",
             ))
         }
+    }
+
+    /// Report whether self is the current main IO.
+    ///
+    /// This can be used to minimize race condition windows when running
+    /// commands in threads.
+    pub fn is_main(&self) -> bool {
+        Self::main().is_ok_and(|main| Arc::ptr_eq(&main.inner, &self.inner))
     }
 
     /// Set the current IO as the main IO.
@@ -542,8 +550,7 @@ impl IO {
         let err_is_tty = inner
             .error
             .as_ref()
-            .map(|e| e.is_tty())
-            .unwrap_or_else(|| out_is_tty);
+            .map_or_else(|| out_is_tty, |e| e.is_tty());
 
         inner.flush()?;
         inner.output = {
@@ -750,7 +757,7 @@ impl Drop for IOState {
         let _ = self.set_progress(&[]);
         let _ = self.flush();
         // Drop the output and error. This sends EOF to pager.
-        self.output = Box::new(Vec::new());
+        self.output = Box::<Vec<u8>>::default();
         self.error = None;
         self.pager_progress = None;
         self.wait_pager();

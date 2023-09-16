@@ -17,8 +17,13 @@ export function LargeSpinner() {
   );
 }
 
-export function Center(props: FlexProps) {
-  return FlexBox({...props, className: addClassName('center-container', props)});
+export function Center(props: ContainerProps) {
+  const className = addClassName('center-container', props);
+  return (
+    <div {...props} className={className}>
+      {props.children}
+    </div>
+  );
 }
 
 export function FlexRow(props: FlexProps) {
@@ -43,6 +48,11 @@ export function ScrollX(props: ScrollProps) {
 /** Container that scrolls vertically. */
 export function ScrollY(props: ScrollProps) {
   return Scroll({...props, direction: 'y'});
+}
+
+/** Visually empty flex item with `flex-grow: 1` to insert as much space as possible between siblings. */
+export function FlexSpacer() {
+  return <div className={'spacer'} />;
 }
 
 type ContainerProps = React.DetailedHTMLProps<React.HTMLAttributes<HTMLDivElement>, HTMLDivElement>;
@@ -70,6 +80,8 @@ type ScrollProps = ContainerProps & {
   direction?: 'x' | 'y';
   /** maxHeight or maxWidth depending on scroll direction. */
   maxSize?: string | number;
+  /** height or width depending on scroll direction. */
+  size?: string | number;
   /** Whether to hide the scroll bar. */
   hideBar?: boolean;
   /** On-scroll event handler. */
@@ -85,9 +97,15 @@ function Scroll(props: ScrollProps) {
   if (direction === 'x') {
     style.overflowX = 'auto';
     style.maxWidth = props.maxSize ?? '100%';
+    if (props.size != null) {
+      style.width = props.size;
+    }
   } else {
     style.overflowY = 'auto';
     style.maxHeight = props.maxSize ?? '100%';
+    if (props.size != null) {
+      style.height = props.size;
+    }
   }
   if (hideBar) {
     style.scrollbarWidth = 'none';

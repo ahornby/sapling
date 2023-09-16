@@ -67,8 +67,6 @@ from typing import (
 import bindings
 from edenscm import tracing
 
-from edenscmnative import osutil
-
 from . import (
     blackbox,
     encoding,
@@ -82,6 +80,7 @@ from . import (
 )
 from .pycompat import decodeutf8, encodeutf8, range
 
+osutil = bindings.cext.osutil
 
 getsignal = signalmod.getsignal
 signal = signalmod.signal
@@ -188,7 +187,6 @@ setsignalhandler = platform.setsignalhandler
 shellquote = platform.shellquote
 split = platform.split
 sshargs = platform.sshargs
-# pyre-fixme[16]: Module `osutil` has no attribute `statfiles`.
 statfiles = getattr(osutil, "statfiles", platform.statfiles)
 statisexec = platform.statisexec
 syncfile = platform.syncfile
@@ -482,12 +480,7 @@ def popen4(cmd, env=None, newlines=False, bufsize=-1):
 
 def version():
     """Return version information if available."""
-    try:
-        from . import __version__
-
-        return __version__.version
-    except ImportError:
-        return "unknown"
+    return bindings.version.VERSION
 
 
 def versionagedays() -> int:
@@ -587,6 +580,54 @@ def caller():
     return caller
 
 
+def call_once(cache_val=True):
+    """
+    returns a decorator that ensures the given `func` is only executed once,
+    even if it is called multiple times. It also provides an option to cache
+    the result of the initial function call for subsequent invocations.
+
+    >>> @call_once(cache_val=True)
+    ... def expensive_op():
+    ...   print("performing an expensive operation")
+    ...   return 42
+    ...
+    >>> expensive_op()
+    performing an expensive operation
+    42
+    >>> expensive_op()
+    42
+    >>> @call_once(cache_val=False)
+    ... def expensive_op():
+    ...   print("performing an expensive operation")
+    ...   return 42
+    ...
+    >>> expensive_op()
+    performing an expensive operation
+    42
+    >>> expensive_op()
+    """
+
+    def _decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            if not wrapper.called:
+                val = func(*args, **kwargs)
+                wrapper.called = True
+                if cache_val:
+                    wrapper.val = val
+                return val
+            else:
+                # `wrapper.val` is the cached val if `cache_val`
+                # is True, otherwise it is the default val `None`
+                return wrapper.val
+
+        wrapper.called = False
+        wrapper.val = None
+        return wrapper
+
+    return _decorator
+
+
 def cachefunc(func):
     """cache the result of function calls"""
     # XXX doesn't handle keywords args
@@ -616,16 +657,6 @@ def cachefunc(func):
             return cache[args]
 
     return f
-
-
-def Enum(clsname, names, module=None):
-    """Returns an enum like type
-
-    >>> e = Enum("EnumName", "Val1 Val2 Val3", module=__name__)
-    """
-    namespace = {n: i for i, n in enumerate(names.split(), 1)}
-    namespace["__module__"] = module or __name__
-    return type(clsname, (object,), namespace)
 
 
 class cow:
@@ -1461,6 +1492,10 @@ def copyfiles(src, dst, hardlink=None, num=0, progress=None):
     return hardlink, num
 
 
+def noop(*_args, **_kwargs):
+    pass
+
+
 def _reloadenv():
     """Reset some functions that are sensitive to environment variables"""
 
@@ -1481,6 +1516,10 @@ def _reloadenv():
 
         def istest():
             return True
+
+        # Silence exceptions in __del__
+        if sys.unraisablehook is not noop:
+            sys.unraisablehook = noop
 
     else:
 

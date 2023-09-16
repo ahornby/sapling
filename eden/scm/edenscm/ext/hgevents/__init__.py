@@ -107,12 +107,7 @@ def wrapupdate(
     orig,
     repo,
     node,
-    branchmerge,
-    force,
-    ancestor=None,
-    mergeancestor=False,
-    labels=None,
-    matcher=None,
+    branchmerge=False,
     wc=None,
     **kwargs,
 ):
@@ -122,22 +117,14 @@ def wrapupdate(
         return orig(
             repo,
             node,
-            branchmerge,
-            force,
-            ancestor,
-            mergeancestor,
-            labels,
-            matcher,
+            branchmerge=branchmerge,
             wc=wc,
             **kwargs,
         )
     distance = 0
-    partial = True
     oldnode = repo["."].node()
     newnode = repo[node].node()
-    if matcher is None or matcher.always():
-        partial = False
-        distance = watchmanclient.calcdistance(repo, oldnode, newnode)
+    distance = watchmanclient.calcdistance(repo, oldnode, newnode)
 
     with watchmanclient.state_update(
         repo,
@@ -145,18 +132,13 @@ def wrapupdate(
         oldnode=oldnode,
         newnode=newnode,
         distance=distance,
-        partial=partial,
         metadata={"merge": branchmerge},
     ):
         return orig(
             repo,
             node,
-            branchmerge,
-            force,
-            ancestor,
-            mergeancestor,
-            labels,
-            matcher,
+            branchmerge=branchmerge,
+            wc=wc,
             **kwargs,
         )
 

@@ -7,13 +7,21 @@ ENV TZ=Etc/UTC
 
 # Update and install some basic packages to register a PPA.
 RUN apt-get -y update
-RUN apt-get -y install curl git
+RUN apt-get -y install ca-certificates curl git gnupg
+
+# Install the github cli so that verify-addons-folder.py tests can find it
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | gpg --dearmor -o /usr/share/keyrings/githubcli-archive-keyring.gpg;
+RUN echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | tee /etc/apt/sources.list.d/github-cli.list > /dev/null;
+RUN apt update && apt install -y gh;
 
 # Use a PPA to ensure a specific version of Node (the default Node on
 # Ubuntu 20.04 is v10, which is too old):
-RUN curl -fsSL https://deb.nodesource.com/setup_16.x | bash -
+RUN mkdir -p /etc/apt/keyrings
+RUN curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
+RUN echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_16.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list
 
 # Now we can install the bulk of the packages:
+RUN apt-get -y update
 RUN apt-get -y install nodejs pkg-config libssl-dev cython3 make g++ dpkg-dev python3.10 python3.10-dev python3.10-distutils
 
 # Unfortunately, we cannot `apt install cargo` because at the time of this

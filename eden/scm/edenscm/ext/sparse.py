@@ -198,26 +198,6 @@ def extsetup(ui) -> None:
     _setupadd(ui)
     _setupdirstate(ui)
     _setupdiff(ui)
-    # if fsmonitor is enabled, tell it to use our hash function
-    try:
-        fsmonitor = extensions.find("fsmonitor")
-
-        def _hashignore(orig, ignore):
-            return _hashmatcher(ignore)
-
-        extensions.wrapfunction(fsmonitor, "_hashignore", _hashignore)
-    except KeyError:
-        pass
-    # do the same for hgwatchman, old name
-    try:
-        hgwatchman = extensions.find("hgwatchman")
-
-        def _hashignore(orig, ignore):
-            return _hashmatcher(ignore)
-
-        extensions.wrapfunction(hgwatchman, "_hashignore", _hashignore)
-    except KeyError:
-        pass
 
 
 def reposetup(ui, repo) -> None:
@@ -388,9 +368,9 @@ def _setupupdates(_ui) -> None:
 
     extensions.wrapfunction(mergemod, "calculateupdates", _calculateupdates)
 
-    def _update(orig, repo, node, branchmerge, *args, **kwargs):
+    def _update(orig, repo, node, branchmerge=False, **kwargs):
         try:
-            results = orig(repo, node, branchmerge, *args, **kwargs)
+            results = orig(repo, node, branchmerge=branchmerge, **kwargs)
         except Exception:
             if _hassparse(repo):
                 repo._clearpendingprofileconfig()
@@ -404,20 +384,6 @@ def _setupupdates(_ui) -> None:
         return results
 
     extensions.wrapfunction(mergemod, "update", _update)
-
-    def _checkcollision(orig, repo, wmf, actions):
-        # If disablecasecheck is on, this should be a no-op. Run orig just to
-        # be safe.
-        if repo.ui.configbool("perftweaks", "disablecasecheck"):
-            return orig(repo, wmf, actions)
-
-        if hasattr(repo, "sparsematch"):
-            # Only check for collisions on files and directories in the
-            # sparse profile
-            wmf = wmf.matches(repo.sparsematch())
-        return orig(repo, wmf, actions)
-
-    extensions.wrapfunction(mergemod, "_checkcollision", _checkcollision)
 
 
 def _setupcommit(ui) -> None:

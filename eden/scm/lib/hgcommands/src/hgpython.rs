@@ -7,6 +7,7 @@
 
 use std::cell::RefCell;
 use std::env;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::RwLock;
 use std::sync::Weak;
@@ -72,10 +73,39 @@ impl HgPython {
 
         // If this fails, it's a fatal error.
         let name = "bindings";
-        let bindings_module = PyModule::new(py, &name).unwrap();
+        let bindings_module = PyModule::new(py, name).unwrap();
         prepare_builtin_modules(py, &bindings_module).unwrap();
         let sys_modules = PyDict::extract(py, &sys.get(py, "modules").unwrap()).unwrap();
         sys_modules.set_item(py, name, bindings_module).unwrap();
+        Self::update_meta_path(py, &sys);
+    }
+
+    fn update_meta_path(py: Python, sys: &PyModule) {
+        // When running inside the repo, auto-enable "dev" mode with desired paths.
+        // This can be overridden by SAPLING_PYTHON_HOME.
+        let mut home: Option<String> = None;
+        if let Ok(v) = std::env::var("SAPLING_PYTHON_HOME") {
+            if !v.is_empty() && Path::new(&v).is_dir() {
+                home = Some(v)
+            }
+        } else {
+            home = infer_python_home();
+        }
+        if let Some(dir) = home.as_ref() {
+            // Append the Python home to sys.path.
+            tracing::debug!(
+                "Python modules will be imported from filesystem {} (SAPLING_PYTHON_HOME)",
+                dir
+            );
+            let sys_path = PyList::extract(py, &sys.get(py, "path").unwrap()).unwrap();
+            sys_path.append(py, PyString::new(py, dir).into_object());
+        } else {
+            tracing::debug!("Python modules will be imported by BindingsModuleFinder");
+        }
+
+        let meta_path_finder = pymodules::BindingsModuleFinder::new(py, home).unwrap();
+        let meta_path = PyList::extract(py, &sys.get(py, "meta_path").unwrap()).unwrap();
+        meta_path.insert(py, 0, meta_path_finder.into_object());
     }
 
     fn update_path(py: Python, sys: &PyModule) {
@@ -83,8 +113,6 @@ impl HgPython {
         // alongside the binary. Let's setup the PATH so we discover those python modules.
         // An example layout:
         //   $PREFIX/usr/local/bin/hg
-        //   $PREFIX/usr/local/lib/python3.8/site-packages/edenscmnative
-        //   $PREFIX/usr/local/lib/python3.8/site-packages/edenscmdeps3.zip
         //   $PREFIX/usr/local/lib/python3.8/site-packages/edenscm
         let py_version: (i32, i32, i32, String, i32) =
             sys.get(py, "version_info").unwrap().extract(py).unwrap();
@@ -194,7 +222,7 @@ impl HgPython {
                 } else {
                     let message =
                         format_py_error(py, &err).unwrap_or("unknown python exception".to_string());
-                    let _ = io.write_err(&message);
+                    let _ = io.write_err(message);
                     1
                 }
             }
@@ -296,14 +324,14 @@ impl HgPython {
 impl Drop for HgPython {
     fn drop(&mut self) {
         if self.py_initialized_by_us {
-            info_span!("Finalize Python").in_scope(|| py_finalize())
+            info_span!("Finalize Python").in_scope(py_finalize)
         }
     }
 }
 
 fn read_to_py_object(py: Python, reader: &dyn clidispatch::io::Read) -> PyObject {
     let any = reader.as_any();
-    if let Some(_) = any.downcast_ref::<std::io::Stdin>() {
+    if any.downcast_ref::<std::io::Stdin>().is_some() {
         // The Python code accepts None, and will use its default input stream.
         py.None()
     } else if let Some(obj) = any.downcast_ref::<WrappedIO>() {
@@ -318,9 +346,9 @@ fn read_to_py_object(py: Python, reader: &dyn clidispatch::io::Read) -> PyObject
 
 fn write_to_py_object(py: Python, writer: &dyn clidispatch::io::Write) -> PyObject {
     let any = writer.as_any();
-    if let Some(_) = any.downcast_ref::<std::io::Stdout>() {
+    if any.downcast_ref::<std::io::Stdout>().is_some() {
         py.None()
-    } else if let Some(_) = any.downcast_ref::<std::io::Stderr>() {
+    } else if any.downcast_ref::<std::io::Stderr>().is_some() {
         py.None()
     } else if let Some(obj) = any.downcast_ref::<WrappedIO>() {
         obj.0.clone_ref(py)
@@ -349,7 +377,7 @@ fn init_bindings_commands(py: Python, package: &str) -> PyResult<PyModule> {
             let io = IO::new(fin, fout, Some(ferr));
             io.set_main();
             let result = Ok(crate::run_command(args, &io));
-            if let Ok(old_io) = old_io {
+            if let (Ok(old_io), true) = (old_io, io.is_main()) {
                 old_io.set_main();
             }
             result
@@ -423,6 +451,41 @@ pub fn prepare_builtin_modules(py: Python<'_>, module: &PyModule) -> PyResult<()
         "commands",
         init_bindings_commands(py, module.name(py)?)?,
     )?;
-    bindings::populate_module(py, &module)?;
+    bindings::populate_module(py, module)?;
     Ok(())
+}
+
+fn infer_python_home() -> Option<String> {
+    let exe_path = match std::env::current_exe() {
+        Ok(path) => path,
+        _ => return None,
+    };
+
+    if cfg!(unix) && (exe_path.starts_with("/usr/") || exe_path.starts_with("/opt/")) {
+        // Unlikely an in-repo path. Skip repo discovery.
+        return None;
+    }
+
+    // Try to locate the repo root and check the known "home" path.
+    let prefix = if cfg!(feature = "fb") {
+        // fbsource
+        "fbcode/eden/scm"
+    } else {
+        // github: facebook/sapling
+        "eden/scm"
+    };
+    let mut path: &Path = exe_path.as_path();
+    while let Some(parent) = path.parent() {
+        path = parent;
+        if path.join(".hg").is_dir() || path.join(".sl").is_dir() {
+            let maybe_home = path.join(prefix);
+            if maybe_home.is_dir() {
+                tracing::debug!("Discovered SAPLING_PYTHON_HOME at {}", maybe_home.display());
+                return Some(maybe_home.display().to_string());
+            }
+            break;
+        }
+    }
+
+    None
 }

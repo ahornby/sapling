@@ -19,19 +19,6 @@ from . import error, git, match as matchmod, node, pathutil, pycompat, scmutil, 
 from .i18n import _
 
 
-_gitcopytrace = None
-
-
-def _newgitcopytrace(repo):
-    global _gitcopytrace
-    if _gitcopytrace is None:
-        import bindings
-
-        gitdir = git.readgitdir(repo)
-        _gitcopytrace = bindings.copytrace.gitcopytrace(gitdir)
-    return _gitcopytrace
-
-
 def _findlimit(repo, a, b):
     """
     Find the earliest revision that's an ancestor of a or b but not both, except
@@ -184,8 +171,7 @@ def _gitfindcopies(repo, oldnode, newnode):
         return {}
 
     try:
-        gitcopytrace = _newgitcopytrace(repo)
-        return gitcopytrace.findcopies(oldnode, newnode)
+        return repo._gitcopytrace.findcopies(oldnode, newnode)
     except error.UncategorizedNativeError:
         return {}
 
