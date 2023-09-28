@@ -575,12 +575,12 @@ class hgbuildmo(build):
             pofile = join(podir, po)
             modir = join("locale", po[:-3], "LC_MESSAGES")
             mofile = join(modir, "hg.mo")
-            mobuildfile = join("edenscm", mofile)
+            mobuildfile = join("sapling", mofile)
             cmd = ["msgfmt", "-v", "-o", mobuildfile, pofile]
             if sys.platform != "sunos5":
                 # msgfmt on Solaris does not know about -c
                 cmd.append("-c")
-            self.mkpath(join("edenscm", modir))
+            self.mkpath(join("sapling", modir))
             self.make_file([pofile], mobuildfile, spawn, (cmd,))
 
 
@@ -651,14 +651,6 @@ class buildembedded(Command):
     def finalize_options(self):
         pass
 
-    def _process_isl(self, dirforisl):
-        """Copy edenscm-isl, if present, to the destination.
-
-        This is for external OSS build."""
-        isldir = pjoin(scriptdir, "build", distutils_dir_name("lib"), "edenscm-isl")
-        if os.path.isdir(isldir):
-            copy_to(isldir, pjoin(dirforisl, "edenscm-isl"))
-
     def _zip_pyc_files(self, zipname, package):
         """Modify a zip archive to include our .pyc files"""
         sourcedir = pjoin(scriptdir, package)
@@ -721,9 +713,8 @@ class buildembedded(Command):
         tocopy = {
             "contrib/editmergeps.ps1": "contrib/editmergeps.ps1",
             "contrib/editmergeps.bat": "contrib/editmergeps.bat",
+            "isl-dist.tar.xz": "isl-dist.tar.xz",
         }
-        if havefb and iswindows:
-            tocopy["edenscm/commands/isl"] = "isl/isl"
         for sname, tname in tocopy.items():
             source = pjoin(scriptdir, sname)
             target = pjoin(dirtocopy, tname)
@@ -733,7 +724,6 @@ class buildembedded(Command):
         embdir = pjoin(scriptdir, "build", "embedded")
         ensureempty(embdir)
         ensureexists(embdir)
-        self._process_isl(embdir)
 
         # On Windows, Python shared library has to live at the same level
         # as the main project binary, since this is the location which
@@ -742,7 +732,7 @@ class buildembedded(Command):
 
         # Build everything into pythonXX.zip, which is in the default sys.path.
         zippath = pjoin(embdir, f"python{PY_VERSION}.zip")
-        self._zip_pyc_files(zippath, "edenscm")
+        self._zip_pyc_files(zippath, "sapling")
         self._zip_pyc_files(zippath, "ghstack")
         self._copy_hg_exe(embdir)
         self._copy_other(embdir)
@@ -755,7 +745,7 @@ class hgbuildpy(build_py):
         if self.distribution.pure:
             self.distribution.ext_modules = []
         elif self.distribution.cffi:
-            from edenscm.cffi import bdiffbuild, mpatchbuild
+            from sapling.cffi import bdiffbuild, mpatchbuild
 
             exts = [
                 mpatchbuild.ffi.distutils_extension(),
@@ -763,13 +753,13 @@ class hgbuildpy(build_py):
             ]
             # cffi modules go here
             if sys.platform == "darwin":
-                from edenscm.cffi import osutilbuild
+                from sapling.cffi import osutilbuild
 
                 exts.append(osutilbuild.ffi.distutils_extension())
             self.distribution.ext_modules = exts
 
     def run(self):
-        basepath = os.path.join(self.build_lib, "edenscm")
+        basepath = os.path.join(self.build_lib, "sapling")
         self.mkpath(basepath)
 
         build_py.run(self)
@@ -778,7 +768,7 @@ class hgbuildpy(build_py):
 class buildextindex(Command):
     description = "generate prebuilt index of ext (for frozen package)"
     user_options = []
-    _indexfilename = "edenscm/ext/__index__.py"
+    _indexfilename = "sapling/ext/__index__.py"
 
     def initialize_options(self):
         pass
@@ -793,7 +783,7 @@ class buildextindex(Command):
 
         # here no extension enabled, disabled() lists up everything
         code = (
-            "import pprint; from edenscm import extensions; "
+            "import pprint; from sapling import extensions; "
             "pprint.pprint(extensions.disabled())"
         )
         returncode, out, err = runcmd([sys.executable, "-c", code], localhgenv())
@@ -826,11 +816,6 @@ class BuildInteractiveSmartLog(build):
         )
 
     def run(self):
-        if not ossbuild:
-            raise DistutilsSetupError(
-                "ISL should only built as part of the open source build"
-            )
-
         # External path to addons/
         addons_path = os.path.realpath(pjoin(scriptdir, "..", "..", "addons"))
         if not os.path.isdir(addons_path):
@@ -841,32 +826,25 @@ class BuildInteractiveSmartLog(build):
                 # revision in the Sapling repo.
                 return
 
-        isl_out = os.path.realpath(pjoin(self.build_temp, "edenscm-isl"))
-        ensureempty(isl_out)
+        env = None
+        if havefb and "YARN" not in os.environ:
+            env = {
+                **os.environ,
+                "YARN": os.path.realpath(
+                    pjoin(
+                        scriptdir,
+                        "../../../xplat/third-party/yarn",
+                        iswindows and "yarn.bat" or "yarn",
+                    )
+                ),
+            }
 
         subprocess.run(
-            [lookup_path("yarn"), "install", "--prefer-offline"],
+            [sys.executable, "build-tar.py", "-o", pjoin(scriptdir, "isl-dist.tar.xz")],
             check=True,
             cwd=addons_path,
+            env=env,
         )
-        subprocess.run(
-            [lookup_path("node"), "release.js", isl_out],
-            check=True,
-            cwd=os.path.join(addons_path, "isl"),
-        )
-        copy_to(isl_out, pjoin(self.build_lib, "edenscm-isl"))
-
-
-def lookup_path(cmd: str) -> str:
-    r"""Use PATH to resolve `cmd` to an absolute path.
-
-    `subprocess` has trouble finding executables on Windows, such as
-    when running `yarn` when it is in your PATH as `C:\somewhere\yarn.CMD`.
-    Here we use `shutil.which` to pre-expand the executable path, which works better."""
-    found = shutil.which(cmd)
-    if not found:
-        raise RuntimeError(f"Could not find '{cmd}' in path")
-    return found
 
 
 class hginstall(install):
@@ -1021,16 +999,16 @@ cmdclass = {
 
 packages = [
     os.path.dirname(p).replace("/", ".").replace("\\", ".")
-    for p in glob.glob("edenscm/**/__init__.py", recursive=True)
+    for p in glob.glob("sapling/**/__init__.py", recursive=True)
 ] + [
-    "edenscmnative",
+    "saplingnative",
     "ghstack",
 ]
 
 common_depends = [
-    "edenscm/bitmanipulation.h",
-    "edenscm/compat.h",
-    "edenscm/cext/util.h",
+    "sapling/bitmanipulation.h",
+    "sapling/compat.h",
+    "sapling/cext/util.h",
 ]
 
 
@@ -1112,11 +1090,11 @@ libraries = [
     (
         "mpatch",
         {
-            "sources": ["edenscm/mpatch.c"],
+            "sources": ["sapling/mpatch.c"],
             "depends": [
-                "edenscm/bitmanipulation.h",
-                "edenscm/compat.h",
-                "edenscm/mpatch.h",
+                "sapling/bitmanipulation.h",
+                "sapling/compat.h",
+                "sapling/mpatch.h",
             ],
             "include_dirs": ["."] + include_dirs,
         },
@@ -1207,7 +1185,7 @@ if os.name == "nt":
     msvccompiler.MSVCCompiler = HackedMSVCCompiler
 
 packagedata = {
-    "edenscm": [
+    "sapling": [
         "mercurial/locale/*/LC_MESSAGES/hg.mo",
         "mercurial/help/*.txt",
         "mercurial/help/internals/*.txt",
@@ -1348,13 +1326,15 @@ rustextbinaries = [
     ),
 ]
 
-if not ossbuild:
+skip_other_binaries = bool(os.environ.get("SAPLING_SKIP_OTHER_RUST_BINARIES"))
+
+if not ossbuild and not skip_other_binaries:
     rustextbinaries += [
         RustBinary("mkscratch", manifest="exec/scratch/Cargo.toml"),
         RustBinary("scm_daemon", manifest="exec/scm_daemon/Cargo.toml"),
     ]
 
-if havefb and iswindows:
+if havefb and iswindows and not skip_other_binaries:
     rustextbinaries += [RustBinary("fbclone", manifest="fb/fbclone/Cargo.toml")]
 
 
@@ -1363,7 +1343,7 @@ if sys.platform == "cygwin":
 
 
 setup(
-    name="edenscm",
+    name="sapling",
     version=setupversion,
     author="Olivia Mackall and many others",
     url="https://sapling-scm.com/",

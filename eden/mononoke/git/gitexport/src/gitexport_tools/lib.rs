@@ -12,6 +12,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::Error;
+use anyhow::Result;
 use blobstore::Loadable;
 use blobstore::PutBehaviour;
 use borrowed::borrowed;
@@ -23,6 +24,8 @@ use fbinit::FacebookInit;
 use fileblob::Fileblob;
 use futures::stream::TryStreamExt;
 use futures::stream::{self};
+use indicatif::ProgressBar;
+use indicatif::ProgressStyle;
 use mononoke_api::BookmarkKey;
 use mononoke_api::ChangesetContext;
 use mononoke_api::CoreContext;
@@ -30,6 +33,7 @@ use mononoke_api::MononokeError;
 use mononoke_api::RepoContext;
 use mononoke_types::BonsaiChangeset;
 use mononoke_types::ChangesetId;
+use mononoke_types::FileChange;
 use mononoke_types::NonRootMPath;
 use rand::distributions::Alphanumeric;
 use rand::distributions::DistString;
@@ -37,11 +41,15 @@ use repo_blobstore::RepoBlobstoreArc;
 use slog::debug;
 use slog::error;
 use slog::info;
+use slog::trace;
+use slog::Drain;
 use sql::rusqlite::Connection as SqliteConnection;
 use test_repo_factory::TestRepoFactory;
 
 pub use crate::partial_commit_graph::build_partial_commit_graph_for_export;
 use crate::partial_commit_graph::ChangesetParents;
+
+pub const MASTER_BOOKMARK: &str = "master";
 
 /// Given a list of changesets, their parents and a list of paths, create
 /// copies in a target mononoke repository containing only changes that
@@ -52,13 +60,14 @@ pub async fn rewrite_partial_changesets(
     changesets: Vec<ChangesetContext>,
     changeset_parents: &ChangesetParents,
     export_paths: Vec<NonRootMPath>,
-) -> Result<RepoContext, MononokeError> {
+) -> Result<RepoContext> {
     let ctx: &CoreContext = source_repo_ctx.ctx();
 
     let logger = ctx.logger();
 
+    info!(logger, "Copying changesets to temporary repo...");
+
     debug!(logger, "export_paths: {:#?}", &export_paths);
-    debug!(logger, "changeset_parents: {:#?}", &changeset_parents);
 
     // Repo that will hold the partial changesets that will be exported to git
     let temp_repo_ctx = create_temp_repo(fb, ctx).await?;
@@ -69,25 +78,43 @@ pub async fn rewrite_partial_changesets(
         let should_export = export_paths.iter().any(|p| p.is_prefix_of(source_path));
 
         if !should_export {
-            debug!(
+            trace!(
                 logger_clone,
-                "Path {:#?} will NOT be exported.", &source_path
+                "Path {:#?} will NOT be exported.",
+                &source_path
             );
             return Ok(vec![]);
         }
 
-        debug!(logger_clone, "Path {:#?} will be exported.", &source_path);
+        trace!(logger_clone, "Path {:#?} will be exported.", &source_path);
         Ok(vec![source_path.clone()])
     });
 
+    let num_changesets = changesets.len().try_into().unwrap();
     let cs_results: Vec<Result<ChangesetContext, MononokeError>> =
         changesets.into_iter().map(Ok).collect::<Vec<_>>();
+
+    let mb_progress_bar = if logger.is_enabled(slog::Level::Info) {
+        let progress_bar = ProgressBar::new(num_changesets)
+        .with_message("Copying changesets")
+        .with_style(
+            ProgressStyle::with_template(
+                "[{percent}%] {msg} [{bar:60.cyan}] (ETA: {eta}) ({human_pos}/{human_len}) ({per_sec}) ",
+            )?
+            .progress_chars("#>-"),
+        );
+        progress_bar.enable_steady_tick(std::time::Duration::from_secs(5));
+        Some(progress_bar)
+    } else {
+        None
+    };
 
     let (new_bonsai_changesets, _) = stream::iter(cs_results)
         .try_fold(
             (Vec::new(), HashMap::new()),
             |(mut new_bonsai_changesets, remapped_parents), changeset| {
                 borrowed!(source_repo_ctx);
+                borrowed!(mb_progress_bar);
                 cloned!(multi_mover);
                 async move {
                     let (new_bcs, remapped_parents) = create_bonsai_for_new_repo(
@@ -99,15 +126,19 @@ pub async fn rewrite_partial_changesets(
                     )
                     .await?;
                     new_bonsai_changesets.push(new_bcs);
+                    if let Some(progress_bar) = mb_progress_bar {
+                        progress_bar.inc(1);
+                    }
                     Ok((new_bonsai_changesets, remapped_parents))
                 }
             },
         )
         .await?;
 
-    debug!(
+    trace!(
         logger,
-        "new_bonsai_changesets: {:#?}", &new_bonsai_changesets
+        "new_bonsai_changesets: {:#?}",
+        &new_bonsai_changesets
     );
 
     let head_cs_id = new_bonsai_changesets
@@ -115,6 +146,7 @@ pub async fn rewrite_partial_changesets(
         .ok_or(Error::msg("No changesets were moved"))?
         .get_changeset_id();
 
+    debug!(logger, "Uploading copied changesets...");
     upload_commits(
         source_repo_ctx.ctx(),
         new_bonsai_changesets,
@@ -125,7 +157,7 @@ pub async fn rewrite_partial_changesets(
 
     // Set master bookmark to point to the latest changeset
     if let Err(err) = temp_repo_ctx
-        .create_bookmark(&BookmarkKey::from_str("master")?, head_cs_id, None)
+        .create_bookmark(&BookmarkKey::from_str(MASTER_BOOKMARK)?, head_cs_id, None)
         .await
     {
         // TODO(T161902005): stop failing silently on bookmark creation
@@ -146,7 +178,7 @@ async fn create_bonsai_for_new_repo(
     changeset_ctx: ChangesetContext,
 ) -> Result<(BonsaiChangeset, HashMap<ChangesetId, ChangesetId>), MononokeError> {
     let logger = changeset_ctx.repo().ctx().logger();
-    debug!(
+    trace!(
         logger,
         "Rewriting changeset: {:#?} | {:#?}",
         &changeset_ctx.id(),
@@ -173,6 +205,31 @@ async fn create_bonsai_for_new_repo(
         .unwrap_or_default();
     let mut mut_bcs = bcs.into_mut();
     mut_bcs.parents = orig_parent_ids.clone();
+
+    // If this isn't the first changeset (i.e. that creates the oldest exported
+    // directory), we need to make sure that file changes that copy from
+    // previous commits only reference revisions that are also being exported.
+    if let Some(new_parent_cs_id) = orig_parent_ids.first() {
+        // TODO(T161204758): iterate over all parents and select one that is the closest
+        // ancestor of each commit in the `copy_from` field.
+        mut_bcs.file_changes.iter_mut().for_each(|(_p, fc)| {
+            if let FileChange::Change(tracked_fc) = fc {
+                // If any FileChange copies a file from a previous revision (e.g. a parent),
+                // set the `copy_from` field to point to its new parent.
+                //
+                // Since we're building a history using all changesets that
+                // affect the exported directories, any file being copied
+                // should always exist in the new parent.
+                //
+                // If this isn't done, it might not be possible to rewrite the
+                // commit to the new repo, because the changeset referenced in
+                // its `copy_from` field will not have been remapped.
+                if let Some((_p, copy_from_cs_id)) = tracked_fc.copy_from_mut() {
+                    *copy_from_cs_id = new_parent_cs_id.clone();
+                };
+            };
+        });
+    };
 
     let rewritten_bcs_mut = rewrite_commit(
         source_repo_ctx.ctx(),
@@ -239,6 +296,8 @@ async fn create_temp_repo(fb: FacebookInit, ctx: &CoreContext) -> Result<RepoCon
 }
 
 #[cfg(test)]
+#[allow(non_snake_case)] // For test commits
+
 mod test {
 
     use std::collections::VecDeque;
@@ -268,30 +327,29 @@ mod test {
         let (source_repo_ctx, changeset_ids) =
             build_test_repo(fb, &ctx, GitExportTestRepoOptions::default()).await?;
 
-        let first = changeset_ids["first"];
-        let third = changeset_ids["third"];
-        let fifth = changeset_ids["fifth"];
-        let sixth = changeset_ids["sixth"];
-        let seventh = changeset_ids["seventh"];
-        let ninth = changeset_ids["ninth"];
-        let tenth = changeset_ids["tenth"];
+        let A = changeset_ids["A"];
+        let C = changeset_ids["C"];
+        let E = changeset_ids["E"];
+        let F = changeset_ids["F"];
+        let G = changeset_ids["G"];
+        let I = changeset_ids["I"];
+        let J = changeset_ids["J"];
 
         // Test that changesets are rewritten when relevant changesets are given
         // topologically sorted
-        let relevant_changeset_ids: Vec<ChangesetId> =
-            vec![first, third, fifth, sixth, seventh, ninth, tenth];
+        let relevant_changeset_ids: Vec<ChangesetId> = vec![A, C, E, F, G, I, J];
 
         let relevant_changesets: Vec<ChangesetContext> =
             get_relevant_changesets_from_ids(&source_repo_ctx, relevant_changeset_ids).await?;
 
         let relevant_changeset_parents = HashMap::from([
-            (first, vec![]),
-            (third, vec![first]),
-            (fifth, vec![third]),
-            (sixth, vec![fifth]),
-            (seventh, vec![sixth]),
-            (ninth, vec![seventh]),
-            (tenth, vec![ninth]),
+            (A, vec![]),
+            (C, vec![A]),
+            (E, vec![C]),
+            (F, vec![E]),
+            (G, vec![F]),
+            (I, vec![G]),
+            (J, vec![I]),
         ]);
 
         let temp_repo_ctx = rewrite_partial_changesets(
@@ -305,7 +363,7 @@ mod test {
 
         let temp_repo_master_csc = temp_repo_ctx
             .resolve_bookmark(
-                &BookmarkKey::from_str("master")?,
+                &BookmarkKey::from_str(MASTER_BOOKMARK)?,
                 BookmarkFreshness::MostRecent,
             )
             .await?
@@ -371,22 +429,22 @@ mod test {
         }
 
         assert_eq!(result.len(), 7);
-        assert_eq!(result[0], build_expected_tuple("first", vec![EXPORT_FILE]));
-        assert_eq!(result[1], build_expected_tuple("third", vec![EXPORT_FILE]));
-        assert_eq!(result[2], build_expected_tuple("fifth", vec![EXPORT_FILE]));
+        assert_eq!(result[0], build_expected_tuple("A", vec![EXPORT_FILE]));
+        assert_eq!(result[1], build_expected_tuple("C", vec![EXPORT_FILE]));
+        assert_eq!(result[2], build_expected_tuple("E", vec![EXPORT_FILE]));
         assert_eq!(
             result[3],
-            build_expected_tuple("sixth", vec![FILE_IN_SECOND_EXPORT_DIR])
+            build_expected_tuple("F", vec![FILE_IN_SECOND_EXPORT_DIR])
         );
         assert_eq!(
             result[4],
-            build_expected_tuple("seventh", vec![EXPORT_FILE, FILE_IN_SECOND_EXPORT_DIR])
+            build_expected_tuple("G", vec![EXPORT_FILE, FILE_IN_SECOND_EXPORT_DIR])
         );
         assert_eq!(
             result[5],
-            build_expected_tuple("ninth", vec![SECOND_EXPORT_FILE])
+            build_expected_tuple("I", vec![SECOND_EXPORT_FILE])
         );
-        assert_eq!(result[6], build_expected_tuple("tenth", vec![EXPORT_FILE]));
+        assert_eq!(result[6], build_expected_tuple("J", vec![EXPORT_FILE]));
 
         Ok(())
     }
@@ -400,23 +458,19 @@ mod test {
         let (source_repo_ctx, changeset_ids) =
             build_test_repo(fb, &ctx, GitExportTestRepoOptions::default()).await?;
 
-        let first = changeset_ids["first"];
-        let third = changeset_ids["third"];
-        let fourth = changeset_ids["fourth"];
-        let fifth = changeset_ids["fifth"];
+        let A = changeset_ids["A"];
+        let C = changeset_ids["C"];
+        let D = changeset_ids["D"];
+        let E = changeset_ids["E"];
 
         // Passing an irrelevant changeset in the list should result in an error
-        let broken_changeset_list_ids: Vec<ChangesetId> = vec![first, third, fourth, fifth];
+        let broken_changeset_list_ids: Vec<ChangesetId> = vec![A, C, D, E];
 
         let broken_changeset_list: Vec<ChangesetContext> =
             get_relevant_changesets_from_ids(&source_repo_ctx, broken_changeset_list_ids).await?;
 
-        let broken_changeset_parents = HashMap::from([
-            (first, vec![]),
-            (third, vec![first]),
-            (fourth, vec![third]),
-            (fifth, vec![fourth]),
-        ]);
+        let broken_changeset_parents =
+            HashMap::from([(A, vec![]), (C, vec![A]), (D, vec![C]), (E, vec![D])]);
 
         let error = rewrite_partial_changesets(
             fb,

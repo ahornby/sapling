@@ -308,9 +308,11 @@ struct ObjectStoreStats : StatsGroup<ObjectStoreStats> {
   Duration getBlob{"store.get_blob_us"};
   Duration getBlobMetadata{"store.get_blob_metadata_us"};
 
+  Counter getBlobFromMemory{"object_store.get_blob.memory"};
   Counter getBlobFromLocalStore{"object_store.get_blob.local_store"};
   Counter getBlobFromBackingStore{"object_store.get_blob.backing_store"};
 
+  Counter getTreeFromMemory{"object_store.get_tree.memory"};
   Counter getTreeFromLocalStore{"object_store.get_tree.local_store"};
   Counter getTreeFromBackingStore{"object_store.get_tree.backing_store"};
 

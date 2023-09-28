@@ -48,6 +48,13 @@ impl ContentStoreFetchMetrics {
         self.lfsptr_hits += keys;
     }
 
+    pub(crate) fn time_from_duration(
+        &mut self,
+        keys: std::time::Duration,
+    ) -> Result<(), anyhow::Error> {
+        self.common.time_from_duration(keys)
+    }
+
     fn metrics(&self) -> impl Iterator<Item = (&'static str, usize)> {
         std::iter::once(("lfsptrhits", self.lfsptr_hits))
             .filter(|&(_, v)| v != 0)
@@ -68,6 +75,7 @@ pub struct FileStoreFetchMetrics {
     pub(crate) lfs: LocalAndCacheFetchMetrics,
     pub(crate) aux: LocalAndCacheFetchMetrics,
     pub(crate) contentstore: ContentStoreFetchMetrics,
+    pub(crate) edenapi: FetchMetrics,
 }
 
 impl AddAssign for FileStoreFetchMetrics {
@@ -76,6 +84,7 @@ impl AddAssign for FileStoreFetchMetrics {
         self.lfs += rhs.lfs;
         self.aux += rhs.aux;
         self.contentstore += rhs.contentstore;
+        self.edenapi += rhs.edenapi;
     }
 }
 
@@ -85,6 +94,7 @@ impl FileStoreFetchMetrics {
             .chain(namespaced("lfs", self.lfs.metrics()))
             .chain(namespaced("aux", self.aux.metrics()))
             .chain(namespaced("contentstore", self.contentstore.metrics()))
+            .chain(namespaced("edenapi", self.edenapi.metrics()))
     }
     /// Update ODS stats.
     /// This assumes that fbinit was called higher up the stack.

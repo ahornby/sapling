@@ -17,7 +17,6 @@ import {
   type ChangedFilesDisplayType,
   changedFilesDisplayType,
 } from './ChangedFileDisplayTypePicker';
-import serverAPI from './ClientToServerAPI';
 import {
   commitFieldsBeingEdited,
   commitMode,
@@ -70,7 +69,7 @@ import {useContextMenu} from 'shared/ContextMenu';
 import {Icon} from 'shared/Icon';
 import {useDeepMemo} from 'shared/hooks';
 import {minimalDisambiguousPaths} from 'shared/minimalDisambiguousPaths';
-import {basename, notEmpty} from 'shared/utils';
+import {basename, notEmpty, partition} from 'shared/utils';
 
 import './UncommittedChanges.css';
 
@@ -465,6 +464,7 @@ function FileSelectionCheckbox({
     <VSCodeCheckbox
       checked={selection.isFullyOrPartiallySelected(file.path)}
       indeterminate={selection.isPartiallySelected(file.path)}
+      data-testid={'file-selection-checkbox'}
       // Note: Using `onClick` instead of `onChange` since onChange apparently fires when the controlled `checked` value changes,
       // which means this fires when using "select all" / "deselect all"
       onClick={e => {
@@ -656,10 +656,8 @@ export function UncommittedChanges({place}: {place: Place}) {
               <VSCodeButton
                 appearance="icon"
                 disabled={noFilesSelected}
+                data-testid={'discard-all-selected-button'}
                 onClick={() => {
-                  const selectedFiles = uncommittedChanges
-                    .filter(file => selection.isFullyOrPartiallySelected(file.path))
-                    .map(file => file.path);
                   platform.confirm(t('confirmDiscardChanges')).then(ok => {
                     if (!ok) {
                       return;
@@ -679,8 +677,21 @@ export function UncommittedChanges({place}: {place: Place}) {
                       selection.discardPartialSelections();
                       runOperation(operation);
                     } else {
-                      // only a subset of files selected -> we need to revert selected files individually
-                      runOperation(new RevertOperation(selectedFiles));
+                      const selectedFiles = uncommittedChanges.filter(file =>
+                        selection.isFullyOrPartiallySelected(file.path),
+                      );
+                      const [selectedTrackedFiles, selectedUntrackedFiles] = partition(
+                        selectedFiles,
+                        file => file.status !== '?', // only untracked, not missing
+                      );
+                      if (selectedTrackedFiles.length > 0) {
+                        // only a subset of files selected -> we need to revert selected tracked files individually
+                        runOperation(new RevertOperation(selectedTrackedFiles.map(f => f.path)));
+                      }
+                      if (selectedUntrackedFiles.length > 0) {
+                        // untracked files must be purged separately to delete from disk
+                        runOperation(new PurgeOperation(selectedUntrackedFiles.map(f => f.path)));
+                      }
                     }
                   });
                 }}>
@@ -957,6 +968,7 @@ function FileActions({
             className="file-show-on-hover"
             key={file.path}
             appearance="icon"
+            data-testid="file-action-delete"
             onClick={async () => {
               const ok = await platform.confirm(
                 t('Are you sure you want to delete $file?', {replace: {$file: file.path}}),
@@ -964,11 +976,7 @@ function FileActions({
               if (!ok) {
                 return;
               }
-              // There's no `sl` command that will delete an untracked file, we need to do it manually.
-              serverAPI.postMessage({
-                type: 'deleteFile',
-                filePath: file.path,
-              });
+              runOperation(new PurgeOperation([file.path]));
             }}>
             <Icon icon="trash" />
           </VSCodeButton>

@@ -120,6 +120,10 @@ impl Metadata {
         self.set_main_id()
     }
 
+    pub fn client_info(&self) -> Option<&ClientInfo> {
+        self.client_info.as_ref()
+    }
+
     pub fn set_main_id(&mut self) -> &mut Self {
         self.client_info.as_mut().map(|x| {
             x.request_info.as_mut().map(|client_request_info| {
@@ -208,10 +212,6 @@ impl Metadata {
         self.client_info
             .as_ref()
             .and_then(|ci| ci.fb.sandcastle_alias())
-    }
-
-    pub fn clientinfo_u64tag(&self) -> Option<u64> {
-        self.client_info.as_ref()?.u64token
     }
 
     pub fn sandcastle_nonce(&self) -> Option<&str> {
