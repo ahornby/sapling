@@ -7,7 +7,6 @@
 
 #![feature(error_generic_member_access)]
 #![feature(iterator_try_reduce)]
-#![feature(provide_any)]
 
 pub mod mode;
 
