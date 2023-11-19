@@ -11,6 +11,8 @@ use std::iter::zip;
 use std::sync::Arc;
 
 use anyhow::Result;
+use async_runtime::block_in_place;
+use async_runtime::spawn_blocking;
 use async_trait::async_trait;
 use configmodel::Config;
 use configmodel::ConfigExt;
@@ -23,7 +25,6 @@ use manifest_tree::Diff;
 use manifest_tree::TreeManifest;
 use parking_lot::Mutex;
 use pathmatcher::AlwaysMatcher;
-use storemodel::futures::StreamExt;
 use storemodel::FileStore;
 use types::Key;
 use types::RepoPath;
@@ -327,25 +328,27 @@ impl RenameFinderInner {
         old_path: &RepoPath,
     ) -> Result<Option<RepoPathBuf>> {
         tracing::trace!(keys_len = keys.len(), " read_renamed_metadata_forward");
-        let mut renames = self.file_reader.get_rename_stream(keys).await;
-        while let Some(rename) = renames.next().await {
-            let (key, rename_from_key) = rename?;
-            if let Some(rename_from_key) = rename_from_key {
+        block_in_place(move || {
+            let renames = self.file_reader.get_rename_iter(keys)?;
+            for rename in renames {
+                let (key, rename_from_key) = rename?;
                 if rename_from_key.path.as_repo_path() == old_path {
                     return Ok(Some(key.path));
                 }
             }
-        }
-        Ok(None)
+            Ok(None)
+        })
     }
 
     async fn read_renamed_metadata_backward(&self, key: Key) -> Result<Option<RepoPathBuf>> {
-        let mut renames = self.file_reader.get_rename_stream(vec![key]).await;
-        if let Some(rename) = renames.next().await {
-            let (_, rename_from_key) = rename?;
-            return Ok(rename_from_key.map(|k| k.path));
-        }
-        Ok(None)
+        block_in_place(move || {
+            let renames = self.file_reader.get_rename_iter(vec![key])?;
+            for rename in renames {
+                let (_, rename_from_key) = rename?;
+                return Ok(Some(rename_from_key.path));
+            }
+            Ok(None)
+        })
     }
 
     async fn find_rename_in_direction(
@@ -377,14 +380,12 @@ impl RenameFinderInner {
         keys: Vec<Key>,
         source_key: Key,
     ) -> Result<Option<RepoPathBuf>> {
-        let mut source = self
-            .file_reader
-            .get_content_stream(vec![source_key.clone()])
-            .await;
-        let source_content = match source.next().await {
-            None => return Err(CopyTraceError::FileNotFound(source_key.path).into()),
-            Some(content_and_key) => content_and_key?.0,
-        };
+        let source_content = spawn_blocking({
+            let path = source_key.path.clone();
+            let reader = self.file_reader.clone();
+            move || reader.get_content(&path, source_key.hgid)
+        })
+        .await??;
 
         let config_percentage = self.get_similarity_threshold()?;
         let config_max_edit_cost = self.get_max_edit_cost()?;
@@ -401,15 +402,20 @@ impl RenameFinderInner {
             " content similarity configs"
         );
 
-        let mut candidates = self.file_reader.get_content_stream(keys).await;
-        while let Some(candidate) = candidates.next().await {
-            let (candidate_content, k) = candidate?;
-            if edit_cost(&source_content, &candidate_content, max_edit_cost + 1) <= max_edit_cost {
-                return Ok(Some(k.path));
+        let file_reader = self.file_reader.clone();
+        spawn_blocking(move || {
+            let iter = file_reader.get_content_iter(keys)?;
+            for entry in iter {
+                let (k, candidate_content) = entry?;
+                if edit_cost(&source_content, &candidate_content, max_edit_cost + 1)
+                    <= max_edit_cost
+                {
+                    return Ok(Some(k.path));
+                }
             }
-        }
-
-        Ok(None)
+            Ok(None)
+        })
+        .await?
     }
 
     fn get_key_from_path(&self, tree: &TreeManifest, path: &RepoPath) -> Result<Key> {

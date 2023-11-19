@@ -390,11 +390,13 @@ class Client:
             pass
 
         infos = {}
+        diff_number_str = None  # for error message
         try:
             nodes = ret["data"]["query"][0]["results"]["nodes"]
             for node in nodes:
                 info = {}
-                infos[str(node["number"])] = info
+                diff_number_str = str(node["number"])
+                infos[diff_number_str] = info
 
                 status = node["diff_status_name"]
                 # GraphQL uses "Closed" but Conduit used "Committed" so let's
@@ -426,12 +428,17 @@ class Client:
                 )
                 if active_version is None:
                     active_version = node.get("latest_active_phabricator_version", {})
-                commit_hash = active_version.get("commit_hash_best_effort")
-                if commit_hash is not None:
-                    info["hash"] = commit_hash
+                if active_version is not None:
+                    commit_hash = active_version.get("commit_hash_best_effort")
+                    if commit_hash is not None:
+                        info["hash"] = commit_hash
 
         except (AttributeError, KeyError, TypeError):
-            raise ClientError(None, "Unexpected graphql response format")
+            if diff_number_str is not None:
+                msg = _("Unexpected graphql response format for D%s") % diff_number_str
+            else:
+                msg = _("Unexpected graphql response format")
+            raise ClientError(None, msg)
 
         return infos
 

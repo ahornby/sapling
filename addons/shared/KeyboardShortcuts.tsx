@@ -11,7 +11,7 @@ import {createContext, useContext, useEffect} from 'react';
 
 /* eslint-disable no-bitwise */
 
-type Modifiers = number;
+type Modifiers = Modifier | Array<Modifier>;
 /**
  * Modifiers for keyboard shortcuts, intended to be bitwise-OR'd together.
  * e.g. `Modifier.CMD | Modifier.CTRL`.
@@ -37,7 +37,10 @@ export enum KeyCode {
   N = 78,
   P = 80,
   R = 82,
+  S = 83,
+  T = 84,
   Period = 190,
+  QuestionMark = 191,
   SingleQuote = 222,
   LeftArrow = 37,
   UpArrow = 38,
@@ -59,7 +62,14 @@ function isTargetTextInputElement(event: KeyboardEvent): boolean {
   );
 }
 
-class CommandDispatcher<CommandName extends string> extends window.EventTarget {
+class CommandDispatcher<CommandName extends string> extends (
+  window as {
+    EventTarget: {
+      new (): EventTarget;
+      prototype: EventTarget;
+    };
+  }
+).EventTarget {
   private keydownListener: (event: KeyboardEvent) => void;
   constructor(commands: CommandMap<CommandName>) {
     super();
@@ -86,7 +96,7 @@ class CommandDispatcher<CommandName extends string> extends window.EventTarget {
         [CommandName, CommandDefinition]
       >) {
         const [mods, key] = cmdAttrs;
-        if (key === event.keyCode && mods === modValue) {
+        if (key === event.keyCode && collapseModifiersToNumber(mods) === modValue) {
           this.dispatchEvent(new Event(command));
           break;
         }
@@ -94,6 +104,10 @@ class CommandDispatcher<CommandName extends string> extends window.EventTarget {
     };
     document.body.addEventListener('keydown', this.keydownListener);
   }
+}
+
+function collapseModifiersToNumber(mods: Modifiers): number {
+  return Array.isArray(mods) ? mods.reduce((acc, mod) => acc | mod, Modifier.NONE) : mods;
 }
 
 /**
@@ -114,6 +128,7 @@ export function makeCommandDispatcher<CommandName extends string>(
   FunctionComponent<PropsWithChildren>,
   (command: CommandName, handler: () => void) => void,
   (command: CommandName) => void,
+  CommandMap<CommandName>,
 ] {
   const commandDispatcher = new CommandDispatcher(commands);
   const Context = createContext(commandDispatcher);
@@ -132,5 +147,6 @@ export function makeCommandDispatcher<CommandName extends string>(
     ({children}) => <Context.Provider value={commandDispatcher}>{children}</Context.Provider>,
     useCommand,
     (command: CommandName) => commandDispatcher.dispatchEvent(new Event(command)),
+    commands,
   ];
 }

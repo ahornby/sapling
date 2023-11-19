@@ -7,7 +7,7 @@
 
 #include "eden/fs/store/hg/HgDatapackStore.h"
 
-#include <folly/Optional.h>
+#include <folly/Range.h>
 #include <folly/io/IOBuf.h>
 #include <folly/logging/xlog.h>
 #include <memory>
@@ -54,20 +54,21 @@ Tree::value_type fromRawTreeEntry(
   std::optional<Hash20> contentSha1;
   std::optional<Hash32> contentBlake3;
 
-  if (entry.size != nullptr) {
-    size = *entry.size;
+  if (entry.has_size) {
+    size = entry.size;
   }
 
-  if (entry.content_sha1 != nullptr) {
-    contentSha1.emplace(*entry.content_sha1);
+  if (entry.has_sha1) {
+    contentSha1.emplace(Hash20(std::move(entry.content_sha1)));
   }
 
-  if (entry.content_blake3 != nullptr) {
-    contentBlake3.emplace(*entry.content_blake3);
+  if (entry.has_blake3) {
+    contentBlake3.emplace(Hash32(std::move(entry.content_blake3)));
   }
 
-  auto name = PathComponent(folly::StringPiece{entry.name.asByteRange()});
-  auto hash = Hash20{entry.hash};
+  auto name = PathComponent(folly::StringPiece{
+      folly::ByteRange{entry.name.data(), entry.name.size()}});
+  Hash20 hash(std::move(entry.hash));
 
   auto fullPath = path + name;
   auto proxyHash = HgProxyHash::store(fullPath, hash, hgObjectIdFormat);
@@ -89,8 +90,8 @@ TreePtr fromRawTree(
     const std::unordered_set<RelativePath>& filteredPaths) {
   Tree::container entries{kPathMapDefaultCaseSensitive};
 
-  entries.reserve(tree->length);
-  for (uintptr_t i = 0; i < tree->length; i++) {
+  entries.reserve(tree->entries.size());
+  for (uintptr_t i = 0; i < tree->entries.size(); i++) {
     try {
       auto entry = fromRawTreeEntry(tree->entries[i], path, hgObjectIdFormat);
       // TODO(xavierd): In the case where this checks becomes too hot, we may
@@ -283,11 +284,13 @@ BlobMetadataPtr HgDatapackStore::getLocalBlobMetadata(
       store_.getBlobMetadata(hgInfo.byteHash(), true /*local_only*/);
   if (metadata) {
     std::optional<Hash32> blake3;
-    if (metadata->content_blake3 != nullptr) {
-      blake3.emplace(*metadata->content_blake3);
+    if (metadata->has_blake3) {
+      blake3.emplace(Hash32{std::move(metadata->content_blake3)});
     }
     return std::make_shared<BlobMetadataPtr::element_type>(BlobMetadata{
-        Hash20{metadata->content_sha1}, blake3, metadata->total_size});
+        Hash20{std::move(metadata->content_sha1)},
+        blake3,
+        metadata->total_size});
   }
   return nullptr;
 }
@@ -325,12 +328,12 @@ void HgDatapackStore::getBlobMetadataBatch(
         } else {
           auto& aux = auxTry.value();
           std::optional<Hash32> blake3;
-          if (aux->content_blake3 != nullptr) {
-            blake3.emplace(*aux->content_blake3);
+          if (aux->has_blake3) {
+            blake3.emplace(Hash32{std::move(aux->content_blake3)});
           }
 
           result = folly::Try{std::make_shared<BlobMetadataPtr::element_type>(
-              Hash20{aux->content_sha1}, blake3, aux->total_size)};
+              Hash20{std::move(aux->content_sha1)}, blake3, aux->total_size)};
         }
         for (auto& importRequest : importRequestList) {
           importRequest->getPromise<BlobMetadataPtr>()->setWith(

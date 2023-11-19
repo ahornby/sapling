@@ -1031,17 +1031,16 @@ class rebaseruntime:
 
 
 def _simplemerge(ui, basectx, ctx, p1ctx, manifestbuilder):
-    from ..simplemerge import get_automerge_algos, Merge3Text, render_minimized
+    from ..simplemerge import Merge3Text, render_minimized
 
     conflicts = []
     resolved = {}
-    automerge_algos = get_automerge_algos(ui)
     for file in manifestbuilder.modifiedconflicts():
         basetext = basectx[file].data()
         localtext = ctx[file].data()
         othertext = p1ctx[file].data()
 
-        m3 = Merge3Text(basetext, localtext, othertext, automerge_algos=automerge_algos)
+        m3 = Merge3Text(basetext, localtext, othertext, ui=ui)
 
         merged_lines, conflictscount = render_minimized(m3)
         merged = b"".join(merged_lines)
@@ -1722,9 +1721,13 @@ def rebasenode(repo, rev, p1, base, state, collapse, dest, wctx):
     # Prepare the labels for rebase. This is currently a config option since
     # not all users are ready for the new label.
     if repo.ui.configbool("experimental", "rebase-long-labels"):
-        labels = ["dest (rebasing onto)", "source (being rebased)"]
+        labels = [
+            "dest (rebasing onto)",
+            "source (being rebased)",
+            "base (parent of source)",
+        ]
     else:
-        labels = ["dest", "source"]
+        labels = ["dest", "source", "base"]
     # When collapsing in-place, the parent is the common ancestor, we
     # have to allow merging with it.
     stats = mergemod.merge(

@@ -13,9 +13,7 @@ use std::ops::DerefMut;
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::anyhow;
 use anyhow::Error;
-use async_runtime::try_block_unless_interrupted;
 use configmodel::Config;
 use configmodel::ConfigExt;
 use manifest::FileMetadata;
@@ -26,9 +24,7 @@ use pathmatcher::DynMatcher;
 use pathmatcher::ExactMatcher;
 use pathmatcher::UnionMatcher;
 pub use sparse::Root;
-use storemodel::futures::StreamExt;
 use storemodel::FileStore;
-use types::Key;
 use types::RepoPath;
 use types::RepoPathBuf;
 use vfs::VFS;
@@ -96,16 +92,15 @@ pub fn build_matcher(
     let hasher = Mutex::new(DefaultHasher::new());
     prof.hash(hasher.lock().deref_mut());
 
-    let matcher = try_block_unless_interrupted(prof.matcher(|path| async {
+    let matcher = prof.matcher(|path| {
         let path = path;
 
         let file_id = {
             let manifest = manifest.clone();
             let repo_path = RepoPathBuf::from_string(path.clone())?;
 
-            // Work around nested block_on() calls by spawning a new thread.
-            // Once the Manifest is async this can go away.
-            tokio::task::spawn_blocking(move || match manifest.get(&repo_path)? {
+            // This might block.
+            match manifest.get(&repo_path)? {
                 None => {
                     tracing::warn!(?repo_path, "non-existent sparse profile include");
                     Ok::<_, Error>(None)
@@ -117,32 +112,23 @@ pub fn build_matcher(
                         Ok(None)
                     }
                 },
-            })
-            .await??
+            }
         };
 
-        let file_id = match file_id {
+        let file_id = match file_id? {
             Some(id) => id,
             None => return Ok(None),
         };
 
         let repo_path = RepoPathBuf::from_string(path.clone())?;
-        let mut stream = store
-            .get_content_stream(vec![Key::new(repo_path.clone(), file_id.clone())])
-            .await;
-        match stream.next().await {
-            Some(Ok((bytes, _key))) => {
-                let mut bytes = bytes.into_vec();
-                if let Some(extra) = overrides.get(&path) {
-                    bytes.append(&mut extra.to_string().into_bytes());
-                }
-                bytes.hash(hasher.lock().deref_mut());
-                Ok(Some(bytes))
-            }
-            Some(Err(err)) => Err(err),
-            None => Err(anyhow!("no contents for {}", repo_path)),
+        let bytes = store.get_content(&repo_path, file_id)?;
+        let mut bytes = bytes.into_vec();
+        if let Some(extra) = overrides.get(&path) {
+            bytes.append(&mut extra.to_string().into_bytes());
         }
-    }))?;
+        bytes.hash(hasher.lock().deref_mut());
+        Ok(Some(bytes))
+    })?;
 
     Ok((matcher, hasher.into_inner()))
 }
@@ -201,9 +187,9 @@ pub fn disk_overrides(dot_path: &Path) -> anyhow::Result<HashMap<String, String>
 mod tests {
     use std::collections::BTreeMap;
 
-    use futures::stream;
-    use futures::stream::BoxStream;
     use pathmatcher::Matcher;
+    use storemodel::minibytes::Bytes;
+    use storemodel::KeyStore;
     use types::HgId;
     use types::Parents;
     use types::RepoPath;
@@ -515,33 +501,17 @@ inc
     }
 
     #[async_trait::async_trait]
-    impl FileStore for StubCommit {
-        async fn get_content_stream(
-            &self,
-            keys: Vec<Key>,
-        ) -> BoxStream<anyhow::Result<(storemodel::minibytes::Bytes, Key)>> {
-            stream::iter(keys.into_iter().map(|k| match self.file_id(&k.path) {
-                None => Err(anyhow!("no such path")),
-                Some(id) if id == k.hgid => {
-                    Ok((self.files.get(&k.path).unwrap().clone().into(), k))
+    impl KeyStore for StubCommit {
+        fn get_local_content(&self, path: &RepoPath, hgid: HgId) -> anyhow::Result<Option<Bytes>> {
+            match self.file_id(path) {
+                Some(id) if id == hgid => {
+                    Ok(Some(Bytes::copy_from_slice(self.files.get(path).unwrap())))
                 }
-                Some(_) => Err(anyhow!("bad file id")),
-            }))
-            .boxed()
-        }
-
-        async fn get_rename_stream(
-            &self,
-            _keys: Vec<Key>,
-        ) -> BoxStream<anyhow::Result<(Key, Option<Key>)>> {
-            stream::empty().boxed()
-        }
-
-        fn get_local_content(
-            &self,
-            _key: &Key,
-        ) -> anyhow::Result<Option<storemodel::minibytes::Bytes>> {
-            Ok(None)
+                _ => Ok(None),
+            }
         }
     }
+
+    #[async_trait::async_trait]
+    impl FileStore for StubCommit {}
 }

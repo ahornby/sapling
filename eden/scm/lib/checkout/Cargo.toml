@@ -7,10 +7,11 @@ edition = "2021"
 
 [dependencies]
 anyhow = "=1.0.72"
-async-runtime = { version = "0.1.0", path = "../async-runtime" }
+atexit = { version = "0.1.0", path = "../util/atexit" }
 configmodel = { version = "0.1.0", path = "../config/model" }
+crossbeam = "0.8"
 fail = { version = "0.4", features = ["failpoints"] }
-futures = { version = "0.3.28", features = ["async-await", "compat"] }
+fs-err = { version = "2.6.0", features = ["tokio"] }
 io = { version = "0.1.0", path = "../io" }
 manifest = { version = "0.1.0", path = "../manifest", features = ["for-tests"] }
 manifest-tree = { version = "0.1.0", path = "../manifest-tree" }
@@ -24,8 +25,7 @@ serde_json = { version = "1.0.100", features = ["float_roundtrip", "unbounded_de
 status = { version = "0.1.0", path = "../status" }
 storemodel = { version = "0.1.0", path = "../storemodel" }
 thiserror = "1.0.43"
-tokio = { version = "1.29.1", features = ["full", "test-util", "tracing"] }
-tracing = "0.1.35"
+tracing = "0.1.40"
 treestate = { version = "0.1.0", path = "../treestate" }
 types = { version = "0.1.0", path = "../types" }
 util = { version = "0.1.0", path = "../util" }

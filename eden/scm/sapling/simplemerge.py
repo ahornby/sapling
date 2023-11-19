@@ -141,11 +141,11 @@ def automerge_adjacent_changes(base_lines, a_lines, b_lines) -> Optional[List[by
     return merged_lines
 
 
-def automerge_common_changes(base_lines, a_lines, b_lines) -> Optional[List[bytes]]:
+def automerge_subset_changes(base_lines, a_lines, b_lines) -> Optional[List[bytes]]:
     if base_lines:
         return None
     if len(a_lines) > len(b_lines):
-        return automerge_common_changes(base_lines, b_lines, a_lines)
+        return automerge_subset_changes(base_lines, b_lines, a_lines)
     if is_sub_list(a_lines, b_lines):
         return b_lines
 
@@ -219,12 +219,8 @@ def splitwordswithoutemptylines(text):
 AUTOMERGE_ALGORITHMS = {
     "word-merge": automerge_wordmerge,
     "adjacent-changes": automerge_adjacent_changes,
-    "common-changes": automerge_common_changes,
+    "subset-changes": automerge_subset_changes,
 }
-
-
-def get_automerge_algos(ui):
-    return ui.configlist("merge", "automerge-algos")
 
 
 class Merge3Text:
@@ -233,14 +229,19 @@ class Merge3Text:
     Given strings BASE, OTHER, THIS, tries to produce a combined text
     incorporating the changes from both BASE->OTHER and BASE->THIS."""
 
-    def __init__(self, basetext, atext, btext, automerge_algos=(), in_wordmerge=False):
-        if in_wordmerge and automerge_algos:
+    def __init__(self, basetext, atext, btext, ui=None, in_wordmerge=False):
+        self.in_wordmerge = in_wordmerge
+
+        # ui is used for (1) getting automerge configs; (2) prompt choices
+        self.ui = ui
+        self.automerge_fns = {}
+        self.automerge_mode = ""
+        self.init_automerge_fields(ui)
+
+        if in_wordmerge and self.automerge_fns:
             raise error.Abort(
                 _("word-level merge does not support automerge algorithms")
             )
-
-        self.in_wordmerge = in_wordmerge
-        self.automerge_fns = self.init_automerge_fns(automerge_algos)
 
         self.basetext = basetext
         self.atext = atext
@@ -253,17 +254,20 @@ class Merge3Text:
         self.a = split(atext)
         self.b = split(btext)
 
-    def init_automerge_fns(self, automerge_algos):
-        automerge_fns = []
+    def init_automerge_fields(self, ui):
+        if not ui:
+            return
+        self.automerge_mode = ui.config("automerge", "mode", "prompt")
+        automerge_fns = self.automerge_fns
+        automerge_algos = ui.configlist("automerge", "merge-algos")
         for name in automerge_algos:
             try:
-                automerge_fns.append(AUTOMERGE_ALGORITHMS[name])
+                automerge_fns[name] = AUTOMERGE_ALGORITHMS[name]
             except KeyError:
                 raise error.Abort(
                     _("unknown automerge algorithm '%s', availabe algorithms are %s")
                     % (name, list(AUTOMERGE_ALGORITHMS.keys()))
                 )
-        return automerge_fns
 
     def merge_groups(self, disable_automerge=False):
         """Yield sequence of line groups.
@@ -305,7 +309,7 @@ class Merge3Text:
                 b_lines = self.b[t[5] : t[6]]
                 merged_lines = None
                 if not disable_automerge:
-                    for fn in self.automerge_fns:
+                    for _name, fn in self.automerge_fns.items():
                         merged_lines = fn(base_lines, a_lines, b_lines)
                         if merged_lines is not None:
                             yield "automerge", merged_lines
@@ -602,62 +606,103 @@ def _picklabels(overrides):
 
 
 def render_mergediff(m3, name_a, name_b, name_base):
+    return _render_mergediff_ext(m3, name_a, name_b, name_base, one_side=True)
+
+
+def render_mergediff2(m3, name_a, name_b, name_base):
+    return _render_mergediff_ext(m3, name_a, name_b, name_base, one_side=False)
+
+
+def _render_mergediff_ext(m3, name_a, name_b, name_base, one_side=True):
     newline = _detect_newline(m3)
     lines = []
     conflictscount = 0
     for what, group_lines in m3.merge_groups():
         if what == "conflict":
             base_lines, a_lines, b_lines = group_lines
-            basetext = b"".join(base_lines)
-            bblocks = list(
-                mdiff.allblocks(
-                    basetext,
-                    b"".join(b_lines),
-                    lines1=base_lines,
-                    lines2=b_lines,
+            lines.extend(
+                _render_diff_conflict(
+                    base_lines,
+                    a_lines,
+                    b_lines,
+                    name_base,
+                    name_a,
+                    name_b,
+                    newline,
+                    one_side=one_side,
                 )
             )
-            ablocks = list(
-                mdiff.allblocks(
-                    basetext,
-                    b"".join(a_lines),
-                    lines1=base_lines,
-                    lines2=b_lines,
-                )
-            )
-
-            def matchinglines(blocks):
-                return sum(block[1] - block[0] for block, kind in blocks if kind == "=")
-
-            def difflines(blocks, lines1, lines2):
-                for block, kind in blocks:
-                    if kind == "=":
-                        for line in lines1[block[0] : block[1]]:
-                            yield b" " + line
-                    else:
-                        for line in lines1[block[0] : block[1]]:
-                            yield b"-" + line
-                        for line in lines2[block[2] : block[3]]:
-                            yield b"+" + line
-
-            lines.append(b"<<<<<<<" + newline)
-            if matchinglines(ablocks) < matchinglines(bblocks):
-                lines.append(b"======= " + name_a + newline)
-                lines.extend(a_lines)
-                lines.append(b"------- " + name_base + newline)
-                lines.append(b"+++++++ " + name_b + newline)
-                lines.extend(difflines(bblocks, base_lines, b_lines))
-            else:
-                lines.append(b"------- " + name_base + newline)
-                lines.append(b"+++++++ " + name_a + newline)
-                lines.extend(difflines(ablocks, base_lines, a_lines))
-                lines.append(b"======= " + name_b + newline)
-                lines.extend(b_lines)
-            lines.append(b">>>>>>>" + newline)
             conflictscount += 1
         else:
             lines.extend(group_lines)
     return lines, conflictscount
+
+
+def _render_diff_conflict(
+    base_lines,
+    a_lines,
+    b_lines,
+    name_base=b"",
+    name_a=b"",
+    name_b=b"",
+    newline=b"\n",
+    one_side=True,  # diff on one side of the conflict, other diff on both sides
+):
+    basetext = b"".join(base_lines)
+    bblocks = list(
+        mdiff.allblocks(
+            basetext,
+            b"".join(b_lines),
+            lines1=base_lines,
+            lines2=b_lines,
+        )
+    )
+    ablocks = list(
+        mdiff.allblocks(
+            basetext,
+            b"".join(a_lines),
+            lines1=base_lines,
+            lines2=b_lines,
+        )
+    )
+
+    def matchinglines(blocks):
+        return sum(block[1] - block[0] for block, kind in blocks if kind == "=")
+
+    def difflines(blocks, lines1, lines2):
+        for block, kind in blocks:
+            if kind == "=":
+                for line in lines1[block[0] : block[1]]:
+                    yield b" " + line
+            else:
+                for line in lines1[block[0] : block[1]]:
+                    yield b"-" + line
+                for line in lines2[block[2] : block[3]]:
+                    yield b"+" + line
+
+    lines = []
+    if one_side:
+        lines.append(b"<<<<<<<" + newline)
+        if matchinglines(ablocks) < matchinglines(bblocks):
+            lines.append(b"======= " + name_a + newline)
+            lines.extend(a_lines)
+            lines.append(b"------- " + name_base + newline)
+            lines.append(b"+++++++ " + name_b + newline)
+            lines.extend(difflines(bblocks, base_lines, b_lines))
+        else:
+            lines.append(b"------- " + name_base + newline)
+            lines.append(b"+++++++ " + name_a + newline)
+            lines.extend(difflines(ablocks, base_lines, a_lines))
+            lines.append(b"======= " + name_b + newline)
+            lines.extend(b_lines)
+        lines.append(b">>>>>>>" + newline)
+    else:
+        lines.append(b"<<<<<<< " + name_a + newline)
+        lines.extend(difflines(ablocks, base_lines, a_lines))
+        lines.append(b"======= " + name_base + newline)
+        lines.extend(difflines(bblocks, base_lines, b_lines))
+        lines.append(b">>>>>>> " + name_b + newline)
+    return lines
 
 
 def _resolve(m3, sides):
@@ -701,8 +746,7 @@ def simplemerge(ui, localctx, basectx, otherctx, **opts):
     except error.Abort:
         return 1
 
-    automerge_algos = get_automerge_algos(ui)
-    m3 = Merge3Text(basetext, localtext, othertext, automerge_algos=automerge_algos)
+    m3 = Merge3Text(basetext, localtext, othertext, ui=ui)
 
     conflictscount = 0
     if mode == "union":

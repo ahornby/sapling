@@ -49,30 +49,28 @@ use vfs::VFS;
 #[cfg(feature = "eden")]
 use crate::edenfs::EdenFileSystem;
 use crate::errors;
+use crate::filesystem::FileSystem;
 use crate::filesystem::FileSystemType;
 use crate::filesystem::PendingChange;
-use crate::filesystem::PendingChanges;
 use crate::git::parse_submodules;
 use crate::physicalfs::PhysicalFileSystem;
 use crate::status::compute_status;
 use crate::util::walk_treestate;
 use crate::watchmanfs::WatchmanFileSystem;
 
-type ArcFileStore = Arc<dyn FileStore>;
-type ArcReadTreeManifest = Arc<dyn ReadTreeManifest + Send + Sync>;
+#[cfg(not(feature = "eden"))]
+pub struct EdenFsClient {}
 
-pub(crate) struct FileSystem {
-    vfs: VFS,
-    file_store: ArcFileStore,
-    file_system_type: FileSystemType,
-    pub(crate) inner: Box<dyn PendingChanges + Send>,
-}
-
-impl AsRef<Box<dyn PendingChanges + Send>> for FileSystem {
-    fn as_ref(&self) -> &Box<dyn PendingChanges + Send> {
-        &self.inner
+#[cfg(not(feature = "eden"))]
+impl EdenFsClient {
+    pub fn from_wdir(_wdir_root: &Path) -> anyhow::Result<Self> {
+        panic!("cannot use EdenFS in a non-EdenFS build");
     }
 }
+
+type ArcFileStore = Arc<dyn FileStore>;
+type ArcReadTreeManifest = Arc<dyn ReadTreeManifest + Send + Sync>;
+type BoxFileSystem = Box<dyn FileSystem + Send>;
 
 pub struct WorkingCopy {
     vfs: VFS,
@@ -81,10 +79,11 @@ pub struct WorkingCopy {
     treestate: Arc<Mutex<TreeState>>,
     tree_resolver: ArcReadTreeManifest,
     filestore: ArcFileStore,
-    pub(crate) filesystem: Mutex<FileSystem>,
+    pub(crate) filesystem: Mutex<BoxFileSystem>,
     ignore_matcher: Arc<GitignoreMatcher>,
-    locker: Arc<RepoLocker>,
-    dot_hg_path: PathBuf,
+    pub(crate) locker: Arc<RepoLocker>,
+    pub(crate) dot_hg_path: PathBuf,
+    eden_client: Option<Arc<EdenFsClient>>,
 }
 
 impl WorkingCopy {
@@ -110,14 +109,15 @@ impl WorkingCopy {
             vfs.case_sensitive(),
         ));
 
-        let filesystem = Mutex::new(Self::construct_file_system(
+        let (filesystem, eden_client) = Self::construct_file_system(
             vfs.clone(),
             file_system_type,
             treestate.clone(),
             tree_resolver.clone(),
             filestore.clone(),
             locker.clone(),
-        )?);
+        )?;
+        let filesystem = Mutex::new(filesystem);
 
         let root = vfs.root();
         let ident = match identity::sniff_dir(root)? {
@@ -139,6 +139,7 @@ impl WorkingCopy {
             ignore_matcher,
             locker,
             dot_hg_path,
+            eden_client,
         })
     }
 
@@ -167,8 +168,18 @@ impl WorkingCopy {
         self.treestate.lock().parents().collect()
     }
 
-    pub fn set_parents(&mut self, parents: &mut dyn Iterator<Item = &HgId>) -> Result<()> {
-        self.treestate.lock().set_parents(parents)
+    pub fn set_parents(
+        &mut self,
+        parents: Vec<HgId>,
+        parent_tree_hash: Option<HgId>,
+    ) -> Result<()> {
+        let p1 = parents
+            .get(0)
+            .context("At least one parent is required for setting parents")?
+            .clone();
+        let p2 = parents.get(1).copied();
+        self.treestate.lock().set_parents(&mut parents.iter())?;
+        self.filesystem.lock().set_parents(p1, p2, parent_tree_hash)
     }
 
     pub fn filestore(&self) -> ArcFileStore {
@@ -217,38 +228,40 @@ impl WorkingCopy {
         tree_resolver: ArcReadTreeManifest,
         store: ArcFileStore,
         locker: Arc<RepoLocker>,
-    ) -> Result<FileSystem> {
-        let inner: Box<dyn PendingChanges + Send> = match file_system_type {
-            FileSystemType::Normal => Box::new(PhysicalFileSystem::new(
-                vfs.clone(),
-                tree_resolver,
-                store.clone(),
-                treestate,
-                locker,
-            )?),
-            FileSystemType::Watchman => Box::new(WatchmanFileSystem::new(
-                vfs.clone(),
-                treestate,
-                tree_resolver,
-                store.clone(),
-                locker,
-            )?),
+    ) -> Result<(BoxFileSystem, Option<Arc<EdenFsClient>>)> {
+        Ok(match file_system_type {
+            FileSystemType::Normal => (
+                Box::new(PhysicalFileSystem::new(
+                    vfs.clone(),
+                    tree_resolver,
+                    store.clone(),
+                    treestate,
+                    locker,
+                )?),
+                None,
+            ),
+            FileSystemType::Watchman => (
+                Box::new(WatchmanFileSystem::new(
+                    vfs.clone(),
+                    tree_resolver,
+                    store.clone(),
+                    treestate,
+                    locker,
+                )?),
+                None,
+            ),
             FileSystemType::Eden => {
                 #[cfg(not(feature = "eden"))]
                 panic!("cannot use EdenFS in a non-EdenFS build");
                 #[cfg(feature = "eden")]
                 {
-                    let wdir = vfs.root();
-                    let client = EdenFsClient::from_wdir(wdir)?;
-                    Box::new(EdenFileSystem::new(treestate, client)?)
+                    let client = Arc::new(EdenFsClient::from_wdir(vfs.root())?);
+                    (
+                        Box::new(EdenFileSystem::new(treestate, client.clone())?),
+                        Some(client),
+                    )
                 }
             }
-        };
-        Ok(FileSystem {
-            vfs,
-            file_store: store,
-            file_system_type,
-            inner,
         })
     }
 
@@ -281,38 +294,6 @@ impl WorkingCopy {
         Ok(added_files)
     }
 
-    fn sparse_matcher(
-        &self,
-        manifests: &[Arc<RwLock<TreeManifest>>],
-    ) -> Result<Option<DynMatcher>> {
-        assert!(!manifests.is_empty());
-
-        let fs = &self.filesystem.lock();
-
-        if fs.file_system_type == FileSystemType::Eden {
-            return Ok(None);
-        }
-
-        let mut sparse_matchers: Vec<DynMatcher> = Vec::new();
-        for manifest in manifests.iter() {
-            if let Some((matcher, _hash)) = crate::sparse::repo_matcher(
-                &self.vfs,
-                &fs.vfs.root().join(self.ident.dot_dir()),
-                manifest.read().clone(),
-                fs.file_store.clone(),
-            )? {
-                sparse_matchers.push(matcher);
-            }
-        }
-
-        if sparse_matchers.is_empty() {
-            // Indicates we have no .hg/sparse (i.e. sparse is disabled).
-            Ok(None)
-        } else {
-            Ok(Some(Arc::new(UnionMatcher::new(sparse_matchers))))
-        }
-    }
-
     pub fn status(
         &self,
         mut matcher: DynMatcher,
@@ -336,7 +317,10 @@ impl WorkingCopy {
             )));
         }
 
-        let sparse_matcher = self.sparse_matcher(&manifests)?;
+        let sparse_matcher = self
+            .filesystem
+            .lock()
+            .sparse_matcher(&manifests, self.ident.dot_dir())?;
 
         if let Some(sparse) = sparse_matcher.clone() {
             matcher = Arc::new(IntersectMatcher::new(vec![matcher, sparse]));
@@ -379,7 +363,6 @@ impl WorkingCopy {
         let pending_changes = self
             .filesystem
             .lock()
-            .inner
             .pending_changes(
                 matcher.clone(),
                 ignore_matcher,
@@ -506,5 +489,11 @@ impl WorkingCopy {
         )?;
 
         Ok(copied)
+    }
+
+    pub fn eden_client(&self) -> Result<Arc<EdenFsClient>> {
+        self.eden_client
+            .clone()
+            .context("EdenFS client not available in current working copy")
     }
 }

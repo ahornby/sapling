@@ -983,6 +983,21 @@ pub struct RemoteDatabaseConfig {
     pub db_address: String,
 }
 
+/// Configuration for a remote OSS MySQL database
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct OssRemoteDatabaseConfig {
+    /// Host to connect to
+    pub host: String,
+    /// Port to connect to
+    pub port: i16,
+    /// User of the database
+    pub user: String,
+    /// Name of the secret where the DB password is stored
+    pub secret_name: String,
+    /// Name of the database
+    pub database: String,
+}
+
 /// Configuration for a sharded remote MySQL database
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct ShardedRemoteDatabaseConfig {
@@ -1048,6 +1063,23 @@ pub struct RemoteMetadataDatabaseConfig {
     pub deletion_log: Option<RemoteDatabaseConfig>,
 }
 
+/// Configuration for the Metadata database when it is remote.
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct OssRemoteMetadataDatabaseConfig {
+    /// Database for the primary metadata.
+    pub primary: OssRemoteDatabaseConfig,
+    /// Database for possibly sharded filenodes.
+    pub filenodes: OssRemoteDatabaseConfig,
+    /// Database for commit mutation metadata.
+    pub mutation: OssRemoteDatabaseConfig,
+    /// Database for sparse profiles sizes.
+    pub sparse_profiles: OssRemoteDatabaseConfig,
+    /// Database for bonsai blob mapping
+    pub bonsai_blob_mapping: Option<OssRemoteDatabaseConfig>,
+    /// Database for deletion log
+    pub deletion_log: Option<OssRemoteDatabaseConfig>,
+}
+
 /// Configuration for the Metadata database
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub enum MetadataDatabaseConfig {
@@ -1055,6 +1087,8 @@ pub enum MetadataDatabaseConfig {
     Local(LocalDatabaseConfig),
     /// Remote MySQL databases
     Remote(RemoteMetadataDatabaseConfig),
+    /// OSS Remote MySQL Databases
+    OssRemote(OssRemoteMetadataDatabaseConfig),
 }
 
 impl Default for MetadataDatabaseConfig {
@@ -1071,6 +1105,7 @@ impl MetadataDatabaseConfig {
         match self {
             MetadataDatabaseConfig::Local(_) => true,
             MetadataDatabaseConfig::Remote(_) => false,
+            MetadataDatabaseConfig::OssRemote(_) => false,
         }
     }
 
@@ -1078,6 +1113,7 @@ impl MetadataDatabaseConfig {
     pub fn primary_address(&self) -> Option<String> {
         match self {
             MetadataDatabaseConfig::Remote(remote) => Some(remote.primary.db_address.clone()),
+            MetadataDatabaseConfig::OssRemote(_) => None,
             MetadataDatabaseConfig::Local(_) => None,
         }
     }
@@ -1177,6 +1213,19 @@ pub enum DefaultSmallToLargeCommitSyncPathAction {
     PrependPrefix(NonRootMPath),
 }
 
+/// Whether any changes made to git submodules should be stripped from
+/// the changesets before being synced.
+/// Since this is used in the small repo config, defininig a struct to set the
+/// default to true, to avoid accidentally syncing git submodules to large repos.
+#[derive(Debug, Clone, Eq, PartialEq, Default)]
+pub enum GitSubmodulesChangesAction {
+    /// Sync all changes made to git submodules without alterations.
+    Keep,
+    /// Strip any changes made to git submodules from the synced bonsai.
+    #[default]
+    Strip,
+}
+
 /// Commit sync configuration for a small repo
 /// Note: this configuration is always from the point of view
 /// of the small repo, meaning a key in the `map` is a path
@@ -1187,6 +1236,9 @@ pub struct SmallRepoCommitSyncConfig {
     pub default_action: DefaultSmallToLargeCommitSyncPathAction,
     /// A map of prefix replacements when syncing
     pub map: HashMap<NonRootMPath, NonRootMPath>,
+    /// Whether any changes made to git submodules should be stripped from
+    /// the changesets before being synced.
+    pub git_submodules_action: GitSubmodulesChangesAction,
 }
 
 /// Commit sync direction

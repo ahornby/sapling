@@ -5,9 +5,11 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+import type {EditedMessage} from './CommitInfoState';
 import type {CommitMessageFields, FieldConfig, FieldsBeingEdited} from './types';
 
 import {Internal} from '../Internal';
+import {t} from '../i18n';
 import {clearOnCwdChange} from '../recoilUtils';
 import {atom} from 'recoil';
 import {notEmpty} from 'shared/utils';
@@ -30,6 +32,16 @@ export function allFieldsBeingEdited(schema: Array<FieldConfig>): FieldsBeingEdi
   return Object.fromEntries(schema.map(config => [config.key, true]));
 }
 
+function fieldEqual(
+  config: FieldConfig,
+  a: Partial<CommitMessageFields>,
+  b: Partial<CommitMessageFields>,
+): boolean {
+  return config.type === 'field'
+    ? arraysEqual((a[config.key] ?? []) as Array<string>, (b[config.key] ?? []) as Array<string>)
+    : a[config.key] === b[config.key];
+}
+
 /**
  * Construct value representing which fields differ between two parsed messages, by comparing each field.
  * ```
@@ -38,16 +50,42 @@ export function allFieldsBeingEdited(schema: Array<FieldConfig>): FieldsBeingEdi
  */
 export function findFieldsBeingEdited(
   schema: Array<FieldConfig>,
-  a: CommitMessageFields,
-  b: CommitMessageFields,
+  a: Partial<CommitMessageFields>,
+  b: Partial<CommitMessageFields>,
 ): FieldsBeingEdited {
+  return Object.fromEntries(schema.map(config => [config.key, !fieldEqual(config, a, b)]));
+}
+
+export function anyEditsMade(
+  schema: Array<FieldConfig>,
+  latestMessage: CommitMessageFields,
+  edited: Partial<CommitMessageFields>,
+): boolean {
+  return Object.keys(edited).some(key => {
+    const config = schema.find(config => config.key === key);
+    if (config == null) {
+      return false;
+    }
+    return !fieldEqual(config, latestMessage, edited);
+  });
+}
+
+/** Given an edited message (Partial<CommitMessageFields>), remove any fields that haven't been meaningfully edited.
+ * (exactly equals latest underlying message)
+ */
+export function removeNoopEdits(
+  schema: Array<FieldConfig>,
+  latestMessage: CommitMessageFields,
+  edited: Partial<CommitMessageFields>,
+): Partial<CommitMessageFields> {
   return Object.fromEntries(
-    schema.map(config => [
-      config.key,
-      config.type === 'field'
-        ? !arraysEqual(a[config.key] as Array<string>, b[config.key] as Array<string>)
-        : a[config.key] !== b[config.key],
-    ]),
+    Object.entries(edited).filter(([key]) => {
+      const config = schema.find(config => config.key === key);
+      if (config == null) {
+        return false;
+      }
+      return !fieldEqual(config, latestMessage, edited);
+    }),
   );
 }
 
@@ -61,14 +99,24 @@ export function commitMessageFieldsToString(
 ): string {
   return schema
     .filter(config => config.key === 'Title' || isFieldNonEmpty(fields[config.key]))
-    .map(
-      config =>
-        // stringified messages of the form Key: value, except the title or generic description don't need a label
-        (config.key === 'Title' || config.key === 'Description' ? '' : config.key + ': ') +
-        (config.type === 'field'
+    .map(config => {
+      // stringified messages of the form Key: value, except the title or generic description don't need a label
+      const prefix =
+        config.key === 'Title' || config.key === 'Description' ? '' : config.key + ': ';
+
+      if (config.key === 'Title') {
+        const value = fields[config.key] as string;
+        if (value.trim().length === 0) {
+          return t('Temporary Commit');
+        }
+      }
+
+      const value =
+        config.type === 'field'
           ? (config.formatValues ?? joinWithComma)(fields[config.key] as Array<string>)
-          : fields[config.key]),
-    )
+          : fields[config.key];
+      return prefix + value;
+    })
     .join('\n\n');
 }
 
@@ -213,4 +261,21 @@ export const commitMessageFieldsSchema = atom<Array<FieldConfig>>({
 
 export function getDefaultCommitMessageSchema() {
   return Internal.CommitMessageFieldSchema ?? OSSDefaultFieldSchema;
+}
+
+export function editedMessageSubset(
+  message: CommitMessageFields,
+  fieldsBeingEdited: FieldsBeingEdited,
+): EditedMessage {
+  const fields = Object.fromEntries(
+    Object.entries(message).filter(([k]) => fieldsBeingEdited[k] ?? false),
+  );
+  return {fields};
+}
+
+export function applyEditedFields(
+  message: CommitMessageFields,
+  editedMessage: Partial<CommitMessageFields>,
+): CommitMessageFields {
+  return {...message, ...editedMessage} as CommitMessageFields;
 }

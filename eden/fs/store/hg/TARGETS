@@ -189,7 +189,6 @@ cpp_library(
         "//eden/fs/telemetry:structured_logger",
         "//eden/fs/utils:ref_ptr",
         "//eden/fs/utils:utils",
-        "//folly:optional",
         "//folly/io:iobuf",
         "//folly/logging:logging",
     ],
@@ -197,7 +196,9 @@ cpp_library(
         "//eden/fs/model:model-fwd",
         "//eden/fs/telemetry:telemetry",
         "//eden/fs/utils:path",
-        "//eden/scm/lib/backingstore/c_api:c_api",
+        "//eden/scm/lib/backingstore:backingstore",  # @manual
+        "//eden/scm/lib/backingstore:backingstore_bridge@header",  # @manual
+        "//eden/scm/lib/backingstore:sapling_native_backingstore-include",
         "//folly:range",
         "//folly/futures:core",
     ],

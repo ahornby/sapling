@@ -188,6 +188,11 @@ def loaddoc(topic, subdir=None):
 
 helptable = sorted(
     [
+        (
+            ["automerge"],
+            _("Automerge Algorithms in 3-way File Merge"),
+            loaddoc("automerge"),
+        ),
         (["bundlespec"], _("Bundle File Formats"), loaddoc("bundlespec")),
         (["cache"], _("File/Manifest Cache"), cachehelp),
         (["color"], _("Colorizing Outputs"), loaddoc("color")),
@@ -476,6 +481,10 @@ class _helpdispatch:
         # aliases
         # try to simplify aliases, ex. compress ['ab', 'abc', 'abcd', 'abcde']
         # to ['ab', 'abcde']
+        try:
+            aliases = aliases.documented()
+        except AttributeError:
+            pass
         slimaliases = []
         sortedaliases = sorted(aliases)
         for i, alias in enumerate(sortedaliases):

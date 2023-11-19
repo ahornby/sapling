@@ -459,6 +459,10 @@ function strip_glog {
   sed -E -e 's%^[VDIWECF][[:digit:]]{4} [[:digit:]]{2}:?[[:digit:]]{2}:?[[:digit:]]{2}(\.[[:digit:]]+)?\s+(([0-9a-f]+)\s+)?(\[([^]]+)\]\s+)?(\(([^\)]+)\)\s+)?(([a-zA-Z0-9_./-]+):([[:digit:]]+))\]\s+%%'
 }
 
+function with_stripped_logs {
+  "$@" 2>&1 | strip_glog
+}
+
 function wait_for_json_record_count {
   # We ask jq to count records for us, so that we're a little more robust ot
   # newlines and such.
@@ -534,6 +538,16 @@ function flush_mononoke_bookmarks {
 
 function force_update_configerator {
   sslcurl -X POST -fsS "https://localhost:$MONONOKE_SOCKET/control/force_update_configerator"
+}
+
+# We can't use the "with client certs" option everywhere
+# because it breaks connecting to ephemeral mysql instances.
+function start_and_wait_for_mononoke_server_with_client_certs {
+    THRIFT_TLS_CL_CA_PATH="$TEST_CERTDIR/root-ca.crt" \
+    THRIFT_TLS_CL_CERT_PATH="$TEST_CERTDIR/proxy.crt" \
+    THRIFT_TLS_CL_KEY_PATH="$TEST_CERTDIR/proxy.key" \
+    mononoke "$@"
+    wait_for_mononoke
 }
 
 function start_and_wait_for_mononoke_server {
@@ -929,7 +943,6 @@ function setup_mononoke_repo_config {
   mkdir -p "repo_definitions/$reponame_urlencoded"
   mkdir -p "$TESTTMP/monsql"
   mkdir -p "$TESTTMP/$reponame_urlencoded"
-  mkdir -p "$TESTTMP/traffic-replay-blobstore"
   cat > "repos/$reponame_urlencoded/server.toml" <<CONFIG
 hash_validation_percentage=100
 CONFIG

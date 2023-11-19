@@ -8,9 +8,9 @@ import re
 import time
 from dataclasses import dataclass
 
-from sapling import error, mdiff, registrar, scmutil
+from sapling import error, mdiff, registrar, scmutil, ui
 from sapling.i18n import _
-from sapling.simplemerge import Merge3Text, render_minimized
+from sapling.simplemerge import Merge3Text, render_mergediff2, render_minimized
 
 cmdtable = {}
 command = registrar.command(cmdtable)
@@ -25,10 +25,10 @@ class SmartMerge3Text(Merge3Text):
     """
 
     def __init__(self, basetext, atext, btext):
-        automerge_algos = ["adjacent-changes", "common-changes"]
-        Merge3Text.__init__(
-            self, basetext, atext, btext, automerge_algos=automerge_algos
-        )
+        lui = ui.ui()
+        lui.setconfig("automerge", "mode", "accept")
+        lui.setconfig("automerge", "merge-algos", "adjacent-changes,subset-changes")
+        Merge3Text.__init__(self, basetext, atext, btext, ui=lui)
 
 
 @dataclass
@@ -53,7 +53,7 @@ def debugsmerge(ui, repo, *args, **opts):
 
     desttext, srctext, basetext = [readfile(p) for p in args]
     m3 = SmartMerge3Text(basetext, desttext, srctext)
-    lines = render_mergediff2(m3, b"dest", b"source")[0]
+    lines = render_mergediff2(m3, b"dest", b"source", b"base")[0]
     mergedtext = b"".join(lines)
     ui.fout.write(mergedtext)
 
@@ -99,7 +99,7 @@ def sresolve(ui, repo, *args, **opts):
     else:
         m3 = Merge3Text(basetext, desttext, srctext)
 
-    mergedtext = b"".join(render_mergediff2(m3, b"dest", b"source")[0])
+    mergedtext = b"".join(render_mergediff2(m3, b"dest", b"source", b"base")[0])
 
     if output := opts.get("output"):
         ui.write(f"writing to file: {output}\n")
@@ -301,52 +301,6 @@ def unidiff(atext, btext, filepath="") -> bytes:
     for hunk in hunks:
         result.append(b"".join(hunk[1]))
     return b"\n".join(result)
-
-
-def render_mergediff2(m3, name_a, name_b):
-    lines = []
-    conflicts = False
-    for what, group_lines in m3.merge_groups():
-        if what == "conflict":
-            base_lines, a_lines, b_lines = group_lines
-            basetext = b"".join(base_lines)
-            bblocks = list(
-                mdiff.allblocks(
-                    basetext,
-                    b"".join(b_lines),
-                    lines1=base_lines,
-                    lines2=b_lines,
-                )
-            )
-            ablocks = list(
-                mdiff.allblocks(
-                    basetext,
-                    b"".join(a_lines),
-                    lines1=base_lines,
-                    lines2=b_lines,
-                )
-            )
-
-            def difflines(blocks, lines1, lines2):
-                for block, kind in blocks:
-                    if kind == "=":
-                        for line in lines1[block[0] : block[1]]:
-                            yield b" " + line
-                    else:
-                        for line in lines1[block[0] : block[1]]:
-                            yield b"-" + line
-                        for line in lines2[block[2] : block[3]]:
-                            yield b"+" + line
-
-            lines.append(b"<<<<<<< %s\n" % name_a)
-            lines.extend(difflines(ablocks, base_lines, a_lines))
-            lines.append(b"=======\n")
-            lines.extend(difflines(bblocks, base_lines, b_lines))
-            lines.append(b">>>>>>> %s\n" % name_b)
-            conflicts = True
-        else:
-            lines.extend(group_lines)
-    return lines, conflicts
 
 
 def readfile(path):

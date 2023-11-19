@@ -13,9 +13,7 @@ use std::str::FromStr;
 use anyhow::anyhow;
 use anyhow::Context;
 use async_runtime::spawn;
-use async_runtime::spawn_blocking;
 use cxx::UniquePtr;
-use futures::StreamExt;
 use manifest::FileMetadata;
 use manifest::FsNodeMetadata;
 use manifest::Manifest;
@@ -27,7 +25,6 @@ use sparse::Matcher;
 use sparse::Root;
 use tokio::sync::Mutex;
 use types::HgId;
-use types::Key;
 use types::RepoPath;
 use types::RepoPathBuf;
 
@@ -211,36 +208,29 @@ async fn _profile_contents_from_repo(
     // Get the metadata of the filter file and verify it's a valid file.
     let p = id.repo_path.clone();
 
-    let metadata = spawn_blocking(move || tree_manifest.get(&p)).await??;
-    let file_id = match metadata {
-        None => {
-            return Err(anyhow!("{:?} is not a valid filter file", id.repo_path));
-        }
-        Some(fs_node) => match fs_node {
-            FsNodeMetadata::File(FileMetadata { hgid, .. }) => hgid,
-            FsNodeMetadata::Directory(_) => {
-                return Err(anyhow!(
-                    "{:?} is a directory, not a valid filter file",
-                    id.repo_path
-                ));
+    let matcher = async_runtime::block_in_place(|| -> anyhow::Result<_> {
+        let metadata = tree_manifest.get(&p)?;
+        let file_id = match metadata {
+            None => {
+                return Err(anyhow!("{:?} is not a valid filter file", id.repo_path));
             }
-        },
-    };
+            Some(fs_node) => match fs_node {
+                FsNodeMetadata::File(FileMetadata { hgid, .. }) => hgid,
+                FsNodeMetadata::Directory(_) => {
+                    return Err(anyhow!(
+                        "{:?} is a directory, not a valid filter file",
+                        id.repo_path
+                    ));
+                }
+            },
+        };
 
-    // TODO(cuev): Is there a better way to do this?
-    let mut stream = repo_store
-        .get_content_stream(vec![Key::new(id.repo_path.clone(), file_id)])
-        .await;
-    match stream.next().await {
-        Some(Ok((bytes, _key))) => {
-            let bytes = bytes.into_vec();
-            let root = Root::from_bytes(bytes, id.repo_path.to_string()).unwrap();
-            let matcher = root.matcher(|_| async move { Ok(Some(vec![])) }).await?;
-            Ok(Box::new(MercurialMatcher { matcher }))
-        }
-        Some(Err(err)) => Err(err),
-        None => Err(anyhow!("no contents for filter file {}", &id.repo_path)),
-    }
+        let data = repo_store.get_content(&id.repo_path, file_id)?;
+        let root = Root::from_bytes(data, id.repo_path.to_string())?;
+        let matcher = root.matcher(|_| Ok(Some(vec![])))?;
+        Ok(matcher)
+    })?;
+    Ok(Box::new(MercurialMatcher { matcher }))
 }
 
 // CXX doesn't allow async functions to be exposed to C++. This function wraps the bulk of the

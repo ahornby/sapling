@@ -262,8 +262,20 @@ def comparechunks(chunks, headers):
     return newpatch.getvalue() == originalpatch.getvalue()
 
 
+class AliasList(list):
+    """Like "list" but provides a "documented" API to hide "undocumented" aliases"""
+
+    _raw = ""
+
+    def documented(self):
+        """documented aliases"""
+        return self._raw.lstrip("^").split("||", 1)[0].split("|")
+
+
 def parsealiases(cmd):
-    return cmd.lstrip("^").split("|")
+    aliases = AliasList(s for s in cmd.lstrip("^").split("|") if s)
+    aliases._raw = cmd
+    return aliases
 
 
 def setupwrapcolorwrite(ui):
@@ -1999,8 +2011,6 @@ class changeset_printer:
         self.ui.write(columns["user"] % ctx.user(), label="log.user")
         self.ui.write(columns["date"] % util.datestr(ctx.date()), label="log.date")
 
-        self._exthook(ctx)
-
         if self.ui.debugflag:
             files = ctx.p1().status(ctx)[:3]
             for key, value in zip(["files", "files+", "files-"], files):
@@ -2040,9 +2050,6 @@ class changeset_printer:
         self.ui.write("\n")
 
         self.showpatch(ctx, matchfn, hunksfilterfn=hunksfilterfn)
-
-    def _exthook(self, ctx):
-        """empty method used by extension as a hook point"""
 
     def showpatch(self, ctx, matchfn, hunksfilterfn=None):
         if not matchfn:
