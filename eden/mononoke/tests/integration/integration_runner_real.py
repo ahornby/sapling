@@ -4,6 +4,8 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
+# pyre-unsafe
+
 """Runner for Mononoke/Mercurial integration tests."""
 
 import json
@@ -172,6 +174,7 @@ def _hg_runner(
                 # non-utf8 data will result in "Illegal byte sequence" error.
                 # That is why we are forcing the "C" locale.
                 "HGTEST_LOCALE": "C",
+                "DEBUGRUNTEST_DEFAULT_DISABLED": "1",
                 "PYTHON_SYS_EXECUTABLE": manifest_env["BINARY_HGPYTHON"],
             }
         )
@@ -268,7 +271,7 @@ def run_tests(
 
     success = True
 
-    for (prefix, runner, tests) in work:
+    for prefix, runner, tests in work:
         args = list(test_flags.runner_args())
 
         if xunit_output is not None:

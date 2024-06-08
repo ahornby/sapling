@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
   $ setconfig experimental.allowfilepeer=True
 
   $ setconfig experimental.rebase-long-labels=True

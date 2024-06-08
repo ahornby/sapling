@@ -7,13 +7,12 @@
 
 import './SplitDiffHunk.css';
 
-import type {SplitDiffTableProps} from './SplitDiffHunk';
 import type {Context} from './types';
 import type {ParsedDiff} from 'shared/patch/parse';
 
 import {generatedStatusDescription} from '../../GeneratedFile';
 import {Tooltip} from '../../Tooltip';
-import {T} from '../../i18n';
+import {T, t} from '../../i18n';
 import platform from '../../platform';
 import {GeneratedStatus} from '../../types';
 import {FileHeader, diffTypeToIconType} from './SplitDiffFileHeader';
@@ -36,11 +35,6 @@ export function SplitDiffView({
   const fileName = patch.newFileName ?? patch.oldFileName ?? '/dev/null';
   // whether the file is manually or automatically collapsed by the chevron
   const collapsed = ctx.collapsed;
-
-  // Type hack to get a templatized version of a React.memo-ized component
-  const TypedSplitDiffTable = SplitDiffTable as unknown as React.FC<SplitDiffTableProps>;
-
-  const t = ctx.translate ?? (s => s);
 
   const isGenerated = generatedStatus != null && generatedStatus === GeneratedStatus.Generated;
   // whether the file content is collapsed due to being generated
@@ -100,9 +94,7 @@ export function SplitDiffView({
         fileActions={fileActions}
       />
       {!collapsed && preamble && <div className="split-diff-view-file-preamble">{preamble}</div>}
-      {!collapsed && !isContentCollapsed && (
-        <TypedSplitDiffTable ctx={ctx} path={path} patch={patch} />
-      )}
+      {!collapsed && !isContentCollapsed && <SplitDiffTable ctx={ctx} path={path} patch={patch} />}
     </div>
   );
 }

@@ -6,11 +6,11 @@
  */
 
 import type {MouseEvent, ReactNode} from 'react';
-import type {TypedEventEmitter} from 'shared/TypedEventEmitter';
 import type {ExclusiveOr} from 'shared/typeUtils';
 
+import {ViewportOverlay} from './ViewportOverlay';
 import React, {useLayoutEffect, useEffect, useRef, useState} from 'react';
-import ReactDOM from 'react-dom';
+import {TypedEventEmitter} from 'shared/TypedEventEmitter';
 import {findParentWithClassName} from 'shared/utils';
 import {getZoomLevel} from 'shared/zoom';
 
@@ -23,7 +23,18 @@ export type Placement = 'top' | 'bottom' | 'left' | 'right';
  */
 export const DOCUMENTATION_DELAY = 750;
 
+const tooltipGroups: Map<string, TypedEventEmitter<'change', HTMLDivElement>> = new Map();
+function getTooltipGroup(group: string): TypedEventEmitter<'change', HTMLDivElement> {
+  let found = tooltipGroups.get(group);
+  if (found == null) {
+    found = new TypedEventEmitter();
+    tooltipGroups.set(group, found);
+  }
+  return found;
+}
+
 type TooltipProps = {
+  inline?: boolean;
   children: ReactNode;
   placement?: Placement;
   /**
@@ -49,6 +60,9 @@ type TooltipProps = {
     trigger: 'click';
     component: (dismiss: () => void) => JSX.Element;
     title?: string | React.ReactNode;
+    /** If provided, opening this tooltip will close all other tooltips using the same group */
+    group?: string;
+    /** TypedEventEmitter that allows external callers to toggle this tooltip */
     additionalToggles?: TypedEventEmitter<'change', unknown> | TypedEventEmitter<'change', null>;
   }
 >;
@@ -91,7 +105,10 @@ export function Tooltip({
   shouldShow,
   onDismiss,
   additionalToggles,
+  group,
+  inline: inlineProp,
 }: TooltipProps) {
+  const inline = inlineProp ?? false;
   const trigger = triggerProp ?? 'hover';
   const placement = placementProp ?? 'top';
   const [visible, setVisible] = useState<VisibleState>(false);
@@ -143,6 +160,23 @@ export function Tooltip({
     };
   }, [additionalToggles]);
 
+  useEffect(() => {
+    if (group) {
+      const hide = (clickedOn: HTMLDivElement) => {
+        if (clickedOn === ref.current) {
+          // don't hide the tooltip we're trying to show right now
+          return;
+        }
+        setVisible(false);
+      };
+      const found = getTooltipGroup(group);
+      found.on('change', hide);
+      return () => {
+        found?.off('change', hide);
+      };
+    }
+  }, [group]);
+
   // scrolling or resizing the window should hide all tooltips to prevent lingering.
   useEffect(() => {
     if (visible) {
@@ -192,12 +226,17 @@ export function Tooltip({
 
   return (
     <div
-      className="tooltip-creator"
+      className={inline ? 'tooltip-creator-inline' : 'tooltip-creator'}
       ref={ref}
       onClick={
         trigger === 'click'
           ? (event: MouseEvent) => {
               if (visible !== true || !eventIsFromInsideTooltip(event)) {
+                if (group != null) {
+                  // close other tooltips in the same group before opening
+                  const found = getTooltipGroup(group);
+                  found.emit('change', ref.current as HTMLDivElement);
+                }
                 setVisible(vis => vis !== true);
                 // don't trigger global click listener in the same tick
                 event.stopPropagation();
@@ -285,50 +324,25 @@ function RenderTooltipOnto({
   // rather than as a descendant of the tooltip creator.
   // This allows us to use absolute coordinates for positioning, and for
   // tooltips to "escape" their containing elements, scroll, inherited styles, etc.
-  return ReactDOM.createPortal(
-    <div
-      ref={tooltipRef}
-      role="tooltip"
-      className={
-        `tooltip tooltip-${effectivePlacement}` +
-        (typeof children === 'string' ? ' simple-text-tooltip' : '')
-      }
-      style={style}>
-      <div
-        className={`tooltip-arrow tooltip-arrow-${effectivePlacement}`}
-        // If we had to push the tooltip back to prevent overflow,
-        // we also need to move the arrow the opposite direction so it still lines up.
-        style={{transform: `translate(${-viewportAdjust.left}px, ${-viewportAdjust.top}px)`}}
-      />
-      {children}
-    </div>,
-    getTooltipContainer(),
-  );
-}
-
-let cachedRoot: HTMLElement | undefined;
-const getTooltipContainer = (): HTMLElement => {
-  if (cachedRoot) {
-    // memoize since our root component won't change
-    return cachedRoot;
-  }
-  throw new Error(
-    'TooltipRootContainer not found. Make sure you render it at the root of the tree.',
-  );
-};
-
-export function TooltipRootContainer() {
-  const rootRef = useRef<HTMLDivElement | null>(null);
-  useEffect(() => {
-    if (rootRef.current) {
-      cachedRoot = rootRef.current;
-    }
-    return () => {
-      cachedRoot = undefined;
-    };
-  }, []);
   return (
-    <div ref={rootRef} className="tooltip-root-container" data-testid="tooltip-root-container" />
+    <ViewportOverlay>
+      <div
+        ref={tooltipRef}
+        role="tooltip"
+        className={
+          `tooltip tooltip-${effectivePlacement}` +
+          (typeof children === 'string' ? ' simple-text-tooltip' : '')
+        }
+        style={style}>
+        <div
+          className={`tooltip-arrow tooltip-arrow-${effectivePlacement}`}
+          // If we had to push the tooltip back to prevent overflow,
+          // we also need to move the arrow the opposite direction so it still lines up.
+          style={{transform: `translate(${-viewportAdjust.left}px, ${-viewportAdjust.top}px)`}}
+        />
+        {children}
+      </div>
+    </ViewportOverlay>
   );
 }
 

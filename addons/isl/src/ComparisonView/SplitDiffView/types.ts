@@ -5,36 +5,24 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-import type {RecoilValueReadOnly} from 'recoil';
 import type {Comparison} from 'shared/Comparison';
-
-export type LineRangeParams<Id> = {
-  // 1-based line number.
-  start: number;
-  numLines: number;
-  id: Id;
-};
 
 /**
  * Context used to render SplitDiffView
  */
 export type Context = {
-  /**
-   * Arbitrary identifying information for a given SplitDiffView, usually
-   * information like a hash or revset + path.
-   */
   id: {path: string; comparison: Comparison};
-  atoms: {
-    lineRange: (
-      params: LineRangeParams<{path: string; comparison: Comparison}>,
-    ) => RecoilValueReadOnly<Array<string>>;
-  };
-  translate?: (s: string) => string;
   copy?: (s: string) => void;
   openFile?: () => unknown;
   openFileToLine?: (line: OneIndexedLineNumber) => unknown;
   collapsed: boolean;
   setCollapsed: (collapsed: boolean) => void;
+  supportsExpandingContext: boolean;
+  /**
+   * Whether to render as a side-by-side diff view, or a unified view where deleted and added lines are interleaved.
+   * TODO: make this controllable / configurable / responsive based on screen width
+   */
+  display: 'split' | 'unified';
 };
 
 export type OneIndexedLineNumber = Exclude<number, 0>;

@@ -13,14 +13,14 @@
 #include <folly/String.h>
 #include <folly/io/Cursor.h>
 #include <folly/io/IOBuf.h>
-#include <folly/json.h>
+#include <folly/json/json.h>
 #include <optional>
 
-#include "eden/fs/utils/FileUtils.h"
+#include "eden/common/utils/FileUtils.h"
+#include "eden/common/utils/PathMap.h"
+#include "eden/common/utils/SystemError.h"
+#include "eden/common/utils/Throw.h"
 #include "eden/fs/utils/FilterUtils.h"
-#include "eden/fs/utils/PathMap.h"
-#include "eden/fs/utils/SystemError.h"
-#include "eden/fs/utils/Throw.h"
 
 using folly::ByteRange;
 using folly::IOBuf;

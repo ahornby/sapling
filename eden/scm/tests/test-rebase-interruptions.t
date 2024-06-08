@@ -1,3 +1,7 @@
+#modern-config-incompatible
+
+#require no-eden
+
 #chg-compatible
   $ setconfig experimental.allowfilepeer=True
 

@@ -8,10 +8,11 @@
 #include "folly/portability/Windows.h"
 
 #include <ProjectedFSLib.h> // @manual
+
+#include "eden/common/utils/ImmediateFuture.h"
+#include "eden/common/utils/PathFuncs.h"
 #include "eden/fs/inodes/RequestContext.h"
 #include "eden/fs/prjfs/PrjfsChannel.h"
-#include "eden/fs/utils/ImmediateFuture.h"
-#include "eden/fs/utils/PathFuncs.h"
 
 namespace facebook::eden {
 
@@ -43,6 +44,10 @@ class PrjfsRequestContext : public RequestContext {
                 ProcessId{prjfsData.TriggeringProcessId})),
         channel_(std::move(channel)),
         commandId_(prjfsData.CommandId) {}
+
+  folly::ReadMostlyWeakPtr<PrjfsChannelInner> getChannelForAsyncUse() {
+    return folly::ReadMostlyWeakPtr<PrjfsChannelInner>{channel_};
+  }
 
   ImmediateFuture<folly::Unit> catchErrors(ImmediateFuture<folly::Unit>&& fut) {
     return std::move(fut).thenTry([this](folly::Try<folly::Unit>&& try_) {

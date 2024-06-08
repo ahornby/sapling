@@ -44,6 +44,7 @@ from . import (
     pycompat,
     registrar,
     scmutil,
+    tracing,
     ui as uimod,
     util,
 )
@@ -51,7 +52,7 @@ from .i18n import _, _x
 
 
 cliparser = bindings.cliparser
-rsconfig = bindings.configloader.config
+rscontext = bindings.context.context
 
 
 unrecoverablewrite = registrar.command.unrecoverablewrite
@@ -140,11 +141,11 @@ class request:
                 raise exc
 
 
-def run(args, fin, fout, ferr, rcfg: rsconfig, skipprehooks: bool):
+def run(args, fin, fout, ferr, rctx: rscontext, skipprehooks: bool):
     "run the command in sys.argv"
     _initstdio()
 
-    ui = uimod.ui(rcfg=rcfg)
+    ui = uimod.ui(rctx=rctx)
 
     if not ui or ui.configbool("experimental", "mercurial-shim", True):
         from . import mercurialshim
@@ -354,7 +355,11 @@ def dispatch(req):
 
             if metrics:
                 # developer config: devel.print-metrics
-                if ui.configbool("devel", "print-metrics"):
+
+                # This used to be a bool, but I changed it to a prefix list. Keep previous
+                # behavior around by using empty prefix to mean print everything.
+                prefix = ui.config("devel", "print-metrics")
+                if prefix == "":
                     # Print it out.
                     msg = "%s\n" % pformat({"metrics": metrics}).replace("'", " ")
                     ui.flush()
@@ -902,12 +907,15 @@ def _dispatch(req):
         for ui_ in uis:
             ui_.setconfig("profiling", "enabled", "true", "--profile")
 
+    if lui.configbool("experimental", "evalframe-passthrough"):
+        bindings.cext.evalframe_set_pass_through()
+
     with profiling.profile(lui) as profiler:
         # progress behavior might be changed by extensions
         progress.init()
         # Configure extensions in phases: uisetup, extsetup, cmdtable, and
         # reposetup
-        extensions.loadall(lui)
+        extensions.initialload(lui)
         # Propagate any changes to lui.__class__ by extensions
         ui.__class__ = lui.__class__
 
@@ -931,6 +939,9 @@ def _dispatch(req):
         fullargs = args
 
         cmd, func, args, options, cmdoptions, foundaliases = _parse(lui, args)
+
+        tracing.debug(target="command_info", command=cmd)
+
         lui.cmdname = ui.cmdname = cmd
         lui.cmdtype = ui.cmdtype = getattr(func, "cmdtype", None)
 
@@ -1086,10 +1097,6 @@ def _dispatch(req):
             elif rpath:
                 ui.warn(_("warning: --repository ignored\n"))
 
-            from . import match as matchmod, mdiff
-
-            mdiff.init(ui)
-
             ui.log("command", "%s\n", msg)
             if repo:
                 repo.dirstate.loginfo(ui, "pre")
@@ -1157,6 +1164,7 @@ def _exceptionwarning(ui):
     return _("** @LongProduct@ (version %s) has crashed:\n") % util.version()
 
 
+# NB: handlecommandexception() is replaced by the errorredirect extension.
 def handlecommandexception(ui):
     """Produce a warning message for broken commands
 

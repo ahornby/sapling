@@ -9,26 +9,53 @@ import type {CommitInfo} from '../types';
 import type {CommitInfoMode} from './CommitInfoState';
 import type {CommitMessageFields, FieldConfig} from './types';
 
-import {globalRecoil} from '../AccessGlobalRecoil';
+import {FlexSpacer} from '../ComponentUtils';
+import {Internal} from '../Internal';
 import {DOCUMENTATION_DELAY, Tooltip} from '../Tooltip';
 import {tracker} from '../analytics';
+import {Button} from '../components/Button';
 import {LinkButton} from '../components/LinkButton';
 import {T, t} from '../i18n';
+import {readAtom, writeAtom} from '../jotaiUtils';
+import foundPlatform from '../platform';
 import {dagWithPreviews} from '../previews';
 import {layout} from '../stylexUtils';
 import {font, spacing} from '../tokens.stylex';
 import {useModal} from '../useModal';
-import {commitMessageTemplate, editedCommitMessages} from './CommitInfoState';
+import {
+  getDefaultEditedCommitMessage,
+  commitMessageTemplate,
+  editedCommitMessages,
+} from './CommitInfoState';
 import {
   parseCommitMessageFields,
   commitMessageFieldsSchema,
   mergeCommitMessageFields,
   findConflictingFieldsWhenMerging,
+  mergeOnlyEmptyMessageFields,
 } from './CommitMessageFields';
 import {SmallCapsTitle} from './utils';
 import * as stylex from '@stylexjs/stylex';
-import {useRecoilCallback} from 'recoil';
+import {useCallback} from 'react';
+import {useContextMenu} from 'shared/ContextMenu';
 import {Icon} from 'shared/Icon';
+
+/**
+ * The last entry in a tokenized field value is used as the value being typed in the editor.
+ * When filling, we want all the values to be tokens and not inserted to the editors.
+ * Add empty entries at the end of all tokenized fields to force tokens.
+ */
+function forceTokenizeAllFields(fields: CommitMessageFields): CommitMessageFields {
+  const result: CommitMessageFields = {};
+  for (const [key, value] of Object.entries(fields)) {
+    if (Array.isArray(value)) {
+      result[key] = value.length > 0 && value.at(-1) ? [...value, ''] : value;
+    } else {
+      result[key] = value;
+    }
+  }
+  return result;
+}
 
 const fillCommitMessageMethods: Array<{
   label: string;
@@ -42,8 +69,8 @@ const fillCommitMessageMethods: Array<{
     label: t('last commit'),
     tooltip: t("Fill in the previous commit's message here."),
     getMessage: (commit: CommitInfo, mode: CommitInfoMode) => {
-      const schema = globalRecoil().getLoadable(commitMessageFieldsSchema).valueMaybe();
-      const dag = globalRecoil().getLoadable(dagWithPreviews).valueMaybe();
+      const schema = readAtom(commitMessageFieldsSchema);
+      const dag = readAtom(dagWithPreviews);
       if (!dag || !schema) {
         return undefined;
       }
@@ -53,7 +80,13 @@ const fillCommitMessageMethods: Array<{
       if (!parent) {
         return undefined;
       }
-      return parseCommitMessageFields(schema, parent.title, parent.description);
+      const fields = parseCommitMessageFields(schema, parent.title, parent.description);
+
+      if (Internal.diffFieldTag) {
+        // don't fill in diff field, so we don't conflict with a previous diff
+        delete fields[Internal.diffFieldTag];
+      }
+      return forceTokenizeAllFields(fields);
     },
   },
   {
@@ -62,62 +95,79 @@ const fillCommitMessageMethods: Array<{
       'Fill in your configured commit message template.\nSee `sl help config` for more information.',
     ),
     getMessage: (_commit: CommitInfo, _mode: CommitInfoMode) => {
-      const template = globalRecoil().getLoadable(commitMessageTemplate).valueMaybe();
-      return template?.fields as CommitMessageFields | undefined;
+      const template = readAtom(commitMessageTemplate);
+      return template as CommitMessageFields | undefined;
     },
   },
 ];
 
 export function FillCommitMessage({commit, mode}: {commit: CommitInfo; mode: CommitInfoMode}) {
   const showModal = useModal();
-  const fillMessage = useRecoilCallback(
-    ({set, snapshot}) =>
-      async (newMessage: CommitMessageFields) => {
-        const hashOrHead = mode === 'commit' ? 'head' : commit.hash;
-        // TODO: support amending a message
-
-        const schema = snapshot.getLoadable(commitMessageFieldsSchema).valueMaybe();
-        const existing = snapshot.getLoadable(editedCommitMessages(hashOrHead)).valueMaybe();
-        if (existing?.type === 'optimistic' || schema == null) {
-          return;
-        }
-        if (existing == null) {
-          set(editedCommitMessages(hashOrHead), {fields: newMessage});
-          return;
-        }
-        const oldMessage = existing.fields as CommitMessageFields;
-        const buttons = [
-          {label: t('Cancel')},
-          {label: t('Overwrite')},
-          {label: t('Merge'), primary: true},
-        ] as const;
-        let answer: (typeof buttons)[number] | undefined = buttons[2]; // merge if no conflicts
-        const conflictingFields = findConflictingFieldsWhenMerging(schema, oldMessage, newMessage);
-        if (conflictingFields.length > 0) {
-          answer = await showModal({
-            type: 'confirm',
-            title: t('Commit Messages Conflict'),
-            icon: 'warning',
-            message: (
-              <MessageConflictWarning
-                conflictingFields={conflictingFields}
-                oldMessage={oldMessage}
-                newMessage={newMessage}
-              />
-            ),
-            buttons,
-          });
-        }
-        if (answer === buttons[2]) {
-          // TODO: T177275949 should we warn about conflicts instead of just merging?
-          const merged = mergeCommitMessageFields(schema, oldMessage, newMessage);
-          set(editedCommitMessages(hashOrHead), {fields: merged});
-          return;
-        } else if (answer === buttons[1]) {
-          set(editedCommitMessages(hashOrHead), {fields: newMessage});
-          return;
+  const menu = useContextMenu(() => [
+    {
+      label: t('Clear commit message'),
+      onClick: async () => {
+        const confirmed = await foundPlatform.confirm(
+          t('Are you sure you want to clear the currently edited commit message?'),
+        );
+        if (confirmed) {
+          writeAtom(editedCommitMessages('head'), {});
         }
       },
+    },
+  ]);
+  const fillMessage = useCallback(
+    async (newMessage: CommitMessageFields) => {
+      const hashOrHead = mode === 'commit' ? 'head' : commit.hash;
+      // TODO: support amending a message
+
+      const schema = readAtom(commitMessageFieldsSchema);
+      const existing = readAtom(editedCommitMessages(hashOrHead));
+      if (schema == null) {
+        return;
+      }
+      if (existing == null) {
+        writeAtom(editedCommitMessages(hashOrHead), getDefaultEditedCommitMessage());
+        return;
+      }
+      const oldMessage = existing as CommitMessageFields;
+      const buttons = [
+        {label: t('Cancel')},
+        {label: t('Overwrite')},
+        {label: t('Merge')},
+        {label: t('Only Fill Empty'), primary: true},
+      ] as const;
+      let answer: (typeof buttons)[number] | undefined = buttons[2]; // merge if no conflicts
+      const conflictingFields = findConflictingFieldsWhenMerging(schema, oldMessage, newMessage);
+      if (conflictingFields.length > 0) {
+        answer = await showModal({
+          type: 'confirm',
+          title: t('Commit Messages Conflict'),
+          icon: 'warning',
+          message: (
+            <MessageConflictWarning
+              conflictingFields={conflictingFields}
+              oldMessage={oldMessage}
+              newMessage={newMessage}
+            />
+          ),
+          buttons,
+        });
+      }
+      if (answer === buttons[3]) {
+        const merged = mergeOnlyEmptyMessageFields(schema, oldMessage, newMessage);
+        writeAtom(editedCommitMessages(hashOrHead), merged);
+        return;
+      } else if (answer === buttons[2]) {
+        const merged = mergeCommitMessageFields(schema, oldMessage, newMessage);
+        writeAtom(editedCommitMessages(hashOrHead), merged);
+        return;
+      } else if (answer === buttons[1]) {
+        writeAtom(editedCommitMessages(hashOrHead), newMessage);
+        return;
+      }
+    },
+    [commit, mode, showModal],
   );
 
   const methods = (
@@ -152,6 +202,10 @@ export function FillCommitMessage({commit, mode}: {commit: CommitInfo; mode: Com
   return (
     <div {...stylex.props(layout.flexRow, styles.container)}>
       <T replace={{$methods: methods}}>Fill commit message from $methods</T>
+      <FlexSpacer />
+      <Button icon onClick={menu} data-testid="fill-commit-message-more-options">
+        <Icon icon="ellipsis" />
+      </Button>
     </div>
   );
 }
@@ -170,40 +224,49 @@ function MessageConflictWarning({
       <div>
         <T>The new commit message being loaded conflicts with your current message.</T>
       </div>
-      <div>
-        <T>Would you like to merge them or overwrite your current message with the new one?</T>
+      <div style={{maxWidth: '500px'}}>
+        <T>
+          Would you like to overwrite your current message with the new one, merge them, or only
+          fill fields that are empty in the current message?
+        </T>
       </div>
       <div style={{marginBlock: spacing.pad}}>
         <T>These fields are conflicting:</T>
       </div>
       <div>
-        {conflictingFields.map((field, i) => (
-          <div key={i} {...stylex.props(layout.paddingBlock)}>
-            <SmallCapsTitle>
-              <Icon icon={field.icon} />
-              {field.key}
-            </SmallCapsTitle>
-            <div {...stylex.props(layout.flexRow)}>
-              <b>
-                <T>Current:</T>
-              </b>
-              <Truncate>{oldMessage[field.key]}</Truncate>
+        {conflictingFields.map((field, i) => {
+          const oldValue = oldMessage[field.key];
+          const newValue = newMessage[field.key];
+          return (
+            <div key={i} {...stylex.props(layout.paddingBlock)}>
+              <SmallCapsTitle>
+                <Icon icon={field.icon} />
+                {field.key}
+              </SmallCapsTitle>
+              <div {...stylex.props(layout.flexRow)}>
+                <b>
+                  <T>Current:</T>
+                </b>
+                <Truncate>{oldValue}</Truncate>
+              </div>
+              <div {...stylex.props(layout.flexRow)}>
+                <b>
+                  <T>New:</T>
+                </b>
+                <Truncate>{newValue}</Truncate>
+              </div>
             </div>
-            <div {...stylex.props(layout.flexRow)}>
-              <b>
-                <T>New:</T>
-              </b>
-              <Truncate>{newMessage[field.key]}</Truncate>
-            </div>
-          </div>
-        ))}
+          );
+        })}
       </div>
     </div>
   );
 }
 
 function Truncate({children}: {children: string | Array<string>}) {
-  const content = Array.isArray(children) ? children.join(', ') : children;
+  const content = Array.isArray(children)
+    ? children.filter(v => v.trim() !== '').join(', ')
+    : children;
   return (
     <span {...stylex.props(styles.truncate)} title={content}>
       {content}
@@ -215,8 +278,9 @@ const styles = stylex.create({
   container: {
     padding: spacing.half,
     paddingInline: spacing.pad,
+    paddingBottom: 0,
     gap: spacing.half,
-    alignItems: 'baseline',
+    alignItems: 'center',
     fontSize: font.small,
     marginInline: spacing.pad,
     marginTop: spacing.half,

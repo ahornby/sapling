@@ -72,6 +72,8 @@ pub const NULL_ID: HgId = HgId::from_byte_array([0; HgId::len()]);
 /// The hard-coded 'working copy parent' Mercurial id.
 pub const WDIR_ID: HgId = HgId::from_byte_array([0xff; HgId::len()]);
 
+pub const WDIR_REV: i64 = i64::MAX;
+
 /// The hard-coded 'pending file add' manifest node id.
 pub const MF_ADDED_NODE_ID: HgId = HgId::from_byte_array([
     b'0', b'0', b'0', b'0', b'0', b'0', b'0', b'0', b'0', b'0', b'0', b'0', b'0', b'0', b'0', b'a',
@@ -82,6 +84,12 @@ pub const MF_ADDED_NODE_ID: HgId = HgId::from_byte_array([
 pub const MF_MODIFIED_NODE_ID: HgId = HgId::from_byte_array([
     b'0', b'0', b'0', b'0', b'0', b'0', b'0', b'0', b'0', b'0', b'0', b'0', b'm', b'o', b'd', b'i',
     b'f', b'i', b'e', b'd',
+]);
+
+/// The hard-coded 'untracked file' manifest node id.
+pub const MF_UNTRACKED_NODE_ID: HgId = HgId::from_byte_array([
+    b'0', b'0', b'0', b'0', b'0', b'0', b'0', b'0', b'0', b'0', b'0', b'u', b'n', b't', b'r', b'a',
+    b'c', b'k', b'e', b'd',
 ]);
 
 impl HgId {

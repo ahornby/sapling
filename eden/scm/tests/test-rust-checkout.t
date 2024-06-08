@@ -1,6 +1,4 @@
-#debugruntest-compatible
 
-  $ configure modernclient
   $ setconfig checkout.use-rust=true
   $ setconfig experimental.nativecheckout=true
 
@@ -10,11 +8,21 @@
   >     # A/bar = bar
   > EOS
 
+#if eden
+
+Quick check for making sure this test is capable of using EdenFS
+  $ ls -a $TESTTMP/.eden-backing-repos
+  repo1
+
+#endif
+
+
 Unknown file w/ different content - conflict:
   $ echo nope > foo
   $ hg go $A
-  foo: untracked file differs
-  abort: untracked files in working directory differ from files in requested revision
+  abort: 1 conflicting file changes:
+   foo
+  (commit, shelve, goto --clean to discard all your changes, or goto --merge to merge them)
   [255]
 
 
@@ -46,7 +54,8 @@ Run it again to make sure we didn't clear out state file:
   [255]
 
   $ hg go --continue
-  abort: not in an interrupted goto state
+  abort: outstanding merge conflicts
+  (use 'hg resolve --list' to list, 'hg resolve --mark FILE' to mark resolved)
   [255]
 
   $ hg resolve --mark foo
@@ -79,7 +88,8 @@ Can continue interrupted checkout:
   [255]
 
   $ LOG=checkout=debug hg go -q --continue 2>&1 | grep skipped_count
-  DEBUG apply_store: checkout: skipped files based on progress skipped_count=3
+  DEBUG checkout:apply_store: checkout: skipped files based on progress skipped_count=3 (no-eden !)
+  DEBUG checkout:apply_store: checkout: skipped files based on progress skipped_count=0 (eden !)
   $ hg st
   $ tglog
   @  a19fc4bcafed 'A'
@@ -105,7 +115,7 @@ Don't fail with open files that can't be deleted:
     with open("unlink_fail/foo"), open("unlink_fail/bar"):
 
       $ hg go $B
-      update failed to remove foo: Can't remove file "*foo": The process cannot access the file because it is being used by another process. (os error 32)! (glob) (windows !)
+      update failed to remove foo: Can't remove file "*foo": The process cannot access the file because it is being used by another process. (os error 32)! (glob) (windows !) (no-eden !)
       2 files updated, 0 files merged, 1 files removed, 0 files unresolved
 
 
@@ -157,6 +167,7 @@ Various invalid arg combos:
   $ hg go $A
   abort: 1 conflicting file changes:
    foo
+  (commit, shelve, goto --clean to discard all your changes, or goto --merge to merge them)
   [255]
 
   $ echo untracked > bar
@@ -164,8 +175,10 @@ Various invalid arg combos:
   M foo
   ? bar
   $ hg go $A
-  bar: untracked file differs
-  abort: untracked files in working directory differ from files in requested revision
+  abort: 2 conflicting file changes:
+   bar
+   foo
+  (commit, shelve, goto --clean to discard all your changes, or goto --merge to merge them)
   [255]
 
   $ hg go -q --clean $A
@@ -196,6 +209,24 @@ Various invalid arg combos:
   $ cat foo
   two (no-eol)
 
+--clean doesn't delete added files:
+  $ newclientrepo
+  $ touch a b c d
+  $ hg commit -Aqm foo
+  $ touch foo
+  $ hg add foo
+  $ rm a
+  $ hg rm b
+  $ echo c > c
+  $ hg st
+  M c
+  A foo
+  R b
+  ! a
+  $ hg go -qC .
+  $ hg st
+  ? foo
+
 Non --clean keeps unconflicting changes:
   $ newclientrepo
   $ drawdag <<'EOS'
@@ -205,11 +236,18 @@ Non --clean keeps unconflicting changes:
   > EOS
   $ hg go -q $A
   $ echo foo >> A
+  $ touch foo
+  $ mkdir bar
+  $ echo bar > bar/bar
   $ hg st
   M A
+  ? bar/bar
+  ? foo
   $ hg go -q $B
   $ hg st
   M A
+  ? bar/bar
+  ? foo
 
 Update active bookmark
   $ newclientrepo
@@ -223,18 +261,18 @@ Update active bookmark
   cat: .hg/bookmarks.current: $ENOENT$
   [1]
   $ hg go BOOK_B
-  (activating bookmark BOOK_B)
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  (activating bookmark BOOK_B)
   $ cat .hg/bookmarks.current
   BOOK_B (no-eol)
   $ hg go BOOK_A
-  (changing active bookmark from BOOK_B to BOOK_A)
   0 files updated, 0 files merged, 1 files removed, 0 files unresolved
+  (changing active bookmark from BOOK_B to BOOK_A)
   $ cat .hg/bookmarks.current
   BOOK_A (no-eol)
   $ hg go $B
-  (leaving bookmark BOOK_A)
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
+  (leaving bookmark BOOK_A)
   $ cat .hg/bookmarks.current
   cat: .hg/bookmarks.current: $ENOENT$
   [1]
@@ -272,3 +310,169 @@ Support "preupdate" and "update" hooks:
   $ hg whereami
   426bada5c67598ca65036d57d9e4b64b0c1ce7a0
 #endif
+
+Test --check
+  $ newclientrepo
+  $ drawdag <<'EOS'
+  > A
+  > EOS
+  $ touch B
+  $ hg go --check -q $A
+  $ hg st
+  ? B
+  $ rm A
+  $ SL_LOG=checkout_info=debug hg go --check -q null
+  DEBUG checkout_info: checkout_mode="rust"
+  abort: uncommitted changes
+  [255]
+  $ hg go --clean --check -q null
+  abort: can only specify one of -C/--clean, -c/--check, or -m/--merge
+  [255]
+
+Bail on dir/path conflict with added file:
+  $ newclientrepo
+  $ drawdag <<'EOS'
+  > B  # B/dir/foo=foo
+  > |
+  > A
+  > EOS
+  $ hg go -q $A
+  $ touch dir
+  $ hg add dir
+TODO(sggutier): In this case EdenFS and non-EdenFS behavior differ, fix this later
+  $ hg go $B
+  abort: 1 conflicting file changes: (no-eden !)
+   dir (no-eden !)
+  (commit, shelve, goto --clean to discard all your changes, or goto --merge to merge them) (no-eden !)
+  abort: file metadata for dir not found at source commit (eden !)
+  [255]
+
+Bail on untracked file conflict only if contents differ:
+  $ newclientrepo
+  $ drawdag <<'EOS'
+  > B  # B/foo=foo\n
+  > |
+  > A
+  > EOS
+  $ hg go -q $A
+  $ echo bar > foo
+  $ hg go $B
+  abort: 1 conflicting file changes:
+   foo
+  (commit, shelve, goto --clean to discard all your changes, or goto --merge to merge them)
+  [255]
+  $ echo foo > foo
+  $ hg go -q $B
+
+Bail on untracked file path conflict:
+  $ newclientrepo
+  $ drawdag <<'EOS'
+  > B  # B/foo/bar=foo\n
+  > |
+  > A
+  > EOS
+  $ hg go -q $A
+  $ echo foo > foo
+TODO(sggutier): In this case EdenFS and non-EdenFS behavior differ, fix this later
+  $ hg go $B
+  abort: 1 conflicting file changes: (no-eden !)
+   foo (no-eden !)
+  (commit, shelve, goto --clean to discard all your changes, or goto --merge to merge them) (no-eden !)
+  abort: file metadata for foo not found at source commit (eden !)
+  [255]
+  $ rm foo
+  $ mkdir -p foo/bar
+  $ echo foo > foo/bar/baz
+TODO(sggutier): In this case EdenFS and non-EdenFS behavior differ, fix this later
+  $ hg go $B
+  abort: 1 conflicting file changes: (no-eden !)
+   foo/bar/baz (no-eden !)
+  (commit, shelve, goto --clean to discard all your changes, or goto --merge to merge them) (no-eden !)
+  [255] (no-eden !)
+  update complete (eden !)
+  $ hg go -q $B --config experimental.checkout.rust-path-conflicts=false
+  $ hg st
+  ! foo/bar (eden !)
+  ? foo/bar/baz (eden !)
+
+Deleted file replaced by untracked directory:
+  $ newclientrepo
+  $ drawdag <<'EOS'
+  > B  # B/foo=bar\n
+  > |
+  > A  # A/foo=foo\n
+  > EOS
+  $ hg go -q $A
+  $ rm foo
+  $ mkdir foo
+  $ echo foo > foo/bar
+  $ hg st
+  ! foo
+  ? foo/bar
+  $ hg go $B
+  abort: 1 conflicting file changes:
+   foo
+  (commit, shelve, goto --clean to discard all your changes, or goto --merge to merge them)
+  [255]
+  $ hg rm foo --mark
+  $ hg add foo/bar
+  $ hg st
+  A foo/bar
+  R foo
+  $ hg go $B
+  abort: 1 conflicting file changes:
+   foo
+  (commit, shelve, goto --clean to discard all your changes, or goto --merge to merge them)
+  [255]
+TODO(sggutier): This is yet another case of differing behavior between Eden and non-Eden
+  $ hg go -qC $B
+  $ hg st
+  ! foo (eden !)
+  ? foo/bar (eden !)
+
+#if no-eden
+Don't output too many conflicts. This behavior only occurs on non-EdenFS (no need to fix):
+  $ newclientrepo
+  $ drawdag <<'EOS'
+  > B  # B/foo=bar\n
+  > |
+  > A
+  > EOS
+  $ hg go -q $A
+  $ mkdir foo
+  $ for i in `seq 100`; do
+  >   touch foo/file$i
+  > done
+  $ hg go -q $B
+  abort: 100 conflicting file changes:
+   foo/file* (glob)
+   foo/file* (glob)
+   foo/file* (glob)
+   foo/file* (glob)
+   foo/file* (glob)
+   ...and 95 more
+  (commit, shelve, goto --clean to discard all your changes, or goto --merge to merge them)
+  [255]
+#endif
+
+Test update_distance logging:
+  $ newclientrepo
+  $ drawdag <<'EOS'
+  > C
+  > |
+  > B D
+  > |/
+  > A
+  > EOS
+  $ LOG=update_size=trace hg go -q $A
+   INFO update_size: update_distance=1
+  $ LOG=update_size=trace hg go -q $A
+   INFO update_size: update_distance=0
+  $ LOG=update_size=trace hg go -q $D
+   INFO update_size: update_distance=1
+  $ LOG=update_size=trace hg go -q $C
+   INFO update_size: update_distance=3
+  $ LOG=update_size=trace hg go -q $B
+   INFO update_size: update_distance=1
+  $ LOG=update_size=trace hg go -q null
+   INFO update_size: update_distance=2

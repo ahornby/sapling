@@ -64,6 +64,7 @@ import threading
 import time
 import unittest
 import xml.dom.minidom as minidom
+from pathlib import Path
 
 # If we're running in an embedded Python build, it won't add the test directory
 # to the path automatically, so let's add it manually.
@@ -103,6 +104,13 @@ except ImportError:
     buckpath = buckruletype = None
 
 from watchman import Watchman, WatchmanTimeout
+
+if os.environ.get("HGTEST_USE_EDEN", "0") == "1":
+    from edenfs import EdenFsManager
+
+    use_edenfs = True
+else:
+    use_edenfs = False
 
 if os.environ.get("RTUNICODEPEDANTRY", False):
     try:
@@ -190,6 +198,7 @@ else:
 
 # For Windows support
 wifexited = getattr(os, "WIFEXITED", lambda x: False)
+
 
 # Whether to use IPv6
 def checksocketfamily(name, port=20058):
@@ -367,7 +376,11 @@ def compatiblewithdebugruntest(path):
     """check whether a .t test is compatible with debugruntest"""
     try:
         with open(path, "r", encoding="utf8") as f:
-            return "#debugruntest-compatible" in f.read(1024)
+            contents = f.read(1024)
+            return "#debugruntest-compatible" in contents or (
+                os.environ.get("DEBUGRUNTEST_DEFAULT_DISABLED") != "1"
+                and "#debugruntest-incompatible" not in contents
+            )
     except IOError as ex:
         if ex.errno != errno.ENOENT:
             raise
@@ -1199,6 +1212,11 @@ class Test(unittest.TestCase):
                 self.tearDown()
                 raise RuntimeError("timed out waiting for watchman")
 
+        if use_edenfs:
+            shortname = hashlib.sha1(_bytespath("%s" % name)).hexdigest()[:6]
+            self._edenfsdir = Path(self._threadtmp) / f"{shortname}.edenfs"
+            self._edenfsmanager = EdenFsManager(self._edenfsdir)
+
     def run(self, result):
         """Run this test and report results against a TestResult instance."""
         # This function is extremely similar to unittest.TestCase.run(). Once
@@ -1365,6 +1383,17 @@ class Test(unittest.TestCase):
             except Exception:
                 pass
 
+        if use_edenfs:
+            try:
+                self._edenfsmanager.eden.kill()
+                if self._keeptmpdir:
+                    log(f"Keeping edenfs dir: {self._edenfsmanager.test_dir}\n")
+                else:
+                    self._edenfsmanager.eden.cleanup()
+                    shutil.rmtree(self._edenfsmanager.test_dir, ignore_errors=True)
+            except Exception:
+                pass
+
         if (
             (self._ret != 0 or self._out != self._refout)
             and not self._skipped
@@ -1419,6 +1448,11 @@ class Test(unittest.TestCase):
             ),
             # [ipv4]
             (rb"([^0-9])%s" % re.escape(_bytespath(self._localip())), rb"\1$LOCALIP"),
+            # localhost:port
+            (
+                rb"([^0-9])localhost:[0-9]+",
+                rb"\1localhost:$LOCAL_PORT",
+            ),
             (rb"\bHG_TXNID=TXN:[a-f0-9]{40}\b", rb"HG_TXNID=TXN:$ID$"),
         ]
         r.append((_bytespath(self._escapepath(self._testtmp)), b"$TESTTMP"))
@@ -1860,7 +1894,8 @@ class TTest(Test):
 
     def _computehghave(self, reqs):
         # TODO do something smarter when all other uses of hghave are gone.
-        runtestdir = os.path.abspath(os.path.dirname(__file__))
+        if (runtestdir := os.environ.get("RUNTESTDIR", None)) is None:
+            runtestdir = os.path.abspath(os.path.dirname(__file__))
         tdir = runtestdir.replace("\\", "/")
         proc = Popen4(
             '%s debugpython -- "%s/hghave" %s'
@@ -2278,6 +2313,9 @@ class DebugRunTestTest(Test):
         return os.path.join(self._testdir, self.basename)
 
     def _run(self, env):
+        if use_edenfs:
+            self._edenfsmanager.start(env)
+
         cmdargs = [
             self._hgcommand,
             "debugpython",
@@ -3031,7 +3069,12 @@ class TextTestRunner(unittest.TextTestRunner):
                     self.stream.write("\n")
                     # Also write the file names to temporary files.  So it can be
                     # used in adhoc scripts like `hg revert $(cat .testfailed)`.
-                    with open(".test%s" % title.lower(), "a") as f:
+                    testsdir = os.path.abspath(os.path.dirname(__file__))
+                    if not os.path.exists(testsdir):
+                        # It's possible for the current directory to not exist if tests are run using Buck
+                        testsdir = ""
+                    filepath = os.path.join(testsdir, f".test{title.lower()}")
+                    with open(filepath, "a") as f:
                         for name in names:
                             f.write(name + "\n")
                         f.write("\n")
@@ -3503,8 +3546,13 @@ class TestRunner:
         os.environ["TMPBINDIR"] = self._tmpbindir
         os.environ["PYTHON"] = PYTHON
 
-        runtestdir = os.path.abspath(os.path.dirname(__file__))
-        os.environ["RUNTESTDIR"] = runtestdir
+        # One of our Buck targets sets this env var pointing to all the misc.
+        # files under tests/ including the .t tests themselves. run-tests.py
+        # directly tries to launch files like tinit.sh, so we need to help
+        # it to find these files.
+        if (runtestdir := os.environ.get("RUNTESTDIR", None)) is None:
+            runtestdir = os.path.abspath(os.path.dirname(__file__))
+            os.environ["RUNTESTDIR"] = runtestdir
         path = [self._bindir, runtestdir] + os.environ["PATH"].split(os.pathsep)
         if os.path.islink(__file__):
             # test helper will likely be at the end of the symlink
@@ -3588,6 +3636,16 @@ class TestRunner:
         If you wish to inject custom tests into the test harness, this would
         be a good function to monkeypatch or override in a derived class.
         """
+
+        def transform_test_basename(path):
+            """transform test_revert_t to test-revert.t"""
+            dirname, basename = os.path.split(path)
+            if basename.startswith("test_") and basename.endswith("_t"):
+                basename = basename[:-2].replace("_", "-") + ".t"
+                return os.path.join(dirname, basename)
+            else:
+                return path
+
         if not args:
             if self.options.changed:
                 proc = Popen4(
@@ -3610,6 +3668,7 @@ class TestRunner:
 
         tests = []
         for t in args:
+            t = transform_test_basename(t)
             if not (
                 os.path.basename(t).startswith("test-")
                 and (t.endswith(".py") or t.endswith(".t"))
@@ -4051,9 +4110,7 @@ class TestRunner:
             if found:
                 vlog("# Found prerequisite", p, "at", found)
             else:
-                print(
-                    "WARNING: Did not find prerequisite tool: %s " % p.decode("utf-8")
-                )
+                print("WARNING: Did not find prerequisite tool: %s " % p)
 
 
 def aggregateexceptions(path):
@@ -4083,10 +4140,41 @@ def ensureenv():
     """
     hgdir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
     envpath = os.path.join(hgdir, "build", "env")
-    if not os.path.exists(envpath):
+    skipensureenv = "HGRUNTEST_SKIP_ENV" in os.environ
+    iswindows = os.name == "nt"
+    if (skipensureenv and not iswindows) or not os.path.exists(envpath):
         return
     with open(envpath, "r") as f:
         env = dict(l.split("=", 1) for l in f.read().splitlines() if "=" in l)
+
+    # A minority of our old non-debugruntest tests still rely on being able to
+    # run bash commands plus having commands like `less` available. On our CI
+    # this is not an issue, since those are already part of our path there.
+    # However, locally we usually don't have those on our path so let's try
+    # to get them from the list of env bars in ../build/env and relaunch this
+    # with that appended to our path. Note that in this case we cannot simply
+    # keep loading all the environment variables from `build/env`, since running
+    # run-tests.py as a Buck target generates a .par file. When this
+    # run-tests.py is built and run as a par, the par logic will modify PATH and
+    # other library and Python-related environment variables at startup.
+    # Changing the Python-related and library ones can prevent the .par from
+    # properly running in the first place, while the PATH one can make it loop.
+    # The modified PATH will trick ensureenv to relaunch with a different PATH,
+    # and enter an infinite loop of (par modifies PATH, ensureenv modifies PATH
+    # and relaunch). To avoid the loop we use a separate env var to tell
+    # ensureenv to skip.
+    if skipensureenv and iswindows:
+        esep = ";"
+        ppath = os.path.join("fbcode", "eden", "scm", "build", "bin")
+        k = "PATH"
+        origpath = os.environ[k]
+        newpath = esep.join([p for p in env[k].split(esep) if ppath in p])
+        if newpath and newpath not in origpath:
+            newpath += esep + origpath
+        else:
+            newpath = origpath
+        env = {k: newpath}
+
     if all(os.environ.get(k) == v for k, v in env.items()):
         # No restart needed
         return
@@ -4109,7 +4197,7 @@ def os_times():
     return times
 
 
-if __name__ == "__main__":
+def main() -> None:
     ensureenv()
     runner = TestRunner()
 
@@ -4123,3 +4211,7 @@ if __name__ == "__main__":
         pass
 
     sys.exit(runner.run(sys.argv[1:]))
+
+
+if __name__ == "__main__":
+    main()  # pragma: no cover

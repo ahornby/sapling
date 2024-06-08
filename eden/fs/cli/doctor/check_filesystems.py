@@ -4,6 +4,8 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
+# pyre-strict
+
 import hashlib
 import json
 import os
@@ -191,7 +193,7 @@ class LowDiskSpaceMacOS(Problem):
 
     util = "/System/Library/Filesystems/apfs.fs/Contents/Resources/apfs.util"
     util_check = f"sudo {util} -G ~/*"
-    util_purge = f"sudo {util} -P ~/*"
+    util_purge = f"sudo {util} -P -low ~/*"
 
     def __init__(self, message: str, severity: ProblemSeverity) -> None:
         addtl_msg = (
@@ -882,6 +884,11 @@ def get_hg_diff(checkout: EdenCheckout) -> Set[Path]:
 def check_hg_status_match_hg_diff(
     tracker: ProblemTracker, instance: EdenInstance, checkout: EdenCheckout
 ) -> None:
+    if checkout.get_config().scm_type == "filteredhg":
+        # TODO(cuev): This check is currently broken on FilteredHg because we
+        # don't pass the active filter to the getScmStatusV2 call in
+        # get_modified_files. We will skip the check until we fix it.
+        return
     try:
         modified_files = get_modified_files(instance, checkout)
     except InProgressCheckoutError:

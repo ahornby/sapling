@@ -11,9 +11,9 @@ atomicfile = { version = "0.1.0", path = "../atomicfile" }
 dirs = "2.0"
 fn-error-context = "0.2"
 fs2 = "0.4"
-hostname = "0.3"
 lazystr = { version = "0.1.0", path = "../lazystr" }
 rand = { version = "0.8", features = ["small_rng"] }
+shell-escape = "0.1.5"
 shellexpand = "2.1.2"
 thiserror = "1.0.49"
 

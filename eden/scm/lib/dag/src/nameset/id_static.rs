@@ -23,16 +23,20 @@ use crate::Group;
 use crate::IdSet;
 use crate::IdSetIter;
 use crate::IdSpan;
+use crate::NameSet;
 use crate::Result;
 use crate::VertexName;
 
 /// A set backed by [`IdSet`] + [`IdMap`].
 /// Efficient for DAG calculation.
+#[derive(Clone)]
 pub struct IdStaticSet {
     pub(crate) spans: IdSet,
     pub(crate) map: Arc<dyn IdConvert + Send + Sync>,
     pub(crate) dag: Arc<dyn DagAlgorithm + Send + Sync>,
     hints: Hints,
+    // If true, iterate in ASC order instead of DESC.
+    reversed: bool,
 }
 
 struct Iter {
@@ -155,6 +159,10 @@ impl fmt::Debug for IdStaticSet {
             1 => write!(f, " + 1 span")?,
             n => write!(f, " + {} spans", n)?,
         }
+        if self.reversed {
+            // + means ASC order.
+            write!(f, " +")?;
+        }
         write!(f, ">")?;
         Ok(())
     }
@@ -179,37 +187,28 @@ impl IdStaticSet {
             map,
             hints,
             dag,
+            reversed: false,
         }
     }
-}
 
-#[async_trait::async_trait]
-impl AsyncNameSetQuery for IdStaticSet {
-    async fn iter(&self) -> Result<BoxVertexStream> {
-        let iter = Iter {
-            iter: self.spans.clone().into_iter(),
-            map: self.map.clone(),
-            reversed: false,
-            buf: Default::default(),
-        };
-        Ok(iter.into_box_stream())
+    /// Change the iteration order between (DESC default) and ASC.
+    pub fn reversed(mut self) -> Self {
+        self.reversed = !self.reversed;
+        if self.reversed {
+            self.hints.remove_flags(Flags::ID_DESC | Flags::TOPO_DESC);
+            self.hints.add_flags(Flags::ID_ASC);
+        } else {
+            self.hints.remove_flags(Flags::ID_ASC);
+            self.hints.add_flags(Flags::ID_DESC | Flags::TOPO_DESC);
+        }
+        self
     }
 
-    async fn iter_rev(&self) -> Result<BoxVertexStream> {
-        let iter = Iter {
-            iter: self.spans.clone().into_iter(),
-            map: self.map.clone(),
-            reversed: true,
-            buf: Default::default(),
-        };
-        Ok(iter.into_box_stream())
+    pub(crate) fn is_reversed(&self) -> bool {
+        self.reversed
     }
 
-    async fn count(&self) -> Result<usize> {
-        Ok(self.spans.count() as usize)
-    }
-
-    async fn first(&self) -> Result<Option<VertexName>> {
+    async fn max(&self) -> Result<Option<VertexName>> {
         debug_assert_eq!(self.spans.max(), self.spans.iter_desc().nth(0));
         match self.spans.max() {
             Some(id) => {
@@ -221,7 +220,7 @@ impl AsyncNameSetQuery for IdStaticSet {
         }
     }
 
-    async fn last(&self) -> Result<Option<VertexName>> {
+    async fn min(&self) -> Result<Option<VertexName>> {
         debug_assert_eq!(self.spans.min(), self.spans.iter_desc().rev().nth(0));
         match self.spans.min() {
             Some(id) => {
@@ -230,6 +229,54 @@ impl AsyncNameSetQuery for IdStaticSet {
                 Ok(Some(name))
             }
             None => Ok(None),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl AsyncNameSetQuery for IdStaticSet {
+    async fn iter(&self) -> Result<BoxVertexStream> {
+        let iter = Iter {
+            iter: self.spans.clone().into_iter(),
+            map: self.map.clone(),
+            reversed: self.reversed,
+            buf: Default::default(),
+        };
+        Ok(iter.into_box_stream())
+    }
+
+    async fn iter_rev(&self) -> Result<BoxVertexStream> {
+        let iter = Iter {
+            iter: self.spans.clone().into_iter(),
+            map: self.map.clone(),
+            reversed: !self.reversed,
+            buf: Default::default(),
+        };
+        Ok(iter.into_box_stream())
+    }
+
+    async fn count(&self) -> Result<u64> {
+        Ok(self.spans.count())
+    }
+
+    async fn size_hint(&self) -> (u64, Option<u64>) {
+        let size = self.spans.count();
+        (size, Some(size))
+    }
+
+    async fn first(&self) -> Result<Option<VertexName>> {
+        if self.reversed {
+            self.min().await
+        } else {
+            self.max().await
+        }
+    }
+
+    async fn last(&self) -> Result<Option<VertexName>> {
+        if self.reversed {
+            self.max().await
+        } else {
+            self.min().await
         }
     }
 
@@ -264,6 +311,46 @@ impl AsyncNameSetQuery for IdStaticSet {
     fn id_convert(&self) -> Option<&dyn IdConvert> {
         Some(self.map.as_ref() as &dyn IdConvert)
     }
+
+    fn specialized_reverse(&self) -> Option<NameSet> {
+        Some(NameSet::from_query(self.clone().reversed()))
+    }
+
+    fn specialized_take(&self, take: u64) -> Option<NameSet> {
+        let spans = if self.reversed {
+            let len = self.spans.count();
+            // [--skip-][take]
+            // [-----len-----]
+            let skip = len.saturating_sub(take);
+            self.spans.skip(skip).take(take)
+        } else {
+            // [take][-------]
+            // [-----len-----]
+            self.spans.take(take)
+        };
+        Some(NameSet::from_query(Self {
+            spans,
+            ..self.clone()
+        }))
+    }
+
+    fn specialized_skip(&self, skip: u64) -> Option<NameSet> {
+        let spans = if self.reversed {
+            let len = self.spans.count();
+            // [--take-][skip]
+            // [-----len-----]
+            let take = len.saturating_sub(skip);
+            self.spans.take(take)
+        } else {
+            // [skip][-------]
+            // [-----len-----]
+            self.spans.skip(skip)
+        };
+        Some(NameSet::from_query(Self {
+            spans,
+            ..self.clone()
+        }))
+    }
 }
 
 #[cfg(test)]
@@ -271,6 +358,7 @@ impl AsyncNameSetQuery for IdStaticSet {
 pub(crate) mod tests {
     use std::ops::Deref;
 
+    use futures::TryStreamExt;
     use nonblocking::non_blocking_result as r;
 
     use super::super::tests::*;
@@ -299,6 +387,7 @@ pub(crate) mod tests {
         with_dag(|dag| {
             let bef = r(dag.range("B".into(), "F".into()))?;
             check_invariants(bef.deref())?;
+            assert_eq!(nb(bef.size_hint()), (3, Some(3)));
 
             Ok(())
         })
@@ -424,6 +513,59 @@ pub(crate) mod tests {
             let sorted = r(dag.sort(&set))?;
             assert_eq!(format!("{:?}", &sorted), "<spans [G+6, E+4, C+2] + 1 span>");
             Ok(())
+        })
+    }
+
+    #[test]
+    fn test_reversed() -> Result<()> {
+        with_dag(|dag| {
+            let desc = r(dag.all())?;
+            let asc = desc
+                .as_any()
+                .downcast_ref::<IdStaticSet>()
+                .unwrap()
+                .clone()
+                .reversed();
+            check_invariants(&asc)?;
+            assert_eq!(format!("{:?}", &asc), "<spans [A:G+0:6] +>");
+            assert_eq!(
+                format!("{:?}", r(r(asc.iter())?.try_collect::<Vec<_>>())?),
+                "[A, B, C, D, E, F, G]"
+            );
+
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn test_intersect_difference_preserve_reverse_order() -> Result<()> {
+        with_dag(|dag| -> Result<()> {
+            let abc = "A B C".into();
+            let cd = "C D".into();
+            let cba = r(dag.sort(&abc))?; // DESC
+            let dc = r(dag.sort(&cd))?;
+            let abc = cba.reverse();
+
+            let ab = abc.clone() - dc.clone();
+            check_invariants(&*ab)?;
+            assert_eq!(fmt_iter(&ab), "[A, B]");
+
+            let abc2 = abc.clone() & cba.clone();
+            check_invariants(&*abc2)?;
+            assert_eq!(fmt_iter(&abc2), "[A, B, C]");
+
+            let cba2 = cba & abc;
+            check_invariants(&*cba2)?;
+            assert_eq!(fmt_iter(&cba2), "[C, B, A]");
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn test_skip_take_reverse() -> Result<()> {
+        with_dag(|dag| {
+            let set = r(dag.sort(&NameSet::from("A B C")))?;
+            check_skip_take_reverse(set)
         })
     }
 

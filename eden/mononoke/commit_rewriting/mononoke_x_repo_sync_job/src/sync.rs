@@ -19,23 +19,35 @@ use bookmarks::BookmarkKey;
 use bookmarks::BookmarkUpdateLogEntry;
 use bookmarks::BookmarkUpdateReason;
 use bookmarks::BookmarksRef;
-use changeset_fetcher::ChangesetFetcherArc;
-use changeset_fetcher::ChangesetFetcherRef;
+use borrowed::borrowed;
+use bulk_derivation::BulkDerivation;
 use commit_graph::CommitGraphRef;
 use context::CoreContext;
 use cross_repo_sync::find_toposorted_unsynced_ancestors;
 use cross_repo_sync::find_toposorted_unsynced_ancestors_with_commit_graph;
-use cross_repo_sync::types::Source;
-use cross_repo_sync::types::Target;
+use cross_repo_sync::get_version_and_parent_map_for_sync_via_pushrebase;
+use cross_repo_sync::log_debug;
+use cross_repo_sync::log_info;
+use cross_repo_sync::log_trace;
+use cross_repo_sync::log_warning;
+use cross_repo_sync::run_and_log_stats_to_scuba;
+use cross_repo_sync::unsafe_get_parent_map_for_target_bookmark_rewrite;
 use cross_repo_sync::CandidateSelectionHint;
 use cross_repo_sync::CommitSyncContext;
 use cross_repo_sync::CommitSyncOutcome;
 use cross_repo_sync::CommitSyncer;
 use cross_repo_sync::PushrebaseRewriteDates;
+use cross_repo_sync::Source;
+use cross_repo_sync::Target;
+use derived_data_utils::derived_data_utils;
+use fsnodes::RootFsnodeId;
 use futures::future::try_join_all;
+use futures::stream;
 use futures::stream::TryStreamExt;
 use futures::try_join;
+use futures::StreamExt;
 use futures_stats::TimedFutureExt;
+use futures_stats::TimedTryFutureExt;
 use indicatif::ProgressBar;
 use indicatif::ProgressStyle;
 use metaconfig_types::CommitSyncConfigVersion;
@@ -44,9 +56,6 @@ use mononoke_types::Timestamp;
 use repo_blobstore::RepoBlobstoreRef;
 use repo_identity::RepoIdentityRef;
 use scuba_ext::MononokeScubaSampleBuilder;
-use slog::info;
-use slog::trace;
-use slog::warn;
 use synced_commit_mapping::SyncedCommitMapping;
 
 use crate::reporting::log_bookmark_deletion_result;
@@ -89,7 +98,7 @@ pub async fn sync_single_bookmark_update_log<M: SyncedCommitMapping + Clone + 's
 where
     R: Repo,
 {
-    info!(ctx.logger(), "processing log entry #{}", entry.id);
+    log_info(ctx, format!("processing log entry #{}", entry.id));
     let source_bookmark = Source(entry.bookmark_name);
     let target_bookmark = Target(
         commit_syncer.get_bookmark_renamer().await?(&source_bookmark)
@@ -130,9 +139,9 @@ where
         pushrebase_rewrite_dates,
         Some(entry.timestamp),
         &None,
+        false,
     )
     .await
-    // TODO(stash): test with other movers
     // Note: counter update might fail after a successful sync
 }
 
@@ -152,17 +161,53 @@ pub async fn sync_commit_and_ancestors<M: SyncedCommitMapping + Clone + 'static,
     pushrebase_rewrite_dates: PushrebaseRewriteDates,
     bookmark_update_timestamp: Option<Timestamp>,
     unsafe_change_mapping_version_during_pushrebase: &Option<CommitSyncConfigVersion>,
+    unsafe_force_rewrite_parent_to_target_bookmark: bool,
 ) -> Result<SyncResult, Error>
 where
     R: Repo,
 {
-    let (unsynced_ancestors, unsynced_ancestors_versions) =
-        find_toposorted_unsynced_ancestors(ctx, commit_syncer, to_cs_id.clone()).await?;
+    log_debug(
+        ctx,
+        format!("Syncing commit {to_cs_id} from commit {0:#?}", from_cs_id),
+    );
 
-    let version = if !unsynced_ancestors_versions.has_ancestor_with_a_known_outcome() {
+    log_debug(ctx, format!("Targeting bookmark {0:#?}", target_bookmark));
+
+    if let Some(new_version) = unsafe_change_mapping_version_during_pushrebase {
+        log_warning(
+            ctx,
+            format!("Changing mapping version during pushrebase to {new_version}"),
+        );
+    };
+    if unsafe_force_rewrite_parent_to_target_bookmark {
+        log_warning(ctx, "UNSAFE: Bypass working copy validation is enabled!");
+    };
+
+    let hint = match target_bookmark {
+        Some(target_bookmark) if common_pushrebase_bookmarks.contains(target_bookmark) => Some(
+            CandidateSelectionHint::AncestorOfBookmark(
+                target_bookmark.clone(),
+                Target(commit_syncer.get_target_repo().clone()),
+            )
+            .try_into_desired_relationship(ctx)
+            .await?
+            .ok_or_else(||
+                anyhow!(
+                    "ProgrammingError: hint doesn't represent relationship when targeting bookmark {target_bookmark}"
+                )
+            )?,
+        ),
+        _ => None,
+    };
+    log_debug(ctx, "finding unsynced ancestors from source repo...");
+
+    let (unsynced_ancestors, synced_ancestors_versions) =
+        find_toposorted_unsynced_ancestors(ctx, commit_syncer, to_cs_id.clone(), hint).await?;
+
+    let version = if !synced_ancestors_versions.has_ancestor_with_a_known_outcome() {
         return Ok(SyncResult::SkippedNoKnownVersion);
     } else {
-        let maybe_version = unsynced_ancestors_versions
+        let maybe_version = synced_ancestors_versions
             .get_only_version()
             .with_context(|| format!("failed to sync cs id {}", to_cs_id))?;
         maybe_version.ok_or_else(|| {
@@ -174,7 +219,7 @@ where
     };
 
     let len = unsynced_ancestors.len();
-    info!(ctx.logger(), "{} unsynced ancestors of {}", len, to_cs_id);
+    log_info(ctx, format!("{} unsynced ancestors of {}", len, to_cs_id));
 
     if let Some(target_bookmark) = target_bookmark {
         // This is forward sync. The direction is small to large, so the source bookmark is the small
@@ -190,6 +235,38 @@ where
                 check_forward_move(ctx, commit_syncer, to_cs_id, from_cs_id).await?;
             }
 
+            log_debug(ctx, "obtaining version for the sync...");
+
+            let (version, parent_mapping) = match (
+                unsafe_change_mapping_version_during_pushrebase,
+                unsafe_force_rewrite_parent_to_target_bookmark,
+            ) {
+                // `unsafe_force_rewrite_parent_to_target_bookmark` can only be
+                // used when a new mapping version is also manually specified,
+                // because some validation is skipped **because we know the
+                // mapping version that will be used in the end**.
+                (Some(new_version), true) => {
+                    let parent_map = unsafe_get_parent_map_for_target_bookmark_rewrite(
+                        ctx,
+                        commit_syncer,
+                        target_bookmark,
+                        &synced_ancestors_versions,
+                    )
+                    .await?;
+                    (new_version.clone(), parent_map)
+                }
+                _ => {
+                    get_version_and_parent_map_for_sync_via_pushrebase(
+                        ctx,
+                        commit_syncer,
+                        target_bookmark,
+                        version,
+                        &synced_ancestors_versions,
+                    )
+                    .await?
+                }
+            };
+
             return sync_commits_via_pushrebase(
                 ctx,
                 commit_syncer,
@@ -201,6 +278,7 @@ where
                 pushrebase_rewrite_dates,
                 bookmark_update_timestamp,
                 unsafe_change_mapping_version_during_pushrebase,
+                parent_mapping,
             )
             .await
             .map(SyncResult::Synced);
@@ -255,7 +333,7 @@ where
 /// for setting up the initial configuration for the sync. The validation of the version
 /// applicability to pushrebased bookmarks belongs to caller.
 /// ```
-pub async fn sync_commits_via_pushrebase<M: SyncedCommitMapping + Clone + 'static, R>(
+async fn sync_commits_via_pushrebase<M: SyncedCommitMapping + Clone + 'static, R>(
     ctx: &CoreContext,
     commit_syncer: &CommitSyncer<M, R>,
     target_bookmark: &Target<BookmarkKey>,
@@ -266,10 +344,17 @@ pub async fn sync_commits_via_pushrebase<M: SyncedCommitMapping + Clone + 'stati
     pushrebase_rewrite_dates: PushrebaseRewriteDates,
     bookmark_update_timestamp: Option<Timestamp>,
     unsafe_change_mapping_version: &Option<CommitSyncConfigVersion>,
+    parent_mapping: HashMap<ChangesetId, ChangesetId>,
 ) -> Result<Vec<ChangesetId>, Error>
 where
     R: Repo,
 {
+    if let Some(new_version) = unsafe_change_mapping_version {
+        log_warning(
+            ctx,
+            format!("UNSAFE: changing mapping version during pushrebase to {new_version}"),
+        );
+    };
     let change_mapping_version =
         if let Some(unsafe_change_mapping_version) = unsafe_change_mapping_version {
             if version != unsafe_change_mapping_version {
@@ -280,7 +365,7 @@ where
             None
         };
 
-    let source_repo = commit_syncer.get_source_repo();
+    let small_repo = commit_syncer.get_source_repo();
     // It stores commits that were introduced as part of current bookmark update, but that
     // shouldn't be pushrebased.
     let mut no_pushrebase = HashSet::new();
@@ -292,7 +377,7 @@ where
             continue;
         }
 
-        let bcs = cs_id.load(ctx, source_repo.repo_blobstore()).await?;
+        let bcs = cs_id.load(ctx, small_repo.repo_blobstore()).await?;
 
         let mut parents = bcs.parents();
         let maybe_p1 = parents.next();
@@ -302,7 +387,7 @@ where
                 return Err(format_err!("only 2 parent merges are supported"));
             }
 
-            no_pushrebase.extend(validate_if_new_repo_merge(ctx, source_repo, p1, p2).await?);
+            no_pushrebase.extend(validate_if_new_repo_merge(ctx, small_repo, p1, p2).await?);
         }
     }
 
@@ -319,9 +404,9 @@ where
             )
             .await?
         } else {
-            info!(
-                ctx.logger(),
-                "syncing {} via pushrebase for {}", cs_id, &target_bookmark
+            log_info(
+                ctx,
+                format!("syncing {} via pushrebase for {}", cs_id, &target_bookmark),
             );
             let (stats, result) = pushrebase_commit(
                 ctx,
@@ -331,6 +416,7 @@ where
                 pushrebase_rewrite_dates,
                 version.clone(),
                 change_mapping_version.clone(),
+                parent_mapping.clone(),
             )
             .timed()
             .await;
@@ -363,7 +449,7 @@ pub async fn sync_commit_without_pushrebase<M: SyncedCommitMapping + Clone + 'st
 where
     R: Repo,
 {
-    info!(ctx.logger(), "syncing {}", cs_id);
+    log_info(ctx, format!("syncing {}", cs_id));
     let bcs = cs_id
         .load(ctx, commit_syncer.get_source_repo().repo_blobstore())
         .await?;
@@ -373,10 +459,10 @@ where
         // merge commit and ancestors of common pushrebase bookmark in target repo.
         // The code below does exactly that - it fetches common_pushrebase_bookmarks and parent
         // commits from the target repo, and then it checks if there are no intersection.
-        let target_repo = commit_syncer.get_target_repo();
+        let large_repo = commit_syncer.get_target_repo();
         let mut book_values = vec![];
         for common_bookmark in common_pushrebase_bookmarks {
-            book_values.push(target_repo.bookmarks().get(ctx.clone(), common_bookmark));
+            book_values.push(large_repo.bookmarks().get(ctx.clone(), common_bookmark));
         }
 
         let book_values = try_join_all(book_values).await?;
@@ -389,7 +475,7 @@ where
         .await?;
         let maybe_independent_branch = check_if_independent_branch_and_return(
             ctx,
-            target_repo,
+            large_repo,
             parents.into_iter().flatten().collect(),
             book_values,
         )
@@ -414,11 +500,29 @@ where
             .timed()
             .await
     } else {
+        // When there are multiple choices for what should be the parent of the commit there's no
+        // right or wrong answers, yet we have to pick something. Let's find something close to
+        // mainline branch if possible.
+        //
+        // XXXX: With current "hinting" infra we can pull of this trick reliably only when there's
+        // one common pushrebase bookmark. That's fine, we don't have more in production and maybe
+        // we shouldn't even allow more than one.
+        // For now let's give privilige to the first one.
+        let parent_mapping_selection_hint: CandidateSelectionHint<R> =
+            if let Some(bookmark) = common_pushrebase_bookmarks.iter().next() {
+                CandidateSelectionHint::AncestorOfBookmark(
+                    Target(bookmark.clone()),
+                    Target(commit_syncer.get_target_repo().clone()),
+                )
+            } else {
+                // XXX: in this case it should be "Any" rather than "Only"
+                CandidateSelectionHint::Only
+            };
         commit_syncer
             .unsafe_sync_commit(
                 ctx,
                 cs_id,
-                CandidateSelectionHint::Only,
+                parent_mapping_selection_hint,
                 CommitSyncContext::XRepoSyncJob,
                 Some(version.clone()),
             )
@@ -451,18 +555,44 @@ pub async fn sync_commits_for_initial_import<M: SyncedCommitMapping + Clone + 's
     // Sync config version to use for importing the commits.
     config_version: CommitSyncConfigVersion,
     disable_progress_bar: bool,
+    no_automatic_derivation: bool,
+    derivation_batch_size: usize,
 ) -> Result<Vec<ChangesetId>>
 where
     R: Repo,
 {
-    info!(ctx.logger(), "syncing {}", cs_id);
+    log_info(ctx, format!("Syncing {cs_id} for inital import"));
+    log_info(
+        ctx,
+        format!(
+            "Source repo: {} / Target repo: {}",
+            commit_syncer.get_source_repo().repo_identity().name(),
+            commit_syncer.get_target_repo().repo_identity().name(),
+        ),
+    );
+    log_debug(
+        ctx,
+        format!(
+            "Automatic derivation is {0}",
+            if no_automatic_derivation {
+                "disabled"
+            } else {
+                "enabled"
+            }
+        ),
+    );
 
     // All the synced ancestors of the provided commit should have been synced
     // using the config version that was provided manually, or we can create
     // a broken set of commits.
-    let (unsynced_ancestors, synced_ancestors_versions) =
-        find_toposorted_unsynced_ancestors_with_commit_graph(ctx, commit_syncer, cs_id.clone())
-            .await?;
+    let (unsynced_ancestors, synced_ancestors_versions, last_synced_ancestors) =
+        run_and_log_stats_to_scuba(
+            ctx,
+            "Finding toposorted unsynced ancestors with commit graph",
+            None,
+            find_toposorted_unsynced_ancestors_with_commit_graph(ctx, commit_syncer, cs_id.clone()),
+        )
+        .await?;
 
     let synced_ancestors_versions = synced_ancestors_versions
         .versions
@@ -483,15 +613,14 @@ where
 
     let num_unsynced_ancestors: u64 = unsynced_ancestors.len().try_into()?;
 
-    info!(
-        ctx.logger(),
-        "Found {0} unsynced ancestors", num_unsynced_ancestors
+    log_info(
+        ctx,
+        format!("Found {0} unsynced ancestors", num_unsynced_ancestors),
     );
 
-    trace!(
-        ctx.logger(),
-        "Unsynced ancestors: {0:#?}",
-        &unsynced_ancestors
+    log_trace(
+        ctx,
+        format!("Unsynced ancestors: {0:#?}", &unsynced_ancestors),
     );
 
     let mb_prog_bar = if disable_progress_bar {
@@ -509,7 +638,56 @@ where
         Some(progress_bar)
     };
 
+    let large_repo = commit_syncer.get_target_repo();
+
+    if !no_automatic_derivation {
+        // Data derivation during the import uses `derive_bulk` to derive the
+        // changetsets in batches, which expects the ancestors of all commits
+        // in a batch to be derived.
+        // If an import is interrupted or crashes, the latest synced changesets
+        // might not have been derived, which leads to crashing the first batch
+        // of the next run.
+        // To avoid this, we derive all the types for the latest synced changeset
+        // before starting the import.
+        for synced_ancestor in last_synced_ancestors {
+            log_info(
+                ctx,
+                format!("Backfilling derived data for latest synced ancestor {synced_ancestor}"),
+            );
+            let derived_data_types = large_repo
+                .repo_derived_data()
+                .active_config()
+                .types
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            stream::iter(derived_data_types).map(anyhow::Ok)
+                .try_for_each_concurrent(10, |ddt| {
+                    borrowed!(ctx, large_repo);
+                    async move {
+                        let derived_utils = derived_data_utils(ctx.fb, large_repo, ddt)?;
+                        let (stats, _res) = derived_utils
+                            .derive(ctx.clone(), large_repo.repo_derived_data_arc(), synced_ancestor)
+                            .try_timed()
+                            .await?;
+                        log_info(
+                            ctx,
+                            format!(
+                                "Backfilled {0} derivation for synced ancestor {synced_ancestor} in {1:.3}s",
+                                ddt.name(),
+                                stats.completion_time.as_secs(),
+                            ),
+                        );
+                        Ok(())
+                    }
+                })
+                .await?;
+        }
+    };
+
     let mut res = vec![];
+    let mut changesets_to_derive = vec![];
+
     // Sync all of the ancestors first
     for ancestor_cs_id in unsynced_ancestors {
         let (stats, mb_synced) = commit_syncer
@@ -527,6 +705,38 @@ where
             .clone()
             .ok_or(anyhow!("Failed to sync ancestor commit {}", ancestor_cs_id))?;
         res.push(synced);
+        changesets_to_derive.push(synced);
+
+        log_debug(
+            ctx,
+            format!("Ancestor {ancestor_cs_id} synced successfully as {synced}"),
+        );
+
+        // Fsnodes always need to be derived synchronously during initial
+        // import because syncing a commit with submodule expansion depends
+        // on the fsnodes of its parents.
+        //
+        // If fsnodes aren't derived synchronously, expansion of submodules
+        // will derive it using an InMemoryRepo, throwing away all the results
+        // and doing it all again in the next changeset.
+        let root_fsnode_id = large_repo
+            .repo_derived_data()
+            .derive::<RootFsnodeId>(ctx, synced)
+            .await?;
+        log_trace(
+            ctx,
+            format!(
+                "Root fsnode id from {synced}: {0}",
+                root_fsnode_id.into_fsnode_id()
+            ),
+        );
+
+        if !no_automatic_derivation {
+            if changesets_to_derive.len() >= derivation_batch_size {
+                derive_initial_import_batch(ctx, large_repo, &changesets_to_derive).await?;
+                changesets_to_derive.clear();
+            };
+        };
 
         if let Some(progress_bar) = &mb_prog_bar {
             progress_bar.inc(1);
@@ -534,6 +744,12 @@ where
 
         log_success_to_scuba(scuba_sample.clone(), ancestor_cs_id, mb_synced, stats, None);
     }
+
+    // Make sure we derive the last batch
+    if !no_automatic_derivation && !changesets_to_derive.is_empty() {
+        derive_initial_import_batch(ctx, large_repo, &changesets_to_derive).await?;
+        changesets_to_derive.clear();
+    };
 
     let (stats, result) = commit_syncer
         .unsafe_sync_commit(
@@ -600,7 +816,7 @@ where
             source_bookmark
         ))
     } else {
-        info!(ctx.logger(), "deleting bookmark {}", target_bookmark);
+        log_info(ctx, format!("deleting bookmark {}", target_bookmark));
         let (stats, result) = delete_bookmark(
             ctx.clone(),
             commit_syncer.get_target_repo(),
@@ -664,12 +880,13 @@ async fn pushrebase_commit<M: SyncedCommitMapping + Clone + 'static, R>(
     pushrebase_rewrite_dates: PushrebaseRewriteDates,
     version: CommitSyncConfigVersion,
     change_mapping_version: Option<CommitSyncConfigVersion>,
+    parent_mapping: HashMap<ChangesetId, ChangesetId>,
 ) -> Result<Option<ChangesetId>, Error>
 where
     R: Repo,
 {
-    let source_repo = commit_syncer.get_source_repo();
-    let bcs = cs_id.load(ctx, source_repo.repo_blobstore()).await?;
+    let small_repo = commit_syncer.get_source_repo();
+    let bcs = cs_id.load(ctx, small_repo.repo_blobstore()).await?;
     commit_syncer
         .unsafe_sync_commit_pushrebase(
             ctx,
@@ -679,6 +896,7 @@ where
             pushrebase_rewrite_dates,
             version,
             change_mapping_version,
+            parent_mapping,
         )
         .await
 }
@@ -696,18 +914,12 @@ where
 /// This function returns new commits that were introduced by this merge
 async fn validate_if_new_repo_merge(
     ctx: &CoreContext,
-    repo: &(
-         impl ChangesetFetcherRef
-         + ChangesetFetcherArc
-         + RepoBlobstoreRef
-         + RepoIdentityRef
-         + CommitGraphRef
-     ),
+    repo: &(impl RepoBlobstoreRef + RepoIdentityRef + CommitGraphRef),
     p1: ChangesetId,
     p2: ChangesetId,
 ) -> Result<Vec<ChangesetId>, Error> {
-    let p1gen = repo.changeset_fetcher().get_generation_number(ctx, p1);
-    let p2gen = repo.changeset_fetcher().get_generation_number(ctx, p2);
+    let p1gen = repo.commit_graph().changeset_generation(ctx, p1);
+    let p2gen = repo.commit_graph().changeset_generation(ctx, p2);
     let (p1gen, p2gen) = try_join!(p1gen, p2gen)?;
     // FIXME: this code has an assumption that parent with a smaller generation number is a
     // parent that introduces a new repo. This is usually the case, however it might not be true
@@ -732,7 +944,7 @@ async fn validate_if_new_repo_merge(
 /// i.e. (::branch_tips) is returned in mercurial's revset terms
 async fn check_if_independent_branch_and_return(
     ctx: &CoreContext,
-    repo: &(impl ChangesetFetcherArc + RepoBlobstoreRef + RepoIdentityRef + CommitGraphRef),
+    repo: &(impl RepoBlobstoreRef + RepoIdentityRef + CommitGraphRef),
     branch_tips: Vec<ChangesetId>,
     other_branches: Vec<ChangesetId>,
 ) -> Result<Option<Vec<ChangesetId>>, Error> {
@@ -781,7 +993,7 @@ async fn delete_bookmark(
     let maybe_bookmark_val = repo.bookmarks().get(ctx.clone(), bookmark).await?;
     if let Some(bookmark_value) = maybe_bookmark_val {
         book_txn.delete(bookmark, bookmark_value, BookmarkUpdateReason::XRepoSync)?;
-        let res = book_txn.commit().await?;
+        let res = book_txn.commit().await?.is_some();
 
         if res {
             Ok(())
@@ -789,9 +1001,12 @@ async fn delete_bookmark(
             Err(format_err!("failed to delete a bookmark"))
         }
     } else {
-        warn!(
-            ctx.logger(),
-            "Not deleting '{}' bookmark because it does not exist", bookmark
+        log_warning(
+            &ctx,
+            format!(
+                "Not deleting '{}' bookmark because it does not exist",
+                bookmark
+            ),
         );
         Ok(())
     }
@@ -819,7 +1034,7 @@ async fn move_or_create_bookmark(
             book_txn.create(bookmark, cs_id, BookmarkUpdateReason::XRepoSync)?;
         }
     }
-    let res = book_txn.commit().await?;
+    let res = book_txn.commit().await?.is_some();
 
     if res {
         Ok(())
@@ -828,12 +1043,49 @@ async fn move_or_create_bookmark(
     }
 }
 
+async fn derive_initial_import_batch<R: Repo>(
+    ctx: &CoreContext,
+    large_repo: &R,
+    changesets_to_derive: &[ChangesetId],
+) -> Result<()> {
+    let derived_data_types = large_repo
+        .repo_derived_data()
+        .active_config()
+        .types
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+
+    // Derive all the data types in bulk to speed up the overall import process
+    let duration = large_repo
+        .repo_derived_data()
+        .manager()
+        .derive_bulk(
+            ctx,
+            changesets_to_derive.to_vec(),
+            None,
+            &derived_data_types,
+        )
+        .await?;
+
+    log_debug(
+        ctx,
+        format!(
+            "Finished bulk derivation of {0} changesets in {1:.3} seconds",
+            changesets_to_derive.len(),
+            duration.as_secs_f64()
+        ),
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod test {
     use bookmarks::BookmarkUpdateLogRef;
     use bookmarks::BookmarksMaybeStaleExt;
     use bookmarks::Freshness;
-    use cross_repo_sync::validation;
+    use cross_repo_sync::find_bookmark_diff;
+    use cross_repo_sync::verify_working_copy;
     use cross_repo_sync_test_utils::init_small_large_repo;
     use cross_repo_sync_test_utils::TestRepo;
     use fbinit::FacebookInit;
@@ -1234,7 +1486,7 @@ mod test {
         )
         .await?;
 
-        let actually_missing = validation::find_bookmark_diff(ctx.clone(), commit_syncer)
+        let actually_missing = find_bookmark_diff(ctx.clone(), commit_syncer)
             .await?
             .into_iter()
             .map(|diff| diff.target_bookmark().clone())
@@ -1249,7 +1501,13 @@ mod test {
             .await?;
         for head in heads {
             println!("verifying working copy for {}", head);
-            validation::verify_working_copy(ctx.clone(), commit_syncer.clone(), head).await?;
+            verify_working_copy(
+                ctx,
+                commit_syncer,
+                head,
+                commit_syncer.live_commit_sync_config.clone(),
+            )
+            .await?;
         }
 
         Ok(())
@@ -1277,7 +1535,7 @@ mod test {
             .bookmark_update_log()
             .read_next_bookmark_log_entries(
                 ctx.clone(),
-                start_from as u64,
+                start_from.try_into()?,
                 read_all,
                 Freshness::MostRecent,
             )
@@ -1293,7 +1551,7 @@ mod test {
 
         let mut res = vec![];
         for entry in log_entries {
-            let entry_id = entry.id;
+            let entry_id = entry.id.try_into()?;
             let single_res = sync_single_bookmark_update_log(
                 ctx,
                 commit_syncer,

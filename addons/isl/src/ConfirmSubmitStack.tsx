@@ -7,7 +7,6 @@
 
 import type {CommitInfo} from './types';
 import type {MutableRefObject} from 'react';
-import type {Snapshot} from 'recoil';
 
 import {Commit} from './Commit';
 import {FlexSpacer} from './ComponentUtils';
@@ -15,16 +14,16 @@ import {Tooltip} from './Tooltip';
 import {VSCodeCheckbox} from './VSCodeCheckbox';
 import {codeReviewProvider} from './codeReview/CodeReviewInfo';
 import {submitAsDraft, SubmitAsDraftCheckbox} from './codeReview/DraftCheckbox';
+import {Divider} from './components/Divider';
 import {t, T} from './i18n';
 import {configBackedAtom, readAtom} from './jotaiUtils';
 import {CommitPreview} from './previews';
 import {useModal} from './useModal';
-import {VSCodeDivider, VSCodeButton, VSCodeTextField} from '@vscode/webview-ui-toolkit/react';
+import {VSCodeButton, VSCodeTextField} from '@vscode/webview-ui-toolkit/react';
 import {useAtom, useAtomValue} from 'jotai';
 import {useState} from 'react';
-import {useRecoilCallback, useRecoilValue} from 'recoil';
 import {useAutofocusRef} from 'shared/hooks';
-import {unwrap} from 'shared/utils';
+import {nullthrows} from 'shared/utils';
 
 import './ConfirmSubmitStack.css';
 
@@ -39,8 +38,8 @@ export type SubmitConfirmationReponse =
 
 type SubmitType = 'submit' | 'submit-all' | 'resubmit';
 
-export function shouldShowSubmitStackConfirmation(snapshot: Snapshot): boolean {
-  const provider = snapshot.getLoadable(codeReviewProvider).valueMaybe();
+export function shouldShowSubmitStackConfirmation(): boolean {
+  const provider = readAtom(codeReviewProvider);
   const shouldShowConfirmation = readAtom(confirmShouldSubmitEnabledAtom);
   return (
     shouldShowConfirmation === true &&
@@ -60,15 +59,18 @@ export function shouldShowSubmitStackConfirmation(snapshot: Snapshot): boolean {
 export function useShowConfirmSubmitStack() {
   const showModal = useModal();
 
-  return useRecoilCallback(({snapshot}) => async (mode: SubmitType, stack: Array<CommitInfo>) => {
-    if (!shouldShowSubmitStackConfirmation(snapshot)) {
+  return async (mode: SubmitType, stack: Array<CommitInfo>) => {
+    if (!shouldShowSubmitStackConfirmation()) {
       const draft = readAtom(submitAsDraft);
       return {submitAsDraft: draft ?? false};
     }
 
-    const provider = snapshot.getLoadable(codeReviewProvider).valueMaybe();
+    const provider = readAtom(codeReviewProvider);
 
-    const replace = {$numCommits: String(stack.length), $cmd: unwrap(provider).submitCommandName()};
+    const replace = {
+      $numCommits: String(stack.length),
+      $cmd: nullthrows(provider).submitCommandName(),
+    };
     const title =
       mode === 'submit'
         ? t('Submitting $numCommits commits for review with $cmd', {replace})
@@ -83,7 +85,7 @@ export function useShowConfirmSubmitStack() {
       ),
     });
     return response;
-  });
+  };
 }
 
 function ConfirmModalContent({
@@ -102,7 +104,7 @@ function ConfirmModalContent({
 
   const submitRef = useAutofocusRef();
 
-  const provider = useRecoilValue(codeReviewProvider);
+  const provider = useAtomValue(codeReviewProvider);
   return (
     <div className="confirm-submit-stack" data-testid="confirm-submit-stack">
       <div className="confirm-submit-stack-content">
@@ -126,7 +128,7 @@ function ConfirmModalContent({
         )}
         <SubmitAsDraftCheckbox commitsToBeSubmit={stack} />
       </div>
-      <VSCodeDivider />
+      <Divider />
       <div className="use-modal-buttons">
         <Tooltip
           placement="bottom"

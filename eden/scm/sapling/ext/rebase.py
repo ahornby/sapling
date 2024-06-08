@@ -29,10 +29,8 @@ from bindings import checkout as nativecheckout
 from sapling import (
     bookmarks,
     cmdutil,
-    commands,
     context,
     copies,
-    destutil,
     dirstateguard,
     error,
     extensions,
@@ -93,6 +91,13 @@ def _savegraft(ctx, extra) -> None:
         extra["intermediate-source"] = s
 
 
+def _reproduciblecommits(ctx, extra) -> None:
+    # If we want reproducible commits, we need stable dates. The mutation date in
+    # extras is always "now", which affects the commit hash. Nothing uses this
+    # extra, so should be okay to skip.
+    extra.pop("mutdate", None)
+
+
 def _savebranch(ctx, extra) -> None:
     extra["branch"] = ctx.branch()
 
@@ -109,36 +114,6 @@ def _makeextrafn(copiers):
             c(ctx, extra)
 
     return extrafn
-
-
-def _destrebase(repo, sourceset, destspace=None):
-    """small wrapper around destmerge to pass the right extra args
-
-    Please wrap destutil.destmerge instead."""
-    return destutil.destmerge(
-        repo,
-        action="rebase",
-        sourceset=sourceset,
-        onheadcheck=False,
-        destspace=destspace,
-    )
-
-
-revsetpredicate = registrar.revsetpredicate()
-
-
-@revsetpredicate("_destrebase")
-def _revsetdestrebase(repo, subset, x):
-    # ``_rebasedefaultdest()``
-
-    # default destination for rebase.
-    # # XXX: Currently private because I expect the signature to change.
-    # # XXX: - bailing out in case of ambiguity vs returning all data.
-    # i18n: "_rebasedefaultdest" is a keyword
-    sourceset = None
-    if x is not None:
-        sourceset = revset.getset(repo, smartset.fullreposet(repo), x)
-    return subset & smartset.baseset([_destrebase(repo, sourceset)], repo=repo)
 
 
 def _ctxdesc(ctx) -> str:
@@ -283,6 +258,10 @@ class rebaseruntime:
 
         e = opts.get("extrafn")  # internal, used by e.g. hgsubversion
         self.extrafns = [_savegraft]
+
+        if repo.ui.configbool("rebase", "reproducible-commits"):
+            self.extrafns.append(_reproduciblecommits)
+
         if e:
             self.extrafns = [e]
 
@@ -1201,12 +1180,6 @@ def rebase(ui, repo, templ=None, **opts):
 
       Configuration Options:
 
-      You can make rebase require a destination if you set the following config
-      option::
-
-        [commands]
-        rebase.requiredest = True
-
       By default, rebase will close the transaction after each commit. For
       performance purposes, you can configure rebase to use a single transaction
       across the entire rebase. WARNING: This setting introduces a significant
@@ -1232,6 +1205,34 @@ def rebase(ui, repo, templ=None, **opts):
     unresolved conflicts.
 
     """
+
+    if not opts.get("date"):
+        opts["date"] = _defaultdate(ui)
+
+    if not (opts.get("continue") or opts.get("abort") or opts.get("restack")):
+        # 'hg rebase' w/o args should do nothing
+        if not opts.get("dest"):
+            raise error.Abort("you must specify a destination (-d) for the rebase")
+
+        # 'hg rebase' can fast-forward bookmark
+        prev = repo["."]
+
+        # Only fast-forward the bookmark if no source nodes were explicitly
+        # specified.
+        if not (opts.get("base") or opts.get("source") or opts.get("rev")):
+            dests = opts.get("dest")
+            if dests and len(dests) == 1 and dests[0] != prev:
+                dest = scmutil.revsingle(repo, dests[0])
+                common = dest.ancestor(prev)
+                if prev == common and dest != prev:
+                    activebookmark = repo._activebookmark
+                    result = hg.updatetotally(ui, repo, dest.node(), activebookmark)
+                    if activebookmark:
+                        with repo.wlock():
+                            bookmarks.update(repo, [prev.node()], dest.node())
+                    ui.status(_("nothing to rebase - fast-forwarded to %s\n") % dest)
+                    return result
+
     inmemory = ui.configbool("rebase", "experimental.inmemory")
 
     # Check for conditions that disable in-memory merge if it was requested.
@@ -1279,6 +1280,24 @@ def rebase(ui, repo, templ=None, **opts):
                 repo.currenttransaction().abort()
     else:
         return _origrebase(ui, repo, rbsrt, **opts)
+
+
+def _defaultdate(ui):
+    if ui.configbool("tweakdefaults", "rebasekeepdate"):
+        # We want to "keep" the source commit's date. We don't actually enable this
+        # anywhere since things like ISL use commit date to infer "liveness", so we want
+        # to bump it on rebase.
+        return None
+
+    if ui.configbool("rebase", "reproducible-commits"):
+        # We want rebase to create reproducible commits, which in practice means dates
+        # must be stable (so we want to maintain the commit's date).
+        return None
+
+    if stub := ui.config("devel", "default-date"):
+        return stub
+
+    return "%d %d" % util.makedate()
 
 
 @perftrace.tracefunc("Rebase")
@@ -1392,9 +1411,11 @@ def _definedestmap(
     destlen = len(dests)
     if destlen == 1:
         destf = dests[0]
+    elif destlen == 0:
+        raise error.Abort(_("rebase dest is required"))
     else:
         destf = None
-    if destlen > 1:
+
         if srcf or basef:
             raise error.Abort(
                 _("multiple --dest requires --rev, not --base or --source")
@@ -1414,11 +1435,6 @@ def _definedestmap(
     cmdutil.checkunfinished(repo)
     if not rbsrt.inmemory:
         cmdutil.bailifchanged(repo)
-
-    if ui.configbool("commands", "rebase.requiredest") and not dests:
-        raise error.Abort(
-            _("you must specify a destination"), hint=_("use: @prog@ rebase -d REV")
-        )
 
     dest = None
     destmap = None
@@ -1455,12 +1471,9 @@ def _definedestmap(
         if not base:
             ui.status(_('empty "base" revision set - ' "can't compute rebase set\n"))
             return None
-        if destf:
-            # --base does not support multiple destinations
-            dest = scmutil.revsingle(repo, destf)
-        else:
-            dest = repo[_destrebase(repo, base, destspace=destspace)]
-            destf = str(dest)
+
+        # --base does not support multiple destinations
+        dest = scmutil.revsingle(repo, destf)
 
         rootnodes = []  # selected children of branching points
         bpbase = {}  # {branchingpoint: [origbase]}
@@ -1526,10 +1539,6 @@ def _definedestmap(
                     % ("+".join(str(repo[r]) for r in base), dest)
                 )
             return None
-
-    if not destf and not dests:
-        dest = repo[_destrebase(repo, rebaseset, destspace=destspace)]
-        destf = str(dest)
 
     allsrc = revsetlang.formatspec("%ld", rebaseset)
     alias = {"ALLSRC": allsrc}
@@ -1704,6 +1713,7 @@ def concludenode(
             mutinfo = mutation.record(repo, extra, preds, mutop)
         if extrafn:
             extrafn(ctx, extra)
+
         loginfo = {"predecessors": ctx.hex(), "mutation": "rebase"}
 
         destphase = max(ctx.phase(), phases.draft)
@@ -2333,76 +2343,6 @@ def clearrebased(
         templ.setprop("nodereplacements", replacements)
 
 
-def pullrebase(orig, ui, repo, *args, **opts):
-    "Call rebase after pull if the latter has been invoked with --rebase"
-    ret = None
-    if opts.get(r"rebase"):
-        if ui.configbool("commands", "rebase.requiredest"):
-            msg = _("rebase destination required by configuration")
-            hint = _("use @prog@ pull followed by @prog@ rebase -d DEST")
-            raise error.Abort(msg, hint=hint)
-
-        with repo.wlock(), repo.lock():
-            if opts.get(r"update"):
-                del opts[r"update"]
-                ui.debug(
-                    "--update and --rebase are not compatible, ignoring "
-                    "the update flag\n"
-                )
-
-            cmdutil.checkunfinished(repo)
-            cmdutil.bailifchanged(
-                repo,
-                hint=_(
-                    "cannot pull with rebase: "
-                    "please commit or shelve your changes first"
-                ),
-            )
-
-            revsprepull = len(repo)
-            origpostincoming = commands.postincoming
-
-            def _dummy(*args, **kwargs):
-                pass
-
-            commands.postincoming = _dummy
-            try:
-                ret = orig(ui, repo, *args, **opts)
-            finally:
-                commands.postincoming = origpostincoming
-            revspostpull = len(repo)
-            if revspostpull > revsprepull:
-                # --rev option from pull conflict with rebase own --rev
-                # dropping it
-                if r"rev" in opts:
-                    del opts[r"rev"]
-                # positional argument from pull conflicts with rebase's own
-                # --source.
-                if r"source" in opts:
-                    del opts[r"source"]
-                # revsprepull is the len of the repo, not revnum of tip.
-                destspace = list(repo.changelog.revs(start=revsprepull))
-                opts[r"_destspace"] = destspace
-                try:
-                    rebase(ui, repo, **opts)
-                except error.NoMergeDestAbort:
-                    # we can maybe update instead
-                    rev, _a, _b = destutil.destupdate(repo)
-                    if rev == repo["."].rev():
-                        ui.status(_("nothing to rebase\n"))
-                    else:
-                        ui.status(_("nothing to rebase - updating instead\n"))
-                        # not passing argument to get the bare update behavior
-                        # with warning and trumpets
-                        commands.update(ui, repo)
-    else:
-        if opts.get(r"tool"):
-            raise error.Abort(_("--tool can only be used with --rebase"))
-        ret = orig(ui, repo, *args, **opts)
-
-    return ret
-
-
 def _filterobsoleterevs(repo, revs):
     """returns a set of the obsolete revisions in revs"""
     return set(r for r in revs if repo[r].obsolete())
@@ -2484,11 +2424,5 @@ def summaryhook(ui, repo) -> None:
 
 
 def uisetup(ui) -> None:
-    # Replace pull with a decorator to provide --rebase option
-    entry = extensions.wrapcommand(commands.table, "pull", pullrebase)
-    entry[1].append(
-        ("", "rebase", None, _("rebase current commit or current stack onto master"))
-    )
-    entry[1].append(("t", "tool", "", _("specify merge tool for rebase")))
     cmdutil.summaryhooks.add("rebase", summaryhook)
     cmdutil.afterresolvedstates.append(("rebasestate", _("@prog@ rebase --continue")))

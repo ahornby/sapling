@@ -1,5 +1,6 @@
 #chg-compatible
 #require no-fsmonitor
+#debugruntest-incompatible
 
 Short help:
 
@@ -273,6 +274,8 @@ Test extension help:
       Enabled extensions:
   
        conflictinfo
+       eden          accelerated hg functionality in Eden checkouts (eden !)
+       copytrace     extension that does copytracing fast
        debugshell    a python shell with repo, changelog & manifest objects
        errorredirect
                      redirect error message
@@ -281,11 +284,12 @@ Test extension help:
        progressfile  allows users to have JSON progress bar information written
                      to a path
        rebase        command to move sets of revisions to a different ancestor
-       eden          accelerated hg functionality in Eden checkouts (eden !)
        remotefilelog
                      minimize and speed up large repositories
        sampling      (no help text available)
        treemanifest
+       tweakdefaults
+                     user friendly defaults
   
       Disabled extensions:
   
@@ -301,13 +305,10 @@ Test extension help:
                      provide information about the client in server telemetry
        clonebundles  advertise pre-generated bundles to seed clones
        commitcloud   back up and sync changesets via the cloud
-       copytrace     extension that does copytracing fast
        crdump        (no help text available)
        debugnetwork  test network connections to the server
        dialect       replace terms with more widely used equivalents
        dirsync
-       disablesymlinks
-                     disables symlink support when enabled
        drop          drop specified changeset from the stack
        edensparse    allow sparse EdenFS checkouts
        extdiff       command to allow external programs to compare revisions
@@ -354,8 +355,6 @@ Test extension help:
        stablerev     provide a way to expose the "stable" commit via a revset
        traceprof     (no help text available)
        treemanifestserver
-       tweakdefaults
-                     user friendly defaults
        undo          (no help text available)
        win32mbcs     allow the use of MBCS paths with problematic encodings
 
@@ -472,6 +471,8 @@ Verbose help for add
       --hidden                consider hidden changesets
       --pager TYPE            when to paginate (boolean, always, auto, or never)
                               (default: auto)
+      --reason VALUE [+]      why this runs, usually set by automation
+                              (ADVANCED)
 
 Test the textwidth config option
 
@@ -895,7 +896,7 @@ Test list of internal help commands
 
   $ hg help debug | grep -E 'Debug|debugshell|debugapi'
   Debug commands (internal and unsupported):
-   debugapi      send an EdenAPI request and print its output
+   debugapi      send an SaplingRemoteAPI request and print its output
    debugshell    (no help text available)
 
 Test list of commands with command with no help text

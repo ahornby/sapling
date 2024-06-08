@@ -5,94 +5,77 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+import type {DetailedHTMLProps} from 'react';
+
 import serverAPI from './ClientToServerAPI';
 import {t} from './i18n';
-import platform from './platform';
-import {latestCommits} from './serverAPIState';
-import {selector, useRecoilValueLoadable} from 'recoil';
+import {atomFamilyWeak, lazyAtom} from './jotaiUtils';
+import {colors, radius} from './tokens.stylex';
+import * as stylex from '@stylexjs/stylex';
+import {useAtomValue} from 'jotai';
 
-const uniqueAuthors = selector<Array<string>>({
-  key: 'uniqueAuthors',
-  get: ({get}): Array<string> => {
-    const commits = get(latestCommits);
-    const authors = commits
-      .filter(commit => commit.phase !== 'public')
-      .map(commit => commit.author);
-    const unique = new Set(authors);
-    return Array.from(unique);
-  },
-});
-
-type StoredAvatarData = {
-  lastFetched: number;
-  avatars: Array<[string, string]>;
-};
-
-function getCachedAvatars(authors: Array<string>): undefined | Map<string, string> {
-  try {
-    const found = platform.getTemporaryState('avatars') as StoredAvatarData;
-    if (
-      // not yet cached
-      found == null ||
-      // cache expired
-      new Date().valueOf() - new Date(found.lastFetched).valueOf() > 24 * 60 * 60 * 1000
-    ) {
-      return undefined;
-    }
-    const storedAvatars = new Map(found.avatars);
-
-    // make sure the cache is exhaustive
-    if (authors.every(author => storedAvatars.has(author))) {
-      return storedAvatars;
-    }
-  } catch {
-    // ignore
-  }
-  return undefined;
-}
-function storeCachedAvatars(avatars: Map<string, string>) {
-  platform.setTemporaryState('avatars', {
-    lastFetched: new Date().valueOf(),
-    avatars: Array.from(avatars),
-  } as StoredAvatarData);
-}
-
-const avatars = selector<Map<string, string>>({
-  key: 'avatars',
-  get: ({get}) => {
-    const authors = get(uniqueAuthors);
-
-    const found = getCachedAvatars(authors);
-    if (found != null) {
-      return found;
-    }
-
+const avatarUrl = atomFamilyWeak((author: string) => {
+  // Rate limitor for the same author is by lazyAtom and atomFamilyWeak caching.
+  return lazyAtom(async () => {
     serverAPI.postMessage({
       type: 'fetchAvatars',
-      authors,
+      authors: [author],
     });
+    const result = await serverAPI.nextMessageMatching('fetchedAvatars', ({authors}) =>
+      authors.includes(author),
+    );
+    return result.avatars.get(author);
+  }, undefined);
+});
 
-    return (async () => {
-      const result = await serverAPI.nextMessageMatching('fetchedAvatars', () => true);
+export function AvatarImg({
+  url,
+  username,
+  xstyle,
+  ...rest
+}: {url?: string; username: string; xstyle?: stylex.StyleXStyles} & DetailedHTMLProps<
+  React.ImgHTMLAttributes<HTMLImageElement>,
+  HTMLImageElement
+>) {
+  return url == null ? null : (
+    <img
+      {...stylex.props(styles.circle, xstyle)}
+      src={url}
+      width={14}
+      height={14}
+      alt={t("$user's avatar photo", {replace: {$user: username}})}
+      {...rest}
+    />
+  );
+}
 
-      storeCachedAvatars(result.avatars);
-
-      return result.avatars;
-    })();
+const styles = stylex.create({
+  circle: {
+    width: 14,
+    height: 14,
+    border: '2px solid',
+    borderRadius: radius.full,
+    borderColor: colors.fg,
+  },
+  empty: {
+    content: '',
+    backgroundColor: 'var(--foreground)',
   },
 });
 
-export function Avatar({username}: {username: string}) {
-  const storage = useRecoilValueLoadable(avatars);
-  const img = storage.valueMaybe()?.get(username);
+export function BlankAvatar() {
+  return <div {...stylex.props(styles.circle, styles.empty)} />;
+}
 
-  return (
-    <div className="commit-avatar">
-      {img == null ? null : (
-        <img src={img} width={14} height={14} alt={t("$user's avatar photo")} />
-      )}
-    </div>
-  );
+export function Avatar({
+  username,
+  ...rest
+}: {username: string} & DetailedHTMLProps<
+  React.ImgHTMLAttributes<HTMLImageElement>,
+  HTMLImageElement
+>) {
+  const url = useAtomValue(avatarUrl(username));
+  return url == null ? <BlankAvatar /> : <AvatarImg url={url} username={username} {...rest} />;
 }
 
 /** Render as a SVG pattern */
@@ -107,8 +90,7 @@ export function AvatarPattern({
   id: string;
   fallbackFill: string;
 }) {
-  const storage = useRecoilValueLoadable(avatars);
-  const img = storage.valueMaybe()?.get(username);
+  const img = useAtomValue(avatarUrl(username));
   return (
     <pattern
       id={id}

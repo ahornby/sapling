@@ -20,8 +20,12 @@ use anyhow::anyhow;
 use anyhow::Result;
 use arc_swap::ArcSwap;
 use configloader::hg::PinnedConfig;
+use configloader::Config;
+use edenapi::configmodel::config::ContentHash;
+use edenapi::configmodel::ConfigExt;
 use log::warn;
 use repo::repo::Repo;
+use repo::RepoMinimalInfo;
 use storemodel::BoxIterator;
 use storemodel::Bytes;
 use storemodel::FileAuxData;
@@ -29,11 +33,10 @@ use storemodel::FileStore;
 use storemodel::TreeEntry;
 use storemodel::TreeStore;
 use tracing::instrument;
+use types::fetch_mode::FetchMode;
 use types::HgId;
 use types::Key;
 use types::RepoPath;
-
-use crate::FetchMode;
 
 pub struct BackingStore {
     // ArcSwap is similar to RwLock, but has lower overhead for read operations.
@@ -52,7 +55,20 @@ struct Inner {
     // State used to track the touch file and determine if we need to reload ourself.
     create_time: Instant,
     touch_file_mtime: Option<SystemTime>,
+
+    // To prevent multiple threads reloading at the same time.
     already_reloading: AtomicBool,
+
+    // Last time we did a full reload of the Repo.
+    last_reload: Instant,
+
+    // Controlled by config "backingstore.reload-check-interval-secs".
+    // Sets the minimum delay before we check if we need to reload (defaults to 5s).
+    reload_check_interval: Duration,
+
+    // Controlled by config "backingstore.reload-interval-secs".
+    // Sets the maximum time since last reload until we force a reload (defaults to 5m).
+    reload_interval: Duration,
 }
 
 impl BackingStore {
@@ -98,22 +114,34 @@ impl BackingStore {
     ) -> Result<Inner> {
         constructors::init();
 
-        let mut config = configloader::hg::load(Some(root), extra_configs)?;
+        let info = RepoMinimalInfo::from_repo_root(root.to_path_buf())?;
+        let mut config = configloader::hg::embedded_load(Some(&info), extra_configs)?;
 
         let source = "backingstore".into();
-        config.set("store", "aux", Some("true"), &source);
         if !allow_retries {
             config.set("lfs", "backofftimes", Some(""), &source);
             config.set("lfs", "throttlebackofftimes", Some(""), &source);
             config.set("edenapi", "max-retry-per-request", Some("0"), &source);
         }
 
+        // Allow overrideing scmstore.tree-metadata-mode for eden only.
+        if let Some(mode) = config.get_nonempty("eden", "tree-metadata-mode") {
+            config.set(
+                "scmstore",
+                "tree-metadata-mode",
+                Some(mode),
+                &"backingstore".into(),
+            );
+        }
+
         // Apply indexed log configs, which can affect edenfs behavior.
         indexedlog::config::configure(&config)?;
 
-        let repo = Repo::load_with_config(root, config.clone())?;
+        let repo = Repo::load_with_config(root, config)?;
         let filestore = repo.file_store()?;
         let treestore = repo.tree_store()?;
+
+        let config = repo.config().clone();
 
         Ok(Inner {
             treestore,
@@ -124,6 +152,13 @@ impl BackingStore {
             create_time: Instant::now(),
             touch_file_mtime,
             already_reloading: AtomicBool::new(false),
+            last_reload: Instant::now(),
+            reload_check_interval: config
+                .get_opt("backingstore", "reload-check-interval-secs")?
+                .unwrap_or(Duration::from_secs(5)),
+            reload_interval: config
+                .get_opt("backingstore", "reload-interval-secs")?
+                .unwrap_or(Duration::from_secs(300)),
         })
     }
 
@@ -216,23 +251,26 @@ impl BackingStore {
         self.inner.load().flush();
     }
 
-    // Fully reload the stores if a touch file has a newer mtime than last time
-    // we checked, or the touch file exists and didn't exist last time. The main
-    // purpose of reloading is to allow a running EdenFS to pick up Sapling
-    // config changes that affect fetching/caching.
+    // Fully reload the stores if:
+    //   - a touch file has a newer mtime than last time we checked, or
+    //   - the touch file exists and didn't exist last time, or
+    //   - sapling configs appear changed on disk
     //
-    // We perform the check at most once every 5 seconds. If the touch file
-    // hasn't changed, we still swap out the Inner object solely to reset the
-    // state we use to track the touch file (i.e. we keep all the store objects
-    // the same). Any errors reloading are ignored and the existing stores are
-    // used.
+    // The main purpose of reloading is to allow a running EdenFS to pick up
+    // Sapling config changes that affect fetching/caching.
+    //
+    // We perform the check at most once every `reload_check_interval=5`
+    // seconds. If we aren't reloading, we still swap out the Inner object
+    // solely to reset the state we use to track the touch file (i.e. we keep
+    // all the store objects the same). Any errors reloading are ignored and the
+    // existing stores are used.
     //
     // We return an arc_swap::Guard so we only call inner.load() once normally.
     #[instrument(level = "trace", skip(self))]
     fn maybe_reload(&self) -> arc_swap::Guard<Arc<Inner>> {
         let inner = self.inner.load();
 
-        if inner.create_time.elapsed() < Duration::from_secs(5) {
+        if inner.create_time.elapsed() < inner.reload_check_interval {
             return inner;
         }
 
@@ -244,17 +282,38 @@ impl BackingStore {
             return inner;
         }
 
+        let since_last_reload = inner.last_reload.elapsed();
+
+        let mut needs_reload = false;
+
+        // If it has been at least `reload_interval`, check if sapling config has changed.
+        if !inner.reload_interval.is_zero() && since_last_reload >= inner.reload_interval {
+            if let Ok(info) = RepoMinimalInfo::from_repo_root(inner.repo.path().to_owned()) {
+                if let Ok(config) =
+                    configloader::hg::embedded_load(Some(&info), &inner.extra_configs)
+                {
+                    if let Some(reason) =
+                        diff_config_files(&inner.repo.config().files(), &config.files())
+                    {
+                        tracing::info!("sapling config files differ: {reason}");
+                        needs_reload = true;
+                    } else {
+                        tracing::debug!("sapling config files haven't changed");
+                    }
+                }
+            }
+        };
+
         let new_mtime = touch_file_mtime();
 
-        let needs_reload =
-            new_mtime
-                .as_ref()
-                .is_some_and(|new_mtime| match &inner.touch_file_mtime {
-                    Some(old_mtime) => new_mtime > old_mtime,
-                    None => true,
-                });
+        tracing::debug!(last_reload=?since_last_reload, old_mtime=?inner.touch_file_mtime, ?new_mtime, "checking touch file");
 
-        tracing::debug!(old_mtime=?inner.touch_file_mtime, ?new_mtime, "checking touch file mtime");
+        needs_reload |= new_mtime
+            .as_ref()
+            .is_some_and(|new_mtime| match &inner.touch_file_mtime {
+                Some(old_mtime) => new_mtime > old_mtime,
+                None => true,
+            });
 
         let new_inner = if needs_reload {
             tracing::info!("reloading backing store");
@@ -270,13 +329,17 @@ impl BackingStore {
                 &inner.extra_configs,
                 new_mtime,
             ) {
-                Ok(new_inner) => new_inner,
+                Ok(mut new_inner) => {
+                    new_inner.last_reload = Instant::now();
+                    new_inner
+                }
                 Err(err) => {
                     tracing::warn!(?err, "error reloading backingstore");
                     inner.as_ref().soft_reload(new_mtime)
                 }
             }
         } else {
+            tracing::debug!("not reloading backing store");
             inner.as_ref().soft_reload(new_mtime)
         };
 
@@ -284,6 +347,35 @@ impl BackingStore {
 
         self.inner.load()
     }
+}
+
+fn diff_config_files(
+    old: &[(PathBuf, Option<ContentHash>)],
+    new: &[(PathBuf, Option<ContentHash>)],
+) -> Option<String> {
+    let mut new: HashMap<PathBuf, Option<ContentHash>> = new.iter().cloned().collect();
+
+    for (old_path, old_hash) in old.iter() {
+        if let Some(new_hash) = new.remove(old_path) {
+            let mismatch = match (old_hash, new_hash) {
+                (None, None) => false,
+                (None, Some(_)) => true,
+                (Some(_), None) => true,
+                (Some(old_hash), Some(ref new_hash)) => old_hash != new_hash,
+            };
+
+            if mismatch {
+                return Some(format!("file {} metadata mismatch", old_path.display()));
+            }
+        } else {
+            return Some(format!("file {} was deleted", old_path.display()));
+        }
+    }
+
+    // Anything left is a new file we didn't have last time.
+    new.keys()
+        .next()
+        .map(|added| format!("file {} was added", added.display()))
 }
 
 impl Inner {
@@ -298,7 +390,10 @@ impl Inner {
 
             touch_file_mtime,
             create_time: Instant::now(),
+            last_reload: self.last_reload,
             already_reloading: AtomicBool::new(false),
+            reload_check_interval: self.reload_check_interval,
+            reload_interval: self.reload_interval,
         }
     }
 
@@ -331,10 +426,16 @@ where
     IntermediateType: Into<OutputType>,
 {
     fn get_local_single(&self, path: &RepoPath, id: HgId) -> Result<Option<IntermediateType>>;
-    fn get_single(&self, path: &RepoPath, id: HgId) -> Result<IntermediateType>;
+    fn get_single(
+        &self,
+        path: &RepoPath,
+        id: HgId,
+        fetch_mode: FetchMode,
+    ) -> Result<IntermediateType>;
     fn get_batch_iter(
         &self,
         keys: Vec<Key>,
+        fetch_mode: FetchMode,
     ) -> Result<BoxIterator<Result<(Key, IntermediateType)>>>;
 
     // The following methods are "derived" from the above.
@@ -347,7 +448,8 @@ where
                 .map(|v| v.into());
             Ok(maybe_value)
         } else {
-            let value = self.get_single(RepoPath::empty(), hgid)?;
+            // FetchMode::RemoteOnly and FetchMode::AllowRemote
+            let value = self.get_single(RepoPath::empty(), hgid, fetch_mode)?;
             let value = value.into();
             Ok(Some(value))
         }
@@ -374,7 +476,7 @@ where
             let mut key_to_index = indexed_keys(&keys);
             let mut remaining = keys.len();
             let mut errors = Vec::new();
-            match self.get_batch_iter(keys) {
+            match self.get_batch_iter(keys, fetch_mode) {
                 Err(e) => errors.push(e),
                 Ok(iter) => {
                     for entry in iter {
@@ -415,11 +517,15 @@ impl LocalRemoteImpl<Bytes, Vec<u8>> for Arc<dyn FileStore> {
     fn get_local_single(&self, path: &RepoPath, id: HgId) -> Result<Option<Bytes>> {
         self.get_local_content(path, id)
     }
-    fn get_single(&self, path: &RepoPath, id: HgId) -> Result<Bytes> {
-        self.get_content(path, id)
+    fn get_single(&self, path: &RepoPath, id: HgId, fetch_mode: FetchMode) -> Result<Bytes> {
+        self.get_content(path, id, fetch_mode)
     }
-    fn get_batch_iter(&self, keys: Vec<Key>) -> Result<BoxIterator<Result<(Key, Bytes)>>> {
-        self.get_content_iter(keys)
+    fn get_batch_iter(
+        &self,
+        keys: Vec<Key>,
+        fetch_mode: FetchMode,
+    ) -> Result<BoxIterator<Result<(Key, Bytes)>>> {
+        self.get_content_iter(keys, fetch_mode)
     }
 }
 
@@ -428,11 +534,15 @@ impl LocalRemoteImpl<FileAuxData> for Arc<dyn FileStore> {
     fn get_local_single(&self, path: &RepoPath, id: HgId) -> Result<Option<FileAuxData>> {
         self.get_local_aux(path, id)
     }
-    fn get_single(&self, path: &RepoPath, id: HgId) -> Result<FileAuxData> {
-        self.get_aux(path, id)
+    fn get_single(&self, path: &RepoPath, id: HgId, fetch_mode: FetchMode) -> Result<FileAuxData> {
+        self.get_aux(path, id, fetch_mode)
     }
-    fn get_batch_iter(&self, keys: Vec<Key>) -> Result<BoxIterator<Result<(Key, FileAuxData)>>> {
-        self.get_aux_iter(keys)
+    fn get_batch_iter(
+        &self,
+        keys: Vec<Key>,
+        fetch_mode: FetchMode,
+    ) -> Result<BoxIterator<Result<(Key, FileAuxData)>>> {
+        self.get_aux_iter(keys, fetch_mode)
     }
 }
 
@@ -441,9 +551,14 @@ impl LocalRemoteImpl<Box<dyn TreeEntry>> for Arc<dyn TreeStore> {
     fn get_local_single(&self, path: &RepoPath, id: HgId) -> Result<Option<Box<dyn TreeEntry>>> {
         self.get_local_tree(path, id)
     }
-    fn get_single(&self, path: &RepoPath, id: HgId) -> Result<Box<dyn TreeEntry>> {
+    fn get_single(
+        &self,
+        path: &RepoPath,
+        id: HgId,
+        fetch_mode: FetchMode,
+    ) -> Result<Box<dyn TreeEntry>> {
         match self
-            .get_tree_iter(vec![Key::new(path.to_owned(), id)])?
+            .get_tree_iter(vec![Key::new(path.to_owned(), id)], fetch_mode)?
             .next()
         {
             Some(Ok((_key, tree))) => Ok(tree),
@@ -454,8 +569,9 @@ impl LocalRemoteImpl<Box<dyn TreeEntry>> for Arc<dyn TreeStore> {
     fn get_batch_iter(
         &self,
         keys: Vec<Key>,
+        fetch_mode: FetchMode,
     ) -> Result<BoxIterator<Result<(Key, Box<dyn TreeEntry>)>>> {
-        self.get_tree_iter(keys)
+        self.get_tree_iter(keys, fetch_mode)
     }
 }
 

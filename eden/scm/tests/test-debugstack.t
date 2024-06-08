@@ -1,7 +1,8 @@
-#debugruntest-compatible
+
+#require no-eden
+
 
   $ configure modern
-  $ enable tweakdefaults
   $ setconfig tweakdefaults.showupdated=true
 
 Test utils:

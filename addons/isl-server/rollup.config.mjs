@@ -9,14 +9,16 @@ import alias from '@rollup/plugin-alias';
 import cjs from '@rollup/plugin-commonjs';
 import nodeResolve from '@rollup/plugin-node-resolve';
 import replace from '@rollup/plugin-replace';
-import path from 'path';
+import path from 'node:path';
 import esbuild from 'rollup-plugin-esbuild';
+import {fileURLToPath} from 'node:url';
 
 // eslint-disable-next-line no-undef
 const isProduction = process.env.NODE_ENV === 'production';
 
-const __dirname = new URL('.', import.meta.url).pathname;
-const projectRootDir = path.resolve(__dirname, '..');
+const filePath = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(filePath);
+const projectRootDir = path.dirname(__dirname);
 
 const customResolver = nodeResolve({
   extensions: ['.ts', '.mjs', '.js', '.jsx', '.json', '.sass', '.scss'],

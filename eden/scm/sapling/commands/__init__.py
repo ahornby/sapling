@@ -176,6 +176,7 @@ globalopts = cmdutil._typedflags(
             _("when to paginate (boolean, always, auto, or never)"),
             _("TYPE"),
         ),
+        ("", "reason", [], _("why this runs, usually set by automation (ADVANCED)")),
     ]
 )
 
@@ -493,6 +494,7 @@ def annotate(ui, repo, *pats, **opts):
     for abs in ctx.walk(m):
         fctx = ctx[abs]
         rootfm.startitem()
+        rootfm.context(ctx=ctx)
         rootfm.data(abspath=abs, path=m.rel(abs))
         if not opts.get("text") and fctx.isbinary():
             rootfm.plain(_("%s: binary file\n") % ((pats and m.rel(abs)) or abs))
@@ -805,7 +807,7 @@ def _dobackout(ui, repo, node=None, rev=None, **opts):
     else:
         hg.clean(repo, node, show_stats=False)
         repo.dirstate.setbranch(branch)
-        cmdutil.revert(ui, repo, rctx, repo.dirstate.parents(), forcecopytracing=True)
+        cmdutil.revert(ui, repo, rctx, repo.dirstate.parents())
         # Ensure reverse-renames are preserved during the backout. In theory
         # cmdutil.revert() should handle this, but it's extremely complex, so
         # let's just double check it here.
@@ -4390,6 +4392,20 @@ def merge(ui, repo, node=None, **opts):
     if not node:
         node = repo[destutil.destmerge(repo)].node()
 
+    max_distance = ui.configint("merge", "max-distance")
+    if max_distance:
+        # merge distance is computed as the number of commit between the common ancestors and the merge
+        distance = repo.dageval(
+            lambda: len(
+                range(children(gcaall(dot() + lookup(node))), dot() + lookup(node))
+            )
+        )
+        if distance > max_distance:
+            raise error.Abort(
+                _("merging distant ancestors is not supported for this repository"),
+                hint=_("use rebase instead"),
+            )
+
     if opts.get("preview"):
         # find nodes that are ancestors of p2 but not of p1
         p1 = repo.lookup(".")
@@ -4662,7 +4678,7 @@ def postincoming(ui, repo, modheads, optupdate, checkout, brev):
     """
     if optupdate:
         try:
-            return hg.updatetotally(ui, repo, checkout, brev)
+            return hg.updatetotally(ui, repo, checkout or repo["tip"].node(), brev)
         except error.UpdateAbort as inst:
             msg = _("not updating: %s") % str(inst)
             hint = inst.hint
@@ -4721,11 +4737,6 @@ def pull(ui, repo, source="default", **opts):
     """
     if ui.configbool("pull", "automigrate"):
         repo.automigratestart()
-
-    if ui.configbool("commands", "update.requiredest") and opts.get("update"):
-        msg = _("update destination required by configuration")
-        hint = _("use @prog@ pull followed by @prog@ goto DEST")
-        raise error.Abort(msg, hint=hint)
 
     # Allows us to announce larger changes affecting all the users by displaying
     # config-driven hint on pull.
@@ -5232,7 +5243,7 @@ def remove(ui, repo, *pats, **opts):
 @command(
     "rename|move|mv",
     [
-        ("", "mark", None, _("mark as a rename without actual renaming")),
+        ("", "mark", None, _("mark a rename that has already occurred")),
         ("", "amend", None, _("amend the current commit to mark a rename")),
         ("A", "after", None, _("alias to --mark (DEPRECATED)")),
         ("f", "force", None, _("forcibly copy over an existing managed file")),
@@ -6416,13 +6427,6 @@ def update(
     if rev is not None and rev != "" and node is not None:
         raise error.Abort(_("please specify just one revision"))
 
-    if ui.configbool("commands", "update.requiredest"):
-        if not node and not rev and not date:
-            raise error.Abort(
-                _("you must specify a destination"),
-                hint=_('for example: @prog@ goto ".::"'),
-            )
-
     if rev is None or rev == "":
         rev = node
 
@@ -6434,21 +6438,17 @@ def update(
             _("can only specify one of -C/--clean, -c/--check, " "or -m/--merge")
         )
 
-    # If nothing was passed, the default behavior (moving to branch tip)
-    # can be disabled and replaced with an error.
-    # internal config: ui.disallowemptyupdate
-    if ui.configbool("ui", "disallowemptyupdate"):
-        if node is None and rev is None and not date:
-            raise error.Abort(
-                _(
-                    "You must specify a destination to update to,"
-                    + ' for example "@prog@ goto main".'
-                ),
-                hint=_(
-                    "If you're trying to move a bookmark forward, try "
-                    + '"@prog@ rebase -d <destination>".'
-                ),
-            )
+    if node is None and rev is None and not date:
+        raise error.Abort(
+            _(
+                "You must specify a destination to update to,"
+                + ' for example "@prog@ goto main".'
+            ),
+            hint=_(
+                "If you're trying to move a bookmark forward, try "
+                + '"@prog@ rebase -d <destination>".'
+            ),
+        )
 
     # Suggest `hg prev` as an alternative to 'hg update .^'.
     # internal config: ui.suggesthgprev

@@ -6,6 +6,7 @@ oncall("source_control")
 thrift_library(
     name = "megarepo_configs",
     languages = [
+        "hs2",
         "rust",
         "py3",
         "cpp2",
@@ -25,6 +26,9 @@ thrift_library(
     thrift_srcs = {
         "megarepo_configs.thrift": [],
     },
+    deps = [
+        "//thrift/annotation:rust",
+    ],
 )
 
 thrift_library(

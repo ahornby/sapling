@@ -44,14 +44,13 @@ use serde::Deserializer;
 use serde::Serialize;
 use serde::Serializer;
 use strum::EnumString;
-use strum::EnumVariantNames;
 use strum::VariantNames;
-use thrift_types::edenfs::errors::eden_service::PrefetchFilesError;
-use thrift_types::edenfs::types::GlobParams;
-use thrift_types::edenfs::types::MountInfo;
-use thrift_types::edenfs::types::MountState;
-use thrift_types::edenfs::types::PredictiveFetch;
-use thrift_types::edenfs::types::PrefetchParams;
+use thrift_types::edenfs::GlobParams;
+use thrift_types::edenfs::MountInfo;
+use thrift_types::edenfs::MountState;
+use thrift_types::edenfs::PredictiveFetch;
+use thrift_types::edenfs::PrefetchParams;
+use thrift_types::edenfs_clients::errors::PrefetchFilesError;
 use thrift_types::fbthrift::ApplicationExceptionErrorCode;
 use toml::value::Value;
 use uuid::Uuid;
@@ -75,7 +74,7 @@ const SNAPSHOT_MAGIC_4: &[u8] = b"eden\x00\x00\x00\x04";
 // List of supported repository types. This should stay in sync with the list
 // in the Python CLI at fs/cli_rs/edenfs-client/src/checkout.rs and the list in
 // the Daemon's CheckoutConfig at fs/config/CheckoutConfig.h.
-#[derive(Deserialize, Serialize, Debug, PartialEq, EnumVariantNames, EnumString)]
+#[derive(Deserialize, Serialize, Debug, PartialEq, VariantNames, EnumString)]
 #[serde(rename_all = "lowercase")]
 enum RepositoryType {
     #[strum(serialize = "git")]
@@ -88,7 +87,7 @@ enum RepositoryType {
     FilteredHg,
 }
 
-#[derive(Deserialize, Serialize, Debug, PartialEq, EnumVariantNames, EnumString)]
+#[derive(Deserialize, Serialize, Debug, PartialEq, VariantNames, EnumString)]
 #[serde(rename_all = "lowercase")]
 enum MountProtocol {
     #[strum(serialize = "fuse")]
@@ -99,7 +98,7 @@ enum MountProtocol {
     Prjfs,
 }
 
-#[derive(Deserialize, Serialize, Debug, PartialEq, EnumVariantNames, EnumString)]
+#[derive(Deserialize, Serialize, Debug, PartialEq, VariantNames, EnumString)]
 #[serde(rename_all = "lowercase")]
 enum InodeCatalogType {
     #[strum(serialize = "legacy")]
@@ -775,7 +774,7 @@ impl EdenFsCheckout {
             .collect::<std::io::Result<HashSet<_>>>()
             .with_context(|| {
                 anyhow!(
-                    "Cannot read conents for prefetch profile '{}'",
+                    "Cannot read contents for prefetch profile '{}'",
                     profile_path.display()
                 )
             })?)
@@ -987,9 +986,9 @@ impl EdenFsCheckout {
                     This means prefetch-profiles.predictive-prefetching-enabled is not set in \
                     the EdenFS configs.",
                 );
-            } else {
-                return Ok(());
             }
+
+            return Ok(());
         }
 
         if !EdenFsCheckout::should_prefetch_profiles(&config) && !predictive {

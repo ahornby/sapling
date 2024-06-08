@@ -18,19 +18,20 @@ import type {
 } from 'shared/types/stack';
 
 import {
+  commitMessageFieldsSchema,
   commitMessageFieldsToString,
-  getDefaultCommitMessageSchema,
   mergeCommitMessageFields,
   parseCommitMessageFields,
 } from '../CommitInfoView/CommitMessageFields';
 import {t} from '../i18n';
-import {assert, firstLine} from '../utils';
+import {readAtom} from '../jotaiUtils';
+import {assert} from '../utils';
 import {FileStackState} from './fileStackState';
 import deepEqual from 'fast-deep-equal';
 import {Seq, List, Map as ImMap, Set as ImSet, Record, is} from 'immutable';
-import {cached} from 'shared/LRU';
+import {LRU, cachedMethod} from 'shared/LRU';
 import {SelfUpdate} from 'shared/immutableExt';
-import {generatorContains, unwrap, zip} from 'shared/utils';
+import {firstLine, generatorContains, nullthrows, zip} from 'shared/utils';
 
 type CommitStackProps = {
   /**
@@ -126,21 +127,17 @@ export class CommitStackState extends SelfUpdate<CommitStackRecord> {
    * `record` initialization is for internal use only.
    */
   constructor(originalStack?: Readonly<ExportStack>, record?: CommitStackRecord) {
-    if (originalStack !== undefined) {
-      const bottomFiles = getBottomFilesFromExportStack(originalStack);
-      const stack = getCommitStatesFromExportStack(originalStack);
-      super(
-        CommitStackRecord({
-          originalStack,
-          bottomFiles,
-          stack,
-        }),
-      );
-    } else if (record !== undefined) {
-      super(record);
-    } else {
-      super(CommitStackRecord());
-    }
+    super(
+      originalStack !== undefined
+        ? CommitStackRecord({
+            originalStack,
+            bottomFiles: getBottomFilesFromExportStack(originalStack),
+            stack: getCommitStatesFromExportStack(originalStack),
+          })
+        : record !== undefined
+        ? record
+        : CommitStackRecord(),
+    );
   }
 
   // Delegates to SelfUpdate.inner
@@ -411,9 +408,9 @@ export class CommitStackState extends SelfUpdate<CommitStackRecord> {
       if (changedRevs.has(rev)) {
         return revToMark(rev);
       } else {
-        const nodes = unwrap(state.stack.get(rev)).originalNodes;
+        const nodes = nullthrows(state.stack.get(rev)).originalNodes;
         assert(nodes.size === 1, 'unchanged commits should have exactly 1 nodes');
-        return unwrap(nodes.first());
+        return nullthrows(nodes.first());
       }
     };
 
@@ -442,11 +439,20 @@ export class CommitStackState extends SelfUpdate<CommitStackRecord> {
           return [path, newFile];
         }),
       );
+      // Ensure the text is not empty with a filler title.
+      const text =
+        commit.text.trim().length === 0 ||
+        // if a commit template is used, but the title is not given, then we may have non-title text.
+        // sl would trim the leading whitespace, which can end up using the commit template as the commit title.
+        // Instead, use the same filler title.
+        commit.text[0] === '\n'
+          ? t('(no title provided)') + commit.text
+          : commit.text;
       const importCommit: ImportCommit = {
         mark: revToMark(commit.rev),
         author: commit.author,
         date: [opts?.rewriteDate ?? commit.date.unix, commit.date.tz],
-        text: commit.text,
+        text,
         parents: commit.parents.toArray().map(revToMarkOrHash),
         predecessors: commit.originalNodes.toArray(),
         files: newFiles,
@@ -489,7 +495,7 @@ export class CommitStackState extends SelfUpdate<CommitStackRecord> {
   parentFile(rev: Rev, path: RepoPath, followRenames = true): [Rev, RepoPath, FileState] {
     let prevRev = -1;
     let prevPath = path;
-    let prevFile = unwrap(this.bottomFiles.get(path));
+    let prevFile = nullthrows(this.bottomFiles.get(path));
     const includeBottom = true;
     const logFile = this.logFile(rev, path, followRenames, includeBottom);
     for (const [logRev, logPath, file] of logFile) {
@@ -720,7 +726,7 @@ export class CommitStackState extends SelfUpdate<CommitStackRecord> {
                 : ((c: CommitState): [string, boolean] => [
                     c.text.split('\n').at(0) || [...c.originalNodes].at(0) || '?',
                     isAbsent(c.files.get(path)),
-                  ])(unwrap(stack.get(rev)));
+                  ])(nullthrows(stack.get(rev)));
             spans.push(`${commitTitle}/${path}`);
             if (showContent && !absent) {
               spans.push(`(${fileStack.getRev(fileRev)})`);
@@ -734,7 +740,7 @@ export class CommitStackState extends SelfUpdate<CommitStackRecord> {
 
   /** File name for `fileStacks[index]`. If the file is renamed, return  */
   getFileStackDescription(fileIdx: number): string {
-    const fileStack = unwrap(this.fileStacks.get(fileIdx));
+    const fileStack = nullthrows(this.fileStacks.get(fileIdx));
     const revLength = fileStack.revLength - 1;
     const nameAtFirstRev = this.getFileStackPath(fileIdx, 0);
     const nameAtLastRev = this.getFileStackPath(fileIdx, revLength - 1);
@@ -767,7 +773,7 @@ export class CommitStackState extends SelfUpdate<CommitStackRecord> {
     if (commitRev == null || commitRev < 0) {
       return undefined;
     }
-    return unwrap(this.stack.get(commitRev));
+    return nullthrows(this.stack.get(commitRev));
   }
 
   /**
@@ -789,7 +795,7 @@ export class CommitStackState extends SelfUpdate<CommitStackRecord> {
       return file.data;
     }
     if (file.data instanceof FileIdx) {
-      return unwrap(this.fileStacks.get(file.data.fileIdx)).getRev(file.data.fileRev);
+      return nullthrows(this.fileStacks.get(file.data.fileIdx)).getRev(file.data.fileRev);
     } else {
       throw new Error('getUtf8Data called on non-utf8 file.');
     }
@@ -846,13 +852,13 @@ export class CommitStackState extends SelfUpdate<CommitStackRecord> {
    * commits. For example, if rev 3 depends on rev 2, then rev 3 cannot be
    * moved to be an ancestor of rev 2, and rev 2 cannot be dropped alone.
    */
-  @cached({cacheSize: 100})
-  calculateDepMap(): Readonly<Map<Rev, Set<Rev>>> {
+  calculateDepMap = cachedMethod(this.calculateDepMapImpl, {cache: calculateDepMapCache});
+  private calculateDepMapImpl(): Readonly<Map<Rev, Set<Rev>>> {
     const state = this.maybeBuildFileStacks();
     const depMap = new Map<Rev, Set<Rev>>(state.stack.map(c => [c.rev, new Set()]));
 
     const fileIdxRevToCommitRev = (fileIdx: FileStackIndex, fileRev: Rev): Rev =>
-      unwrap(state.fileToCommit.get(FileIdx({fileIdx, fileRev}))).rev;
+      nullthrows(state.fileToCommit.get(FileIdx({fileIdx, fileRev}))).rev;
 
     // Ask FileStack for dependencies about content edits.
     state.fileStacks.forEach((fileStack, fileIdx) => {
@@ -862,7 +868,7 @@ export class CommitStackState extends SelfUpdate<CommitStackRecord> {
       fileDepMap.forEach((valueFileRevs, keyFileRev) => {
         const keyCommitRev = toCommitRev(keyFileRev);
         if (keyCommitRev >= 0) {
-          const set = unwrap(depMap.get(keyCommitRev));
+          const set = nullthrows(depMap.get(keyCommitRev));
           valueFileRevs.forEach(fileRev => {
             const rev = toCommitRev(fileRev);
             if (rev >= 0) {
@@ -875,7 +881,7 @@ export class CommitStackState extends SelfUpdate<CommitStackRecord> {
 
     // Besides, file deletion / addition / renames also introduce dependencies.
     state.stack.forEach(commit => {
-      const set = unwrap(depMap.get(commit.rev));
+      const set = nullthrows(depMap.get(commit.rev));
       commit.files.forEach((file, path) => {
         const [prevRev, prevPath, prevFile] = state.parentFile(commit.rev, path, true);
         if (prevRev >= 0 && (isAbsent(prevFile) !== isAbsent(file) || prevPath !== path)) {
@@ -903,8 +909,8 @@ export class CommitStackState extends SelfUpdate<CommitStackRecord> {
   /**
    * Test if the commit can be folded with its parent.
    */
-  @cached({cacheSize: 1000})
-  canFoldDown(rev: Rev): boolean {
+  canFoldDown = cachedMethod(this.canFoldDownImpl, {cache: canFoldDownCache});
+  private canFoldDownImpl(rev: Rev): boolean {
     if (rev <= 0) {
       return false;
     }
@@ -916,7 +922,7 @@ export class CommitStackState extends SelfUpdate<CommitStackRecord> {
     if (parentRev == null) {
       return false;
     }
-    const parent = unwrap(this.stack.get(parentRev));
+    const parent = nullthrows(this.stack.get(parentRev));
     if (commit.immutableKind !== 'none' || parent.immutableKind !== 'none') {
       return false;
     }
@@ -946,9 +952,9 @@ export class CommitStackState extends SelfUpdate<CommitStackRecord> {
    * This should only be called when `canFoldDown(rev)` returned `true`.
    */
   foldDown(rev: Rev) {
-    const commit = unwrap(this.stack.get(rev));
-    const parentRev = unwrap(this.singleParentRev(rev));
-    const parent = unwrap(this.stack.get(parentRev));
+    const commit = nullthrows(this.stack.get(rev));
+    const parentRev = nullthrows(this.singleParentRev(rev));
+    const parent = nullthrows(this.stack.get(parentRev));
     let newParentFiles = parent.files;
     const newFiles = commit.files.map((origFile, path) => {
       // Fold copyFrom. `-` means "no change".
@@ -985,7 +991,7 @@ export class CommitStackState extends SelfUpdate<CommitStackRecord> {
     // Fold other properties to parent.
     let newParentText = parent.text;
     if (isMeaningfulText(commit.text)) {
-      const schema = getDefaultCommitMessageSchema();
+      const schema = readAtom(commitMessageFieldsSchema);
       const parentTitle = firstLine(parent.text);
       const parentFields = parseCommitMessageFields(
         schema,
@@ -1019,8 +1025,8 @@ export class CommitStackState extends SelfUpdate<CommitStackRecord> {
   /**
    * Test if the commit can be dropped. That is, none of its descendants depend on it.
    */
-  @cached({cacheSize: 1000})
-  canDrop(rev: Rev): boolean {
+  canDrop = cachedMethod(this.canDropImpl, {cache: canDropCache});
+  private canDropImpl(rev: Rev): boolean {
     if (rev < 0 || this.stack.get(rev)?.immutableKind !== 'none') {
       return false;
     }
@@ -1041,12 +1047,12 @@ export class CommitStackState extends SelfUpdate<CommitStackRecord> {
    */
   drop(rev: Rev): CommitStackState {
     let state = this.useFileStack().inner;
-    const commit = unwrap(state.stack.get(rev));
+    const commit = nullthrows(state.stack.get(rev));
     commit.files.forEach((file, path) => {
       const fileIdxRev: FileIdx | undefined = state.commitToFile.get(CommitIdx({rev, path}));
       if (fileIdxRev != null) {
         const {fileIdx, fileRev} = fileIdxRev;
-        const fileStack = unwrap(state.fileStacks.get(fileIdx));
+        const fileStack = nullthrows(state.fileStacks.get(fileIdx));
         // Drop the rev by remapping it to an unused rev.
         const unusedFileRev = fileStack.source.revLength;
         const newFileStack = fileStack.remapRevs(new Map([[fileRev, unusedFileRev]]));
@@ -1083,7 +1089,7 @@ export class CommitStackState extends SelfUpdate<CommitStackRecord> {
       );
     } else {
       const revMapFunc = (r: Rev) => (r >= rev ? r + 1 : r);
-      const origParents = unwrap(state.stack.get(rev)).parents;
+      const origParents = nullthrows(state.stack.get(rev)).parents;
       newStack = state.stack
         .map(c => rewriteCommitRevs(c, revMapFunc))
         .flatMap(c => {
@@ -1177,12 +1183,13 @@ export class CommitStackState extends SelfUpdate<CommitStackRecord> {
     return true;
   }
 
-  canMoveDown(rev: Rev): boolean {
+  canMoveDown = cachedMethod(this.canMoveDownImpl, {cache: canMoveDownCache});
+  private canMoveDownImpl(rev: Rev): boolean {
     return rev > 0 && this.canMoveUp(rev - 1);
   }
 
-  @cached({cacheSize: 1000})
-  canMoveUp(rev: Rev): boolean {
+  canMoveUp = cachedMethod(this.canMoveUpImpl, {cache: canMoveUpCache});
+  private canMoveUpImpl(rev: Rev): boolean {
     return this.canReorder(reorderedRevs(this, rev));
   }
 
@@ -1220,7 +1227,7 @@ export class CommitStackState extends SelfUpdate<CommitStackRecord> {
       // file revs => commit revs => mapped commit revs => mapped file revs
       const fileRevs = fileStack.revs();
       const commitRevPaths: CommitIdx[] = fileRevs.map(fileRev =>
-        unwrap(state.fileToCommit.get(FileIdx({fileIdx, fileRev}))),
+        nullthrows(state.fileToCommit.get(FileIdx({fileIdx, fileRev}))),
       );
       const commitRevs: Rev[] = commitRevPaths.map(({rev}) => rev);
       const mappedCommitRevs: Rev[] = commitRevs.map(rev => commitRevMap.get(rev) ?? rev);
@@ -1242,7 +1249,7 @@ export class CommitStackState extends SelfUpdate<CommitStackRecord> {
 
     // Update state.stack.
     const newStack = state.stack.map((_commit, rev) => {
-      const commit = unwrap(state.stack.get(order[rev]));
+      const commit = nullthrows(state.stack.get(order[rev]));
       return commit.merge({parents: List(rev > 0 ? [rev - 1] : []), rev});
     });
     state = state.set('stack', newStack);
@@ -1511,6 +1518,12 @@ export class CommitStackState extends SelfUpdate<CommitStackRecord> {
   }
 }
 
+const canDropCache = new LRU(1000);
+const calculateDepMapCache = new LRU(1000);
+const canFoldDownCache = new LRU(1000);
+const canMoveUpCache = new LRU(1000);
+const canMoveDownCache = new LRU(1000);
+
 function getBottomFilesFromExportStack(stack: Readonly<ExportStack>): Map<RepoPath, FileState> {
   // bottomFiles requires that the stack only has one root.
   checkStackSingleRoot(stack);
@@ -1546,7 +1559,7 @@ function convertExportFileToFileState(file: ExportFile | null): FileState {
         ? file.data
         : file.dataBase85
         ? Base85({dataBase85: file.dataBase85})
-        : DataRef(unwrap(file.dataRef)),
+        : DataRef(nullthrows(file.dataRef)),
     copyFrom: file.copyFrom,
     flags: file.flags,
   });

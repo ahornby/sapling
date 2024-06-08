@@ -14,44 +14,40 @@ import {EducationInfoTip} from './Education';
 import {ErrorNotice, InlineErrorBadge} from './ErrorNotice';
 import {Subtle} from './Subtle';
 import {Tooltip} from './Tooltip';
+import {Dropdown} from './components/Dropdown';
+import {TextField} from './components/TextField';
 import {T, t} from './i18n';
+import {writeAtom} from './jotaiUtils';
 import {CommitCloudChangeWorkspaceOperation} from './operations/CommitCloudChangeWorkspaceOperation';
 import {CommitCloudCreateWorkspaceOperation} from './operations/CommitCloudCreateWorkspaceOperation';
 import {CommitCloudSyncOperation} from './operations/CommitCloudSyncOperation';
+import {useRunOperation} from './operationsState';
 import {CommitPreview, dagWithPreviews, useMostRecentPendingOperation} from './previews';
 import {RelativeDate} from './relativeDate';
-import {useRunOperation} from './serverAPIState';
 import {CommitCloudBackupStatus} from './types';
-import {
-  VSCodeButton,
-  VSCodeDropdown,
-  VSCodeOption,
-  VSCodeTextField,
-} from '@vscode/webview-ui-toolkit/react';
+import {registerDisposable} from './utils';
+import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
+import {atom, useAtom, useAtomValue} from 'jotai';
 import {useCallback, useEffect, useRef, useState} from 'react';
-import {atom, useRecoilState, useRecoilValue} from 'recoil';
 import {Icon} from 'shared/Icon';
 import {notEmpty} from 'shared/utils';
 
 import './CommitCloud.css';
 
-const cloudSyncStateAtom = atom<Result<CommitCloudSyncState> | null>({
-  key: 'cloudSyncStateAtom',
-  default: null,
-  effects: [
-    ({setSelf}) => {
-      const disposable = serverAPI.onMessageOfType('fetchedCommitCloudState', event => {
-        setSelf(event.state);
-      });
-      return () => disposable.dispose();
-    },
-  ],
-});
+const cloudSyncStateAtom = atom<Result<CommitCloudSyncState> | null>(null);
+
+registerDisposable(
+  cloudSyncStateAtom,
+  serverAPI.onMessageOfType('fetchedCommitCloudState', event => {
+    writeAtom(cloudSyncStateAtom, event.state);
+  }),
+  import.meta.hot,
+);
 
 const REFRESH_INTERVAL = 30 * 1000;
 
 export function CommitCloudInfo() {
-  const [cloudSyncState, setCloudSyncState] = useRecoilState(cloudSyncStateAtom);
+  const [cloudSyncState, setCloudSyncState] = useAtom(cloudSyncStateAtom);
   const runOperation = useRunOperation();
   const pendingOperation = useMostRecentPendingOperation();
   const isRunningSync = pendingOperation?.trackEventName === 'CommitCloudSyncOperation';
@@ -168,14 +164,14 @@ export function CommitCloudInfo() {
               <T>Commit Cloud Workspace</T>
             </label>
             <div className="commit-cloud-workspace-actions">
-              <VSCodeDropdown
+              <Dropdown
                 value={cloudSyncState?.value.currentWorkspace}
                 disabled={
                   pendingOperation?.trackEventName === 'CommitCloudChangeWorkspaceOperation' ||
                   pendingOperation?.trackEventName === 'CommitCloudCreateWorkspaceOperation'
                 }
                 onChange={event => {
-                  const newChoice = (event.target as HTMLOptionElement).value;
+                  const newChoice = event.currentTarget.value;
                   runOperation(new CommitCloudChangeWorkspaceOperation(newChoice)).then(() => {
                     refreshCommitCloudStatus();
                   });
@@ -185,13 +181,9 @@ export function CommitCloudInfo() {
                       value: {...cloudSyncState?.value, currentWorkspace: newChoice},
                     });
                   }
-                }}>
-                {cloudSyncState?.value.workspaceChoices?.map(name => (
-                  <VSCodeOption key={name} value={name}>
-                    {name}
-                  </VSCodeOption>
-                ))}
-              </VSCodeDropdown>
+                }}
+                options={cloudSyncState?.value.workspaceChoices ?? []}
+              />
               {enteredWorkspaceName == null ? (
                 <VSCodeButton
                   appearance="icon"
@@ -205,11 +197,11 @@ export function CommitCloudInfo() {
                 </VSCodeButton>
               ) : (
                 <div className="commit-cloud-new-workspace-input">
-                  <VSCodeTextField
+                  <TextField
                     ref={newWorkspaceNameRef as React.MutableRefObject<null>}
                     onInput={e => setEnteredWorkspaceName((e.target as HTMLInputElement).value)}>
                     <T>New Workspace Name</T>
-                  </VSCodeTextField>
+                  </TextField>
                   <VSCodeButton
                     appearance="secondary"
                     onClick={e => {
@@ -311,7 +303,7 @@ function CommitCloudSyncStatusBadge({statuses}: {statuses: Map<Hash, CommitCloud
 }
 
 function BackupList({commits}: {commits: Array<Hash>}) {
-  const dag = useRecoilValue(dagWithPreviews);
+  const dag = useAtomValue(dagWithPreviews);
   const infos = commits.map(hash => dag.get(hash)).filter(notEmpty);
   return (
     <div className="commit-cloud-backup-list">

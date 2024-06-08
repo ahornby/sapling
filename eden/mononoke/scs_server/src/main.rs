@@ -26,7 +26,7 @@ use environment::BookmarkCacheOptions;
 use executor_lib::args::ShardedExecutorArgs;
 use executor_lib::RepoShardedProcess;
 use executor_lib::RepoShardedProcessExecutor;
-use fb303_core::server::make_BaseService_server;
+use fb303_core_services::make_BaseService_server;
 use fbinit::FacebookInit;
 use megarepo_api::MegarepoApi;
 use metaconfig_types::ShardedService;
@@ -42,7 +42,7 @@ use panichandler::Fate;
 use permission_checker::DefaultAclProvider;
 use sharding_ext::RepoShard;
 use slog::info;
-use source_control::server::make_SourceControlService_server;
+use source_control_services::make_SourceControlService_server;
 use srserver::service_framework::BuildModule;
 use srserver::service_framework::ContextPropModule;
 use srserver::service_framework::Fb303Module;
@@ -89,6 +89,9 @@ struct ScsServerArgs {
     bound_address_file: Option<String>,
     #[clap(flatten)]
     sharded_executor_args: ShardedExecutorArgs,
+    /// Max memory to use for the thrift server
+    #[clap(long)]
+    max_memory: Option<usize>,
 }
 
 /// Struct representing the Source Control Service process when sharding by
@@ -219,6 +222,10 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
 
     let will_exit = Arc::new(AtomicBool::new(false));
 
+    if let Some(max_memory) = args.max_memory {
+        memory::set_max_memory(max_memory);
+    }
+
     // Initialize the FB303 Thrift stack.
 
     let fb303_base = {
@@ -240,6 +247,7 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
         scuba_builder,
         args.scribe_logging_args.get_scribe(fb)?,
         security_checker,
+        app.configs(),
         &app.repo_configs().common,
     );
     let service = {

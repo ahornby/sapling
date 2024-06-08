@@ -1,4 +1,5 @@
 #chg-compatible
+#debugruntest-incompatible
   $ setconfig experimental.allowfilepeer=True
   $ setconfig devel.segmented-changelog-rev-compat=true
 
@@ -317,7 +318,7 @@ C onto A - rebase onto an ancestor:
 
 Check rebasing public changeset
 
-  $ hg push --config phases.publish=True -q -r 6 # update phase of G
+  $ hg push --config phases.publish=True -q -r 'desc(G)' # update phase of G
   $ hg rebase -d 'desc(A)' -b 'desc(C)'
   nothing to rebase
   $ hg debugmakepublic 'desc(C)'
@@ -856,33 +857,6 @@ Make the repo a bit more interesting
      summary:     initial commit
   
 
-Testing from lower head
-
-  $ hg up 'desc(second)'
-  2 files updated, 0 files merged, 1 files removed, 0 files unresolved
-  $ hg log -r '_destrebase()'
-  commit:      5f7bc9025ed2
-  user:        test
-  date:        Thu Jan 01 00:00:00 1970 +0000
-  summary:     aaa
-  
-
-Testing from upper head
-
-  $ hg log -r '_destrebase(desc(aaa))'
-  commit:      * (glob)
-  user:        test
-  date:        Thu Jan 01 00:00:00 1970 +0000
-  summary:     second source with subdir
-  
-  $ hg up 'desc(aaa)'
-  1 files updated, 0 files merged, 2 files removed, 0 files unresolved
-  $ hg log -r '_destrebase()'
-  commit:      * (glob)
-  user:        test
-  date:        Thu Jan 01 00:00:00 1970 +0000
-  summary:     second source with subdir
-  
 Testing rebase being called inside another transaction
 
   $ cd $TESTTMP

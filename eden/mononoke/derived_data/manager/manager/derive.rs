@@ -29,10 +29,9 @@ use derived_data_service_if::DerivedDataType;
 use derived_data_service_if::RequestError;
 use derived_data_service_if::RequestErrorReason;
 use derived_data_service_if::RequestStatus;
-use futures::future::try_join;
+use either::Either;
 use futures::future::FutureExt;
 use futures::future::TryFutureExt;
-use futures::join;
 use futures::stream;
 use futures::stream::FuturesUnordered;
 use futures::stream::StreamExt;
@@ -40,6 +39,7 @@ use futures::stream::TryStreamExt;
 use futures_stats::TimedFutureExt;
 use futures_stats::TimedTryFutureExt;
 use mononoke_types::ChangesetId;
+use mononoke_types::DerivableType;
 use slog::debug;
 use topo_sort::TopoSortedDagTraversal;
 
@@ -51,32 +51,6 @@ use crate::derivable::DerivationDependencies;
 use crate::error::DerivationError;
 use crate::manager::util::DiscoveryStats;
 
-#[derive(Clone, Copy)]
-pub enum BatchDeriveOptions {
-    Parallel { gap_size: Option<usize> },
-    Serial,
-}
-
-#[derive(Debug)]
-pub enum BatchDeriveStats {
-    Parallel(Duration),
-    Serial(Vec<(ChangesetId, Duration)>),
-}
-
-impl BatchDeriveStats {
-    fn append(self, other: Self) -> anyhow::Result<Self> {
-        use BatchDeriveStats::*;
-        Ok(match (self, other) {
-            (Parallel(d1), Parallel(d2)) => Parallel(d1 + d2),
-            (Serial(mut s1), Serial(mut s2)) => {
-                s1.append(&mut s2);
-                Serial(s1)
-            }
-            _ => anyhow::bail!("Incompatible stats"),
-        })
-    }
-}
-
 /// Trait to allow determination of rederivation.
 pub trait Rederivation: Send + Sync + 'static {
     /// Determine whether a changeset needs rederivation of
@@ -84,12 +58,12 @@ pub trait Rederivation: Send + Sync + 'static {
     ///
     /// If this function returns `None`, then it will only be
     /// derived if it isn't already derived.
-    fn needs_rederive(&self, derivable_name: &str, csid: ChangesetId) -> Option<bool>;
+    fn needs_rederive(&self, derivable_type: DerivableType, csid: ChangesetId) -> Option<bool>;
 
     /// Marks a changeset as having been derived.  After this
     /// is called, `needs_rederive` should not return `true` for
     /// this changeset.
-    fn mark_derived(&self, derivable_name: &str, csid: ChangesetId);
+    fn mark_derived(&self, derivable_type: DerivableType, csid: ChangesetId);
 }
 
 impl DerivedDataManager {
@@ -122,7 +96,9 @@ impl DerivedDataManager {
         &self,
         rederivation: Option<Arc<dyn Rederivation>>,
     ) -> DerivationContext {
-        DerivationContext::new(self.clone(), rederivation, self.repo_blobstore().boxed())
+        self.inner
+            .derivation_context
+            .with_replaced_rederivation(rederivation)
     }
 
     pub async fn check_derived<Derivable>(
@@ -143,115 +119,6 @@ impl DerivedDataManager {
             );
         }
         Ok(())
-    }
-
-    /// Perform derivation for a single changeset.
-    /// Will fail in case data for parents changeset wasn't derived
-    async fn perform_single_derivation<Derivable>(
-        &self,
-        ctx: &CoreContext,
-        derivation_ctx: &DerivationContext,
-        csid: ChangesetId,
-        discovery_stats: &DiscoveryStats,
-    ) -> Result<(ChangesetId, Derivable)>
-    where
-        Derivable: BonsaiDerivable,
-    {
-        let mut scuba = ctx.scuba().clone();
-        scuba
-            .add("changeset_id", csid.to_string())
-            .add("derived_data_type", Derivable::NAME);
-        scuba
-            .clone()
-            .log_with_msg("Waiting for derived data to be generated", None);
-
-        debug!(ctx.logger(), "derive {} for {}", Derivable::NAME, csid);
-        let lease_key = format!("repo{}.{}.{}", self.repo_id(), Derivable::NAME, csid);
-
-        let ctx = ctx.clone_and_reset();
-
-        let (stats, result) = async {
-            let bonsai = csid.load(&ctx, self.repo_blobstore()).map_err(Error::from);
-            let guard = async {
-                if derivation_ctx.needs_rederive::<Derivable>(csid) {
-                    // We are rederiving this changeset, so do not try to take
-                    // the lease, as doing so will drop out immediately
-                    // because the data is already derived.
-                    None
-                } else {
-                    Some(
-                        self.lease()
-                            .try_acquire_in_loop(&ctx, &lease_key, || async {
-                                Ok(Derivable::fetch(&ctx, derivation_ctx, csid)
-                                    .await?
-                                    .is_some())
-                            })
-                            .await,
-                    )
-                }
-            };
-            let (bonsai, guard) = join!(bonsai, guard);
-            if matches!(guard, Some(Ok(None))) {
-                // Something else completed derivation
-                let derived = Derivable::fetch(&ctx, derivation_ctx, csid)
-                    .await?
-                    .ok_or_else(|| {
-                        anyhow!("derivation completed elsewhere but data could not be fetched")
-                    })?;
-                Ok((csid, derived))
-            } else {
-                // We must perform derivation.  Use the appropriate session
-                // class for derivation.
-                let ctx = self.set_derivation_session_class(ctx.clone());
-                let bonsai = bonsai?;
-
-                // The derivation process is additionally logged to the derived
-                // data scuba table.
-                let mut derived_data_scuba = self.derived_data_scuba::<Derivable>();
-                derived_data_scuba.add_changeset(&bonsai);
-                derived_data_scuba.add_discovery_stats(discovery_stats);
-                derived_data_scuba.log_derivation_start(&ctx);
-
-                let (derive_stats, derived) = async {
-                    let parents = derivation_ctx.fetch_parents(&ctx, &bonsai).await?;
-                    Derivable::derive_single(&ctx, derivation_ctx, bonsai, parents).await
-                }
-                .timed()
-                .await;
-
-                derived_data_scuba.log_derivation_end(&ctx, &derive_stats, derived.as_ref().err());
-
-                let derived = derived?;
-
-                // We may now store the mapping, and flush the blobstore to
-                // ensure the mapping is persisted.
-                let (persist_stats, persisted) = derived
-                    .clone()
-                    .store_mapping(&ctx, derivation_ctx, csid)
-                    .timed()
-                    .await;
-
-                derived_data_scuba.log_mapping_insertion(
-                    &ctx,
-                    Some(&derived),
-                    &persist_stats,
-                    persisted.as_ref().err(),
-                );
-
-                persisted?;
-
-                Ok((csid, derived))
-            }
-        }
-        .timed()
-        .await;
-        scuba.add_future_stats(&stats);
-        if result.is_ok() {
-            scuba.log_with_msg("Got derived data", None);
-        } else {
-            scuba.log_with_msg("Failed to get derived data", None);
-        };
-        result
     }
 
     /// Find ancestors of the target changeset that are underived.
@@ -342,10 +209,12 @@ impl DerivedDataManager {
         .try_timed()
         .await?;
 
-        let stats = DiscoveryStats {
+        let discovery_stats = DiscoveryStats {
             find_underived_completion_time: find_underived_stats.completion_time,
             commits_discovered: dag_traversal.len() as u32,
         };
+        let mut derived_data_scuba = self.derived_data_scuba::<Derivable>();
+        derived_data_scuba.add_discovery_stats(&discovery_stats);
         let mut dag_traversal = TopoSortedDagTraversal::new(dag_traversal);
 
         let buffer_size = self.max_parallel_derivations();
@@ -354,14 +223,57 @@ impl DerivedDataManager {
         let mut target_derived = None;
         while !dag_traversal.is_empty() || !derivations.is_empty() {
             let free = buffer_size.saturating_sub(derivations.len());
+            // TODO (Pierre):
+            // This is suboptimal: We spawn derivations for one csid at a time.
+            // We should leverage the batching provided by `derive_exactly_batch`.
+            // This comment was written during a refactoring change, so the existing behaviour was
+            // preserved to avoid mixing refactoring and behavioural changes.
             derivations.extend(dag_traversal.drain(free).map(|csid| {
                 cloned!(ctx, derivation_ctx);
                 let manager = self.clone();
-                let stats = stats.clone();
                 let derivation = async move {
-                    manager
-                        .perform_single_derivation(&ctx, &derivation_ctx, csid, &stats)
-                        .await
+                    let lease_key =
+                        format!("repo{}.{}.{}", manager.repo_id(), Derivable::NAME, csid);
+                    // TODO (Pierre):
+                    // Here, the `needs_rederive` check is only needed in case we are racing with
+                    // something else that is deriving the same changesets as we are, since we
+                    // found these changesets at the beginning of this function by finding
+                    // underived changesets.
+                    // Arguably, it can be removed entirely and just do the work.
+                    // This was modified in a refactoring, so it was preserved to avoid mixing
+                    // refactoring and behavioural changes.
+                    let guard = async {
+                        if derivation_ctx.needs_rederive::<Derivable>(csid) {
+                            // We are rederiving this changeset, so do not try to take the lease,
+                            // as doing so will drop out immediately because the data is already
+                            // derived
+                            None
+                        } else {
+                            Some(
+                                manager
+                                    .lease()
+                                    .try_acquire_in_loop(&ctx, &lease_key, || async {
+                                        Derivable::fetch(&ctx, &derivation_ctx, csid).await
+                                    })
+                                    .await,
+                            )
+                        }
+                    };
+                    let derived = if let Some(Ok(Either::Left(fetched))) = guard.await {
+                        // Something else completed derivation
+                        fetched
+                    } else {
+                        let rederivation = None;
+                        manager
+                            .derive_exactly_batch::<Derivable>(&ctx, vec![csid], rederivation)
+                            .await?;
+                        Derivable::fetch(&ctx, &derivation_ctx, csid)
+                            .await?
+                            .ok_or_else(|| {
+                                anyhow!("derivation completed but data could not be fetched")
+                            })?
+                    };
+                    Ok::<_, DerivationError>((csid, derived))
                 };
                 tokio::spawn(derivation).map_err(Error::from)
             }));
@@ -529,13 +441,34 @@ impl DerivedDataManager {
 
         derived_data_scuba.log_derivation_start(&ctx);
 
+        let predecessor_checks = Derivable::PredecessorDependencies::check_dependencies(
+            &ctx,
+            &derivation_ctx,
+            csid,
+            &mut HashSet::new(),
+        )
+        .await;
+        // If predecessor derived data types are not derived yet, let's derive them
+        if let Err(e) = predecessor_checks {
+            Derivable::PredecessorDependencies::derive_predecessors(
+                self,
+                &ctx,
+                csid,
+                rederivation.clone(),
+                &mut HashSet::new(),
+            )
+            .await
+            .context("failed to derive predecessors")
+            .context(e)?
+        };
+
         let (derive_stats, derived) =
             Derivable::derive_from_predecessor(&ctx, &derivation_ctx, bonsai)
                 .timed()
                 .await;
         derivation_ctx.flush(&ctx).await?;
 
-        derived_data_scuba.log_derivation_end(&ctx, &derive_stats, derived.as_ref().err());
+        derived_data_scuba.log_derivation_end(&ctx, &(derive_stats), derived.as_ref().err());
 
         let derived = derived?;
 
@@ -546,7 +479,7 @@ impl DerivedDataManager {
                 .await?;
             derivation_ctx.flush(&ctx).await?;
             if let Some(rederivation) = rederivation {
-                rederivation.mark_derived(Derivable::NAME, csid);
+                rederivation.mark_derived(Derivable::VARIANT, csid);
             }
             Ok(())
         }
@@ -687,13 +620,16 @@ impl DerivedDataManager {
                         // Currently, this is not supported. Let's fallback to local derivation to
                         // unblock derivation of, for example, "changeset_info" DDT required for most SCS
                         // methods to work.
-                        if let Some(req_err) = e.downcast_ref::<RequestError>() {
-                            if matches!(req_err.reason, RequestErrorReason::commit_not_found(_)) {
-                                derived_data_scuba.log_remote_derivation_end(
-                                    ctx,
-                                    Some(format!("Commit Not Found Response")),
-                                );
-                                return Ok(None);
+                        for cause in e.chain() {
+                            if let Some(req_err) = cause.downcast_ref::<RequestError>() {
+                                if matches!(req_err.reason, RequestErrorReason::commit_not_found(_))
+                                {
+                                    derived_data_scuba.log_remote_derivation_end(
+                                        ctx,
+                                        Some(String::from("Commit Not Found Response")),
+                                    );
+                                    return Ok(None);
+                                }
                             }
                         }
                         if attempt >= RETRY_ATTEMPTS_LIMIT {
@@ -775,13 +711,15 @@ impl DerivedDataManager {
     /// and ancestors of the batch to have already been derived.  If
     /// any dependency or ancestor is not already derived, an error
     /// will be returned.
+    /// If a dependent derived data type has not been derived for the batch of changesets prior to
+    /// this, it will be derived first. The same pre-conditions apply on the dependent derived data
+    /// type.
     pub async fn derive_exactly_batch<Derivable>(
         &self,
         ctx: &CoreContext,
         csids: Vec<ChangesetId>,
-        batch_options: BatchDeriveOptions,
         rederivation: Option<Arc<dyn Rederivation>>,
-    ) -> Result<BatchDeriveStats, DerivationError>
+    ) -> Result<Duration, DerivationError>
     where
         Derivable: BonsaiDerivable,
     {
@@ -793,27 +731,13 @@ impl DerivedDataManager {
                 async move {
                     secondary_data
                         .manager
-                        .derive_exactly_batch::<Derivable>(
-                            ctx,
-                            secondary,
-                            batch_options,
-                            rederivation,
-                        )
+                        .derive_exactly_batch::<Derivable>(ctx, secondary, rederivation)
                         .await
                 }
                 .left_future()
             })
         } else {
-            (
-                csids,
-                future::ready(Ok(match batch_options {
-                    BatchDeriveOptions::Serial => BatchDeriveStats::Serial(vec![]),
-                    BatchDeriveOptions::Parallel { .. } => {
-                        BatchDeriveStats::Parallel(Duration::ZERO)
-                    }
-                }))
-                .right_future(),
-            )
+            (csids, future::ready(Ok(Duration::ZERO)).right_future())
         };
         self.check_enabled::<Derivable>()?;
         let mut derivation_ctx = self.derivation_context(rederivation.clone());
@@ -834,7 +758,7 @@ impl DerivedDataManager {
         }
 
         // Load all of the bonsais for this batch.
-        let bonsais = stream::iter(csids.into_iter().map(|csid| async move {
+        let bonsais = stream::iter(csids.iter().cloned().map(|csid| async move {
             let bonsai = csid.load(ctx, derivation_ctx_ref.blobstore()).await?;
             Ok::<_, Error>(bonsai)
         }))
@@ -864,22 +788,24 @@ impl DerivedDataManager {
 
         // Dependency checks: all ancestors should have this derived
         // data type derived
-        let ancestor_checks = async move {
-            stream::iter(ancestors)
-                .map(|csid| derivation_ctx_ref.fetch_dependency::<Derivable>(ctx, csid))
-                .buffered(100)
-                .try_for_each(|_| async { Ok(()) })
-                .await
-                .with_context(|| {
-                    format!(
-                        "a batch ancestor does not have '{}' derived",
-                        Derivable::NAME
-                    )
-                })
-        };
+        stream::iter(ancestors)
+            .map(|csid| derivation_ctx_ref.fetch_dependency::<Derivable>(ctx, csid))
+            .buffered(100)
+            .try_for_each(|_| async { Ok(()) })
+            .await
+            .with_context(|| {
+                format!(
+                    "a batch ancestor does not have '{}' derived",
+                    Derivable::NAME
+                )
+            })
+            .context(concat!(
+                "derive exactly batch pre-condition not satisfied: ",
+                "all ancestors' and dependencies' data must already have been derived",
+            ))?;
 
-        // Dependency checks: all heads should have their dependent
-        // data types derived.
+        // All heads should have their dependent data types derived.
+        // Let's check if that's the case
         let dependency_checks = async move {
             stream::iter(heads)
                 .map(|csid| async move {
@@ -896,13 +822,22 @@ impl DerivedDataManager {
                 .await
                 .context("a batch dependency has not been derived")
         };
-
-        try_join(ancestor_checks, dependency_checks)
+        // If dependent derived data types are not derived yet, let's derive them
+        let dependent_types_duration = if let Err(e) = dependency_checks.await {
+            // We will derive batch for ourselves and all of our dependencies
+            Derivable::Dependencies::derive_exactly_batch_dependencies(
+                self,
+                ctx,
+                csids,
+                rederivation.clone(),
+                &mut HashSet::new(),
+            )
             .await
-            .context(concat!(
-                "derive exactly batch pre-condition not satisfied: ",
-                "all ancestors' and dependencies' data must already have been derived",
-            ))?;
+            .context("failed to derive batch dependencies")
+            .context(e)?
+        } else {
+            Duration::ZERO
+        };
 
         let ctx = ctx.clone_and_reset();
         let ctx = self.set_derivation_session_class(ctx.clone());
@@ -929,51 +864,23 @@ impl DerivedDataManager {
         derived_data_scuba.add_metadata(ctx.metadata());
         let (overall_stats, result) = async {
             let derivation_ctx_ref = &derivation_ctx;
-            let (batch_stats, derived) = match batch_options {
-                BatchDeriveOptions::Parallel { gap_size } => {
-                    derived_data_scuba.add_batch_parameters(true, gap_size);
-                    let (stats, derived) =
-                        Derivable::derive_batch(ctx, derivation_ctx_ref, bonsais, gap_size)
-                            .try_timed()
-                            .await
-                            .with_context(|| {
-                                if let Some((first, last)) = csid_range {
-                                    format!(
-                                        "failed to derive {} batch (start:{}, end:{})",
-                                        Derivable::NAME,
-                                        first,
-                                        last
-                                    )
-                                } else {
-                                    format!("failed to derive empty {} batch", Derivable::NAME)
-                                }
-                            })?;
-                    (BatchDeriveStats::Parallel(stats.completion_time), derived)
-                }
-                BatchDeriveOptions::Serial => {
-                    derived_data_scuba.add_batch_parameters(false, None);
-                    let mut per_commit_stats = Vec::new();
-                    let mut per_commit_derived = HashMap::new();
-                    for bonsai in bonsais {
-                        let csid = bonsai.get_changeset_id();
-                        let parents = derivation_ctx_ref
-                            .fetch_unknown_parents(ctx, Some(&per_commit_derived), &bonsai)
-                            .await?;
-                        let (stats, derived) =
-                            Derivable::derive_single(ctx, derivation_ctx_ref, bonsai, parents)
-                                .try_timed()
-                                .await
-                                .with_context(|| {
-                                    format!("failed to derive {} for {}", Derivable::NAME, csid)
-                                })?;
-                        per_commit_stats.push((csid, stats.completion_time));
-                        per_commit_derived.insert(csid, derived);
-                    }
-                    (
-                        BatchDeriveStats::Serial(per_commit_stats),
-                        per_commit_derived,
-                    )
-                }
+            let (batch_duration, derived) = {
+                let (stats, derived) = Derivable::derive_batch(ctx, derivation_ctx_ref, bonsais)
+                    .try_timed()
+                    .await
+                    .with_context(|| {
+                        if let Some((first, last)) = csid_range {
+                            format!(
+                                "failed to derive {} batch (start:{}, end:{})",
+                                Derivable::NAME,
+                                first,
+                                last
+                            )
+                        } else {
+                            format!("failed to derive empty {} batch", Derivable::NAME)
+                        }
+                    })?;
+                (stats.completion_time, derived)
             };
 
             // Flush the blobstore.  If it has been set up to cache writes, these
@@ -1001,7 +908,7 @@ impl DerivedDataManager {
                 derivation_ctx.flush(ctx).await?;
                 if let Some(rederivation) = rederivation {
                     for csid in csids {
-                        rederivation.mark_derived(Derivable::NAME, csid);
+                        rederivation.mark_derived(Derivable::VARIANT, csid);
                     }
                 }
                 Ok::<_, Error>(())
@@ -1022,16 +929,16 @@ impl DerivedDataManager {
                 .add_future_stats(&persist_stats)
                 .log_with_msg("Flushed mapping", None);
 
-            Ok(batch_stats)
+            Ok(batch_duration)
         }
         .timed()
         .await;
 
         derived_data_scuba.log_batch_derivation_end(ctx, &overall_stats, result.as_ref().err());
 
-        let batch_stats = result?;
+        let batch_duration = result?;
 
-        Ok(batch_stats.append(secondary_derivation.await?)?)
+        Ok(batch_duration + secondary_derivation.await? + dependent_types_duration)
     }
 
     /// Fetch derived data for a changeset if it has previously been derived.

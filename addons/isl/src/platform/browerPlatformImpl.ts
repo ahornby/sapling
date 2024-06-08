@@ -6,6 +6,7 @@
  */
 
 import type {RepoRelativePath, OneIndexedLineNumber} from '../types';
+import type {Json} from 'shared/typeUtils';
 
 // important: this file should not try to import other code from 'isl',
 // since it will end up getting duplicated when bundling.
@@ -19,6 +20,11 @@ export const browserPlatformImpl = {
   openFile: (path: RepoRelativePath, options?: {line?: OneIndexedLineNumber}) => {
     window.clientToServerAPI?.postMessage({type: 'platform/openFile', path, options});
   },
+  openFiles: (paths: Array<RepoRelativePath>, options?: {line?: OneIndexedLineNumber}) => {
+    window.clientToServerAPI?.postMessage({type: 'platform/openFiles', paths, options});
+  },
+  canCustomizeFileOpener: true,
+  upsellExternalMergeTool: true,
 
   openContainingFolder: (path: RepoRelativePath) => {
     window.clientToServerAPI?.postMessage({type: 'platform/openContainingFolder', path});
@@ -28,11 +34,21 @@ export const browserPlatformImpl = {
     window.open(url, '_blank');
   },
 
-  clipboardCopy(data: string): void {
-    navigator.clipboard.writeText(data);
+  clipboardCopy: (text: string, html?: string) => {
+    if (html) {
+      const htmlBlob = new Blob([html], {type: 'text/html'});
+      const textBlob = new Blob([text], {type: 'text/plain'});
+      const clipboardItem = new window.ClipboardItem({
+        'text/html': htmlBlob,
+        'text/plain': textBlob,
+      });
+      navigator.clipboard.write([clipboardItem]);
+    } else {
+      navigator.clipboard.writeText(text);
+    }
   },
 
-  getTemporaryState<T>(key: string): T | null {
+  getPersistedState<T>(key: string): T | null {
     try {
       const found = localStorage.getItem(key) as string | null;
       if (found == null) {
@@ -43,9 +59,21 @@ export const browserPlatformImpl = {
       return null;
     }
   },
-  setTemporaryState<T>(key: string, value: T): void {
+  setPersistedState<T>(key: string, value: T): void {
     try {
       localStorage.setItem(key, JSON.stringify(value));
     } catch {}
+  },
+  clearPersistedState(): void {
+    try {
+      localStorage.clear();
+    } catch {}
+  },
+  getAllPersistedState(): Json | undefined {
+    try {
+      return {...localStorage};
+    } catch {
+      return undefined;
+    }
   },
 };

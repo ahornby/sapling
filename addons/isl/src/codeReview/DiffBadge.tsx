@@ -10,24 +10,26 @@ import type {UICodeReviewProvider} from './UICodeReviewProvider';
 import type {ReactNode} from 'react';
 
 import {useShowConfirmSubmitStack} from '../ConfirmSubmitStack';
-import {ExternalLink} from '../ExternalLink';
 import {Internal} from '../Internal';
+import {Link} from '../Link';
 import {Tooltip} from '../Tooltip';
+import {clipboardCopyLink, clipboardCopyText} from '../clipboard';
 import {T, t} from '../i18n';
 import {CircleEllipsisIcon} from '../icons/CircleEllipsisIcon';
 import {CircleExclamationIcon} from '../icons/CircleExclamationIcon';
-import {configBackedAtom} from '../jotaiUtils';
+import {configBackedAtom, useAtomGet} from '../jotaiUtils';
 import {PullRevOperation} from '../operations/PullRevOperation';
+import {useRunOperation} from '../operationsState';
 import platform from '../platform';
-import {useRunOperation} from '../serverAPIState';
 import {exactRevset} from '../types';
-import {diffSummary, codeReviewProvider} from './CodeReviewInfo';
+import {codeReviewProvider, diffSummary} from './CodeReviewInfo';
+import {DiffCommentsDetails} from './DiffComments';
 import {openerUrlForDiffUrl} from './github/GitHubUrlOpener';
-import {SyncStatus, syncStatusByHash} from './syncStatus';
+import {SyncStatus, syncStatusAtom} from './syncStatus';
+import * as stylex from '@stylexjs/stylex';
 import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
 import {useAtomValue} from 'jotai';
-import {useState, Component, Suspense} from 'react';
-import {useRecoilValue} from 'recoil';
+import {Component, Suspense, useState} from 'react';
 import {Icon} from 'shared/Icon';
 
 import './DiffBadge.css';
@@ -39,11 +41,12 @@ export const showDiffNumberConfig = configBackedAtom<boolean>('isl.show-diff-num
  * such as its status, number of comments, CI state, etc.
  */
 export function DiffInfo({commit, hideActions}: {commit: CommitInfo; hideActions: boolean}) {
-  const repo = useRecoilValue(codeReviewProvider);
-  const diffId = commit.diffId;
+  const repo = useAtomValue(codeReviewProvider);
+  const {diffId} = commit;
   if (repo == null || diffId == null) {
     return null;
   }
+
   // Do not show diff info (and "Ship It" button) if there are successors.
   // Users should look at the diff info and buttons from the successor commit instead.
   // But the diff number can still be useful so show it.
@@ -59,6 +62,30 @@ export function DiffInfo({commit, hideActions}: {commit: CommitInfo; hideActions
   );
 }
 
+const styles = stylex.create({
+  diffBadge: {
+    color: 'white',
+    cursor: 'pointer',
+    textDecoration: {
+      default: 'none',
+      ':hover': 'underline',
+    },
+  },
+  diffFollower: {
+    alignItems: 'center',
+    display: 'inline-flex',
+    gap: '5px',
+    opacity: '0.9',
+    fontSize: '90%',
+    padding: '0 var(--halfpad)',
+  },
+  diffFollowerIcon: {
+    '::before': {
+      fontSize: '90%',
+    },
+  },
+});
+
 export function DiffBadge({
   diff,
   children,
@@ -72,12 +99,27 @@ export function DiffBadge({
   provider: UICodeReviewProvider;
   syncStatus?: SyncStatus;
 }) {
-  const openerUrl = useRecoilValue(openerUrlForDiffUrl(url));
+  const openerUrl = useAtomValue(openerUrlForDiffUrl(url));
 
   return (
-    <ExternalLink href={openerUrl} className={`diff-badge ${provider.name}-diff-badge`}>
+    <Link href={openerUrl} xstyle={styles.diffBadge}>
       <provider.DiffBadgeContent diff={diff} children={children} syncStatus={syncStatus} />
-    </ExternalLink>
+    </Link>
+  );
+}
+
+export function DiffFollower({commit}: {commit: CommitInfo}) {
+  if (!commit.isFollower) {
+    return null;
+  }
+
+  return (
+    <Tooltip title={t('This commit follows the Pull Request of its nearest descendant above')}>
+      <span {...stylex.props(styles.diffFollower)}>
+        <Icon icon="fold-up" size="S" {...stylex.props(styles.diffFollowerIcon)} />
+        <T>follower</T>
+      </span>
+    </Tooltip>
   );
 }
 
@@ -103,8 +145,8 @@ function DiffInfoInner({
   provider: UICodeReviewProvider;
   hideActions: boolean;
 }) {
-  const diffInfoResult = useRecoilValue(diffSummary(diffId));
-  const syncStatus = useRecoilValue(syncStatusByHash(commit.hash));
+  const diffInfoResult = useAtomValue(diffSummary(diffId));
+  const syncStatus = useAtomGet(syncStatusAtom, commit.hash);
   if (diffInfoResult.error) {
     return <DiffLoadError number={provider.formatDiffNumber(diffId)} provider={provider} />;
   }
@@ -122,10 +164,12 @@ function DiffInfoInner({
       {provider.DiffLandButtonContent && (
         <provider.DiffLandButtonContent diff={info} commit={commit} />
       )}
-      <DiffComments diff={info} />
-      <DiffNumber>{provider.formatDiffNumber(diffId)}</DiffNumber>
+      <DiffComments diffId={diffId} diff={info} />
+      <DiffNumber url={info.url}>{provider.formatDiffNumber(diffId)}</DiffNumber>
       {shouldHideActions ? null : syncStatus === SyncStatus.RemoteIsNewer ? (
         <DownloadNewVersionButton diffId={diffId} provider={provider} />
+      ) : syncStatus === SyncStatus.BothChanged ? (
+        <DownloadNewVersionButton diffId={diffId} provider={provider} bothChanged />
       ) : syncStatus === SyncStatus.LocalIsNewer ? (
         <ResubmitSyncButton commit={commit} provider={provider} />
       ) : null}
@@ -136,19 +180,33 @@ function DiffInfoInner({
 function DownloadNewVersionButton({
   diffId,
   provider,
+  bothChanged,
 }: {
   diffId: DiffId;
   provider: UICodeReviewProvider;
+  bothChanged?: boolean;
 }) {
   const runOperation = useRunOperation();
-  return (
-    <Tooltip
-      title={t('$provider has a newer version of this Diff. Click to download the newer version.', {
+  const tooltip = bothChanged
+    ? t(
+        'Both remote and local verisons have changed.\n\n$provider has a new version of this Diff, but this commit has also changed locally since it was last submitted. You can download the new remote version, but it may not include your other local changes.',
+        {replace: {$provider: provider.label}},
+      )
+    : t('$provider has a newer version of this Diff. Click to download the newer version.', {
         replace: {$provider: provider.label},
-      })}>
+      });
+
+  return (
+    <Tooltip title={tooltip}>
       <VSCodeButton
         appearance="icon"
-        onClick={() => {
+        onClick={async () => {
+          if (bothChanged) {
+            const confirmed = await platform.confirm(tooltip);
+            if (confirmed !== true) {
+              return;
+            }
+          }
           if (Internal.diffDownloadOperation != null) {
             runOperation(Internal.diffDownloadOperation(exactRevset(diffId)));
           } else {
@@ -197,7 +255,7 @@ function ResubmitSyncButton({
   );
 }
 
-function DiffNumber({children}: {children: string}) {
+function DiffNumber({children, url}: {children: string; url?: string}) {
   const [showing, setShowing] = useState(false);
   const showDiffNumber = useAtomValue(showDiffNumberConfig);
   if (!children || !showDiffNumber) {
@@ -209,7 +267,7 @@ function DiffNumber({children}: {children: string}) {
       <span
         className="diff-number"
         onClick={() => {
-          platform.clipboardCopy(children);
+          url == null ? clipboardCopyText(children) : clipboardCopyLink(children, url);
           setShowing(true);
           setTimeout(() => setShowing(false), 2000);
         }}>
@@ -219,15 +277,19 @@ function DiffNumber({children}: {children: string}) {
   );
 }
 
-function DiffComments({diff}: {diff: DiffSummary}) {
+function DiffComments({diff, diffId}: {diff: DiffSummary; diffId: DiffId}) {
   if (!diff.commentCount) {
     return null;
   }
   return (
-    <div className="diff-comments-count">
-      {diff.commentCount}
-      <Icon icon={diff.anyUnresolvedComments ? 'comment-unresolved' : 'comment'} />
-    </div>
+    <Tooltip trigger="click" component={() => <DiffCommentsDetails diffId={diffId} />}>
+      <VSCodeButton appearance="icon">
+        <span className="diff-comments-count">
+          {diff.commentCount}
+          <Icon icon={diff.anyUnresolvedComments ? 'comment-unresolved' : 'comment'} />
+        </span>
+      </VSCodeButton>
+    </Tooltip>
   );
 }
 

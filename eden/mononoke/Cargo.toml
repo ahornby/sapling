@@ -51,25 +51,25 @@ bonsai_git_mapping = { version = "0.1.0", path = "bonsai_git_mapping" }
 bonsai_hg_mapping = { version = "0.1.0", path = "bonsai_hg_mapping" }
 bonsai_svnrev_mapping = { version = "0.1.0", path = "bonsai_svnrev_mapping" }
 borrowed = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-bytes = { version = "1.1", features = ["serde"] }
+bytes = { version = "1.6.0", features = ["serde"] }
 bytesize = "1.1"
 cacheblob = { version = "0.1.0", path = "blobstore/cacheblob" }
 cached_config = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-changeset_fetcher = { version = "0.1.0", path = "blobrepo/changeset_fetcher" }
 changesets = { version = "0.1.0", path = "changesets" }
 check_git_wc = { version = "0.1.0", path = "git/check_git_wc" }
-clap = { version = "4.4.12", features = ["derive", "env", "string", "unicode", "wrap_help"] }
+clap = { version = "4.5.4", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 clap-old = { package = "clap", version = "2.34.0" }
 cloned = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 cmdlib = { version = "0.1.0", path = "cmdlib" }
 cmdlib_logging = { version = "0.1.0", path = "cmdlib/log" }
+commit_graph = { version = "0.1.0", path = "repo_attributes/commit_graph/commit_graph" }
 context = { version = "0.1.0", path = "server/context" }
 facet = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 failure_ext = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 fbinit = { version = "0.1.2", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
-futures = { version = "0.3.28", features = ["async-await", "compat"] }
+futures = { version = "0.3.30", features = ["async-await", "compat"] }
 futures-old = { package = "futures", version = "0.1.31" }
-futures-util = "0.3.7"
+futures-util = "0.3.30"
 git2 = "0.14"
 lock_ext = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 mercurial_derivation = { version = "0.1.0", path = "derived_data/mercurial_derivation" }
@@ -85,7 +85,6 @@ repo_blobstore = { version = "0.1.0", path = "blobrepo/repo_blobstore" }
 repo_derived_data = { version = "0.1.0", path = "repo_attributes/repo_derived_data" }
 repo_identity = { version = "0.1.0", path = "repo_attributes/repo_identity" }
 retry = { version = "0.1.0", path = "common/retry" }
-revset = { version = "0.1.0", path = "revset" }
 scuba_ext = { version = "0.1.0", path = "common/scuba_ext" }
 segmented_changelog = { version = "0.1.0", path = "segmented_changelog" }
 serde = { version = "1.0.185", features = ["derive", "rc"] }
@@ -95,20 +94,23 @@ sql_construct = { version = "0.1.0", path = "common/sql_construct" }
 sql_ext = { version = "0.1.0", path = "common/rust/sql_ext" }
 sqlblob = { version = "0.1.0", path = "blobstore/sqlblob" }
 streaming_clone = { version = "0.1.0", path = "repo_client/streaming_clone" }
-tokio = { version = "1.29.1", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.37.0", features = ["full", "test-util", "tracing"] }
 toml = "0.8.4"
 
 [patch.crates-io]
 abomonation = { git = "https://github.com/markbt/abomonation", rev = "0f43346d2afa2aedc64d61f3f4273e8d1e454642" }
 base64urlsafedata = { git = "https://github.com/kanidm/webauthn-rs.git", rev = "d278c56adfa39a0723c79bdcd461644194bc5138" }
-bindgen = { git = "https://github.com/rust-lang/rust-bindgen", rev = "2997017b5a3065b83e9d76f0080d6cb99c94c0c1" }
-bindgen-cli = { git = "https://github.com/rust-lang/rust-bindgen", rev = "2997017b5a3065b83e9d76f0080d6cb99c94c0c1" }
+bindgen = { git = "https://github.com/rust-lang/rust-bindgen", rev = "7e9043497297e04e91ae76dfe0d2e7998828e529" }
+bindgen-cli = { git = "https://github.com/rust-lang/rust-bindgen", rev = "7e9043497297e04e91ae76dfe0d2e7998828e529" }
+cxx = { package = "cxx", git = "https://github.com/facebookexperimental/cxx.git", rev = "cf9ae5500db7d31292d12a6b0728b0f6a1d7b9c9" }
+cxx-build = { package = "cxx-build", git = "https://github.com/facebookexperimental/cxx.git", rev = "cf9ae5500db7d31292d12a6b0728b0f6a1d7b9c9" }
 graphql-parser = { git = "https://github.com/graphql-rust//graphql-parser", rev = "8d76425d83c40670570cc325f57c730262f07456" }
-imgui = { git = "https://github.com/imgui-rs/imgui-rs.git", rev = "47bb38be50fafe99021b6436672dea1c28920e70" }
 lru-disk-cache = { git = "https://github.com/mozilla/sccache", rev = "fdbf843d174c6796d736b2b61dab0297670390f8" }
+minijail = { git = "https://chromium.googlesource.com/chromiumos/platform/minijail", rev = "13be56d79718425a60173f61f8174669d9cc8930" }
 perf-event = { version = "0.4", git = "https://github.com/krallin/perf-event.git", rev = "86224a9bc025d5d19f719542f27c8c629a08b167" }
 perf-event-open-sys = { version = "4.0", git = "https://github.com/krallin/perf-event.git", rev = "86224a9bc025d5d19f719542f27c8c629a08b167" }
 quickcheck = { git = "https://github.com/jakoschiko/quickcheck", rev = "6ecdf5bb4b0132ce66670b4d46453aa022ea892c" }
+riscv = { git = "https://github.com/rust-embedded/riscv.git", rev = "e9f43ae4722cfcdda67d36fdfcf462a0f12e9928" }
 
 [workspace]
 members = [
@@ -143,8 +145,8 @@ members = [
   "blobstore/fileblob",
   "blobstore/if",
   "blobstore/if/clients",
+  "blobstore/if/mocks",
   "blobstore/if/services",
-  "blobstore/if/types",
   "blobstore/logblob",
   "blobstore/memblob",
   "blobstore/multiplexedblob",
@@ -152,8 +154,8 @@ members = [
   "blobstore/packblob",
   "blobstore/packblob/if",
   "blobstore/packblob/if/clients",
+  "blobstore/packblob/if/mocks",
   "blobstore/packblob/if/services",
-  "blobstore/packblob/if/types",
   "blobstore/prefixblob",
   "blobstore/readonlyblob",
   "blobstore/redactedblobstore",
@@ -166,22 +168,26 @@ members = [
   "blobstore_sync_queue",
   "bonsai_git_mapping",
   "bonsai_git_mapping/git_mapping_pushrebase_hook",
+  "bonsai_git_mapping/if",
+  "bonsai_git_mapping/if/clients",
+  "bonsai_git_mapping/if/mocks",
+  "bonsai_git_mapping/if/services",
   "bonsai_globalrev_mapping",
   "bonsai_globalrev_mapping/globalrev_pushrebase_hook",
   "bonsai_globalrev_mapping/if",
   "bonsai_globalrev_mapping/if/clients",
+  "bonsai_globalrev_mapping/if/mocks",
   "bonsai_globalrev_mapping/if/services",
-  "bonsai_globalrev_mapping/if/types",
   "bonsai_hg_mapping",
   "bonsai_hg_mapping/if",
   "bonsai_hg_mapping/if/clients",
+  "bonsai_hg_mapping/if/mocks",
   "bonsai_hg_mapping/if/services",
-  "bonsai_hg_mapping/if/types",
   "bonsai_svnrev_mapping",
   "bonsai_svnrev_mapping/if",
   "bonsai_svnrev_mapping/if/clients",
+  "bonsai_svnrev_mapping/if/mocks",
   "bonsai_svnrev_mapping/if/services",
-  "bonsai_svnrev_mapping/if/types",
   "bonsai_tag_mapping",
   "bookmarks",
   "bookmarks/bookmarks_cache",
@@ -191,14 +197,17 @@ members = [
   "bookmarks/warm_bookmarks_cache",
   "bulkops",
   "cache_warmup",
+  "cas_client/changesets_uploader",
+  "cas_client/client",
+  "cas_client/scm_client",
   "cats",
   "changesets",
   "changesets/changesets_creation",
   "changesets/changesets_impl",
   "changesets/if",
   "changesets/if/clients",
+  "changesets/if/mocks",
   "changesets/if/services",
-  "changesets/if/types",
   "cmdlib",
   "cmdlib/base_app",
   "cmdlib/caching",
@@ -217,6 +226,7 @@ members = [
   "cmdlib/sharding_ext",
   "cmdlib/x_repo",
   "cmds/copy_blobstore_keys",
+  "commit_cloud",
   "commit_rewriting/backsyncer",
   "commit_rewriting/backsyncer/backsyncer_cmd",
   "commit_rewriting/bookmark_renaming",
@@ -229,6 +239,7 @@ members = [
   "commit_rewriting/mononoke_x_repo_sync_job",
   "commit_rewriting/movers",
   "commit_rewriting/synced_commit_mapping",
+  "commit_rewriting/synced_commit_mapping/pushrebase_hook",
   "common/assembly_line",
   "common/async_limiter",
   "common/async_limiter/examples/tokio_v2",
@@ -239,6 +250,7 @@ members = [
   "common/futures_watchdog",
   "common/iterhelpers",
   "common/logger_ext",
+  "common/memory",
   "common/path_hash",
   "common/reloader",
   "common/rendezvous",
@@ -250,6 +262,12 @@ members = [
   "common/scribe_ext",
   "common/scuba_ext",
   "common/sql_construct",
+  "common/thrift_convert",
+  "common/thrift_convert/proc_macros",
+  "common/thrift_convert/tests/if",
+  "common/thrift_convert/tests/if/clients",
+  "common/thrift_convert/tests/if/mocks",
+  "common/thrift_convert/tests/if/services",
   "common/time_measuring",
   "common/topo_sort",
   "common/type_map",
@@ -259,25 +277,25 @@ members = [
   "derived_data",
   "derived_data/basename_suffix_skeleton_manifest_v3",
   "derived_data/blame",
+  "derived_data/bulk_derivation",
   "derived_data/changeset_info",
-  "derived_data/changeset_info/if",
-  "derived_data/changeset_info/if/clients",
-  "derived_data/changeset_info/if/services",
-  "derived_data/changeset_info/if/types",
   "derived_data/constants",
   "derived_data/deleted_manifest",
   "derived_data/fastlog",
   "derived_data/filenodes_derivation",
   "derived_data/fsnodes",
+  "derived_data/if",
+  "derived_data/if/clients",
+  "derived_data/if/mocks",
+  "derived_data/if/services",
   "derived_data/manager",
   "derived_data/mercurial_derivation",
   "derived_data/remote",
   "derived_data/remote/if",
   "derived_data/remote/if/clients",
+  "derived_data/remote/if/mocks",
   "derived_data/remote/if/services",
-  "derived_data/remote/if/types",
   "derived_data/skeleton_manifest",
-  "derived_data/test/generation_derivation",
   "derived_data/test_manifest",
   "derived_data/test_sharded_manifest",
   "derived_data/test_utils",
@@ -286,31 +304,34 @@ members = [
   "edenapi_service",
   "features/history_traversal",
   "features/redaction",
+  "features/repo_metadata",
   "features/repo_update_logger",
   "filenodes",
   "filenodes/if",
   "filenodes/if/clients",
+  "filenodes/if/mocks",
   "filenodes/if/services",
-  "filenodes/if/types",
   "filestore",
   "git/check_git_wc",
   "git/git-pool",
   "git/git_types",
   "git/git_types/if",
   "git/git_types/if/clients",
+  "git/git_types/if/mocks",
   "git/git_types/if/services",
-  "git/git_types/if/types",
   "git/gitexport",
   "git/gitexport/test_utils",
   "git/gitimport",
   "git/import_direct",
   "git/import_tools",
+  "git/packetline",
   "git/packfile",
   "git/packfile/if",
   "git/packfile/if/clients",
+  "git/packfile/if/mocks",
   "git/packfile/if/services",
-  "git/packfile/if/types",
   "git/protocol",
+  "git_server",
   "git_symbolic_refs",
   "gotham_ext",
   "hgproto",
@@ -326,8 +347,8 @@ members = [
   "megarepo_api/configo_client",
   "megarepo_api/if",
   "megarepo_api/if/clients",
+  "megarepo_api/if/mocks",
   "megarepo_api/if/services",
-  "megarepo_api/if/types",
   "megarepo_api/mapping",
   "megarepo_api/megarepo_config",
   "megarepo_api/megarepo_error",
@@ -336,14 +357,14 @@ members = [
   "mercurial/mutation",
   "mercurial/mutation/if",
   "mercurial/mutation/if/clients",
+  "mercurial/mutation/if/mocks",
   "mercurial/mutation/if/services",
-  "mercurial/mutation/if/types",
   "mercurial/revlog",
   "mercurial/types",
   "mercurial/types/if",
   "mercurial/types/if/clients",
+  "mercurial/types/if/mocks",
   "mercurial/types/if/services",
-  "mercurial/types/if/types",
   "mercurial/types/mocks",
   "metaconfig/parser",
   "metaconfig/types",
@@ -351,8 +372,8 @@ members = [
   "microwave/builder",
   "microwave/if",
   "microwave/if/clients",
+  "microwave/if/mocks",
   "microwave/if/services",
-  "microwave/if/types",
   "mononoke_api",
   "mononoke_api/types",
   "mononoke_api_hg",
@@ -360,17 +381,17 @@ members = [
   "mononoke_hg_sync_job",
   "mononoke_repos",
   "mononoke_types",
-  "mononoke_types/if",
-  "mononoke_types/if/clients",
-  "mononoke_types/if/services",
-  "mononoke_types/if/types",
   "mononoke_types/mocks",
+  "mononoke_types/serialization",
+  "mononoke_types/serialization/clients",
+  "mononoke_types/serialization/mocks",
+  "mononoke_types/serialization/services",
   "mutable_counters",
   "mutable_renames",
   "mutable_renames/if",
   "mutable_renames/if/clients",
+  "mutable_renames/if/mocks",
   "mutable_renames/if/services",
-  "mutable_renames/if/types",
   "newfilenodes",
   "observability",
   "permission_checker",
@@ -392,8 +413,8 @@ members = [
   "repo_attributes/commit_graph/commit_graph_types",
   "repo_attributes/commit_graph/commit_graph_types/if",
   "repo_attributes/commit_graph/commit_graph_types/if/clients",
+  "repo_attributes/commit_graph/commit_graph_types/if/mocks",
   "repo_attributes/commit_graph/commit_graph_types/if/services",
-  "repo_attributes/commit_graph/commit_graph_types/if/types",
   "repo_attributes/commit_graph/in_memory_commit_graph_storage",
   "repo_attributes/commit_graph/preloaded_commit_graph_storage",
   "repo_attributes/commit_graph/sql_commit_graph_storage",
@@ -402,8 +423,12 @@ members = [
   "repo_attributes/hook_manager/repo_hook_file_content_provider",
   "repo_attributes/repo_bookmark_attrs",
   "repo_attributes/repo_cross_repo",
+  "repo_attributes/repo_derivation_queues",
+  "repo_attributes/repo_derivation_queues/if",
+  "repo_attributes/repo_derivation_queues/if/clients",
+  "repo_attributes/repo_derivation_queues/if/mocks",
+  "repo_attributes/repo_derivation_queues/if/services",
   "repo_attributes/repo_derived_data",
-  "repo_attributes/repo_derived_data_service",
   "repo_attributes/repo_identity",
   "repo_attributes/repo_lock/repo_lock",
   "repo_attributes/repo_permission_checker",
@@ -424,8 +449,8 @@ members = [
   "revset/revset-test-helper",
   "scs/if",
   "scs/if/clients",
+  "scs/if/mocks",
   "scs/if/services",
-  "scs/if/types",
   "segmented_changelog",
   "segmented_changelog/bench/concurrent_idmap",
   "segmented_changelog/types",
@@ -440,6 +465,7 @@ members = [
   "streaming_clone",
   "tests/fixtures",
   "tests/utils",
+  "third_party/git_delta",
   "time_window_counter",
   "tools/admin",
   "tools/example",

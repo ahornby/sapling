@@ -16,6 +16,7 @@ import type {
   LandConfirmationInfo,
   CodeReviewProviderSpecificClientToServerMessages,
   ClientToServerMessage,
+  DiffComment,
 } from 'isl/src/types';
 
 type DiffSummaries = Map<DiffId, DiffSummary>;
@@ -45,12 +46,22 @@ export interface CodeReviewProvider {
   getDiffUrlMarkdown(diffId: DiffId): string;
   getCommitHashUrlMarkdown(hash: string): string;
 
+  getRemoteFileURL?(
+    path: string,
+    publicCommitHash: string | null,
+    selectionStart?: {line: number; char: number},
+    selectionEnd?: {line: number; char: number},
+  ): string;
+
   updateDiffMessage?(diffId: DiffId, newTitle: string, newDescription: string): Promise<void>;
 
   getSuggestedReviewers?(context: {paths: Array<string>}): Promise<Array<string>>;
 
   /** Convert usernames/emails to avatar URIs */
   fetchAvatars?(authors: Array<string>): Promise<Map<string, string>>;
+
+  /** Convert usernames/emails to avatar URIs */
+  fetchComments?(diffId: DiffId): Promise<Array<DiffComment>>;
 
   renderMarkup?: (markup: string) => Promise<string>;
 

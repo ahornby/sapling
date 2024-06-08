@@ -127,30 +127,14 @@ class deferredpullattempt(pullattempt):
         return None
 
 
-def _cachedstringmatcher(pattern, _cache={}):
-    # _cache is shared across function calls
-    result = _cache.get(pattern)
-    if result is None:
-        result = util.stringmatcher(pattern)[-1]
-        _cache[pattern] = result
-    return result
-
-
-def trypull(repo, xs):
-    """Pull the list of given names xs.
-
-    Return true if pull succeeded for all names. Does not raise.
+@util.no_recursion
+def calculate_attempts(repo, xs):
+    """Calculate the "pullattempt"s for the given names.
+    This function might return None or a list.
     """
-    # Do not attempt to pull the same name twice, or names in the repo.
-    repo._autopulled = getattr(repo, "_autopulled", set())
-    xs = [x for x in xs if x not in repo._autopulled and x not in repo]
-    if not xs:
-        return False
-    repo._autopulled.update(xs)
-
     # If paths.default is not set. Do not attempt to pull.
     if repo.ui.paths.get("default") is None:
-        return False
+        return
 
     def sortkey(tup):
         name, func = tup
@@ -172,6 +156,19 @@ def trypull(repo, xs):
             if attempt:
                 assert isinstance(attempt, pullattempt)
                 attempts.append(attempt)
+
+    return attempts
+
+
+def trypull(repo, xs):
+    # Do not attempt to pull the same name twice, or names in the repo.
+    repo._autopulled = getattr(repo, "_autopulled", set())
+    xs = [x for x in xs if x not in repo._autopulled and x not in repo]
+    if not xs:
+        return False
+    repo._autopulled.update(xs)
+
+    attempts = calculate_attempts(repo, xs)
 
     # Merge all pullattempts and execute it.
     if attempts:
@@ -229,7 +226,7 @@ def _pullremotebookmarks(repo, x):
     pattern = repo.ui.config("remotenames", "autopullpattern")
     hoist = repo.ui.config("remotenames", "hoist")
     if pattern and "/" in x:
-        matchfn = _cachedstringmatcher(pattern)
+        matchfn = util.cachedstringmatcher(pattern)
         if matchfn(x):
             remotename, name = bookmarks.splitremotename(x)
             if remotename == hoist:
@@ -251,11 +248,29 @@ def _pullhoistnames(repo, x):
     # Pull hoist remote names automatically. For example, "foo" -> "remote/foo".
     hoistpattern = repo.ui.config("remotenames", "autopullhoistpattern")
     if hoistpattern:
-        matchfn = _cachedstringmatcher(hoistpattern)
+        matchfn = util.cachedstringmatcher(hoistpattern)
         if matchfn(x):
             # XXX: remotenames.hoist config should be the "source" but is
             # ignored here. See "_pullremotebookmarks" for reasons.
             return pullattempt(bookmarknames=[x])
+
+
+@builtinautopullpredicate("commitschemes", priority=100, rewritepullrev=True)
+def _commitscheme(repo, x, rewritepullrev=False):
+    # Translate commit of a foreign scheme to local repo's scheme.
+    if not repo.commitscheme.possible_schemes(x):
+        return None
+
+    def generateattempt() -> Optional[pullattempt]:
+        localnode = repo.commitscheme.translate(x, "local")
+        if not localnode:
+            return None
+        return pullattempt(headnodes=[localnode])
+
+    if rewritepullrev:
+        return generateattempt()
+    else:
+        return deferredpullattempt(generate=generateattempt)
 
 
 def loadpredicate(ui, extname, registrarobj):

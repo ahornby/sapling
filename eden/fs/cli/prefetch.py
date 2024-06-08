@@ -3,6 +3,8 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
+# pyre-strict
+
 import argparse
 import os
 import sys
@@ -15,6 +17,7 @@ from thrift.Thrift import TApplicationException
 from .cmd_util import require_checkout
 from .config import EdenCheckout, EdenInstance
 from .subcmd import Subcmd
+
 
 # Avoid CRLF line-endings on Windows.
 def _println(val: str) -> None:
@@ -36,8 +39,10 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument(
         "--pattern-file",
+        metavar="FILE",
         help=(
-            "Specify path to a file that lists patterns/files to match, one per line"
+            "Obtain patterns to match from FILE, one per line. "
+            "If FILE is - , read patterns from standard input."
         ),
     )
     parser.add_argument(
@@ -94,7 +99,8 @@ def _find_checkout_and_patterns(
 
     raw_patterns = list(args.PATTERN)
     if args.pattern_file is not None:
-        with open(args.pattern_file) as f:
+        handle = sys.stdin if args.pattern_file == "-" else open(args.pattern_file)
+        with handle as f:
             raw_patterns.extend(pat.strip() for pat in f.readlines())
 
     patterns = [_clean_pattern(pattern) for pattern in raw_patterns]
@@ -110,9 +116,10 @@ def _find_checkout_and_patterns(
 class GlobCmd(Subcmd):
     NAME = "glob"
     HELP = "Print matching filenames"
-    DESCRIPTION = """Print matching filenames. Glob patterns can be provided
-    either via stdin or a pattern file. This command does not do any filtering
-    based on source control state or gitignore files."""
+    DESCRIPTION = """Print matching filenames.
+    Glob patterns can be provided via a pattern file.
+    This command does not do any filtering based on source control state or
+    gitignore files."""
 
     def setup_parser(self, parser: argparse.ArgumentParser) -> None:
         _add_common_arguments(parser)
@@ -141,7 +148,7 @@ class PrefetchCmd(Subcmd):
     NAME = "prefetch"
     HELP = "Prefetch content for matching file patterns"
     DESCRIPTION = """Prefetch content for matching file patterns.
-    Glob patterns can be provided either via stdin or a pattern file.
+    Glob patterns can be provided via a pattern file.
     This command does not do any filtering based on source control state or
     gitignore files."""
 
@@ -191,41 +198,82 @@ class PrefetchCmd(Subcmd):
 
             silent = args.silent or not args.debug_print
 
+            # TODO(T183395303) Remove fallback when prefetch_fallback ODS counter hits 0.
             with checkout_and_patterns.instance.get_thrift_client_legacy() as client:
                 if args.background or silent:
-                    # TODO(T166554962): handle debug_print in prefetchFiles endpoint
-                    # instead of calling globFiles
-                    client.prefetchFiles(
-                        PrefetchParams(
-                            mountPoint=bytes(checkout_and_patterns.checkout.path),
-                            globs=checkout_and_patterns.patterns,
-                            directoriesOnly=args.directories_only,
-                            background=args.background,
+                    try:
+                        client.prefetchFilesV2(
+                            PrefetchParams(
+                                mountPoint=bytes(checkout_and_patterns.checkout.path),
+                                globs=checkout_and_patterns.patterns,
+                                directoriesOnly=args.directories_only,
+                                background=args.background,
+                                returnPrefetchedFiles=False,
+                            )
                         )
-                    )
+                        telemetry_sample.add_bool("prefetchV2_fallback", False)
+                    except TApplicationException:
+                        client.prefetchFiles(
+                            PrefetchParams(
+                                mountPoint=bytes(checkout_and_patterns.checkout.path),
+                                globs=checkout_and_patterns.patterns,
+                                directoriesOnly=args.directories_only,
+                                background=args.background,
+                            )
+                        )
+                        telemetry_sample.add_bool("prefetchV2_fallback", True)
                 else:
-                    # If debug print is requested, we call into globFiles instead to get the file list
-                    result = client.globFiles(
-                        GlobParams(
-                            mountPoint=bytes(checkout_and_patterns.checkout.path),
-                            globs=checkout_and_patterns.patterns,
-                            includeDotfiles=args.include_dot_files,
-                            prefetchFiles=not args.directories_only,
-                            suppressFileList=False,
-                            background=False,
-                            listOnlyFiles=args.list_only_files,
+                    try:
+                        # Not handling the following arguments used in globFiles
+                        # includeDotfiles is true by default in prefetching
+                        # prefetchFiles is happening in this command
+                        # suppressFileList is replaced by returnPrefetchedFiles
+                        # listOnlyFiles is false by default in prefetching
+                        prefetchResult = client.prefetchFilesV2(
+                            PrefetchParams(
+                                mountPoint=bytes(checkout_and_patterns.checkout.path),
+                                globs=checkout_and_patterns.patterns,
+                                directoriesOnly=args.directories_only,
+                                background=False,
+                                returnPrefetchedFiles=True,
+                            )
                         )
-                    )
-
-                    telemetry_sample.add_int("files_fetched", len(result.matchingFiles))
-
-                    if checkout_and_patterns.patterns and not result.matchingFiles:
-                        _eprintln(
-                            f"No files were matched by the pattern{'s' if len(checkout_and_patterns.patterns) else ''} specified.\n"
-                            "See `eden prefetch -h` for docs on pattern matching.",
+                        telemetry_sample.add_bool("prefetchV2_fallback", False)
+                        if prefetchResult.prefetchedFiles:
+                            result = prefetchResult.prefetchedFiles
+                        else:
+                            result = None
+                    except TApplicationException:
+                        # Falling back to globFiles if V2 doesn't exist
+                        result = client.globFiles(
+                            GlobParams(
+                                mountPoint=bytes(checkout_and_patterns.checkout.path),
+                                globs=checkout_and_patterns.patterns,
+                                includeDotfiles=args.include_dot_files,
+                                prefetchFiles=not args.directories_only,
+                                suppressFileList=False,
+                                background=False,
+                                listOnlyFiles=args.list_only_files,
+                            )
                         )
-                    _println(
-                        "\n".join(os.fsdecode(name) for name in result.matchingFiles)
-                    )
+                        telemetry_sample.add_bool("prefetchV2_fallback", True)
+                    # result should always be set unless there was an error with prefetchV2
+                    if result:
+                        telemetry_sample.add_int(
+                            "files_fetched", len(result.matchingFiles)
+                        )
+
+                        if checkout_and_patterns.patterns and not result.matchingFiles:
+                            _eprintln(
+                                f"No files were matched by the pattern{'s' if len(checkout_and_patterns.patterns) else ''} specified.\n"
+                                "See `eden prefetch -h` for docs on pattern matching.",
+                            )
+                        _println(
+                            "\n".join(
+                                os.fsdecode(name) for name in result.matchingFiles
+                            )
+                        )
+                    else:
+                        _eprintln("Error prefetching files")
 
         return 0

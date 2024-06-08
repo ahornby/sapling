@@ -11,6 +11,7 @@ import type {ChangedFile, ChangedFileType, MergeConflicts, RepoRelativePath} fro
 import type {MutableRefObject} from 'react';
 import type {Comparison} from 'shared/Comparison';
 
+import {Avatar} from './Avatar';
 import {Banner, BannerKind} from './Banner';
 import {File} from './ChangedFile';
 import {
@@ -19,6 +20,7 @@ import {
   changedFilesDisplayType,
 } from './ChangedFileDisplayTypePicker';
 import {Collapsable} from './Collapsable';
+import {Commit} from './Commit';
 import {
   commitMessageTemplate,
   commitMode,
@@ -31,15 +33,26 @@ import {
 } from './CommitInfoView/CommitMessageFields';
 import {temporaryCommitTitle} from './CommitTitle';
 import {OpenComparisonViewButton} from './ComparisonView/OpenComparisonViewButton';
+import {Row} from './ComponentUtils';
 import {ErrorNotice} from './ErrorNotice';
 import {FileTree, FileTreeFolderHeader} from './FileTree';
 import {useGeneratedFileStatuses} from './GeneratedFile';
 import {Internal} from './Internal';
 import {DOCUMENTATION_DELAY, Tooltip} from './Tooltip';
+import {UnsavedFilesCount, confirmUnsavedFiles} from './UnsavedFiles';
+import {tracker} from './analytics';
 import {latestCommitMessageFields} from './codeReview/CodeReviewInfo';
+import {Badge} from './components/Badge';
+import {Button} from './components/Button';
 import {islDrawerState} from './drawerState';
+import {externalMergeToolAtom} from './externalMergeTool';
 import {T, t} from './i18n';
-import {writeAtom} from './jotaiUtils';
+import {DownwardArrow} from './icons/DownwardIcon';
+import {localStorageBackedAtom, readAtom, useAtomGet, writeAtom} from './jotaiUtils';
+import {
+  AutoResolveSettingCheckbox,
+  shouldAutoResolveAllBeforeContinue,
+} from './mergeConflicts/state';
 import {AbortMergeOperation} from './operations/AbortMergeOperation';
 import {AddRemoveOperation} from './operations/AddRemoveOperation';
 import {getAmendOperation} from './operations/AmendOperation';
@@ -47,27 +60,27 @@ import {getCommitOperation} from './operations/CommitOperation';
 import {ContinueOperation} from './operations/ContinueMergeOperation';
 import {DiscardOperation, PartialDiscardOperation} from './operations/DiscardOperation';
 import {PurgeOperation} from './operations/PurgeOperation';
+import {ResolveInExternalMergeToolOperation} from './operations/ResolveInExternalMergeToolOperation';
 import {RevertOperation} from './operations/RevertOperation';
+import {RunMergeDriversOperation} from './operations/RunMergeDriversOperation';
 import {getShelveOperation} from './operations/ShelveOperation';
+import {operationList, useRunOperation} from './operationsState';
 import {useUncommittedSelection} from './partialSelection';
 import platform from './platform';
 import {
+  CommitPreview,
+  dagWithPreviews,
   optimisticMergeConflicts,
   uncommittedChangesWithPreviews,
   useIsOperationRunningOrQueued,
 } from './previews';
 import {selectedCommits} from './selection';
-import {
-  latestHeadCommit,
-  operationList,
-  uncommittedChangesFetchError,
-  useRunOperation,
-} from './serverAPIState';
+import {latestHeadCommit, uncommittedChangesFetchError} from './serverAPIState';
 import {GeneratedStatus} from './types';
-import {VSCodeBadge, VSCodeButton, VSCodeTextField} from '@vscode/webview-ui-toolkit/react';
-import {useAtomValue} from 'jotai';
-import React, {useMemo, useEffect, useRef, useState} from 'react';
-import {useRecoilCallback, useRecoilValue} from 'recoil';
+import * as stylex from '@stylexjs/stylex';
+import {VSCodeButton, VSCodeTextField} from '@vscode/webview-ui-toolkit/react';
+import {useAtom, useAtomValue} from 'jotai';
+import React, {useCallback, useMemo, useEffect, useRef, useState} from 'react';
 import {ComparisonType} from 'shared/Comparison';
 import {Icon} from 'shared/Icon';
 import {useDeepMemo} from 'shared/hooks';
@@ -165,9 +178,25 @@ function SectionedFileList({filesByPrefix, ...rest}: SectionProps) {
     <div className="file-tree">
       {Array.from(filesByPrefix.entries(), ([prefix, files]) => {
         const isCollapsed = collapsedSections.has(prefix);
+        const isEverythingSelected = files.every(file =>
+          rest.selection?.isFullySelected(file.path),
+        );
+        const isPartiallySelected = files.some(file =>
+          rest.selection?.isFullyOrPartiallySelected(file.path),
+        );
         return (
           <div className="file-tree-section" key={prefix}>
             <FileTreeFolderHeader
+              checkedState={
+                isEverythingSelected ? true : isPartiallySelected ? 'indeterminate' : false
+              }
+              toggleChecked={checked => {
+                if (checked) {
+                  rest.selection?.select(...files.map(file => file.path));
+                } else {
+                  rest.selection?.deselect(...files.map(file => file.path));
+                }
+              }}
               isCollapsed={isCollapsed}
               toggleCollapsed={() =>
                 setCollapsedSections(previous =>
@@ -178,7 +207,11 @@ function SectionedFileList({filesByPrefix, ...rest}: SectionProps) {
               }
               folder={prefix}
             />
-            {!isCollapsed ? <LinearFileList {...rest} files={files} /> : null}
+            {!isCollapsed ? (
+              <div className="file-tree-level">
+                <LinearFileList {...rest} files={files} />
+              </div>
+            ) : null}
           </div>
         );
       })}
@@ -345,6 +378,15 @@ export function ChangedFiles(props: {
   );
 }
 
+const generatedFilesInitiallyExpanded = localStorageBackedAtom<boolean>(
+  'isl.expand-generated-files',
+  false,
+);
+
+export const __TEST__ = {
+  generatedFilesInitiallyExpanded,
+};
+
 function LinearFileList(props: {
   files: Array<UIChangedFile>;
   displayType: ChangedFilesDisplayType;
@@ -356,6 +398,7 @@ function LinearFileList(props: {
   const {files, generatedStatuses, ...rest} = props;
 
   const groupedByGenerated = group(files, file => generatedStatuses[file.path]);
+  const [initiallyExpanded, setInitallyExpanded] = useAtom(generatedFilesInitiallyExpanded);
 
   function GeneratedFilesCollapsableSection(status: GeneratedStatus) {
     const group = groupedByGenerated[status] ?? [];
@@ -367,14 +410,15 @@ function LinearFileList(props: {
         title={
           <T
             replace={{
-              $count: <VSCodeBadge>{group.length}</VSCodeBadge>,
+              $count: <Badge>{group.length}</Badge>,
             }}>
             {status === GeneratedStatus.PartiallyGenerated
               ? 'Partially Generated Files $count'
               : 'Generated Files $count'}
           </T>
         }
-        startExpanded={status === GeneratedStatus.PartiallyGenerated}>
+        startExpanded={status === GeneratedStatus.PartiallyGenerated || initiallyExpanded}
+        onToggle={expanded => setInitallyExpanded(expanded)}>
         {group.map(file => (
           <File key={file.path} {...rest} file={file} generatedStatus={status} />
         ))}
@@ -403,70 +447,75 @@ function LinearFileList(props: {
 export type Place = 'main' | 'amend sidebar' | 'commit sidebar';
 
 export function UncommittedChanges({place}: {place: Place}) {
-  const uncommittedChanges = useRecoilValue(uncommittedChangesWithPreviews);
-  const error = useRecoilValue(uncommittedChangesFetchError);
+  const uncommittedChanges = useAtomValue(uncommittedChangesWithPreviews);
+  const error = useAtomValue(uncommittedChangesFetchError);
   // TODO: use dagWithPreviews instead, and update CommitOperation
-  const headCommit = useRecoilValue(latestHeadCommit);
-  const schema = useRecoilValue(commitMessageFieldsSchema);
-  const template = useRecoilValue(commitMessageTemplate);
+  const headCommit = useAtomValue(latestHeadCommit);
+  const schema = useAtomValue(commitMessageFieldsSchema);
+  const template = useAtomValue(commitMessageTemplate);
 
-  const conflicts = useRecoilValue(optimisticMergeConflicts);
+  const conflicts = useAtomValue(optimisticMergeConflicts);
 
   const selection = useUncommittedSelection();
   const commitTitleRef = useRef<HTMLTextAreaElement | undefined>(null);
 
   const runOperation = useRunOperation();
 
-  const openCommitForm = useRecoilCallback(
-    ({set, reset, snapshot}) =>
-      (which: 'commit' | 'amend') => {
-        // make sure view is expanded
-        writeAtom(islDrawerState, val => ({...val, right: {...val.right, collapsed: false}}));
+  const openCommitForm = useCallback(
+    (which: 'commit' | 'amend') => {
+      // make sure view is expanded
+      writeAtom(islDrawerState, val => ({...val, right: {...val.right, collapsed: false}}));
 
-        // show head commit & set to correct mode
-        reset(selectedCommits);
-        set(commitMode, which);
+      // show head commit & set to correct mode
+      writeAtom(selectedCommits, new Set());
+      writeAtom(commitMode, which);
 
-        // Start editing fields when amending so you can go right into typing.
-        if (which === 'amend') {
-          set(forceNextCommitToEditAllFields, true);
-          if (headCommit != null) {
-            const latestMessage = snapshot
-              .getLoadable(latestCommitMessageFields(headCommit.hash))
-              .valueMaybe();
-            if (latestMessage) {
-              set(editedCommitMessages(headCommit.hash), {
-                fields: {...latestMessage},
-              });
-            }
+      // Start editing fields when amending so you can go right into typing.
+      if (which === 'amend') {
+        writeAtom(forceNextCommitToEditAllFields, true);
+        if (headCommit != null) {
+          const latestMessage = readAtom(latestCommitMessageFields(headCommit.hash));
+          if (latestMessage) {
+            writeAtom(editedCommitMessages(headCommit.hash), {
+              ...latestMessage,
+            });
           }
         }
+      }
 
-        const quickCommitTyped = commitTitleRef.current?.value;
-        if (which === 'commit' && quickCommitTyped != null && quickCommitTyped != '') {
-          set(editedCommitMessages('head'), value => ({
-            ...value,
-            fields: {...value.fields, Title: quickCommitTyped},
-          }));
-          // delete what was written in the quick commit form
-          commitTitleRef.current != null && (commitTitleRef.current.value = '');
-        }
-      },
+      const quickCommitTyped = commitTitleRef.current?.value;
+      if (which === 'commit' && quickCommitTyped != null && quickCommitTyped != '') {
+        writeAtom(editedCommitMessages('head'), value => ({
+          ...value,
+          Title: quickCommitTyped,
+        }));
+        // delete what was written in the quick commit form
+        commitTitleRef.current != null && (commitTitleRef.current.value = '');
+      }
+    },
+    [headCommit],
   );
 
-  const onConfirmQuickCommit = () => {
-    const title =
-      (commitTitleRef.current as HTMLInputElement | null)?.value ||
-      template?.fields.Title ||
-      temporaryCommitTitle();
+  const onConfirmQuickCommit = async () => {
+    const shouldContinue = await confirmUnsavedFiles();
+    if (!shouldContinue) {
+      return;
+    }
+
+    const titleEl = commitTitleRef.current as HTMLInputElement | null;
+    const title = titleEl?.value || template?.Title || temporaryCommitTitle();
     // use the template, unless a specific quick title is given
-    const fields: CommitMessageFields = {...template?.fields, Title: title};
+    const fields: CommitMessageFields = {...template, Title: title};
     const message = commitMessageFieldsToString(schema, fields);
     const hash = headCommit?.hash ?? '.';
     const allFiles = uncommittedChanges.map(file => file.path);
     const operation = getCommitOperation(message, hash, selection.selection, allFiles);
     selection.discardPartialSelections();
     runOperation(operation);
+    if (titleEl) {
+      // clear out message now that we've used it
+      titleEl.value = '';
+    }
   };
 
   if (error) {
@@ -612,13 +661,22 @@ export function UncommittedChanges({place}: {place: Place}) {
                         selectedFiles,
                         file => file.status !== '?', // only untracked, not missing
                       );
+                      // Added files should be first reverted, then purged, so they are not tracked and also deleted.
+                      // This way, the partial selection discard matches the non-partial discard.
+                      const addedFilesToAlsoPurge = selectedFiles.filter(
+                        file => file.status === 'A',
+                      );
                       if (selectedTrackedFiles.length > 0) {
                         // only a subset of files selected -> we need to revert selected tracked files individually
                         runOperation(new RevertOperation(selectedTrackedFiles.map(f => f.path)));
                       }
-                      if (selectedUntrackedFiles.length > 0) {
-                        // untracked files must be purged separately to delete from disk
-                        runOperation(new PurgeOperation(selectedUntrackedFiles.map(f => f.path)));
+                      if (selectedUntrackedFiles.length > 0 || addedFilesToAlsoPurge.length > 0) {
+                        // untracked files must be purged separately to delete from disk.
+                        runOperation(
+                          new PurgeOperation(
+                            [...selectedUntrackedFiles, ...addedFilesToAlsoPurge].map(f => f.path),
+                          ),
+                        );
                       }
                     }
                   });
@@ -650,6 +708,7 @@ export function UncommittedChanges({place}: {place: Place}) {
           }}
         />
       )}
+      <UnsavedFilesCount />
       {conflicts != null || place !== 'main' ? null : (
         <div className="button-rows">
           <div className="button-row">
@@ -702,7 +761,12 @@ export function UncommittedChanges({place}: {place: Place}) {
                 appearance="icon"
                 disabled={noFilesSelected || !headCommit}
                 data-testid="uncommitted-changes-quick-amend-button"
-                onClick={() => {
+                onClick={async () => {
+                  const shouldContinue = await confirmUnsavedFiles();
+                  if (!shouldContinue) {
+                    return;
+                  }
+
                   const hash = headCommit?.hash ?? '.';
                   const allFiles = uncommittedChanges.map(file => file.path);
                   const operation = getAmendOperation(
@@ -730,7 +794,44 @@ export function UncommittedChanges({place}: {place: Place}) {
           )}
         </div>
       )}
+      {place === 'main' && <ConflictingIncomingCommit />}
     </div>
+  );
+}
+
+const styles = stylex.create({
+  conflictingIncomingContainer: {
+    gap: 'var(--halfpad)',
+    position: 'relative',
+    paddingLeft: '20px',
+    paddingTop: '5px',
+    marginBottom: '-5px',
+    color: 'var(--scm-added-foreground)',
+  },
+  downwardArrow: {
+    position: 'absolute',
+    top: '20px',
+    left: '5px',
+  },
+});
+
+function ConflictingIncomingCommit() {
+  const conflicts = useAtomValue(optimisticMergeConflicts);
+  // "other" is the incoming / source / your commit
+  const commit = useAtomGet(dagWithPreviews, conflicts?.hashes?.other);
+  if (commit == null) {
+    return null;
+  }
+  return (
+    <Row xstyle={styles.conflictingIncomingContainer}>
+      <DownwardArrow {...stylex.props(styles.downwardArrow)} />
+      <Avatar username={commit.author} />
+      <Commit
+        commit={commit}
+        hasChildren={false}
+        previewType={CommitPreview.NON_ACTIONABLE_COMMIT}
+      />
+    </Row>
   );
 }
 
@@ -748,31 +849,42 @@ function MergeConflictButtons({
   // But only if the abort/continue command succeeded.
   // TODO: is this reliable? Is it possible to get stuck with buttons disabled because
   // we think it's still running?
-  const lastRunOperation = useRecoilValue(operationList).currentOperation;
+  const lastRunOperation = useAtomValue(operationList).currentOperation;
   const justFinishedContinue =
     lastRunOperation?.operation instanceof ContinueOperation && lastRunOperation.exitCode === 0;
   const justFinishedAbort =
     lastRunOperation?.operation instanceof AbortMergeOperation && lastRunOperation.exitCode === 0;
   const isRunningContinue = !!useIsOperationRunningOrQueued(ContinueOperation);
   const isRunningAbort = !!useIsOperationRunningOrQueued(AbortMergeOperation);
+  const isRunningResolveExternal = !!useIsOperationRunningOrQueued(
+    ResolveInExternalMergeToolOperation,
+  );
   const shouldDisableButtons =
-    isRunningContinue || isRunningAbort || justFinishedContinue || justFinishedAbort;
+    isRunningContinue ||
+    isRunningAbort ||
+    isRunningResolveExternal ||
+    justFinishedContinue ||
+    justFinishedAbort;
+
+  const externalMergeTool = useAtomValue(externalMergeToolAtom);
 
   return (
-    <>
-      <VSCodeButton
-        appearance={allConflictsResolved ? 'primary' : 'icon'}
+    <Row style={{flexWrap: 'wrap', marginBottom: 'var(--pad)'}}>
+      <Button
+        primary
         key="continue"
         disabled={!allConflictsResolved || shouldDisableButtons}
         data-testid="conflict-continue-button"
         onClick={() => {
+          if (readAtom(shouldAutoResolveAllBeforeContinue)) {
+            runOperation(new RunMergeDriversOperation());
+          }
           runOperation(new ContinueOperation());
         }}>
         <Icon slot="start" icon={isRunningContinue ? 'loading' : 'debug-continue'} />
         <T>Continue</T>
-      </VSCodeButton>
-      <VSCodeButton
-        appearance="icon"
+      </Button>
+      <Button
         key="abort"
         disabled={shouldDisableButtons}
         onClick={() => {
@@ -780,7 +892,71 @@ function MergeConflictButtons({
         }}>
         <Icon slot="start" icon={isRunningAbort ? 'loading' : 'circle-slash'} />
         <T>Abort</T>
-      </VSCodeButton>
-    </>
+      </Button>
+      {externalMergeTool == null ? (
+        platform.upsellExternalMergeTool ? (
+          <Tooltip
+            title={
+              <div>
+                <T replace={{$tool: <code>{externalMergeTool}</code>, $br: <br />}}>
+                  You can configure an external merge tool to use for resolving conflicts.$br
+                </T>
+              </div>
+            }>
+            <Button
+              icon
+              disabled={allConflictsResolved || shouldDisableButtons}
+              onClick={() => {
+                tracker.track('ClickedConfigureExternalMergeTool');
+                const link = Internal.externalMergeToolDocsLink;
+                if (link) {
+                  platform.openExternalLink(link);
+                  return;
+                }
+                platform.confirm(
+                  t('Configuring External Merge Tools'),
+                  t(
+                    'You can configure ISL to use an external merge tool for resovling conflicts.\n' +
+                      'Set both `ui.merge = mymergetool` and `merge-tool.mymergetool`.\n' +
+                      'See `sl help config.merge-tools` for more information about setting up merge tools.\n',
+                  ),
+                );
+              }}>
+              <Icon icon="gear" />
+              <T>Configure External Merge Tool</T>
+            </Button>
+          </Tooltip>
+        ) : null
+      ) : (
+        <Tooltip
+          title={
+            <div>
+              <T replace={{$tool: <code>{externalMergeTool}</code>, $br: <br />}}>
+                Open your configured external merge tool $tool to resolve all the conflicts.$br
+                Waits for the merge tool to exit before continuing.
+              </T>
+              {allConflictsResolved ? (
+                <>
+                  <br />
+                  <T>Disabled since all conflicts have been resolved.</T>
+                </>
+              ) : null}
+            </div>
+          }>
+          <Button
+            icon
+            disabled={allConflictsResolved || shouldDisableButtons}
+            onClick={() => {
+              runOperation(new ResolveInExternalMergeToolOperation(externalMergeTool));
+            }}>
+            <Icon icon="link-external" />
+            <T>Open External Merge Tool</T>
+          </Button>
+        </Tooltip>
+      )}
+      {Internal.showInlineAutoRunMergeDriversOption === true && (
+        <AutoResolveSettingCheckbox subtle />
+      )}
+    </Row>
   );
 }

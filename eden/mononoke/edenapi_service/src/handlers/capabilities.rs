@@ -11,6 +11,7 @@ use gotham::state::State;
 use gotham_derive::StateData;
 use gotham_derive::StaticResponseExtender;
 use gotham_ext::error::HttpError;
+use gotham_ext::middleware::request_context::RequestContext;
 use gotham_ext::response::BytesBody;
 use mononoke_api::MononokeError;
 use mononoke_api_hg::HgRepoContext;
@@ -18,9 +19,8 @@ use serde::Deserialize;
 
 use crate::context::ServerContext;
 use crate::errors::MononokeErrorExt;
-use crate::handlers::EdenApiMethod;
 use crate::handlers::HandlerInfo;
-use crate::middleware::RequestContext;
+use crate::handlers::SaplingRemoteApiMethod;
 use crate::utils::get_repo;
 
 #[derive(Debug, Deserialize, StateData, StaticResponseExtender)]
@@ -53,7 +53,10 @@ async fn get_capabilities_vec(
 pub async fn capabilities_handler(state: &mut State) -> Result<BytesBody<Bytes>, HttpError> {
     let params = CapabilitiesParams::take_from(state);
 
-    state.put(HandlerInfo::new(&params.repo, EdenApiMethod::Capabilities));
+    state.put(HandlerInfo::new(
+        &params.repo,
+        SaplingRemoteApiMethod::Capabilities,
+    ));
 
     let sctx = ServerContext::borrow_from(state);
     let rctx = RequestContext::borrow_from(state).clone();

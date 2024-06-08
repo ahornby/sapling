@@ -7,7 +7,6 @@
 
 use std::collections::BTreeSet;
 use std::collections::BinaryHeap;
-use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::fmt;
 use std::fmt::Debug;
@@ -33,6 +32,7 @@ use crate::iddagstore::InProcessStore;
 #[cfg(any(test, feature = "indexedlog-backend"))]
 use crate::iddagstore::IndexedLogStore;
 use crate::ops::Persist;
+use crate::ops::StorageVersion;
 #[cfg(any(test, feature = "indexedlog-backend"))]
 use crate::ops::TryClone;
 use crate::segment::FlatSegment;
@@ -268,6 +268,9 @@ impl<Store: IdDagStore> IdDag<Store> {
         };
         let mut last_high = None;
         for seg in &outcome.segments {
+            if seg.low.is_virtual() {
+                continue;
+            }
             if let Some(last_high) = last_high {
                 if last_high >= seg.low {
                     return bug(format!(
@@ -1663,6 +1666,94 @@ pub trait IdDagAlgorithm: IdDagStore {
         }
         Ok(result)
     }
+
+    /// Suggest the next `Id` to test, during a bisect.
+    ///
+    /// - `(low, high)` are explicitly marked ends, either `(good, bad)` or `(bad, good)`.
+    /// - `skip` is an explicitly skipped set.
+    ///
+    /// Return `(id_to_bisect_next, untested_set, roots(high::))`.
+    ///
+    /// If `id_to_bisect_next` is `None`, the bisect is completed. At this time,
+    /// `roots(high::)` is the "first good/bad" set. `untested_set` is usually
+    /// empty, or a subset of `skip`.
+    fn suggest_bisect(
+        &self,
+        low: &IdSet,
+        high: &IdSet,
+        skip: &IdSet,
+    ) -> Result<(Option<Id>, IdSet, IdSet)> {
+        debug!(target: "dag::algo::suggest_bisect", "suggest_bisect({:?}, {:?}, {:?})", low, high, skip);
+        // Handling the two ends is NOT symmetric. For example, assuming high = bad:
+        //
+        //     Y  high (bad)
+        //    / \
+        //  A10  B10
+        //   :    :
+        //  A01  B01
+        //    \ /
+        //     X  low (good)
+        //
+        // - If A05 is "good", then A01::A05 is implicit "good", B01::B10 remains unknown.
+        // - If A05 is "bad", then A05::Y is implicit "bad", B01::B10 can be skipped.
+        //
+        // The final bisect output is a single commit ("first bad"). The contract does not require us
+        // to figure out all "first bad"s in all branches. If X is good, A05 is bad, then we know one
+        // of the "first bad"s must exist in X::A05 and we can ignore other parts like B01::B10.
+
+        // low::low = implicit good.
+        let connected_low = self.range(low.clone(), low.clone())?;
+
+        // Ignore interesting parts - see above for why this is only for "high".
+        let high = self.roots(self.range(high.clone(), high.clone())?)?;
+
+        // The bisect range.
+        let untested = self
+            .range(low.clone(), high.clone())?
+            .difference(&connected_low)
+            .difference(&high);
+        trace!(target: "dag::algo::suggest_bisect", " untested = {:?}", untested);
+
+        let total = untested.count();
+        let ideal = (total + 1) / 2;
+
+        // Consider each linear ranges (flat segments).
+        let flat_segments =
+            self.id_set_to_id_segments_with_max_level(&untested.difference(skip), 0)?;
+        let mut best_score = 0;
+        let mut best_id = None;
+        for id_segment in flat_segments.into_iter().rev() {
+            // Pick "P", let "len(ancestors(P) & untested)" be "x".
+            // - If P is good, bisect total -= x.
+            // - If P is bad, bisect total -= (total + 1 - x).
+            // We want to make good progress even in the worst case, maximize "min(total + 1 - x, x)".
+            // The best happens when "total + 1 - x" is "x", when x = ideal.
+            //
+            // if good, remove "ancestors(P)" from "untested",
+            // if bad, remove "P + (untested - ancestors(P))" from "untested".
+
+            // "ancestors(high)" can be cheaper to calculate than "ancestor(low)", if it follows a
+            // high-level segment. Once we get "ancestors(high)", we can calculate the "count" for
+            // "ancestors(p for p in low..=high)" without calling (slower) "ancestors(p)", because
+            // the segment is "flat" (level 0), it cannot have merges except for "low".
+            let ancestors_high = self.ancestors(id_segment.high.into())?;
+            let high_count = ancestors_high.intersection(&untested).count();
+            let low_count = high_count.saturating_sub(id_segment.high.0 - id_segment.low.0);
+            let best_count = ideal.max(low_count).min(high_count);
+            let score = best_count.min(total + 1 - best_count);
+            if score > best_score {
+                let id = id_segment.low + (best_count - low_count);
+                trace!(target: "dag::algo::suggest_bisect", "  id={} score={}", id, score);
+                best_score = score;
+                best_id = Some(id);
+                if best_count == ideal {
+                    break;
+                }
+            }
+        }
+
+        Ok((best_id, untested, high))
+    }
 }
 
 impl<S: IdDagStore> IdDagAlgorithm for S {}
@@ -1740,24 +1831,6 @@ pub enum FirstAncestorConstraint {
 }
 
 impl<Store: IdDagStore> IdDag<Store> {
-    /// Export non-master DAG as parent_id_func on HashMap.
-    ///
-    /// This can be expensive if there are a lot of non-master ids.
-    /// It is currently only used to rebuild non-master groups after
-    /// id re-assignment.
-    pub fn non_master_parent_ids(&self) -> Result<HashMap<Id, Vec<Id>>> {
-        let mut parents = HashMap::new();
-        let start = Group::NON_MASTER.min_id();
-        for seg in self.next_segments(start, 0)? {
-            let span = seg.span()?;
-            parents.insert(span.low, seg.parents()?);
-            for i in (span.low + 1).to(span.high) {
-                parents.insert(i, vec![i - 1]);
-            }
-        }
-        Ok(parents)
-    }
-
     /// Remove `set` and their descendants. Return `descendents(set)`.
     ///
     /// The returned `descendants(set)` is usually used to remove
@@ -1946,6 +2019,12 @@ impl<P: Fn(Id) -> Result<bool>> LazyPredicate<P> {
             self.false_count += 1;
         }
         Ok(())
+    }
+}
+
+impl<S: StorageVersion> StorageVersion for IdDag<S> {
+    fn storage_version(&self) -> (u64, u64) {
+        self.store.storage_version()
     }
 }
 

@@ -10,9 +10,9 @@ import type {CommitInfo, ExactRevset, SmartlogCommits, SucceedableRevset} from '
 
 import {MutationDag} from './dag/mutation_dag';
 import {writeAtom} from './jotaiUtils';
-import {entangledAtoms} from './recoilUtils';
 import {exactRevset, succeedableRevset} from './types';
-import {DefaultValue} from 'recoil';
+import {registerCleanup} from './utils';
+import {atom} from 'jotai';
 
 type Successions = Array<[oldHash: string, newHash: string]>;
 type SuccessionCallback = (successions: Successions) => unknown;
@@ -54,7 +54,8 @@ export class SuccessionTracker {
    * Called once in the app each time a new batch of commits is fetched,
    * in order to find successions and run callbacks on them.
    */
-  public findNewSuccessionsFromCommits(commits: SmartlogCommits) {
+  public findNewSuccessionsFromCommits(previousDag: Dag, commits: SmartlogCommits) {
+    const tracker = window.globalIslClientTracker; // avoid import cycle
     const successions: Successions = [];
     for (const commit of commits) {
       if (commit.phase === 'public') {
@@ -72,6 +73,31 @@ export class SuccessionTracker {
       if (oldHashes != null && !this.seenHashes.has(newHash)) {
         for (const oldHash of oldHashes) {
           if (this.seenHashes.has(oldHash)) {
+            // HACKY: When we see a succession, we want to persist data forward.
+            // However, we've seen a bug where commit messages get mixed up between commits.
+            // As a precaution, let's not consider commits that change their commit messages
+            // to have different attached diffs.
+            // There may be false positives from this, but they should be rare,
+            // and the cost of successions wrong is relatively small:
+            // commit messages and selection wouldn't be persisted correctly.
+            // TODO: use this for debugging, then find a proper fix or legitimize this.
+            const previousCommit = previousDag.get(oldHash);
+            if (
+              previousCommit != null &&
+              previousCommit.diffId &&
+              previousCommit.diffId !== commit.diffId
+            ) {
+              tracker?.track('BuggySuccessionDetected', {
+                extras: {
+                  oldHash,
+                  newHash,
+                  old: previousCommit.title + '\n' + previousCommit.description,
+                  new: commit.title + '\n' + commit.description,
+                },
+              });
+              continue;
+            }
+
             successions.push([oldHash, newHash]);
           }
         }
@@ -81,32 +107,32 @@ export class SuccessionTracker {
     }
 
     if (successions.length > 0) {
+      tracker?.track('SuccessionsDetected', {extras: {successions}});
       for (const cb of this.callbacks) {
         cb(successions);
       }
     }
   }
 
-  /** Clear all known hashes and remove all listeners, useful for resetting between tests */
+  /** Clear all known hashes, useful for resetting between tests */
   public clear() {
     this.seenHashes.clear();
-    this.callbacks.clear();
   }
 }
 
 export const successionTracker = new SuccessionTracker();
 
-export const [latestSuccessorsMapAtom, latestSuccessorsMap] = entangledAtoms<MutationDag>({
-  key: 'latestSuccessorsMap',
-  default: new MutationDag(),
-});
+export const latestSuccessorsMapAtom = atom<MutationDag>(new MutationDag());
 
-successionTracker.onSuccessions(successions => {
-  writeAtom(latestSuccessorsMapAtom, existing => {
-    const dag = existing instanceof DefaultValue ? new MutationDag() : existing;
-    return dag.addMutations(successions);
-  });
-});
+registerCleanup(
+  successionTracker,
+  successionTracker.onSuccessions(successions => {
+    writeAtom(latestSuccessorsMapAtom, dag => {
+      return dag.addMutations(successions);
+    });
+  }),
+  import.meta.hot,
+);
 
 /**
  * Get the latest successor hash of the given hash,

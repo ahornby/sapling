@@ -358,7 +358,7 @@ async fn run_one(
         cloned!(command, job_params.quiet, sub_params.progress_state,);
         move |ctx: &CoreContext, repo_params: &RepoWalkParams| {
             cloned!(ctx, repo_params.scheduled_max);
-            async move |walk_output, _run_start, _chunk_num, _checkpoint_name| {
+            move |walk_output, _run_start, _chunk_num, _checkpoint_name| async move {
                 cloned!(ctx, sizing_progress_state);
                 // Sizing doesn't use mtime, so remove it from payload
                 let walk_progress = progress_stream(quiet, &progress_state, walk_output).map_ok(
@@ -384,6 +384,7 @@ async fn run_one(
     let walk_state = SamplingWalkVisitor::new(
         repo_params.include_node_types.clone(),
         repo_params.include_edge_types.clone(),
+        repo_params.exclude_nodes.clone(),
         command.sampling_options,
         None,
         command.sampler,

@@ -13,17 +13,24 @@ use async_trait::async_trait;
 use blobrepo::save_bonsai_changesets;
 use bonsai_git_mapping::BonsaiGitMappingEntry;
 use bonsai_git_mapping::BonsaiGitMappingRef;
+use bonsai_git_mapping::BonsaisOrGitShas;
 use bonsai_tag_mapping::BonsaiTagMappingRef;
+use borrowed::borrowed;
+use bulk_derivation::BulkDerivation;
 use bytes::Bytes;
 use changesets::ChangesetsRef;
 use cloned::cloned;
+use commit_graph::CommitGraphRef;
 use context::CoreContext;
 use filestore::FilestoreConfigRef;
 use filestore::StoreRequest;
 use futures::stream;
 use futures::stream::Stream;
+use futures::StreamExt;
+use futures::TryStreamExt;
 use futures_stats::TimedTryFutureExt;
 use gix_hash::ObjectId;
+use import_tools::BackfillDerivation;
 use import_tools::CommitMetadata;
 use import_tools::GitImportLfs;
 use import_tools::GitUploader;
@@ -40,10 +47,12 @@ use mononoke_types::hash;
 use mononoke_types::BonsaiChangeset;
 use mononoke_types::BonsaiChangesetMut;
 use mononoke_types::ChangesetId;
+use mononoke_types::DerivableType;
 use mononoke_types::FileChange;
 use mononoke_types::FileType;
 use mononoke_types::NonRootMPath;
 use repo_blobstore::RepoBlobstoreRef;
+use repo_derived_data::RepoDerivedDataRef;
 use slog::debug;
 use slog::info;
 use sorted_vector_map::SortedVectorMap;
@@ -82,10 +91,12 @@ impl<R> DirectUploader<R> {
 impl<R> GitUploader for DirectUploader<R>
 where
     R: ChangesetsRef
+        + CommitGraphRef
         + RepoBlobstoreRef
         + BonsaiGitMappingRef
         + BonsaiTagMappingRef
         + FilestoreConfigRef
+        + RepoDerivedDataRef
         + Clone
         + Send
         + Sync
@@ -98,6 +109,31 @@ where
         FileChange::Deletion
     }
 
+    async fn preload_uploaded_commits(
+        &self,
+        ctx: &CoreContext,
+        oids: &[gix_hash::ObjectId],
+    ) -> Result<Vec<(gix_hash::ObjectId, ChangesetId)>, Error> {
+        if self.reupload_commits.reupload_commit() {
+            return Ok(Vec::new());
+        }
+        let oids = BonsaisOrGitShas::GitSha1(
+            oids.iter()
+                .map(|oid| hash::GitSha1::from_bytes(oid.as_bytes()))
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        let result = self.inner.bonsai_git_mapping().get(ctx, oids).await?;
+        result
+            .into_iter()
+            .map(|entry| {
+                entry
+                    .git_sha1
+                    .to_object_id()
+                    .map(|git_sha1| (git_sha1, entry.bcs_id))
+            })
+            .collect()
+    }
+
     async fn check_commit_uploaded(
         &self,
         ctx: &CoreContext,
@@ -106,7 +142,6 @@ where
         if self.reupload_commits.reupload_commit() {
             return Ok(None);
         }
-
         self.inner
             .bonsai_git_mapping()
             .get_bonsai_from_git_sha1(ctx, hash::GitSha1::from_bytes(oid.as_bytes())?)
@@ -213,6 +248,7 @@ where
         &self,
         ctx: &CoreContext,
         dry_run: bool,
+        backfill_derivation: BackfillDerivation,
         changesets: Vec<(Self::IntermediateChangeset, hash::GitSha1)>,
     ) -> Result<(), Error> {
         let oid_to_bcsid = changesets
@@ -233,13 +269,98 @@ where
             stats.completion_time
         );
 
-        if !dry_run {
-            self.inner
-                .bonsai_git_mapping()
-                .bulk_add(ctx, &oid_to_bcsid)
-                .await?;
+        if dry_run {
+            // Short circuit the steps that write
+            return Ok(());
         }
 
+        let csids = oid_to_bcsid
+            .iter()
+            .map(|entry| entry.bcs_id)
+            .collect::<Vec<_>>();
+        let batch_size = csids.len();
+        let config = self.inner.repo_derived_data().active_config();
+
+        // Derive all types that don't depend on GitCommit
+        let non_git_types = backfill_derivation
+            .types(&config.types)
+            .into_iter()
+            .filter(|dt| match dt {
+                DerivableType::GitCommits | DerivableType::GitDeltaManifests => false,
+                _ => true,
+            })
+            .collect::<Vec<_>>();
+        // Find the derivation frontier to be resilient to restarts when backfillng wasn't properly
+        // caught up
+        let last_derived = self
+            .inner
+            .commit_graph()
+            .ancestors_frontier_with(ctx, csids.clone(), |csid| {
+                borrowed!(ctx);
+                cloned!(non_git_types);
+                async move {
+                    Ok(stream::iter(non_git_types)
+                        .all(|ddt| async move {
+                            self.inner
+                                .repo_derived_data()
+                                .manager()
+                                .is_derived(ctx, csid, None, ddt.clone())
+                                .await
+                                .unwrap_or(false)
+                        })
+                        .await)
+                }
+            })
+            .await?;
+        self.inner
+            .commit_graph()
+            .ancestors_difference_segment_slices(
+                ctx,
+                csids.clone(),
+                last_derived.clone(),
+                batch_size as u64,
+            )
+            .await?
+            .try_for_each(|chunk| {
+                borrowed!(non_git_types);
+                async move {
+                    self.inner
+                        .repo_derived_data()
+                        .manager()
+                        .derive_bulk(ctx, chunk, None, non_git_types)
+                        .await?;
+                    Ok(())
+                }
+            })
+            .await?;
+
+        // Upload all bonsai git mappings.
+        // This is done instead of deriving git commits. It is not equivalent as roundtrip from
+        // git to bonsai and back is not guaranteed.
+        // We want to do this as late as possible.
+        // Ideally, we would want to do it last as this is what is used to determine whether
+        // it is safe to proceed from there.
+        // We can't actually do it last as it must be done before deriving `GitDeltaManifest`
+        // since that depends on git commits.
+        self.inner
+            .bonsai_git_mapping()
+            .bulk_add(ctx, &oid_to_bcsid)
+            .await?;
+        // derive git delta manifests: note: GitCommit don't need to be explicitly
+        // derived as they were already imported
+        let delta_manifest = backfill_derivation
+            .types(&config.types)
+            .into_iter()
+            .filter(|dt| match dt {
+                DerivableType::GitDeltaManifests => true,
+                _ => false,
+            })
+            .collect::<Vec<_>>();
+        self.inner
+            .repo_derived_data()
+            .manager()
+            .derive_bulk(ctx, csids, None, &delta_manifest)
+            .await?;
         Ok(())
     }
 

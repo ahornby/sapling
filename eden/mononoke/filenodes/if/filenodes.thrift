@@ -5,7 +5,7 @@
  * GNU General Public License version 2.
  */
 
-include "eden/mononoke/mononoke_types/if/mononoke_types_thrift.thrift"
+include "eden/mononoke/mononoke_types/serialization/path.thrift"
 include "eden/mononoke/mercurial/types/if/mercurial_thrift.thrift"
 
 /// Code version used in memcache keys.  This should be changed whenever
@@ -22,15 +22,15 @@ union FilenodeInfoList {
 }
 
 struct FilenodeInfo {
-  // 1 was used previously.
-  2: required mercurial_thrift.HgNodeHash filenode;
+  // 1: deleted
+  2: mercurial_thrift.HgNodeHash filenode;
   3: optional mercurial_thrift.HgNodeHash p1;
   4: optional mercurial_thrift.HgNodeHash p2;
   5: optional FilenodeCopyFrom copyfrom;
-  6: required mercurial_thrift.HgNodeHash linknode;
+  6: mercurial_thrift.HgNodeHash linknode;
 } (rust.exhaustive)
 
 struct FilenodeCopyFrom {
-  1: required mononoke_types_thrift.RepoPath path;
-  2: required mercurial_thrift.HgNodeHash filenode;
+  1: path.RepoPath path;
+  2: mercurial_thrift.HgNodeHash filenode;
 } (rust.exhaustive)

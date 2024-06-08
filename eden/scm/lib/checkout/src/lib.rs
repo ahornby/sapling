@@ -22,9 +22,11 @@ use anyhow::bail;
 use anyhow::format_err;
 use anyhow::Error;
 use anyhow::Result;
+use async_runtime::block_on;
 use atexit::AtExit;
 use context::CoreContext;
 use crossbeam::channel;
+use dag::VertexName;
 #[cfg(windows)]
 use fs_err as fs;
 use manifest::FileMetadata;
@@ -41,8 +43,8 @@ use pathmatcher::UnionMatcher;
 use progress_model::ProgressBar;
 use progress_model::Registry;
 use repo::repo::Repo;
+use serde::Deserialize;
 use storemodel::FileStore;
-use termlogger::TermLogger;
 use tracing::debug;
 use tracing::instrument;
 use tracing::warn;
@@ -50,8 +52,10 @@ use treestate::dirstate;
 use treestate::filestate::FileStateV2;
 use treestate::filestate::StateFlags;
 use treestate::treestate::TreeState;
+use types::fetch_mode::FetchMode;
 use types::hgid::MF_ADDED_NODE_ID;
 use types::hgid::MF_MODIFIED_NODE_ID;
+use types::hgid::MF_UNTRACKED_NODE_ID;
 use types::HgId;
 use types::Key;
 use types::RepoPath;
@@ -61,9 +65,10 @@ use vfs::VFS;
 use workingcopy::sparse;
 use workingcopy::workingcopy::LockedWorkingCopy;
 
+use crate::watchman_state::WatchmanStateChange;
+
 #[allow(dead_code)]
 mod actions;
-pub mod clone;
 #[allow(dead_code)]
 mod conflict;
 #[cfg(feature = "eden")]
@@ -71,6 +76,7 @@ pub mod edenfs;
 pub mod errors;
 #[allow(dead_code)]
 mod merge;
+mod watchman_state;
 
 pub use actions::Action;
 pub use actions::ActionMap;
@@ -85,11 +91,13 @@ use status::Status;
 // Affects progress update frequency and thread count for small checkout.
 const VFS_BATCH_SIZE: usize = 128;
 
-#[derive(PartialEq)]
+#[derive(PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CheckoutMode {
-    Force,
-    NoConflict,
-    Merge,
+    RevertConflicts,
+    AbortIfConflicts,
+    MergeConflicts,
+    AbortIfUncommittedChanges,
 }
 
 /// Contains lists of files to be removed / updated during checkout.
@@ -253,7 +261,7 @@ impl CheckoutPlan {
             .map(|(p, u)| (Key::new(p.clone(), u.content_hgid.clone()), u.clone()))
             .collect();
         let keys: Vec<_> = actions.keys().cloned().collect();
-        let fetch_data_iter = store.get_content_iter(keys)?;
+        let fetch_data_iter = store.get_content_iter(keys, FetchMode::AllowRemote)?;
 
         let stats = thread::scope(|s| -> Result<CheckoutStats> {
             let (tx, rx) = channel::unbounded::<Work>();
@@ -422,7 +430,7 @@ impl CheckoutPlan {
             .map(|(p, u)| Key::new(p.clone(), u.content_hgid.clone()));
         let keys: Vec<_> = keys.collect();
         let (mut count, mut size) = (0, 0);
-        let iter = store.get_content_iter(keys)?;
+        let iter = store.get_content_iter(keys, FetchMode::AllowRemote)?;
         for result in iter {
             let (_key, data) = result?;
             count += 1;
@@ -433,7 +441,21 @@ impl CheckoutPlan {
 
     pub fn check_conflicts(&self, status: &Status) -> Vec<&RepoPath> {
         let mut conflicts = vec![];
-        for file in self.all_files() {
+
+        for file in self.removed_files() {
+            if status.status(file).is_some() {
+                // Include "unknown" files as conflicts. When generating the diff, we skip
+                // unknown files that don't conflict. So, if the diff said to remove an
+                // unknown file, it must have had a path conflict.
+                conflicts.push(file.as_repo_path());
+            }
+        }
+
+        for file in self
+            .update_content
+            .keys()
+            .chain(self.update_meta.iter().map(|u| &u.path))
+        {
             // Unknown files are handled separately in check_unknown_files
             if !matches!(status.status(file), None | Some(FileStatus::Unknown)) {
                 conflicts.push(file.as_repo_path());
@@ -450,9 +472,28 @@ impl CheckoutPlan {
         status: &Status,
     ) -> Result<Vec<RepoPathBuf>> {
         let vfs = &self.checkout.vfs;
-        let mut check_content = vec![];
 
         let unknown: Vec<&RepoPathBuf> = status.unknown().collect();
+        if unknown.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let case_sensitive = vfs.case_sensitive();
+
+        // If case insensitive, the case of files in `unknown` might be different from
+        // that of `filtered_update_content`. When we look up the file in the manifest, we
+        // need to use case of `filtered_update_content`. So, create a map of normalized
+        // (lower case) name to manifest name.
+        let mut update_content_lower_case = HashMap::new();
+        if !case_sensitive {
+            update_content_lower_case = self
+                .filtered_update_content
+                .keys()
+                .map(|p| (p.to_lower_case(), p))
+                .collect::<HashMap<_, _>>();
+        }
+
+        let mut check_content = vec![];
 
         let bar = ProgressBar::new_adhoc("Checking untracked", unknown.len() as u64, "files");
 
@@ -460,7 +501,16 @@ impl CheckoutPlan {
             bar.increase_position(1);
             bar.set_message(file.to_string());
 
-            if !self.filtered_update_content.contains_key(file) {
+            let (going_to_overwrite, file) = if case_sensitive {
+                (self.filtered_update_content.contains_key(file), file)
+            } else {
+                match update_content_lower_case.get(&file.to_lower_case()) {
+                    Some(file) => (true, *file),
+                    None => (false, file),
+                }
+            };
+
+            if !going_to_overwrite {
                 continue;
             }
 
@@ -483,12 +533,8 @@ impl CheckoutPlan {
                     }
                 }
             };
-            let unknown = match state {
-                None => true,
-                Some(state) => !state.state.intersects(
-                    StateFlags::EXIST_P1 | StateFlags::EXIST_P2 | StateFlags::EXIST_NEXT,
-                ),
-            };
+            let unknown = state.map_or(true, |state| !state.state.is_tracked());
+
             if unknown && matches!(vfs.is_file(file), Ok(true)) {
                 let repo_path = file.as_repo_path();
                 let hgid = match manifest.get_file(repo_path)? {
@@ -513,7 +559,7 @@ impl CheckoutPlan {
         }
 
         let mut paths = Vec::new();
-        for entry in store.get_content_iter(check_content)? {
+        for entry in store.get_content_iter(check_content, FetchMode::AllowRemote)? {
             let (key, data) = entry?;
             if let Some(path) = Self::check_content(vfs, key, data) {
                 paths.push(path);
@@ -640,41 +686,44 @@ impl CheckoutProgress {
         let file = util::file::open(path, "r")?;
         let mut reader = BufReader::new(file);
         let mut buffer = vec![];
+
+        let deserialize_buffer = |buffer: &mut Vec<u8>| -> Result<_> {
+            let mut split = buffer.splitn(4, |c| *c == b' ');
+            let hgid = HgId::from_hex(
+                split
+                    .next()
+                    .ok_or_else(|| anyhow!("invalid checkout update hgid format"))?,
+            )?;
+
+            let time = std::str::from_utf8(
+                split
+                    .next()
+                    .ok_or_else(|| anyhow!("invalid checkout update time format"))?,
+            )?
+            .parse::<u128>()?;
+
+            let size = std::str::from_utf8(
+                split
+                    .next()
+                    .ok_or_else(|| anyhow!("invalid checkout update size format"))?,
+            )?
+            .parse::<u64>()?;
+
+            let path = split
+                .next()
+                .ok_or_else(|| anyhow!("invalid checkout update path format"))?;
+            let path = &path[..path.len() - 1];
+            let path = RepoPathBuf::from_string(std::str::from_utf8(path)?.to_string())?;
+
+            Ok((path, (hgid, time, size)))
+        };
+
         loop {
             reader.read_until(0, &mut buffer)?;
             if buffer.is_empty() {
                 break;
             }
-            let (path, (hgid, time, size)) = match (|| -> Result<_> {
-                let mut split = buffer.splitn(4, |c| *c == b' ');
-                let hgid = HgId::from_hex(
-                    split
-                        .next()
-                        .ok_or_else(|| anyhow!("invalid checkout update hgid format"))?,
-                )?;
-
-                let time = std::str::from_utf8(
-                    split
-                        .next()
-                        .ok_or_else(|| anyhow!("invalid checkout update time format"))?,
-                )?
-                .parse::<u128>()?;
-
-                let size = std::str::from_utf8(
-                    split
-                        .next()
-                        .ok_or_else(|| anyhow!("invalid checkout update size format"))?,
-                )?
-                .parse::<u64>()?;
-
-                let path = split
-                    .next()
-                    .ok_or_else(|| anyhow!("invalid checkout update path format"))?;
-                let path = &path[..path.len() - 1];
-                let path = RepoPathBuf::from_string(std::str::from_utf8(path)?.to_string())?;
-
-                Ok((path, (hgid, time, size)))
-            })() {
+            let (path, (hgid, time, size)) = match deserialize_buffer(&mut buffer) {
                 Ok(entry) => entry,
                 Err(_) => {
                     buffer.clear();
@@ -713,7 +762,7 @@ impl CheckoutProgress {
         }
     }
 
-    fn filter_already_written<'a>(
+    fn filter_already_written(
         &self,
         actions: &HashMap<RepoPathBuf, UpdateContentAction>,
     ) -> HashMap<RepoPathBuf, UpdateContentAction> {
@@ -841,14 +890,55 @@ fn truncate_u64(f: &str, path: &RepoPath, v: u64) -> i32 {
     truncated as i32
 }
 
+#[derive(PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "action", content = "maybe_bookmark")]
+pub enum BookmarkAction {
+    // Don't touch active bookmark.
+    None,
+    // Unset active bookmark if set.
+    UnsetActive,
+    // Update active bookmark if value is a valid bookmark, else unset active.
+    SetActiveIfValid(String),
+}
+
+#[derive(PartialEq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportMode {
+    // No informational output.
+    Quiet,
+    // Report all file counts if any are greater than zero.
+    IfChanged,
+    // Always print message.
+    Always,
+    // Only report counts greater than zero.
+    Minimal,
+}
+
+#[instrument(skip_all)]
 pub fn checkout(
     ctx: &CoreContext,
-    repo: &mut Repo,
+    repo: &Repo,
     wc: &LockedWorkingCopy,
     target_commit: HgId,
-    mut maybe_bookmark: Option<String>,
+    bookmark_action: BookmarkAction,
     update_mode: CheckoutMode,
+    report_mode: ReportMode,
 ) -> Result<Option<(usize, usize)>> {
+    if update_mode == CheckoutMode::MergeConflicts {
+        unimplemented!("Rust checkout doesn't support merging files");
+    }
+
+    if update_mode == CheckoutMode::AbortIfUncommittedChanges {
+        let status = wc.status(ctx, Arc::new(AlwaysMatcher::new()), false)?;
+        if status.dirty() {
+            bail!("uncommitted changes");
+        }
+    }
+
+    let revert_conflicts = update_mode == CheckoutMode::RevertConflicts;
+
+    let mut state_change = WatchmanStateChange::maybe_open(wc, target_commit);
+
     let preupdate_hooks = hook::Hooks::from_config(repo.config(), &ctx.io, "preupdate");
     preupdate_hooks.run_shell_hooks(
         Some(repo.path()),
@@ -859,10 +949,26 @@ pub fn checkout(
         ]),
     )?;
 
+    if let Err(err) = prefetch_children(repo, &target_commit) {
+        tracing::warn!(target: "checkout::prefetch", ?err, "unexpected error prefetching lazy children");
+    }
+
+    let source_commit = wc.first_parent()?;
+
+    if ctx
+        .config
+        .get_or("merge", "recordupdatedistance", || true)?
+    {
+        match update_distance(repo, &source_commit, &target_commit) {
+            Ok(update_distance) => tracing::info!(target: "update_size", update_distance),
+            Err(err) => tracing::warn!(?err, "error calculating update distance"),
+        }
+    }
+
     let stats = if repo.requirements.contains("eden") {
         #[cfg(feature = "eden")]
         {
-            edenfs::edenfs_checkout(ctx, repo, wc, target_commit, update_mode)?;
+            edenfs::edenfs_checkout(ctx, repo, wc, target_commit, revert_conflicts)?;
             None
         }
 
@@ -874,7 +980,7 @@ pub fn checkout(
             repo,
             wc,
             target_commit,
-            update_mode,
+            revert_conflicts,
         )?)
     };
 
@@ -891,30 +997,136 @@ pub fn checkout(
         ]),
     )?;
 
-    let local_bms = repo.local_bookmarks()?;
-    if !maybe_bookmark
-        .as_ref()
-        .is_some_and(|bm| local_bms.contains_key(bm))
-    {
-        maybe_bookmark = None;
+    let current_bookmark = wc.active_bookmark()?;
+    let new_bookmark = match bookmark_action {
+        BookmarkAction::None => current_bookmark.clone(),
+        BookmarkAction::UnsetActive => None,
+        BookmarkAction::SetActiveIfValid(bm) => {
+            if repo.local_bookmarks()?.contains_key(&bm) {
+                Some(bm)
+            } else {
+                None
+            }
+        }
+    };
+
+    if report_mode != ReportMode::Quiet {
+        if let Some((updated, removed)) = &stats {
+            let mut items = vec![
+                (*updated, "updated"),
+                (0, "merged"),
+                (*removed, "removed"),
+                (0, "unresolved"),
+            ];
+
+            if report_mode == ReportMode::Minimal {
+                items.retain(|(c, _)| *c > 0);
+            }
+
+            if report_mode == ReportMode::Always || items.iter().any(|(c, _)| *c > 0) {
+                ctx.logger.info(
+                    items
+                        .into_iter()
+                        .map(|(c, n)| format!("{c} files {n}"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                );
+            }
+        } else if report_mode == ReportMode::Always {
+            ctx.logger.info("update complete");
+        }
     }
 
-    let current_bookmark = wc.active_bookmark()?;
-    if maybe_bookmark != current_bookmark {
-        match (&current_bookmark, &maybe_bookmark) {
-            // TODO: color bookmark name
-            (Some(old), Some(new)) => ctx
-                .logger
-                .info(format!("(changing active bookmark from {old} to {new})")),
-            (None, Some(new)) => ctx.logger.info(format!("(activating bookmark {new})")),
-            (Some(old), None) => ctx.logger.info(format!("(leaving bookmark {old})")),
-            (None, None) => {}
+    if new_bookmark != current_bookmark {
+        if report_mode != ReportMode::Quiet {
+            match (&current_bookmark, &new_bookmark) {
+                // TODO: color bookmark name
+                (Some(old), Some(new)) => ctx
+                    .logger
+                    .info(format!("(changing active bookmark from {old} to {new})")),
+                (None, Some(new)) => ctx.logger.info(format!("(activating bookmark {new})")),
+                (Some(old), None) => ctx.logger.info(format!("(leaving bookmark {old})")),
+                (None, None) => {}
+            }
         }
 
-        wc.set_active_bookmark(maybe_bookmark)?;
+        wc.set_active_bookmark(new_bookmark)?;
     }
 
+    wc.journal.record_new_entry(
+        &ctx.raw_args,
+        "wdirparent",
+        ".",
+        &[source_commit],
+        &[target_commit],
+    )?;
+
+    state_change.mark_success();
+
     Ok(stats)
+}
+
+/// Prefetch lazy children of `node`. This makes it possible to "commit" offline.
+/// See D30004908 for context.
+fn prefetch_children(repo: &Repo, node: &HgId) -> Result<()> {
+    if !repo.store_requirements.contains("lazychangelog") {
+        tracing::debug!(target: "checkout::prefetch", "skip prefetch for non-lazychangelog");
+        return Ok(());
+    }
+
+    let vertex = VertexName::copy_from(node.as_ref());
+
+    let dag = repo.dag_commits()?;
+    let mut dag = dag.write();
+
+    let id = match block_on(dag.vertex_id_with_max_group(&vertex, dag::Group::MASTER))? {
+        None => {
+            tracing::debug!(target: "checkout::prefetch", "skip prefetch because {node} is not in master (lazy) group");
+            return Ok(());
+        }
+        Some(id) => id,
+    };
+
+    let id_dag = dag.id_dag_snapshot()?;
+    let id_children = id_dag.children(id.into())?;
+    let id_children: Vec<dag::Id> = id_children.iter_desc().collect();
+
+    // Prefetch children.
+    let children = block_on(dag.vertex_name_batch(&id_children))?
+        .into_iter()
+        .collect::<dag::Result<Vec<_>>>()?;
+
+    tracing::debug!(target: "checkout::prefetch", "children of {node}: {:?}", children);
+
+    block_on(dag.flush(&[]))?;
+
+    Ok(())
+}
+
+#[instrument(skip(repo))]
+fn update_distance(repo: &Repo, source: &HgId, dest: &HgId) -> Result<u64> {
+    let dag = repo.dag_commits()?;
+    let dag = dag.read();
+
+    let to_nameset = |id: &HgId| -> dag::NameSet {
+        if id.is_null() {
+            dag::NameSet::empty()
+        } else {
+            VertexName::copy_from(id.as_ref()).into()
+        }
+    };
+
+    let source = to_nameset(source);
+    let dest = to_nameset(dest);
+
+    block_on(async {
+        Ok(dag
+            .only(source.clone(), dest.clone())
+            .await?
+            .count()
+            .await?
+            + dag.only(dest, source).await?.count().await?)
+    })
 }
 
 fn file_type(vfs: &VFS, path: &RepoPath) -> FileType {
@@ -938,30 +1150,60 @@ fn file_type(vfs: &VFS, path: &RepoPath) -> FileType {
 
 pub fn filesystem_checkout(
     ctx: &CoreContext,
-    repo: &mut Repo,
+    repo: &Repo,
     wc: &LockedWorkingCopy,
     target_commit: HgId,
-    update_mode: CheckoutMode,
+    revert_conflicts: bool,
 ) -> Result<(usize, usize)> {
     let current_commit = wc.first_parent()?;
+
+    if !revert_conflicts && target_commit == current_commit {
+        return Ok((0, 0));
+    }
 
     let tree_resolver = repo.tree_resolver()?;
     let mut current_mf = tree_resolver.get(&current_commit)?;
     let target_mf = tree_resolver.get(&target_commit)?;
 
-    let (sparse_matcher, sparse_change) =
-        create_sparse_matchers(repo, wc.vfs(), &current_mf, &target_mf)?;
+    let (sparse_matcher, sparse_change) = create_sparse_matchers(
+        repo,
+        wc.vfs(),
+        &current_mf,
+        &target_mf,
+        current_commit.is_null(),
+    )?;
 
-    // Overlay manifest with "status" info to include outstanding working copy changes.
-    let status = wc.status(sparse_matcher.clone(), false, repo.config(), &ctx.logger)?;
+    let status = wc.status(ctx, sparse_matcher.clone(), false)?;
+    let ts = wc.treestate();
 
-    if update_mode == CheckoutMode::Force {
-        // With --clean, mix on our working copy changes so they are "undone" by
-        // the diff w/ target manifest.
-        overlay_working_changes(wc.vfs(), &mut current_mf, &status)?;
+    // Overlay working copy changes so they are "undone" by the diff w/ target manifest.
+    overlay_working_changes(
+        &ctx.config,
+        wc.vfs(),
+        &mut current_mf,
+        &status,
+        revert_conflicts,
+    )?;
 
+    if revert_conflicts {
         // --clean clears out any merge state
         wc.clear_merge_state()?;
+
+        // Downgrade added files into untracked files. We keep them around for "--clean"
+        // to avoid accidental data loss.
+        let mut ts = ts.lock();
+        for add in status.added() {
+            ts.insert(
+                add,
+                &FileStateV2 {
+                    state: StateFlags::NEED_CHECK,
+                    mode: 0,
+                    size: 0,
+                    mtime: 0,
+                    copied: None,
+                },
+            )?;
+        }
     }
 
     let progress_path: Option<PathBuf> = if repo.config().get_or_default("checkout", "resumable")? {
@@ -978,12 +1220,12 @@ pub fn filesystem_checkout(
         &target_mf,
         &sparse_matcher,
         sparse_change,
-        progress_path,
+        progress_path.clone(),
     )?;
 
-    if update_mode != CheckoutMode::Force {
+    if !revert_conflicts {
         // 2. Check if status is dirty
-        check_conflicts(&ctx.logger, repo, wc, &plan, &target_mf, &status)?;
+        check_conflicts(repo, wc, &plan, &target_mf, &status)?;
     }
 
     // 3. Signal that an update is being performed
@@ -1004,16 +1246,13 @@ pub fn filesystem_checkout(
 
     // 5. Update the treestate parents, dirstate
     wc.set_parents(vec![target_commit], None)?;
-    record_updates(&plan, wc.vfs(), &mut wc.treestate().lock())?;
-    dirstate::flush(
-        wc.vfs().root(),
-        &mut wc.treestate().lock(),
-        repo.locker(),
-        None,
-        None,
-    )?;
+    record_updates(&plan, wc.vfs(), &mut ts.lock())?;
+    dirstate::flush(wc.vfs().root(), &mut ts.lock(), repo.locker(), None, None)?;
 
     util::file::unlink_if_exists(&updatestate_path)?;
+    if let Some(progress_path) = progress_path {
+        util::file::unlink_if_exists(progress_path)?;
+    }
 
     Ok(plan.stats())
 }
@@ -1021,25 +1260,72 @@ pub fn filesystem_checkout(
 // Apply outstanding working copy changes to the given manifest. This includes
 // the working copy changes in the diff between the working copy manifest and
 // the checkout target manifest.
-fn overlay_working_changes(vfs: &VFS, mf: &mut TreeManifest, status: &Status) -> Result<()> {
+fn overlay_working_changes(
+    config: &dyn Config,
+    vfs: &VFS,
+    mf: &mut TreeManifest,
+    status: &Status,
+    clean: bool,
+) -> Result<()> {
+    use FileStatus::*;
+
+    if clean {
+        // Handle deletes first to avoid path conflicts inserting into manifest.
+        for (p, s) in status.iter() {
+            if matches!(s, Deleted | Removed) {
+                mf.remove(p).map(|_| ())?;
+            }
+        }
+    }
+
     for (p, s) in status.iter() {
         match s {
-            FileStatus::Deleted | FileStatus::Removed => mf.remove(p).map(|_| ())?,
-            FileStatus::Added => mf.insert(
-                p.to_owned(),
-                FileMetadata {
-                    hgid: MF_ADDED_NODE_ID,
-                    file_type: file_type(vfs, p),
-                },
-            )?,
-            FileStatus::Modified => mf.insert(
-                p.to_owned(),
-                FileMetadata {
-                    hgid: MF_MODIFIED_NODE_ID,
-                    file_type: file_type(vfs, p),
-                },
-            )?,
-            FileStatus::Unknown | FileStatus::Ignored | FileStatus::Clean => (),
+            Modified => {
+                if clean {
+                    mf.insert(
+                        p.to_owned(),
+                        FileMetadata::new(MF_MODIFIED_NODE_ID, file_type(vfs, p)),
+                    )?;
+                }
+            }
+            Added => {
+                // Ignore "path already a directory" insertion errors. They happen for
+                // non-clean updates after removing file "foo" and then adding file
+                // "foo/bar". The update will conflict on the removed file, so it isn't
+                // important to have a path conflict for the added file as well.
+                let _ = mf.insert(
+                    p.to_owned(),
+                    FileMetadata {
+                        hgid: MF_ADDED_NODE_ID,
+                        file_type: file_type(vfs, p),
+                        // When doing "sl go -C", we don't want to delete pending adds unless necessary.
+                        // This flag makes the manifest diff skip this file unless it conflicts.
+                        ignore_unless_conflict: clean,
+                    },
+                );
+            }
+            Unknown => {
+                if config.get_or("experimental", "checkout.rust-path-conflicts", || true)? {
+                    let _ = mf.insert(
+                        p.to_owned(),
+                        FileMetadata {
+                            hgid: MF_UNTRACKED_NODE_ID,
+                            file_type: file_type(vfs, p),
+                            ignore_unless_conflict: true,
+                        },
+                    );
+                }
+            }
+
+            // Handled above.
+            Removed | Deleted => {}
+
+            // We could support path conflicts for ignored files, but we would have to
+            // generate status including ignored files (which can be expensive).
+            Ignored => {}
+
+            // Nothing to do (and shouldn't happen since we don't request clean files).
+            Clean => {}
         }
     }
 
@@ -1047,47 +1333,57 @@ fn overlay_working_changes(vfs: &VFS, mf: &mut TreeManifest, status: &Status) ->
 }
 
 pub(crate) fn check_conflicts(
-    lgr: &TermLogger,
-    repo: &mut Repo,
+    repo: &Repo,
     wc: &LockedWorkingCopy,
     plan: &CheckoutPlan,
     target_mf: &TreeManifest,
     status: &Status,
 ) -> Result<()> {
-    let unknown_conflicts = plan.check_unknown_files(
+    let mut conflicts = plan.check_unknown_files(
         target_mf,
         repo.file_store()?.as_ref(),
         &mut wc.treestate().lock(),
         status,
     )?;
-    if !unknown_conflicts.is_empty() {
-        for unknown in unknown_conflicts {
-            lgr.warn(format!("{unknown}: untracked file differs"));
-        }
-        bail!("untracked files in working directory differ from files in requested revision");
-    }
 
-    let conflicts = plan.check_conflicts(status);
+    conflicts.extend(
+        plan.check_conflicts(status)
+            .into_iter()
+            .map(|c| c.to_owned()),
+    );
+
+    conflicts.sort();
+
     if !conflicts.is_empty() {
+        let limit = 5;
+
+        let len = conflicts.len();
+        conflicts.truncate(limit);
+        let mut conflicts = conflicts
+            .into_iter()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>();
+        if len > limit {
+            conflicts.push(format!("...and {} more", len - limit));
+        }
+
         bail!(
-            "{:?} conflicting file changes:\n {}",
-            conflicts.len(),
-            conflicts
-                .iter()
-                .take(5)
-                .map(|p| p.as_str())
-                .collect::<Vec<_>>()
-                .join("\n "),
+            "{:?} conflicting file changes:\n {}\n{}",
+            len,
+            conflicts.join("\n "),
+            "(commit, shelve, goto --clean to discard all your changes, or goto --merge to merge them)",
         );
     }
     Ok(())
 }
 
+#[instrument(skip_all)]
 fn create_sparse_matchers(
-    repo: &mut Repo,
+    repo: &Repo,
     vfs: &VFS,
     current_mf: &TreeManifest,
     target_mf: &TreeManifest,
+    is_clone: bool,
 ) -> Result<(DynMatcher, Option<(DynMatcher, DynMatcher)>)> {
     let dot_path = repo.dot_hg_path().to_owned();
     if util::file::exists(dot_path.join("sparse"))?.is_none() {
@@ -1096,10 +1392,10 @@ fn create_sparse_matchers(
 
     let overrides = sparse::config_overrides(repo.config());
 
-    let (current_sparse, current_hash) = sparse::repo_matcher_with_overrides(
+    let (target_sparse, target_hash) = sparse::repo_matcher_with_overrides(
         vfs,
         &dot_path,
-        current_mf,
+        target_mf,
         repo.file_store()?,
         &overrides,
     )?
@@ -1108,10 +1404,15 @@ fn create_sparse_matchers(
         (matcher, 0)
     });
 
-    let (target_sparse, target_hash) = sparse::repo_matcher_with_overrides(
+    // Optimization when checking out from "null" commit.
+    if is_clone {
+        return Ok((target_sparse, None));
+    }
+
+    let (current_sparse, current_hash) = sparse::repo_matcher_with_overrides(
         vfs,
         &dot_path,
-        target_mf,
+        current_mf,
         repo.file_store()?,
         &overrides,
     )?
@@ -1133,6 +1434,7 @@ fn create_sparse_matchers(
     Ok((sparse_matcher, sparse_change))
 }
 
+#[instrument(skip_all)]
 fn create_plan(
     vfs: &VFS,
     config: &dyn Config,

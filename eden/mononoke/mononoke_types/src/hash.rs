@@ -96,7 +96,7 @@ impl Blake2 {
     }
 
     #[inline]
-    pub fn from_thrift(b: thrift::Blake2) -> Result<Self> {
+    pub fn from_thrift(b: thrift::id::Blake2) -> Result<Self> {
         if b.0.len() != BLAKE2_HASH_LENGTH_BYTES {
             bail!(MononokeTypeError::InvalidThrift(
                 "Blake2".into(),
@@ -132,8 +132,8 @@ impl Blake2 {
         }
     }
 
-    pub fn into_thrift(self) -> thrift::Blake2 {
-        thrift::Blake2(self.0.into())
+    pub fn into_thrift(self) -> thrift::id::Blake2 {
+        thrift::id::Blake2(self.0.into())
     }
 
     // Stable hash prefix for selection when sampling with modulus
@@ -394,8 +394,8 @@ macro_rules! impl_hash {
                 Self::from_str(s.as_str())
             }
 
-            pub fn into_thrift(self) -> thrift::$type {
-                thrift::$type(self.0.into())
+            pub fn into_thrift(self) -> thrift::id::$type {
+                thrift::id::$type(self.0.into())
             }
 
             pub fn into_inner(self) -> [u8; $size] {
@@ -511,11 +511,21 @@ impl GitSha1 {
             )
         })
     }
+
+    pub fn from_object_id(oid: &gix_hash::oid) -> Result<Self> {
+        use anyhow::Context;
+        Self::from_bytes(oid.as_bytes())
+            .with_context(|| format!("Error in converting Git ObjectId {:?} to GitSha1", oid))
+    }
+
+    pub fn from_thrift(b: thrift::id::GitSha1) -> Result<Self> {
+        Self::from_bytes(b.0)
+    }
 }
 
 impl Blake3 {
     #[inline]
-    pub fn from_thrift(b: thrift::Blake3) -> Result<Self> {
+    pub fn from_thrift(b: thrift::id::Blake3) -> Result<Self> {
         Blake3::from_bytes(b.0)
     }
 }
@@ -595,8 +605,8 @@ impl RichGitSha1 {
         format!("{} {}\0", self.ty, self.size).into_bytes()
     }
 
-    pub fn into_thrift(self) -> thrift::GitSha1 {
-        thrift::GitSha1(self.sha1.0.into())
+    pub fn into_thrift(self) -> thrift::id::GitSha1 {
+        thrift::id::GitSha1(self.sha1.0.into())
     }
 }
 
@@ -673,6 +683,15 @@ impl From<lfs_protocol::Sha256> for Sha256 {
 impl From<GitSha1> for EdenapiCommitId {
     fn from(value: GitSha1) -> Self {
         EdenapiCommitId::GitSha1(value.into())
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct MononokeDigest(pub Blake3, pub u64);
+
+impl std::fmt::Display for MononokeDigest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.0, self.1)
     }
 }
 
@@ -798,13 +817,23 @@ mod test {
 
     #[test]
     fn parse_thrift() {
-        let null_thrift = thrift::Blake2(vec![0; BLAKE2_HASH_LENGTH_BYTES].into());
+        let null_thrift = thrift::id::Blake2(vec![0; BLAKE2_HASH_LENGTH_BYTES].into());
         assert_eq!(NULL, Blake2::from_thrift(null_thrift.clone()).unwrap());
         assert_eq!(NULL.into_thrift(), null_thrift);
 
-        let nil_thrift = thrift::Blake2(NILHASH.0.into());
+        let nil_thrift = thrift::id::Blake2(NILHASH.0.into());
         assert_eq!(NILHASH, Blake2::from_thrift(nil_thrift.clone()).unwrap());
         assert_eq!(NILHASH.into_thrift(), nil_thrift);
+    }
+
+    #[test]
+    fn parse_git_sha1_thrift() {
+        let null_thrift = thrift::id::GitSha1(vec![0; 20].into());
+        assert_eq!(
+            GitSha1([0; 20]),
+            GitSha1::from_thrift(null_thrift.clone()).unwrap()
+        );
+        assert_eq!(GitSha1([0; 20]).into_thrift(), null_thrift);
     }
 
     #[test]
@@ -847,19 +876,21 @@ mod test {
 
     #[test]
     fn parse_thrift_bad() {
-        Blake2::from_thrift(thrift::Blake2(vec![].into())).expect_err("unexpected OK - zero len");
-        Blake2::from_thrift(thrift::Blake2(vec![0; 31].into()))
+        Blake2::from_thrift(thrift::id::Blake2(vec![].into()))
+            .expect_err("unexpected OK - zero len");
+        Blake2::from_thrift(thrift::id::Blake2(vec![0; 31].into()))
             .expect_err("unexpected OK - too short");
-        Blake2::from_thrift(thrift::Blake2(vec![0; 33].into()))
+        Blake2::from_thrift(thrift::id::Blake2(vec![0; 33].into()))
             .expect_err("unexpected Ok - too long");
     }
 
     #[test]
     fn parse_blake3_thrift_bad() {
-        Blake3::from_thrift(thrift::Blake3(vec![].into())).expect_err("unexpected OK - zero len");
-        Blake3::from_thrift(thrift::Blake3(vec![0; 31].into()))
+        Blake3::from_thrift(thrift::id::Blake3(vec![].into()))
+            .expect_err("unexpected OK - zero len");
+        Blake3::from_thrift(thrift::id::Blake3(vec![0; 31].into()))
             .expect_err("unexpected OK - too short");
-        Blake3::from_thrift(thrift::Blake3(vec![0; 33].into()))
+        Blake3::from_thrift(thrift::id::Blake3(vec![0; 33].into()))
             .expect_err("unexpected Ok - too long");
     }
 

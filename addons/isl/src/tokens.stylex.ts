@@ -16,6 +16,7 @@ export const colors = stylex.defineVars({
   bg: 'var(--background)',
   fg: 'var(--foreground)',
   brightFg: 'white',
+  focusBorder: 'var(--focus-border)',
 
   hoverDarken: 'rgba(255, 255, 255, 0.1)',
   subtleHoverDarken: 'rgba(255, 255, 255, 0.03)',
@@ -51,6 +52,7 @@ export const light = stylex.createTheme(colors, {
   bg: 'var(--background)',
   fg: 'var(--foreground)',
   brightFg: 'black',
+  focusBorder: 'var(--focus-border)',
 
   hoverDarken: 'rgba(0, 0, 0, 0.1)',
   subtleHoverDarken: 'rgba(0, 0, 0, 0.03)',
@@ -96,6 +98,7 @@ export const radius = stylex.defineVars({
   small: '2.5px',
   round: '5px',
   extraround: '5px',
+  full: '50%',
 });
 
 export const font = stylex.defineVars({

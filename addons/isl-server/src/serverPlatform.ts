@@ -6,15 +6,17 @@
  */
 
 import type {Repository} from './Repository';
+import type {RepositoryContext} from './serverTypes';
 import type {
   AbsolutePath,
   PlatformSpecificClientToServerMessages,
+  RepoRelativePath,
   ServerToClientMessage,
 } from 'isl/src/types';
 
-import {spawn} from 'child_process';
-import pathModule from 'path';
-import {unwrap} from 'shared/utils';
+import {spawn} from 'node:child_process';
+import pathModule from 'node:path';
+import {nullthrows} from 'shared/utils';
 
 /**
  * Platform-specific server-side API for each target: vscode extension host, electron standalone, browser, ...
@@ -26,6 +28,7 @@ export interface ServerPlatform {
   sessionId?: string;
   handleMessageFromClient(
     repo: Repository | undefined,
+    ctx: RepositoryContext,
     message: PlatformSpecificClientToServerMessages,
     postMessage: (message: ServerToClientMessage) => void,
     onDispose: (disapose: () => unknown) => void,
@@ -36,11 +39,15 @@ export const browserServerPlatform: ServerPlatform = {
   platformName: 'browser',
   handleMessageFromClient: (
     repo: Repository | undefined,
+    ctx: RepositoryContext,
     message: PlatformSpecificClientToServerMessages,
   ) => {
     switch (message.type) {
       case 'platform/openContainingFolder': {
-        const absPath: AbsolutePath = pathModule.join(unwrap(repo?.info.repoRoot), message.path);
+        const absPath: AbsolutePath = pathModule.join(
+          nullthrows(repo?.info.repoRoot),
+          message.path,
+        );
         let args: Array<string> = [];
         // use OS-builtin open command to open parent directory
         // (which may open different file extensions with different programs)
@@ -56,38 +63,69 @@ export const browserServerPlatform: ServerPlatform = {
             args = ['xdg-open', pathModule.dirname(absPath)];
             break;
         }
-        repo?.logger.log('open file', absPath);
+        repo?.initialConnectionContext.logger.log('open file', absPath);
         if (args.length > 0) {
           spawnInBackground(repo, args);
         }
         break;
       }
       case 'platform/openFile': {
-        const absPath: AbsolutePath = pathModule.join(unwrap(repo?.info.repoRoot), message.path);
-        let args: Array<string> = [];
-        // use OS-builtin open command to open files
-        // (which may open different file extensions with different programs)
-        // TODO: add a config option to determine which program to launch
-        switch (process.platform) {
-          case 'darwin':
-            args = ['/usr/bin/open', absPath];
-            break;
-          case 'win32':
-            args = ['notepad.exe', absPath];
-            break;
-          case 'linux':
-            args = ['xdg-open', absPath];
-            break;
-        }
-        repo?.logger.log('open file', absPath);
-        if (args.length > 0) {
-          spawnInBackground(repo, args);
+        openFile(repo, ctx, message.path);
+        break;
+      }
+      case 'platform/openFiles': {
+        for (const path of message.paths) {
+          openFile(repo, ctx, path);
         }
         break;
       }
     }
   },
 };
+
+async function openFile(
+  repo: Repository | undefined,
+  ctx: RepositoryContext | undefined,
+  path: RepoRelativePath,
+) {
+  if (repo == null || ctx == null) {
+    return;
+  }
+  const opener = await repo.getConfig(ctx, 'isl.open-file-cmd');
+  const absPath: AbsolutePath = pathModule.join(repo.info.repoRoot, path);
+  let args: Array<string> = [];
+  if (opener) {
+    // opener should be either a JSON string (wrapped in quotes) or a JSON array of strings,
+    // to include arguments
+    try {
+      const jsonOpenerArgs = JSON.parse(opener);
+      args = Array.isArray(jsonOpenerArgs)
+        ? [...jsonOpenerArgs, absPath]
+        : [jsonOpenerArgs, absPath];
+    } catch {
+      // if it's not JSON, it should be a regular string
+      args = [opener, absPath];
+    }
+  } else {
+    // by default, use OS-builtin open command to open files
+    // (which may open different file extensions with different programs)
+    switch (process.platform) {
+      case 'darwin':
+        args = ['/usr/bin/open', absPath];
+        break;
+      case 'win32':
+        args = ['notepad.exe', absPath];
+        break;
+      case 'linux':
+        args = ['xdg-open', absPath];
+        break;
+    }
+  }
+  repo.initialConnectionContext.logger.log('open file', absPath);
+  if (args.length > 0) {
+    spawnInBackground(repo, args);
+  }
+}
 
 /**
  * Because the ISL server is likely running in the background and is
@@ -118,7 +156,7 @@ function spawnInBackground(repo: Repository | undefined, args: Array<string>) {
   });
   // Silent error. Don't crash the server process.
   proc.on('error', err => {
-    repo?.logger.log('failed to open', args, err);
+    repo?.initialConnectionContext.logger.log('failed to open', args, err);
   });
   proc.unref();
 }

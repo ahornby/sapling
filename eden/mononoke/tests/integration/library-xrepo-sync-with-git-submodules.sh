@@ -9,10 +9,6 @@
 
 # Run initial setup (e.g. sync configs, small & large repos)
 REPOTYPE="blob_files"
-LARGE_REPO_NAME="large_repo"
-LARGE_REPO_ID=0
-SMALL_REPO_NAME="small_repo"
-SMALL_REPO_ID=1
 
 # Used by integration tests that source this file
 # shellcheck disable=SC2034
@@ -20,15 +16,14 @@ NEW_BOOKMARK_NAME="SYNCED_HEAD"
 
 LATEST_CONFIG_VERSION_NAME="INITIAL_IMPORT_SYNC_CONFIG"
 
-ENABLE_API_WRITES=1 REPOID="$LARGE_REPO_ID" REPONAME="$LARGE_REPO_NAME" setup_common_config "$REPOTYPE"
-REPOID="$SMALL_REPO_ID" REPONAME="$SMALL_REPO_NAME" setup_common_config "$REPOTYPE"
+
 
 # By default, the `git_submodules_action` will be `STRIP`, meaning that any
 # changes to git submodules will not be synced to the large repo.
 function default_small_repo_config {
   jq . << EOF
   {
-    "repoid": 1,
+    "repoid": $SUBMODULE_REPO_ID,
     "default_action": "prepend_prefix",
     "default_prefix": "smallrepofolder1",
     "bookmark_prefix": "bookprefix1/",
@@ -52,7 +47,7 @@ function default_initial_import_config {
         "versions": [
           {
             "large_repo_id": $LARGE_REPO_ID,
-            "common_pushrebase_bookmarks": [],
+            "common_pushrebase_bookmarks": ["master"],
             "small_repos": [
               $SMALL_REPO_CFG
             ],
@@ -60,11 +55,12 @@ function default_initial_import_config {
           }
         ],
         "common": {
-          "common_pushrebase_bookmarks": [],
+          "common_pushrebase_bookmarks": ["master"],
           "large_repo_id": $LARGE_REPO_ID,
           "small_repos": {
-            "$SMALL_REPO_ID": {
-              "bookmark_prefix": "bookprefix1/"
+            "$SUBMODULE_REPO_ID": {
+              "bookmark_prefix": "bookprefix1/",
+              "common_pushrebase_bookmarks_map": { "master": "heads/master" }
             }
           }
         }
@@ -74,17 +70,30 @@ function default_initial_import_config {
 EOF
 }
 
-# Modify a small repo config in a specific config version to keep the git
-# submodules
-function keep_git_submodules_in_config_version {
+# Update the value for the git submodule action in a small repo config
+# e.g. to keep or expand the changes.
+function set_git_submodules_action_in_config_version {
   VERSION_NAME=$1
   MOD_SMALL_REPO=$2
+  NEW_ACTION=$3
 
-  TEMP_FILE="/tmp/COMMIT_SYNC_CONF_all"
+  TEMP_FILE="$TESTTMP/COMMIT_SYNC_CONF_all"
 
-  jq ".repos.large_repo.versions |= map(if .version_name != \"$VERSION_NAME\" then . else  .small_repos |= map(if .repoid == $MOD_SMALL_REPO then . + {\"git_submodules_action\": 1} else . end) end)" "$COMMIT_SYNC_CONF/all" > "$TEMP_FILE"
+  jq ".repos.large_repo.versions |= map(if .version_name != \"$VERSION_NAME\" then . else  .small_repos |= map(if .repoid == $MOD_SMALL_REPO then . + {\"git_submodules_action\": $NEW_ACTION} else . end) end)" "$COMMIT_SYNC_CONF/all" > "$TEMP_FILE"
 
-  cat "$TEMP_FILE" > "$COMMIT_SYNC_CONF/all"
+  mv "$TEMP_FILE" "$COMMIT_SYNC_CONF/all"
+}
+
+function set_git_submodule_dependencies_in_config_version {
+  VERSION_NAME=$1
+  MOD_SMALL_REPO=$2
+  NEW_VALUE=$3
+
+  TEMP_FILE="$TESTTMP/COMMIT_SYNC_CONF_all"
+
+  jq ".repos.large_repo.versions |= map(if .version_name != \"$VERSION_NAME\" then . else  .small_repos |= map(if .repoid == $MOD_SMALL_REPO then . + {\"submodule_dependencies\": $NEW_VALUE} else . end) end)" "$COMMIT_SYNC_CONF/all" > "$TEMP_FILE"
+
+  mv "$TEMP_FILE" "$COMMIT_SYNC_CONF/all"
 }
 
 function setup_sync_config_stripping_git_submodules {
@@ -92,9 +101,19 @@ function setup_sync_config_stripping_git_submodules {
 }
 
 function run_common_xrepo_sync_with_gitsubmodules_setup {
+  INFINITEPUSH_ALLOW_WRITES=true ENABLE_API_WRITES=1 REPOID="$LARGE_REPO_ID" \
+    REPONAME="$LARGE_REPO_NAME" setup_common_config "$REPOTYPE"
+  # Enable writes in small repo as well, so we can update bookmarks when running gitimport
+  INFINITEPUSH_ALLOW_WRITES=true ENABLE_API_WRITES=1 REPOID="$SUBMODULE_REPO_ID" \
+    REPONAME="$SUBMODULE_REPO_NAME" setup_common_config "$REPOTYPE"
+
   setup_sync_config_stripping_git_submodules
 
   start_and_wait_for_mononoke_server
+
+  # Setting up mutable counter for live forward sync
+  # NOTE: this might need to be updated/refactored when setting up test for backsyncing
+  sqlite3 "$TESTTMP/monsql/sqlite_dbs" "INSERT INTO mutable_counters (repo_id, name, value) VALUES ($LARGE_REPO_ID, 'xreposync_from_$SUBMODULE_REPO_ID', 1)";
 
   cd "$TESTTMP" || exit
 }
@@ -111,15 +130,16 @@ function clone_and_log_large_repo {
     hg pull -q -r "$LARGE_CS_ID"
   done
 
-  hg log --graph -T '{node|short} {desc}\n' --stat -r "all()"
+  hg log --graph -T '{node|short} {desc}\n' --stat -r "sort(all(), desc)"
 
   printf "\n\nRunning mononoke_admin to verify mapping\n\n"
   for LARGE_BCS_ID in "${LARGE_BCS_IDS[@]}"; do
-    quiet_grep RewrittenAs -- with_stripped_logs mononoke_admin_source_target "$LARGE_REPO_ID" "$SMALL_REPO_ID" crossrepo map "$LARGE_BCS_ID"
+    quiet_grep RewrittenAs -- with_stripped_logs mononoke_admin_source_target "$LARGE_REPO_ID" "$SUBMODULE_REPO_ID" crossrepo map "$LARGE_BCS_ID"
   done
 
   printf "\nDeriving all the enabled derived data types\n"
   for LARGE_BCS_ID in "${LARGE_BCS_IDS[@]}"; do
-    quiet mononoke_newadmin derived-data -R "$LARGE_REPO_NAME" derive --all-types -i "$LARGE_BCS_ID"
+    quiet mononoke_newadmin derived-data -R "$LARGE_REPO_NAME" derive --all-types \
+      -i "$LARGE_BCS_ID" 2>&1| rg "Error" || true # filter to keep only Error line if there is an error
   done
 }

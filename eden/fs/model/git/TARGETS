@@ -14,8 +14,8 @@ cpp_library(
     ],
     deps = [
         "fbsource//third-party/fmt:fmt",
+        "//eden/common/utils:throw",
         "//eden/fs/model:model",
-        "//eden/fs/utils:throw",
         "//folly:conv",
     ],
     exported_deps = [
@@ -41,14 +41,14 @@ cpp_library(
         "TopLevelIgnores.h",
     ],
     deps = [
-        "//eden/fs/utils:system_error",
+        "//eden/common/utils:system_error",
         "//folly:file",
         "//folly:file_util",
         "//folly/logging:logging",
     ],
     exported_deps = [
+        "//eden/common/utils:path",
         "//eden/fs/utils:matcher",
-        "//eden/fs/utils:path",
         "//folly:expected",
         "//folly:range",
     ],

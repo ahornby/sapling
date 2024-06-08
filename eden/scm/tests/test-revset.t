@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # Copyright (c) Mercurial Contributors.
@@ -11,6 +13,7 @@
   $ setconfig experimental.allowfilepeer=True
   $ enable commitextras
   $ setconfig 'ui.allowemptycommit=1'
+  $ setconfig checkout.use-rust=false
 
   $ HGENCODING=utf-8
 

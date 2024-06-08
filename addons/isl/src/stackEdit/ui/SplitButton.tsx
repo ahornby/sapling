@@ -6,24 +6,29 @@
  */
 
 import type {CommitInfo} from '../../types';
+import type {TrackEventName} from 'isl-server/src/analytics/eventNames';
 
 import {Tooltip} from '../../Tooltip';
 import {tracker} from '../../analytics';
+import {Button} from '../../components/Button';
 import {T, t} from '../../i18n';
 import {SplitCommitIcon} from '../../icons/SplitCommitIcon';
 import {uncommittedChangesWithPreviews} from '../../previews';
 import {useConfirmUnsavedEditsBeforeSplit} from './ConfirmUnsavedEditsBeforeSplit';
-import {editingStackIntentionHashes} from './stackEditState';
-import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
-import {useRecoilValue, useSetRecoilState} from 'recoil';
+import {bumpStackEditMetric, editingStackIntentionHashes} from './stackEditState';
+import {useAtomValue, useSetAtom} from 'jotai';
 
 /** Button to open split UI for the current commit. Expected to be shown on the head commit.
  * Loads that one commit in the split UI. */
-export function SplitButton({commit}: {commit: CommitInfo}) {
+export function SplitButton({
+  commit,
+  trackerEventName,
+  ...rest
+}: {commit: CommitInfo; trackerEventName: TrackEventName} & React.ComponentProps<typeof Button>) {
   const confirmUnsavedEditsBeforeSplit = useConfirmUnsavedEditsBeforeSplit();
-  const setEditStackIntentionHashes = useSetRecoilState(editingStackIntentionHashes);
+  const setEditStackIntentionHashes = useSetAtom(editingStackIntentionHashes);
 
-  const uncommittedChanges = useRecoilValue(uncommittedChangesWithPreviews);
+  const uncommittedChanges = useAtomValue(uncommittedChangesWithPreviews);
   const hasUncommittedChanges = uncommittedChanges.length > 0;
 
   const onClick = async () => {
@@ -31,16 +36,19 @@ export function SplitButton({commit}: {commit: CommitInfo}) {
       return;
     }
     setEditStackIntentionHashes(['split', new Set([commit.hash])]);
-    tracker.track('SplitOpenFromHeadCommit');
+    if (trackerEventName === 'SplitOpenFromSplitSuggestion') {
+      bumpStackEditMetric('splitFromSuggestion');
+    }
+    tracker.track(trackerEventName);
   };
   return (
     <Tooltip
       title={hasUncommittedChanges ? t('Cannot currently split with uncommitted changes') : ''}
       trigger={hasUncommittedChanges ? 'hover' : 'disabled'}>
-      <VSCodeButton appearance="icon" onClick={onClick} disabled={hasUncommittedChanges}>
-        <SplitCommitIcon slot="start" />
+      <Button onClick={onClick} disabled={hasUncommittedChanges} {...rest}>
+        <SplitCommitIcon />
         <T>Split</T>
-      </VSCodeButton>
+      </Button>
     </Tooltip>
   );
 }

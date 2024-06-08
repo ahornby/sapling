@@ -13,6 +13,10 @@
 #include <folly/portability/GTest.h>
 #include <folly/test/TestUtils.h>
 
+#include "eden/common/utils/FaultInjector.h"
+#include "eden/common/utils/FileUtils.h"
+#include "eden/common/utils/StatTimes.h"
+#include "eden/common/utils/TimeUtil.h"
 #include "eden/fs/config/CheckoutConfig.h"
 #include "eden/fs/inodes/EdenDispatcherFactory.h"
 #include "eden/fs/inodes/EdenMount.h"
@@ -32,10 +36,6 @@
 #include "eden/fs/testharness/TestMount.h"
 #include "eden/fs/testharness/TestUtil.h"
 #include "eden/fs/utils/EdenError.h"
-#include "eden/fs/utils/FaultInjector.h"
-#include "eden/fs/utils/FileUtils.h"
-#include "eden/fs/utils/StatTimes.h"
-#include "eden/fs/utils/TimeUtil.h"
 
 using namespace facebook::eden;
 using namespace std::chrono_literals;
@@ -74,7 +74,7 @@ inline void PrintTo(
 
 namespace {
 
-bool isExecutable(FOLLY_MAYBE_UNUSED int perms) {
+bool isExecutable([[maybe_unused]] int perms) {
 #ifndef _WIN32
   return perms & S_IXUSR;
 #else
@@ -156,7 +156,7 @@ void loadInodes(
     RelativePathPiece path,
     LoadBehavior loadType,
     std::optional<folly::StringPiece> expectedContents,
-    FOLLY_MAYBE_UNUSED mode_t expectedPerms) {
+    [[maybe_unused]] mode_t expectedPerms) {
   switch (loadType) {
     case LoadBehavior::NONE:
       return;
@@ -390,7 +390,7 @@ void testModifyFile(
   }
 
   testMount.getClock().advance(10min);
-  FOLLY_MAYBE_UNUSED auto checkoutStart = testMount.getClock().getTimePoint();
+  [[maybe_unused]] auto checkoutStart = testMount.getClock().getTimePoint();
   auto executor = testMount.getServerExecutor().get();
   auto checkoutResult = testMount.getEdenMount()
                             ->checkout(
@@ -1894,10 +1894,13 @@ class FakePrjfsChannel final : public PrjfsChannel {
             EdenDispatcherFactory::makePrjfsDispatcher(mount.get()),
             mount->getServerState()->getReloadableConfig(),
             &mount->getStraceLogger(),
+            mount->getServerState()->getStructuredLogger(),
+            mount->getServerState()->getFaultInjector(),
             mount->getServerState()->getProcessInfoCache(),
             mount->getCheckoutConfig()->getRepoGuid(),
             mount->getCheckoutConfig()->getEnableWindowsSymlinks(),
-            nullptr),
+            nullptr,
+            mount->getInvalidationThreadPool()),
         actions_{std::move(actions)} {}
 
   static void initializeFakePrjfsChannel(

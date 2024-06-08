@@ -587,30 +587,14 @@ async fn bonsai_changeset_step<V: VisitOne>(
     checker: &Checker<V>,
     key: &ChangesetKey<ChangesetId>,
 ) -> Result<StepOutput, StepError> {
-    const BONSAI_CHANGESET_PARSE_ERROR: &str = "invalid Thrift structure 'BonsaiChangeset'";
     let bcs_id = &key.inner;
+
+    // Get the data, and add direct file data for this bonsai changeset
+    let bcs = bcs_id.load(ctx, repo.repo_blobstore()).await?;
+
     // Build edges, from mostly queue expansion to least
     let mut edges = vec![];
-    // Get the data, and add direct file data for this bonsai changeset
-    let bcs = match bcs_id.load(ctx, repo.repo_blobstore()).await {
-        Err(e) => match e {
-            LoadableError::Error(e) if e.to_string().contains(BONSAI_CHANGESET_PARSE_ERROR) => {
-                let mut scuba = ctx.scuba().clone();
-                scuba.add("changeset_key", key.inner.to_string());
-                scuba.add("repo", repo.repo_identity().name());
-                scuba.log_with_msg(
-                    "Invalid BonsaiChangeset",
-                    "Invalid BonsaiChangeset encountered by walker".to_string(),
-                );
-                return Ok(StepOutput::Done(
-                    checker.step_data(NodeType::Changeset, || NodeData::NotRequired),
-                    edges,
-                ));
-            }
-            other_error => Err(other_error),
-        },
-        bcs => bcs,
-    }?;
+
     // Expands to parents
     checker.add_edge(
         &mut edges,
@@ -924,27 +908,8 @@ async fn hg_changeset_step<V: VisitOne>(
     checker: &Checker<V>,
     key: ChangesetKey<HgChangesetId>,
 ) -> Result<StepOutput, StepError> {
-    const HGCHANGESET_PARSE_ERROR: &str = "Error while deserializing changeset";
+    let hgchangeset = key.inner.load(ctx, repo.repo_blobstore()).await?;
     let mut edges = vec![];
-    let hgchangeset = match key.inner.load(ctx, repo.repo_blobstore()).await {
-        Err(e) => match e {
-            LoadableError::Error(e) if e.to_string().contains(HGCHANGESET_PARSE_ERROR) => {
-                let mut scuba = ctx.scuba().clone();
-                scuba.add("changeset_key", key.inner.to_string());
-                scuba.add("repo", repo.repo_identity().name());
-                scuba.log_with_msg(
-                    "Invalid HgChangset",
-                    "Invalid HgChangset encountered by walker".to_string(),
-                );
-                return Ok(StepOutput::Done(
-                    checker.step_data(NodeType::HgChangeset, || NodeData::NotRequired),
-                    edges,
-                ));
-            }
-            other_error => Err(other_error),
-        },
-        changeset => changeset,
-    }?;
     // 1:1 but will then expand a lot, usually
     checker.add_edge(&mut edges, EdgeType::HgChangesetToHgManifest, || {
         Node::HgManifest(PathKey::new(hgchangeset.manifestid(), WrappedPath::Root))
@@ -1904,6 +1869,7 @@ pub struct RepoWalkParams {
     pub scheduled_max: usize,
     pub sql_shard_info: SqlShardInfo,
     pub walk_roots: Vec<OutgoingEdge>,
+    pub exclude_nodes: HashSet<Node>,
     pub include_node_types: HashSet<NodeType>,
     pub include_edge_types: HashSet<EdgeType>,
     pub hash_validation_node_types: HashSet<NodeType>,
@@ -1974,7 +1940,7 @@ where
             with_blame: repo_params.include_node_types.contains(&NodeType::Blame),
             with_fastlog: include_node_types
                 .iter()
-                .any(|n| n.derived_data_name() == Some(RootFastlog::NAME)),
+                .any(|n| n.derived_data_type() == Some(RootFastlog::VARIANT)),
             with_filenodes: include_edge_types.iter().any(|e| {
                 e.outgoing_type() == NodeType::HgFileNode
                     || e.outgoing_type() == NodeType::HgManifestFileNode

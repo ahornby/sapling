@@ -16,16 +16,19 @@
 #include <chrono>
 #include <csignal>
 #include <type_traits>
+
+#include "eden/common/telemetry/StructuredLogger.h"
+#include "eden/common/utils/Bug.h"
+#include "eden/common/utils/IDGen.h"
 #include "eden/common/utils/Synchronized.h"
+#include "eden/common/utils/SystemError.h"
 #include "eden/fs/fuse/FuseDirList.h"
 #include "eden/fs/fuse/FuseDispatcher.h"
 #include "eden/fs/fuse/FuseRequestContext.h"
 #include "eden/fs/privhelper/PrivHelper.h"
 #include "eden/fs/telemetry/FsEventLogger.h"
-#include "eden/fs/utils/Bug.h"
-#include "eden/fs/utils/IDGen.h"
+#include "eden/fs/telemetry/LogEvent.h"
 #include "eden/fs/utils/StaticAssert.h"
-#include "eden/fs/utils/SystemError.h"
 #include "eden/fs/utils/Thread.h"
 
 using namespace folly;
@@ -656,9 +659,9 @@ FuseChannel::InvalidationEntry::~InvalidationEntry() {
 
 FuseChannel::InvalidationEntry::
     InvalidationEntry(InvalidationEntry&& other) noexcept(
-        std::is_nothrow_move_constructible_v<PathComponent>&&
-            std::is_nothrow_move_constructible_v<folly::Promise<folly::Unit>>&&
-                std::is_nothrow_move_constructible_v<DataRange>)
+        std::is_nothrow_move_constructible_v<PathComponent> &&
+        std::is_nothrow_move_constructible_v<folly::Promise<folly::Unit>> &&
+        std::is_nothrow_move_constructible_v<DataRange>)
     : type(other.type), inode(other.inode) {
   switch (type) {
     case InvalidationType::INODE:
@@ -788,11 +791,14 @@ FuseChannel::FuseChannel(
     const folly::Logger* straceLogger,
     std::shared_ptr<ProcessInfoCache> processInfoCache,
     std::shared_ptr<FsEventLogger> fsEventLogger,
+    const std::shared_ptr<StructuredLogger>& structuredLogger,
     folly::Duration requestTimeout,
     std::shared_ptr<Notifier> notifier,
     CaseSensitivity caseSensitive,
     bool requireUtf8Path,
     int32_t maximumBackgroundRequests,
+    size_t maximumInFlightRequests,
+    std::chrono::nanoseconds highFuseRequestsLogInterval,
     bool useWriteBackCache,
     size_t fuseTraceBusCapacity)
     : privHelper_{privHelper},
@@ -801,12 +807,15 @@ FuseChannel::FuseChannel(
       numThreads_(numThreads),
       dispatcher_(std::move(dispatcher)),
       straceLogger_(straceLogger),
+      structuredLogger_(structuredLogger),
       mountPath_(mountPath),
       requestTimeout_(requestTimeout),
       notifier_(std::move(notifier)),
       caseSensitive_{caseSensitive},
       requireUtf8Path_{requireUtf8Path},
       maximumBackgroundRequests_{maximumBackgroundRequests},
+      maximumInFlightRequests_{maximumInFlightRequests},
+      highFuseRequestsLogInterval_{highFuseRequestsLogInterval},
       useWriteBackCache_{useWriteBackCache},
       fuseDevice_(std::move(fuseDevice)),
       processAccessLog_(std::move(processInfoCache)),
@@ -814,6 +823,14 @@ FuseChannel::FuseChannel(
       traceBus_(TraceBus<FuseTraceEvent>::create(
           "FuseTrace" + mountPath.asString(),
           fuseTraceBusCapacity)) {
+  XLOGF(
+      INFO,
+      "Creating FuseChannel: mountPath={}, numThreads={}, requireUtf8={}, maximumBackgroundRequests={}, useWriteBackCache={}",
+      mountPath,
+      numThreads,
+      requireUtf8Path,
+      maximumBackgroundRequests,
+      useWriteBackCache);
   XCHECK_GE(numThreads_, 1ul);
   installSignalHandler();
 
@@ -1762,7 +1779,23 @@ void FuseChannel::processSession() {
           // in both. I'm sure this could be improved with some cleverness.
           auto request = std::make_shared<FuseRequestContext>(this, *header);
 
-          ++state_.wlock()->pendingRequests;
+          auto now = std::chrono::steady_clock::now();
+          auto should_log = false;
+          {
+            auto state = state_.wlock();
+            ++state->pendingRequests;
+
+            if (state->pendingRequests == maximumInFlightRequests_ &&
+                now >= state->lastHighFuseRequestsLog_ +
+                        highFuseRequestsLogInterval_) {
+              should_log = true;
+              state->lastHighFuseRequestsLog_ = now;
+            }
+          }
+
+          if (should_log) {
+            this->structuredLogger_->logEvent(ManyLiveFsChannelRequests{});
+          }
 
           auto headerCopy = *header;
 

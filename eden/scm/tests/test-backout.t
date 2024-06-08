@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 
   $ eagerepo
 
@@ -114,7 +116,7 @@ test --no-commit
 Test backing out a mv keeps the blame history even if copytracing is off
   $ hg init mv-backout
   $ cd mv-backout
-  $ setconfig experimental.copytrace=off
+  $ setconfig copytrace.dagcopytrace=False
   $ echo a > foo
   $ hg commit -Aqm a
   $ echo b >> foo

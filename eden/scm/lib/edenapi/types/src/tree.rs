@@ -19,9 +19,9 @@ use types::key::Key;
 use types::parents::Parents;
 
 use crate::DirectoryMetadata;
-use crate::EdenApiServerError;
 use crate::FileMetadata;
 use crate::InvalidHgId;
+use crate::SaplingRemoteApiServerError;
 use crate::UploadToken;
 
 #[derive(Debug, Error)]
@@ -56,28 +56,35 @@ impl TreeError {
 /// Structure representing source control tree entry on the wire.
 /// Includes the information required to add the data to a mutable store,
 /// along with the parents for hash validation.
-#[derive(Clone, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct TreeEntry {
     pub key: Key,
     pub data: Option<Bytes>,
     pub parents: Option<Parents>,
-    #[serde(skip)]
-    pub children: Option<Vec<Result<TreeChildEntry, EdenApiServerError>>>,
+    pub children: Option<Vec<Result<TreeChildEntry, SaplingRemoteApiServerError>>>,
 }
 
 impl TreeEntry {
-    pub fn new(key: Key, data: Bytes, parents: Parents) -> Self {
+    pub fn new(key: Key) -> Self {
         Self {
             key,
-            data: Some(data),
-            parents: Some(parents),
-            children: None,
+            ..Default::default()
         }
+    }
+
+    pub fn with_data<'a>(&'a mut self, data: Option<Bytes>) -> &'a mut Self {
+        self.data = data;
+        self
+    }
+
+    pub fn with_parents<'a>(&'a mut self, parents: Option<Parents>) -> &'a mut Self {
+        self.parents = parents;
+        self
     }
 
     pub fn with_children<'a>(
         &'a mut self,
-        children: Option<Vec<Result<TreeChildEntry, EdenApiServerError>>>,
+        children: Option<Vec<Result<TreeChildEntry, SaplingRemoteApiServerError>>>,
     ) -> &'a mut Self {
         self.children = children;
         self
@@ -134,21 +141,21 @@ impl TreeEntry {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[cfg_attr(any(test, feature = "for-tests"), derive(Arbitrary))]
 pub enum TreeChildEntry {
     File(TreeChildFileEntry),
     Directory(TreeChildDirectoryEntry),
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 #[cfg_attr(any(test, feature = "for-tests"), derive(Arbitrary))]
 pub struct TreeChildFileEntry {
     pub key: Key,
     pub file_metadata: Option<FileMetadata>,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 #[cfg_attr(any(test, feature = "for-tests"), derive(Arbitrary))]
 pub struct TreeChildDirectoryEntry {
     pub key: Key,
@@ -163,10 +170,10 @@ impl TreeChildEntry {
         })
     }
 
-    pub fn new_directory_entry(key: Key) -> Self {
+    pub fn new_directory_entry(key: Key, metadata: DirectoryMetadata) -> Self {
         TreeChildEntry::Directory(TreeChildDirectoryEntry {
             key,
-            ..Default::default()
+            directory_metadata: Some(metadata),
         })
     }
 }
@@ -201,10 +208,16 @@ pub struct TreeAttributes {
     pub parents: bool,
     #[serde(default = "get_true")]
     pub child_metadata: bool,
+    #[serde(default = "get_false")]
+    pub augmented_trees: bool,
 }
 
 fn get_true() -> bool {
     true
+}
+
+fn get_false() -> bool {
+    false
 }
 
 impl TreeAttributes {
@@ -213,6 +226,16 @@ impl TreeAttributes {
             manifest_blob: true,
             parents: true,
             child_metadata: true,
+            augmented_trees: false,
+        }
+    }
+
+    pub fn augmented_trees() -> Self {
+        TreeAttributes {
+            manifest_blob: false,  // not used
+            parents: false,        // not used
+            child_metadata: false, // not used
+            augmented_trees: true,
         }
     }
 }
@@ -223,6 +246,7 @@ impl Default for TreeAttributes {
             manifest_blob: true,
             parents: true,
             child_metadata: false,
+            augmented_trees: false,
         }
     }
 }

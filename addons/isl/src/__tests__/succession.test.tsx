@@ -13,8 +13,6 @@ import {resetTestMessages, expectMessageSentToServer, simulateCommits, COMMIT} f
 import {render, act} from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 
-jest.mock('../MessageBus');
-
 describe('succession', () => {
   beforeEach(() => {
     resetTestMessages();
@@ -29,7 +27,7 @@ describe('succession', () => {
         value: [
           COMMIT('1', 'Commit 1', '0', {phase: 'public'}),
           COMMIT('a', 'Commit A', '1'),
-          COMMIT('b', 'Commit B', 'a', {isHead: true}),
+          COMMIT('b', 'Commit B', 'a', {isDot: true}),
           COMMIT('c', 'Commit C', 'b'),
         ],
       });
@@ -58,7 +56,7 @@ describe('succession', () => {
           value: [
             COMMIT('1', 'Commit 1', '0', {phase: 'public'}),
             COMMIT('a2', 'Commit A', '1', {closestPredecessors: ['a']}),
-            COMMIT('b2', 'Commit B', 'a2', {isHead: true, closestPredecessors: ['b']}),
+            COMMIT('b2', 'Commit B', 'a2', {isDot: true, closestPredecessors: ['b']}),
             COMMIT('c2', 'Commit C', 'b2', {closestPredecessors: ['c']}),
           ],
         });
@@ -84,7 +82,7 @@ describe('succession', () => {
         simulateCommits({
           value: [
             COMMIT('1', 'Commit 1', '0', {phase: 'public'}),
-            COMMIT('x', 'Commit X', '1', {isHead: true}),
+            COMMIT('x', 'Commit X', '1', {isDot: true}),
           ],
         });
       });
@@ -92,7 +90,7 @@ describe('succession', () => {
         simulateCommits({
           value: [
             COMMIT('1', 'Commit 1', '0', {phase: 'public'}),
-            COMMIT('x2', 'Commit X2', '1', {isHead: true, closestPredecessors: ['x']}),
+            COMMIT('x2', 'Commit X2', '1', {isDot: true, closestPredecessors: ['x']}),
           ],
         });
       });
@@ -118,7 +116,7 @@ describe('succession', () => {
           value: [
             COMMIT('1', 'Commit 1', '0', {phase: 'public'}),
             COMMIT('a2', 'Commit A', '1', {closestPredecessors: ['a']}),
-            COMMIT('b2', 'Commit B', 'a2', {isHead: true, closestPredecessors: ['b']}),
+            COMMIT('b2', 'Commit B', 'a2', {isDot: true, closestPredecessors: ['b']}),
             COMMIT('c2', 'Commit C', 'b2', {closestPredecessors: ['c']}),
           ],
         });

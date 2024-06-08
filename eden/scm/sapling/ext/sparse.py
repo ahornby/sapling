@@ -440,23 +440,24 @@ def _setupcommit(ui) -> None:
         repo = self._repo
 
         if _hassparse(repo):
-            if not _isedensparse(repo):
-                # Eden sparse repos don't need to refresh -- that's handled on
-                # the EdenFS side
-                ctx = repo[node]
-                profiles = getsparsepatterns(repo, ctx.rev()).allprofiles()
-                if profiles & set(ctx.files()):
-                    origstatus = repo.status()
-                    origsparsematch = repo.sparsematch(
-                        *list(p.rev() for p in ctx.parents() if p.rev() != nullrev)
-                    )
-                    repo._refreshsparse(repo.ui, origstatus, origsparsematch, True)
-            else:
+            if _isedensparse(repo):
                 # We just created a new commit that the edenfs_ffi Rust
                 # repo won't know about until we flush in-memory commit
                 # data to disk. Flush now to avoid unknown commit id errors
                 # in EdenFS when checking edensparse contents.
                 repo.changelog.inner.flushcommitdata()
+
+            # Refresh the sparse profile so that the working copy reflects any
+            # sparse (or edensparse) changes made by the new commit
+            ctx = repo[node]
+            profiles = getsparsepatterns(repo, ctx.rev()).allprofiles()
+            if profiles & set(ctx.files()):
+                origstatus = repo.status()
+                origsparsematch = repo.sparsematch(
+                    *list(p.rev() for p in ctx.parents() if p.rev() != nullrev)
+                )
+                repo._refreshsparse(repo.ui, origstatus, origsparsematch, True)
+
             repo.prunetemporaryincludes()
 
     extensions.wrapfunction(context.committablectx, "markcommitted", _refreshoncommit)
@@ -1002,8 +1003,7 @@ class SparseMixin:
 
         includetemp = kwargs.get("includetemp", True)
 
-        # Don't allow overrides for edensparse checkouts
-        rawconfig = kwargs.get("config") if not _isedensparse(self) else None
+        rawconfig = kwargs.get("config")
 
         cachekey = self._cachekey(revs, includetemp=includetemp)
 
@@ -1381,7 +1381,7 @@ def getsparsepatterns(
                 # we'll append them later.
                 version = debugversion or profile.version()
                 if version == "1":
-                    for (i, value) in enumerate(profile.rules):
+                    for i, value in enumerate(profile.rules):
                         origin = "{} -> {}".format(
                             rawconfig.path, profile.ruleorigin(i)
                         )
@@ -1409,12 +1409,12 @@ def getsparsepatterns(
             excludes.add((value, rawconfig.path))
 
     if includes:
-        for (rule, origin) in includes:
+        for rule, origin in includes:
             rules.append(rule)
             ruleorigins.append(origin)
 
     if excludes:
-        for (rule, origin) in excludes:
+        for rule, origin in excludes:
             rules.append("!" + rule)
             ruleorigins.append(origin)
 
@@ -1585,7 +1585,7 @@ def readsparseprofile(
             profiles.add(value)
             profile = readsparseprofile(repo, rev, value, profileconfigs, depth + 1)
             if profile is not None:
-                for (i, rule) in enumerate(profile.rules):
+                for i, rule in enumerate(profile.rules):
                     rules.append(rule)
                     ruleorigins.append("{} -> {}".format(name, profile.ruleorigin(i)))
                 for subprofile in profile.profiles:
@@ -1648,7 +1648,10 @@ def _getcachedprofileconfigs(repo):
     for name in [pendingfile, profilecachefile]:
         if repo.localvfs.exists(name):
             serialized = repo.localvfs.readutf8(name)
-            return json.loads(serialized)
+            try:
+                return json.loads(serialized)
+            except Exception:
+                continue
     return {}
 
 
@@ -1752,9 +1755,7 @@ def _discover(ui, repo, rev: Optional[str] = None):
             (
                 PROFILE_ACTIVE
                 if p in active
-                else PROFILE_INCLUDED
-                if p in included
-                else PROFILE_INACTIVE
+                else PROFILE_INCLUDED if p in included else PROFILE_INACTIVE
             ),
             md,
         )
@@ -1875,10 +1876,8 @@ def hintlistverbose(profiles, filters, load_matcher) -> Optional[str]:
         )
 
 
-_deprecate = (
-    lambda o, l=_("(DEPRECATED)"): (o[:3] + (" ".join([o[4], l]),) + o[4:])
-    if l not in o[4]
-    else l
+_deprecate = lambda o, l=_("(DEPRECATED)"): (
+    (o[:3] + (" ".join([o[4], l]),) + o[4:]) if l not in o[4] else l
 )
 
 

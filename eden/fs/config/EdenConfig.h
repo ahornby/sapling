@@ -15,6 +15,8 @@
 #include <thrift/lib/cpp/concurrency/ThreadManager.h>
 
 #include "common/rust/shed/hostcaps/hostcaps.h"
+
+#include "eden/common/utils/PathFuncs.h"
 #include "eden/fs/config/ConfigSetting.h"
 #include "eden/fs/config/ConfigSource.h"
 #include "eden/fs/config/ConfigVariables.h"
@@ -24,7 +26,6 @@
 #include "eden/fs/config/MountProtocol.h"
 #include "eden/fs/config/ReaddirPrefetch.h"
 #include "eden/fs/eden-config.h"
-#include "eden/fs/utils/PathFuncs.h"
 
 namespace re2 {
 class RE2;
@@ -259,6 +260,19 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
+   * If Eden is using custom permission checking, the list of methods that any
+   * user can call.
+   */
+  ConfigSetting<std::vector<std::string>> thriftFunctionsAllowlist{
+      "thrift:functions-allowlist",
+      std::vector<std::string>{
+          "BaseService.getCounter",
+          "BaseService.getCounters",
+          "BaseService.getRegexCounters",
+          "BaseService.getSelectedCounters"},
+      this};
+
+  /**
    * The number of Thrift worker threads.
    */
   ConfigSetting<size_t> thriftNumWorkers{
@@ -432,15 +446,26 @@ class EdenConfig : private ConfigSettingManager {
   // [fuse]
 
   /**
-   * The maximum number of concurrent FUSE requests we allow the kernel to send
-   * us.
+   * The maximum number of concurrent background FUSE requests we allow the
+   * kernel to send us. background should mean things like readahead prefetches
+   * and direct I/O, but may include things that seem like more traditionally
+   * foreground I/O. What counts as "background" seems to be up to the
+   * discretion of the kernel.
    *
    * Linux FUSE defaults to 12, but EdenFS can handle a great deal of
    * concurrency.
    */
-  ConfigSetting<int32_t> fuseMaximumRequests{
+  ConfigSetting<int32_t> fuseMaximumBackgroundRequests{
       "fuse:max-concurrent-requests",
       1000,
+      this};
+
+  /**
+   * The number of FUSE dispatcher threads to spawn.
+   */
+  ConfigSetting<int32_t> fuseNumDispatcherThreads{
+      "fuse:num-dispatcher-threads",
+      16,
       this};
 
   /**
@@ -472,6 +497,12 @@ class EdenConfig : private ConfigSettingManager {
    * to 12 (FUSE_DEFAULT_MAX_BACKGROUND) unless this is set high.
    */
   ConfigSetting<uint32_t> maximumFuseRequests{"fuse:max-requests", 1000, this};
+
+  /**
+   * The string we use in the vfs type when mounting the fuse mount. Others will
+   * see this in the mount table on the system.
+   */
+  ConfigSetting<std::string> fuseVfsType{"fuse:vfs-type", "fuse", this};
 
   // [nfs]
 
@@ -641,6 +672,21 @@ class EdenConfig : private ConfigSettingManager {
       true,
       this};
 
+  /**
+   * Controls how frequently we log to the EdenFS log file and scuba tables
+   * about torn reads - i.e. when Prjfs attempts to read a file that was
+   * modified in the middle of an operation.
+   */
+  ConfigSetting<std::chrono::nanoseconds> prjfsTornReadLogInterval{
+      "prjfs:torn-read-log-interval",
+      std::chrono::seconds{10},
+      this};
+
+  ConfigSetting<std::chrono::nanoseconds> tornReadCleanupDelay{
+      "prjfs:torn-read-cleanup-delay",
+      std::chrono::seconds{1},
+      this};
+
   // [fschannel]
 
   /**
@@ -658,6 +704,16 @@ class EdenConfig : private ConfigSettingManager {
   ConfigSetting<uint64_t> maxFsChannelInflightRequests{
       "fschannel:max-inflight-requests",
       1000,
+      this};
+
+  ConfigSetting<bool> unboundedFsChannel{
+      "fschannel:unbounded-task-queue",
+      true,
+      this};
+
+  ConfigSetting<std::chrono::nanoseconds> highFsRequestsLogInterval{
+      "fschannel:high-fs-requests-log-interval",
+      std::chrono::minutes{30},
       this};
 
   // [hg]
@@ -683,7 +739,7 @@ class EdenConfig : private ConfigSettingManager {
   ConfigSetting<bool> fetchHgAuxMetadata{"hg:fetch-aux-metadata", true, this};
 
   /**
-   * Which object ID format should the HgBackingStore use?
+   * Which object ID format should the SaplingBackingStore use?
    */
   ConfigSetting<HgObjectIdFormat> hgObjectIdFormat{
       "hg:object-id-format",
@@ -705,12 +761,12 @@ class EdenConfig : private ConfigSettingManager {
 
   /**
    * Controls the number of blob or prefetch import requests we batch in
-   * HgBackingStore
+   * SaplingBackingStore
    */
   ConfigSetting<uint32_t> importBatchSize{"hg:import-batch-size", 1, this};
 
   /**
-   * Controls the number of tree import requests we batch in HgBackingStore
+   * Controls the number of tree import requests we batch in SaplingBackingStore
    */
   ConfigSetting<uint32_t> importBatchSizeTree{
       "hg:import-batch-size-tree",
@@ -719,7 +775,7 @@ class EdenConfig : private ConfigSettingManager {
 
   /**
    * Controls the max number of blob metadata import requests we batch in
-   * HgBackingStore
+   * SaplingBackingStore
    */
   ConfigSetting<uint32_t> importBatchSizeBlobMeta{
       "hg:import-batch-size-blobmeta",
@@ -982,6 +1038,15 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
+   *  The interval for backgroung periodic unloading of inodes from inodeMap.
+   * The value is in minutes.
+   */
+  ConfigSetting<uint32_t> periodicUnloadIntervalMinutes{
+      "experimental:periodic-inode-map-unload-interval",
+      0,
+      this};
+
+  /**
    * Controls whether EdenFS eagerly invalidates directories during checkout or
    * whether it only does when children were modified.
    *
@@ -1004,7 +1069,48 @@ class EdenConfig : private ConfigSettingManager {
       false,
       this};
 
+  /**
+   * Controls if EdenFS runs a checkout operation on EdenServer's
+   * EdenCPUThreadPool or using the Thrift CPU workers.
+   *
+   * This is a temporary option to help us mitigate and understand S399431.
+   */
+  ConfigSetting<bool> runCheckoutOnEdenCPUThreadpool{
+      "experimental:run-checkout-on-eden-threadpool",
+      false,
+      this};
+
+  /**
+   * Controls if EdenFS runs a prefetch operation serially or not.
+   *
+   * This is a temporary option to help us mitigate and understand S399431.
+   */
+  ConfigSetting<bool> runSerialPrefetch{
+      "experimental:run-serial-prefetch",
+      false,
+      this};
+
+  /**
+   * Controls if batches are sent to Sapling with FetchMode::AllowRemote
+   * or batches are sent to Sapling with FetchMode::LocalOnly and then the
+   * failed requests are sent to Sapling again with FetchMode::RemoteOnly.
+   *
+   * This is a temporary option to test metrics on this new way of batching
+   */
+  ConfigSetting<bool> allowRemoteGetBatch{
+      "experimental:allow-remote-get-batch",
+      true,
+      this};
+
   // [blobcache]
+
+  /**
+   * Controls whether if EdenFS caches blobs in memory.
+   */
+  ConfigSetting<bool> enableInMemoryBlobCaching{
+      "blobcache:enable-in-memory-blob-caching",
+      true,
+      this};
 
   /**
    * How many bytes worth of blobs to keep in memory, at most.
@@ -1026,7 +1132,7 @@ class EdenConfig : private ConfigSettingManager {
   // [treecache]
 
   /**
-   * Controls whether if EdenFS caches tree in memory.
+   * Controls whether if EdenFS caches trees in memory.
    */
   ConfigSetting<bool> enableInMemoryTreeCaching{
       "treecache:enable-in-memory-tree-caching",
@@ -1076,7 +1182,7 @@ class EdenConfig : private ConfigSettingManager {
    */
   ConfigSetting<bool> enableEdenMenu{
       "notifications:enable-eden-menu",
-      false,
+      true,
       this};
 
   /**
@@ -1084,7 +1190,7 @@ class EdenConfig : private ConfigSettingManager {
    */
   ConfigSetting<bool> enableNotifications{
       "notifications:enable-notifications",
-      false,
+      true,
       this};
 
   /**
@@ -1092,7 +1198,7 @@ class EdenConfig : private ConfigSettingManager {
    */
   ConfigSetting<bool> enableEdenDebugMenu{
       "notifications:enable-debug",
-      false,
+      true,
       this};
 
   // [log]
@@ -1296,6 +1402,17 @@ class EdenConfig : private ConfigSettingManager {
   ConfigSetting<std::string> doctorKnownBadKernelVersions{
       "doctor:known-bad-kernel-versions",
       "TODO,TEST",
+      this};
+
+  /**
+   * Known bad edenfs versions for which we should print a warning in `edenfsctl
+   * doctor`. Currently not used in Daemon.
+   * Format:
+   * [<bad_version_1>|<sev_1(optional):reason_1>,<bad_version_2>|<sev_2(optional):reason_2>]
+   */
+  ConfigSetting<std::vector<std::string>> doctorKnownBadEdenFsVersions{
+      "doctor:known-bad-edenfs-versions",
+      {},
       this};
 
   /**

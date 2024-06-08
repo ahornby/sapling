@@ -68,6 +68,8 @@ async fn test_sparse_dag() {
     0 : I+4 [] Root OnlyHead
   Group Non-Master:
    Segments: 0
+  Group Virtual:
+   Segments: 0
 "#
         );
 
@@ -173,11 +175,11 @@ async fn test_add_heads() {
     );
 
     client.flush("G").await;
-    assert_eq!(client.output(), ["resolve names: [I], heads: [B]"]);
+    assert_eq!(client.output(), [] as [&str; 0]);
 
     let mut client = server.client_cloned_data().await;
     let heads = VertexListWithOptions::from(&["K".into()][..])
-        .with_highest_group(Group::MASTER)
+        .with_desired_group(Group::MASTER)
         .chain(&["G".into()][..]);
     client
         .dag
@@ -202,7 +204,7 @@ async fn test_basic_pull() {
     let missing = server.dag.only("D".into(), "B".into()).await.unwrap();
     let pull_data = server.dag.export_pull_data(&missing).await.unwrap();
 
-    let heads = VertexListWithOptions::from(&["D".into()][..]).with_highest_group(Group::MASTER);
+    let heads = VertexListWithOptions::from(&["D".into()][..]).with_desired_group(Group::MASTER);
     client
         .dag
         .import_pull_data(pull_data, &heads)
@@ -219,7 +221,7 @@ async fn test_pull_from_empty_assign_from_zero() {
     let mut client = server.client().await;
     let missing = server.dag.only("D".into(), Set::empty()).await.unwrap();
     let pull_data = server.dag.export_pull_data(&missing).await.unwrap();
-    let heads = VertexListWithOptions::from(&["D".into()][..]).with_highest_group(Group::MASTER);
+    let heads = VertexListWithOptions::from(&["D".into()][..]).with_desired_group(Group::MASTER);
     client
         .dag
         .import_pull_data(pull_data, &heads)
@@ -512,6 +514,84 @@ Lv1: R0-4[]
 P->C: 1->5, 1->N6, 3->8, 7->8, 9->N0
 0->A 1->B 2->C 3->D 4->E 5->X 6->Y 7->Z 8->F 9->G N0->H N6->I N7->J N8->K N9->L"#
     );
+}
+
+#[tokio::test]
+async fn test_flush_no_over_fetch() {
+    let server = TestDag::draw("A..E # master: E");
+    let mut client = server.client_cloned_data().await;
+
+    // Branch off "B".
+    client.drawdag_async("B-X-Y-Z", &[]).await;
+    assert_eq!(
+        client.output(),
+        [
+            "resolve names: [B], heads: [E]",
+            "resolve names: [X], heads: [E]"
+        ]
+    );
+
+    // Flush with a master head. Should not fetch anything.
+    let heads = VertexListWithOptions::from(vec![VertexName::copy_from(b"E")])
+        .with_desired_group(Group::MASTER);
+    client.dag.flush(&heads).await.unwrap();
+    assert_eq!(client.output(), [] as [&str; 0]);
+
+    // "D" remains unknown locally (E~1 is not fetched).
+    assert_eq!(
+        client
+            .dag
+            .contains_vertex_name_locally(&["D".into()])
+            .await
+            .unwrap(),
+        [false]
+    );
+}
+
+#[tokio::test]
+async fn test_offline_commit() {
+    // Test that in A-B-C-D-E, inserting Z with parent B does not trigger
+    // remote lookup if "C" is known (so "Z" and "C" are different vertexes).
+    //
+    // Practically, when checking out "B", prefetch its children "C" to make
+    // offline committing on top of "B" possible.
+
+    let server = TestDag::draw("A..E # master: E");
+
+    {
+        let mut client = server.client_cloned_data().await;
+
+        // Prefetch "B" and "C". Emulate the behavior of checking out "B"
+        // and prefetching B's children.
+        client
+            .dag
+            .vertex_id_batch(&["B".into(), "C".into()])
+            .await
+            .unwrap();
+        assert_eq!(client.output(), ["resolve names: [B, C], heads: [E]",]);
+        client.flush("").await;
+
+        // Add Z as pending, then flush. This should not trigger remote lookup.
+        // This emulates committing on top of "B".
+        client.add_one_vertex("Z", "B").await;
+        client.flush("").await;
+        assert_eq!(client.output(), [] as [&str; 0]);
+    }
+
+    {
+        // Comparsion. What will happen without prefetching children on checkout.
+        let mut client = server.client_cloned_data().await;
+
+        // Prefetch only B. Emulate checking out B without prefetching its children.
+        client.dag.vertex_id("B".into()).await.unwrap();
+        assert_eq!(client.output(), ["resolve names: [B], heads: [E]",]);
+
+        // Add Z as pending, then flush. This will trigger remote lookups to confirm that "Z" does
+        // not exist in the existing lazy graph.
+        client.add_one_vertex("Z", "B").await;
+        client.flush("").await;
+        assert_eq!(client.output(), ["resolve names: [Z], heads: [E]"]);
+    }
 }
 
 #[tokio::test]

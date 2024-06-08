@@ -173,9 +173,20 @@ impl AsyncNameSetQuery for LazySet {
         Ok(Box::pin(stream))
     }
 
-    async fn count(&self) -> Result<usize> {
+    async fn count(&self) -> Result<u64> {
         let inner = self.load_all().await?;
-        Ok(inner.visited.len())
+        Ok(inner.visited.len().try_into()?)
+    }
+
+    async fn size_hint(&self) -> (u64, Option<u64>) {
+        let inner = self.inner.lock().await;
+        let min = inner.visited.len() as u64;
+        let max = match inner.state {
+            State::Incomplete => None,
+            State::Complete => Some(min as u64),
+            State::Error => None,
+        };
+        (min, max)
     }
 
     async fn last(&self) -> Result<Option<VertexName>> {
@@ -273,12 +284,25 @@ mod tests {
         assert_eq!(format!("{:1.3?}", &set), "<lazy [111] + 2 more>");
     }
 
+    #[test]
+    fn test_lazy() -> Result<()> {
+        let set = lazy_set(b"\x11\x33\x22");
+        assert_eq!(nb(set.size_hint()), (0, None));
+        // is_empty() reads one next item.
+        assert!(!nb(set.is_empty())?);
+        assert_eq!(nb(set.size_hint()), (1, None));
+        // count() reads all items.
+        assert_eq!(nb(set.count())?, 3);
+        assert_eq!(nb(set.size_hint()), (3, Some(3)));
+        Ok(())
+    }
+
     quickcheck::quickcheck! {
         fn test_lazy_quickcheck(a: Vec<u8>) -> bool {
             let set = lazy_set(&a);
             check_invariants(&set).unwrap();
 
-            let count = nb(set.count()).unwrap();
+            let count = nb(set.count()).unwrap() as usize;
             assert!(count <= a.len());
 
             let set2: HashSet<_> = a.iter().cloned().collect();

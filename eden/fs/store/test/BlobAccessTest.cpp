@@ -8,6 +8,7 @@
 #include "eden/fs/store/BlobAccess.h"
 #include <folly/portability/GTest.h>
 #include <chrono>
+#include "eden/common/telemetry/NullStructuredLogger.h"
 #include "eden/common/utils/ProcessInfoCache.h"
 #include "eden/fs/config/EdenConfig.h"
 #include "eden/fs/config/ReloadableConfig.h"
@@ -16,7 +17,6 @@
 #include "eden/fs/store/StoreResult.h"
 #include "eden/fs/store/TreeCache.h"
 #include "eden/fs/telemetry/EdenStats.h"
-#include "eden/fs/telemetry/NullStructuredLogger.h"
 #include "eden/fs/testharness/FakeBackingStore.h"
 #include "eden/fs/testharness/LoggingFetchContext.h"
 
@@ -81,8 +81,8 @@ class NullLocalStore final : public LocalStore {
 struct BlobAccessTest : ::testing::Test {
   BlobAccessTest()
       : localStore{std::make_shared<NullLocalStore>()},
-        backingStore{std::make_shared<FakeBackingStore>()},
-        blobCache{BlobCache::create(10, 0, makeRefPtr<EdenStats>())} {
+        backingStore{std::make_shared<FakeBackingStore>(
+            BackingStore::LocalStoreCachingPolicy::NoCaching)} {
     std::shared_ptr<EdenConfig> rawEdenConfig{
         EdenConfig::createTestEdenConfig()};
     rawEdenConfig->inMemoryTreeCacheSize.setValue(
@@ -91,11 +91,14 @@ struct BlobAccessTest : ::testing::Test {
         kTreeCacheMinimumEntries, ConfigSourceType::Default, true);
     auto edenConfig = std::make_shared<ReloadableConfig>(
         rawEdenConfig, ConfigReloadBehavior::NoReload);
-    auto treeCache = TreeCache::create(edenConfig);
+    auto blobCache =
+        BlobCache::create(10, 0, edenConfig, makeRefPtr<EdenStats>());
+    auto treeCache = TreeCache::create(edenConfig, makeRefPtr<EdenStats>());
 
     localStore->open();
     objectStore = ObjectStore::create(
         backingStore,
+        localStore,
         treeCache,
         makeRefPtr<EdenStats>(),
         std::make_shared<ProcessInfoCache>(),
@@ -122,7 +125,6 @@ struct BlobAccessTest : ::testing::Test {
   std::shared_ptr<LocalStore> localStore;
   std::shared_ptr<FakeBackingStore> backingStore;
   std::shared_ptr<ObjectStore> objectStore;
-  std::shared_ptr<BlobCache> blobCache;
   std::shared_ptr<BlobAccess> blobAccess;
 };
 

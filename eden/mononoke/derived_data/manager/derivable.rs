@@ -9,71 +9,26 @@ use std::any::TypeId;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Debug;
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::anyhow;
 use anyhow::Result;
 use async_trait::async_trait;
 use context::CoreContext;
-use derived_data_service_if::types::DerivedData;
+use derived_data_service_if::DerivedData;
 use futures::future::try_join;
 use futures::stream;
 use futures::stream::StreamExt;
 use futures::stream::TryStreamExt;
 use mononoke_types::BonsaiChangeset;
 use mononoke_types::ChangesetId;
-use strum::AsRefStr;
-use strum::Display;
-use strum::EnumString;
+use mononoke_types::DerivableType;
 
 use crate::context::DerivationContext;
-
-/// Enum which consolidates all available derived data types
-/// It provides access to `const &'static str` representation to
-/// use as Name of the derived data type, which is used to
-/// identify or name data (for example lease keys) associated with this
-/// particular derived data type.
-/// It also provides `as_ref()` method for serialization.
-/// and implements FromStr trait for deserialization.
-#[derive(AsRefStr, EnumString, Display, Debug, Clone, PartialEq, Eq, Hash)]
-pub enum DerivableType {
-    BlameV2,
-    BssmV3,
-    ChangesetInfo,
-    DeletedManifests,
-    Fastlog,
-    FileNodes,
-    Fsnodes,
-    HgChangesets,
-    GitTree,
-    GitCommit,
-    GitDeltaManifest,
-    SkeletonManifests,
-    TestManifest,
-    TestShardedManifest,
-    Unodes,
-}
-
-impl DerivableType {
-    const fn name(&self) -> &'static str {
-        match self {
-            DerivableType::BlameV2 => "blame",
-            DerivableType::BssmV3 => "bssm_v3",
-            DerivableType::ChangesetInfo => "changeset_info",
-            DerivableType::DeletedManifests => "deleted_manifest",
-            DerivableType::Fastlog => "fastlog",
-            DerivableType::FileNodes => "filenodes",
-            DerivableType::Fsnodes => "fsnodes",
-            DerivableType::HgChangesets => "hgchangesets",
-            DerivableType::GitTree => "git_trees",
-            DerivableType::GitCommit => "git_commits",
-            DerivableType::GitDeltaManifest => "git_delta_manifests",
-            DerivableType::SkeletonManifests => "skeleton_manifests",
-            DerivableType::TestManifest => "testmanifest",
-            DerivableType::TestShardedManifest => "testshardedmanifest",
-            DerivableType::Unodes => "unodes",
-        }
-    }
-}
+use crate::DerivationError;
+use crate::DerivedDataManager;
+use crate::Rederivation;
 
 /// Defines how derivation occurs.  Each derived data type must implement
 /// `BonsaiDerivable` to describe how to derive a new value from its inputs
@@ -102,6 +57,18 @@ pub trait BonsaiDerivable: Sized + Send + Sync + Clone + Debug + 'static {
     ///
     /// Use the `dependencies!` macro to populate this type.
     type Dependencies: DerivationDependencies;
+
+    /// Types of derived data types which this derived data type
+    /// can use as predecessors for the "predecessors optimization".
+    ///
+    /// This is a technique where you can derive a type from a "predecessor"
+    /// type, which allows to parallelize backfilling of the latter type
+    /// by using the predecessor type to start deriving future commits before
+    /// we have backfilled the latter type.
+    /// Example: SkeletonManifest can be used as a predecessor for BSSM.
+    ///
+    /// Use the `dependencies!` macro to populate this type.
+    type PredecessorDependencies: DerivationDependencies;
 
     /// Derive data for a single changeset.
     ///
@@ -139,7 +106,6 @@ pub trait BonsaiDerivable: Sized + Send + Sync + Clone + Debug + 'static {
         ctx: &CoreContext,
         derivation_ctx: &DerivationContext,
         bonsais: Vec<BonsaiChangeset>,
-        _gap_size: Option<usize>,
     ) -> Result<HashMap<ChangesetId, Self>> {
         let mut res: HashMap<ChangesetId, Self> = HashMap::new();
         // The default implementation must derive sequentially with no
@@ -240,6 +206,24 @@ pub trait DerivationDependencies {
         csid: ChangesetId,
         visited: &mut HashSet<TypeId>,
     ) -> Result<()>;
+    /// Derive all dependent data types for this batch of commits.
+    /// The same pre-conditions apply as in derive.rs
+    async fn derive_exactly_batch_dependencies(
+        ddm: &DerivedDataManager,
+        ctx: &CoreContext,
+        csid: Vec<ChangesetId>,
+        rederivation: Option<Arc<dyn Rederivation>>,
+        visited: &mut HashSet<TypeId>,
+    ) -> Result<Duration, DerivationError>;
+    /// Derive all predecessor data types for this batch of commits.
+    /// The same pre-conditions apply as in derive.rs
+    async fn derive_predecessors(
+        ddm: &DerivedDataManager,
+        ctx: &CoreContext,
+        csid: ChangesetId,
+        rederivation: Option<Arc<dyn Rederivation>>,
+        visited: &mut HashSet<TypeId>,
+    ) -> Result<(), DerivationError>;
 }
 
 #[async_trait]
@@ -250,6 +234,24 @@ impl DerivationDependencies for () {
         _csid: ChangesetId,
         _visited: &mut HashSet<TypeId>,
     ) -> Result<()> {
+        Ok(())
+    }
+    async fn derive_exactly_batch_dependencies(
+        _ddm: &DerivedDataManager,
+        _ctx: &CoreContext,
+        _csid: Vec<ChangesetId>,
+        _rederivation: Option<Arc<dyn Rederivation>>,
+        _visited: &mut HashSet<TypeId>,
+    ) -> Result<Duration, DerivationError> {
+        Ok(Duration::ZERO)
+    }
+    async fn derive_predecessors(
+        _ddm: &DerivedDataManager,
+        _ctx: &CoreContext,
+        _csid: ChangesetId,
+        _rederivation: Option<Arc<dyn Rederivation>>,
+        _visited: &mut HashSet<TypeId>,
+    ) -> Result<(), DerivationError> {
         Ok(())
     }
 }
@@ -276,6 +278,44 @@ where
             Ok(())
         } else {
             Rest::check_dependencies(ctx, derivation_ctx, csid, visited).await
+        }
+    }
+    async fn derive_exactly_batch_dependencies(
+        ddm: &DerivedDataManager,
+        ctx: &CoreContext,
+        csid: Vec<ChangesetId>,
+        rederivation: Option<Arc<dyn Rederivation>>,
+        visited: &mut HashSet<TypeId>,
+    ) -> Result<Duration, DerivationError> {
+        let type_id = TypeId::of::<Derivable>();
+        if visited.insert(type_id) {
+            let res = try_join(
+                ddm.derive_exactly_batch::<Derivable>(ctx, csid.clone(), rederivation.clone()),
+                Rest::derive_exactly_batch_dependencies(ddm, ctx, csid, rederivation, visited),
+            )
+            .await?;
+            Ok(res.0 + res.1)
+        } else {
+            Rest::derive_exactly_batch_dependencies(ddm, ctx, csid, rederivation, visited).await
+        }
+    }
+    async fn derive_predecessors(
+        ddm: &DerivedDataManager,
+        ctx: &CoreContext,
+        csid: ChangesetId,
+        rederivation: Option<Arc<dyn Rederivation>>,
+        visited: &mut HashSet<TypeId>,
+    ) -> Result<(), DerivationError> {
+        let type_id = TypeId::of::<Derivable>();
+        if visited.insert(type_id) {
+            try_join(
+                ddm.derive::<Derivable>(ctx, csid, rederivation.clone()),
+                Rest::derive_predecessors(ddm, ctx, csid, rederivation, visited),
+            )
+            .await?;
+            Ok(())
+        } else {
+            Rest::derive_predecessors(ddm, ctx, csid, rederivation, visited).await
         }
     }
 }

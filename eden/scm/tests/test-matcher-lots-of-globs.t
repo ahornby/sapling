@@ -1,6 +1,7 @@
-#debugruntest-compatible
 
-  $ configure modernclient
+#require no-eden
+
+
 
 Don't crash with lots of glob rules.
 

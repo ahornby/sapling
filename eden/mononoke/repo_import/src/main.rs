@@ -29,6 +29,8 @@ use bookmarks::BookmarkKey;
 use bookmarks::BookmarkUpdateReason;
 use bookmarks::BookmarksRef;
 use borrowed::borrowed;
+use cmdlib_cross_repo::get_all_possible_small_repo_submodule_deps;
+use cmdlib_cross_repo::repo_provider_from_mononoke_app;
 use context::CoreContext;
 use cross_repo_sync::create_commit_syncer_lease;
 use cross_repo_sync::create_commit_syncers;
@@ -38,7 +40,11 @@ use cross_repo_sync::CandidateSelectionHint;
 use cross_repo_sync::CommitSyncContext;
 use cross_repo_sync::CommitSyncOutcome;
 use cross_repo_sync::CommitSyncer;
+use cross_repo_sync::InMemoryRepo;
+use cross_repo_sync::Large;
 use cross_repo_sync::Repo as CrossRepo;
+use cross_repo_sync::SubmoduleDeps;
+use cross_repo_sync::SubmoduleExpansionData;
 use cross_repo_sync::Syncers;
 use derived_data_utils::derived_data_utils;
 use environment::MononokeEnvironment;
@@ -64,6 +70,7 @@ use metaconfig_types::DefaultSmallToLargeCommitSyncPathAction;
 use metaconfig_types::MetadataDatabaseConfig;
 use metaconfig_types::RepoConfig;
 use metaconfig_types::SegmentedChangelogConfig;
+use metaconfig_types::DEFAULT_GIT_SUBMODULE_METADATA_FILE_PREFIX;
 use mononoke_app::args::RepoArgs;
 use mononoke_app::fb303::AliveService;
 use mononoke_app::fb303::Fb303AppExtension;
@@ -78,7 +85,6 @@ use mononoke_types::RepositoryId;
 use movers::DefaultAction;
 use movers::Mover;
 use pushrebase::do_pushrebase_bonsai;
-use repo_derived_data::RepoDerivedDataArc;
 use segmented_changelog::seedheads_from_config;
 use segmented_changelog::SeedHead;
 use segmented_changelog::SegmentedChangelogTailer;
@@ -211,6 +217,7 @@ async fn rewrite_file_paths(
     mover: &Mover,
     gitimport_bcs_ids: &[ChangesetId],
     git_merge_bcs_id: &ChangesetId,
+    submodule_deps: SubmoduleDeps<Repo>,
 ) -> Result<(Vec<ChangesetId>, Option<ChangesetId>), Error> {
     let mut remapped_parents: HashMap<ChangesetId, ChangesetId> = HashMap::new();
     let mut bonsai_changesets = vec![];
@@ -228,6 +235,21 @@ async fn rewrite_file_paths(
 
     for (index, bcs) in gitimport_changesets.iter().enumerate() {
         let bcs_id = bcs.get_changeset_id();
+
+        let large_repo_id = Large(repo.repo_identity().id());
+        let fallback_repos = vec![];
+        let large_in_memory_repo = InMemoryRepo::from_repo(repo, fallback_repos)?;
+        let submodule_expansion_data = match submodule_deps {
+            SubmoduleDeps::ForSync(ref deps) => Some(SubmoduleExpansionData {
+                submodule_deps: deps,
+                x_repo_submodule_metadata_file_prefix: DEFAULT_GIT_SUBMODULE_METADATA_FILE_PREFIX,
+                large_repo_id,
+                large_repo: large_in_memory_repo,
+                dangling_submodule_pointers: vec![],
+            }),
+            SubmoduleDeps::NotNeeded | SubmoduleDeps::NotAvailable => None,
+        };
+
         let rewritten_bcs_opt = rewrite_commit(
             ctx,
             bcs.clone().into_mut(),
@@ -236,10 +258,11 @@ async fn rewrite_file_paths(
             repo,
             Default::default(),
             Default::default(),
+            submodule_expansion_data,
         )
         .await?;
 
-        if let Some(rewritten_bcs_mut) = rewritten_bcs_opt {
+        if let Some(rewritten_bcs_mut) = rewritten_bcs_opt.rewritten {
             let rewritten_bcs = rewritten_bcs_mut.freeze()?;
             let rewritten_bcs_id = rewritten_bcs.get_changeset_id();
             remapped_parents.insert(bcs_id.clone(), rewritten_bcs_id);
@@ -299,7 +322,8 @@ async fn back_sync_commits_to_small_repo(
     let mut synced_bcs_ids = vec![];
     for bcs_id in bcs_ids {
         let (unsynced_ancestors, _) =
-            find_toposorted_unsynced_ancestors(ctx, large_to_small_syncer, bcs_id.clone()).await?;
+            find_toposorted_unsynced_ancestors(ctx, large_to_small_syncer, bcs_id.clone(), None)
+                .await?;
         for ancestor in unsynced_ancestors {
             // It is always safe to use `CandidateSelectionHint::Only` in
             // the large-to-small direction
@@ -385,7 +409,7 @@ async fn derive_bonsais_single_repo(
 
     let derived_utils: Vec<_> = derived_data_types
         .iter()
-        .map(|ty| derived_data_utils(ctx.fb, repo.as_blob_repo(), ty))
+        .map(|ty| derived_data_utils(ctx.fb, repo.as_blob_repo(), *ty))
         .collect::<Result<_, _>>()?;
 
     stream::iter(derived_utils)
@@ -438,7 +462,7 @@ async fn move_bookmark(
     let mut transaction = repo.bookmarks().create_transaction(ctx.clone());
     if maybe_old_csid.is_none() {
         transaction.create(bookmark, old_csid.clone(), BookmarkUpdateReason::ManualMove)?;
-        if !transaction.commit().await? {
+        if transaction.commit().await?.is_none() {
             return Err(format_err!("Logical failure while creating {:?}", bookmark));
         }
         info!(
@@ -470,7 +494,7 @@ async fn move_bookmark(
             BookmarkUpdateReason::ManualMove,
         )?;
 
-        if !transaction.commit().await? {
+        if transaction.commit().await?.is_none() {
             return Err(format_err!("Logical failure while setting {:?}", bookmark));
         }
         info!(
@@ -651,6 +675,7 @@ async fn push_merge_commit(
         repo,
         bookmark_to_merge_into,
         &repo_config.pushrebase,
+        None,
     )?;
 
     let pushrebase_res = do_pushrebase_bonsai(
@@ -958,13 +983,25 @@ async fn get_pushredirected_vars(
             large_repo.name()
         ));
     }
+
+    let live_commit_sync_config = Arc::new(live_commit_sync_config);
+
+    let repo_provider = repo_provider_from_mononoke_app(app);
+    let submodule_deps = get_all_possible_small_repo_submodule_deps(
+        repo.clone(),
+        live_commit_sync_config.clone(),
+        repo_provider,
+    )
+    .await?;
+
     let mapping = open_sql::<SqlSyncedCommitMapping>(ctx.fb, repo.repo_id(), configs, env).await?;
     let syncers = create_commit_syncers(
         ctx,
         repo.clone(),
         large_repo.clone(),
+        submodule_deps,
         mapping.clone(),
-        Arc::new(live_commit_sync_config),
+        live_commit_sync_config,
         x_repo_syncer_lease,
     )?;
 
@@ -1080,7 +1117,7 @@ async fn repo_import(
             &large_repo_config,
             configs,
             env,
-            live_commit_sync_config,
+            live_commit_sync_config.clone(),
         )
         .await?;
 
@@ -1202,12 +1239,21 @@ async fn repo_import(
             .git_merge_bcs_id
             .as_ref()
             .ok_or_else(|| format_err!("gitimported changeset ids are not found"))?;
+
+        let repo_provider = repo_provider_from_mononoke_app(app);
+        let submodule_deps = get_all_possible_small_repo_submodule_deps(
+            repo.clone(),
+            Arc::new(live_commit_sync_config),
+            repo_provider,
+        )
+        .await?;
         let (shifted_bcs_ids, git_merge_shifted_bcs_id) = rewrite_file_paths(
             &ctx,
             &repo,
             &combined_mover,
             gitimport_bcs_ids,
             git_merge_bcs_id,
+            submodule_deps,
         )
         .await?;
 
@@ -1382,7 +1428,7 @@ async fn repo_import(
         BookmarkUpdateReason::ManualMove,
     )?;
 
-    if !transaction.commit().await? {
+    if transaction.commit().await?.is_none() {
         return Err(format_err!(
             "Logical failure while setting {:?} to the merge commit",
             &repo_import_setting.importing_bookmark,

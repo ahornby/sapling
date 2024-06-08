@@ -25,15 +25,18 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use edenapi_trait::EdenApi;
+use edenapi_trait::SaplingRemoteApi;
 pub use edenapi_types::FileAuxData;
 pub use futures;
+use metalog::MetaLog;
 pub use minibytes;
 pub use minibytes::Bytes;
 use once_cell::sync::OnceCell;
+use parking_lot::RwLock;
 use serde::Deserialize;
 use serde::Serialize;
 pub use types;
+use types::fetch_mode::FetchMode;
 pub use types::tree::TreeItemFlag;
 use types::HgId;
 use types::Key;
@@ -53,10 +56,12 @@ pub trait KeyStore: Send + Sync {
     /// - The returned content does not contain raw LFS content. LFS pointer
     ///   is resolved transparently.
     ///
+    /// Fetch mode is ignored in this prototype method
     /// The iterator might block waiting for network.
     fn get_content_iter(
         &self,
         keys: Vec<Key>,
+        _fetch_mode: FetchMode,
     ) -> anyhow::Result<BoxIterator<anyhow::Result<(Key, Bytes)>>> {
         let iter = keys
             .into_iter()
@@ -85,14 +90,21 @@ pub trait KeyStore: Send + Sync {
     /// Read the content of the specified file. Ask a remote server on demand.
     /// When fetching many files, use `get_content_iter` instead of calling
     /// this in a loop.
-    fn get_content(&self, path: &RepoPath, hgid: HgId) -> anyhow::Result<minibytes::Bytes> {
+    fn get_content(
+        &self,
+        path: &RepoPath,
+        hgid: HgId,
+        fetch_mode: FetchMode,
+    ) -> anyhow::Result<minibytes::Bytes> {
         // Handle "broken" implementation that returns Err(_) not Ok(None) on not found.
-        if let Ok(Some(data)) = self.get_local_content(path, hgid) {
-            return Ok(data);
+        if !fetch_mode.is_remote() {
+            if let Ok(Some(data)) = self.get_local_content(path, hgid) {
+                return Ok(data);
+            }
         }
 
         let key = Key::new(path.to_owned(), hgid);
-        match self.get_content_iter(vec![key])?.next() {
+        match self.get_content_iter(vec![key], fetch_mode)?.next() {
             None => Err(anyhow::format_err!("{}@{}: not found remotely", path, hgid)),
             Some(Err(e)) => Err(e),
             Some(Ok((_k, data))) => Ok(data),
@@ -192,20 +204,28 @@ pub trait FileStore: KeyStore + 'static {
     fn get_aux_iter(
         &self,
         keys: Vec<Key>,
+        fetch_mode: FetchMode,
     ) -> anyhow::Result<BoxIterator<anyhow::Result<(Key, FileAuxData)>>> {
-        let iter = self.get_content_iter(keys)?.map(|entry| match entry {
-            Err(e) => Err(e),
-            Ok((key, data)) => Ok((key, FileAuxData::from_content(&data))),
-        });
+        let iter = self
+            .get_content_iter(keys, fetch_mode)?
+            .map(|entry| match entry {
+                Err(e) => Err(e),
+                Ok((key, data)) => Ok((key, FileAuxData::from_content(&data))),
+            });
         Ok(Box::new(iter))
     }
 
     /// Get auxiliary metadata for the given file.
     /// Contact remote server on demand. Might block.
     /// When fetching many files, use `get_aux_iter` instead of calling this in a loop.
-    fn get_aux(&self, path: &RepoPath, id: HgId) -> anyhow::Result<FileAuxData> {
+    fn get_aux(
+        &self,
+        path: &RepoPath,
+        id: HgId,
+        fetch_mode: FetchMode,
+    ) -> anyhow::Result<FileAuxData> {
         let key = Key::new(path.to_owned(), id);
-        match self.get_aux_iter(vec![key])?.next() {
+        match self.get_aux_iter(vec![key], fetch_mode)?.next() {
             None => Err(anyhow::format_err!("{}@{}: not found remotely", path, id)),
             Some(Err(e)) => Err(e),
             Some(Ok((_k, aux))) => Ok(aux),
@@ -222,7 +242,8 @@ pub trait FileStore: KeyStore + 'static {
     /// Get the "raw" content. For LFS this returns its raw pointer.
     /// This is only used by legacy Hg logic and is incompatible with Git.
     fn get_hg_raw_content(&self, path: &RepoPath, id: HgId) -> anyhow::Result<minibytes::Bytes> {
-        self.get_content(path, id)
+        // The default fetch mode is AllowRemote, which accesses both local and remote stores.
+        self.get_content(path, id, FetchMode::AllowRemote)
     }
 
     /// Get the "raw" flags. For LFS this is non-zero.
@@ -296,14 +317,24 @@ pub trait TreeStore: KeyStore {
         Ok(Some(basic_parse_tree(data, self.format())?))
     }
 
+    fn get_remote_tree_iter(
+        &self,
+        _keys: Vec<Key>,
+    ) -> anyhow::Result<BoxIterator<anyhow::Result<(Key, Box<dyn TreeEntry>)>>> {
+        // Function proto, let subclasses implement
+        anyhow::bail!("Remote content iterator is not implemented")
+    }
+
     /// List trees with optional auxiliary metadata.
     /// Get tree entries auxiliary metadata for the given files.
     /// Contact remote server on demand. Might block.
     ///
+    /// Ignores fetch_mode in the default implementation
     /// Currently mainly used by EdenFS.
     fn get_tree_iter(
         &self,
         keys: Vec<Key>,
+        _fetch_mode: FetchMode,
     ) -> anyhow::Result<BoxIterator<anyhow::Result<(Key, Box<dyn TreeEntry>)>>> {
         let iter = keys
             .into_iter()
@@ -390,7 +421,7 @@ pub enum Kind {
     Tree,
 }
 
-/// Provide information about how to build a file and tree store.
+/// Provide information about how to build a file, tree or commit graph backend.
 pub trait StoreInfo: 'static {
     /// Check requirement. Return `true` if the requirement is present.
     fn has_requirement(&self, requirement: &str) -> bool;
@@ -399,7 +430,9 @@ pub trait StoreInfo: 'static {
     /// Provide the "storage path", which is usually `.sl/store` in the backing repo.
     fn store_path(&self) -> &Path;
     /// Provide the remote peer.
-    fn remote_peer(&self) -> anyhow::Result<Option<Arc<dyn EdenApi>>>;
+    fn remote_peer(&self) -> anyhow::Result<Option<Arc<dyn SaplingRemoteApi>>>;
+    // Provide the metalog, useful to sync refs from git.
+    fn metalog(&self) -> anyhow::Result<Arc<RwLock<MetaLog>>>;
 }
 
 /// Provide ways to obtain file and tree stores.

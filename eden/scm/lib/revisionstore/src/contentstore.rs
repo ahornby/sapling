@@ -99,21 +99,23 @@ impl ContentStore {
         let max_bytes_per_log =
             config.get_opt::<ByteCount>("indexedlog", "data.max-bytes-per-log")?;
         let max_bytes = config.get_opt::<ByteCount>("remotefilelog", "cachelimit")?;
-        let config = IndexedLogHgIdDataStoreConfig {
+        let log_config = IndexedLogHgIdDataStoreConfig {
             max_log_count,
             max_bytes_per_log,
             max_bytes,
         };
 
         repair_str += &IndexedLogHgIdDataStore::repair(
+            config,
             get_indexedlogdatastore_path(&shared_path)?,
-            &config,
+            &log_config,
             StoreType::Shared,
         )?;
         if let Some(local_path) = local_path {
             repair_str += &IndexedLogHgIdDataStore::repair(
+                config,
                 get_indexedlogdatastore_path(local_path)?,
-                &config,
+                &log_config,
                 StoreType::Local,
             )?;
         }
@@ -401,6 +403,7 @@ impl<'a> ContentStoreBuilder<'a> {
                     max_bytes,
                 };
                 Arc::new(IndexedLogHgIdDataStore::new(
+                    self.config,
                     get_indexedlogdatastore_path(&cache_path)?,
                     extstored_policy,
                     &config,
@@ -472,6 +475,7 @@ impl<'a> ContentStoreBuilder<'a> {
                             max_bytes: None,
                         };
                         Arc::new(IndexedLogHgIdDataStore::new(
+                            self.config,
                             get_indexedlogdatastore_path(local_path.as_ref().unwrap())?,
                             extstored_policy,
                             &config,
@@ -646,9 +650,9 @@ mod tests {
     use crate::types::ContentHash;
 
     #[cfg(feature = "fb")]
-    fn prepare_lfs_mocks(blob: &TestBlob) -> Vec<Mock> {
-        let m1 = get_lfs_batch_mock(200, &[blob]);
-        let mut m2 = get_lfs_download_mock(200, blob);
+    fn prepare_lfs_mocks(server: &mut mockito::ServerGuard, blob: &TestBlob) -> Vec<Mock> {
+        let m1 = get_lfs_batch_mock(server, 200, &[blob]);
+        let mut m2 = get_lfs_download_mock(server, 200, blob);
         m2.push(m1);
         m2
     }
@@ -863,6 +867,7 @@ mod tests {
             max_bytes: None,
         };
         let store = IndexedLogHgIdDataStore::new(
+            &config,
             get_indexedlogdatastore_path(&localdir)?,
             ExtStoredPolicy::Use,
             &indexed_log_config,
@@ -1000,7 +1005,8 @@ mod tests {
     fn test_lfs_blob() -> Result<()> {
         let cachedir = TempDir::new()?;
         let localdir = TempDir::new()?;
-        let config = make_lfs_config(&cachedir, "test_lfs_blob");
+        let server = mockito::Server::new();
+        let config = make_lfs_config(&server, &cachedir, "test_lfs_blob");
 
         let k1 = key("a", "2");
         let delta = Delta {
@@ -1022,7 +1028,8 @@ mod tests {
     fn test_lfs_metadata() -> Result<()> {
         let cachedir = TempDir::new()?;
         let localdir = TempDir::new()?;
-        let config = make_lfs_config(&cachedir, "test_lfs_metadata");
+        let server = mockito::Server::new();
+        let config = make_lfs_config(&server, &cachedir, "test_lfs_metadata");
 
         let k1 = key("a", "2");
         let data = Bytes::from(&[1, 2, 3, 4, 5][..]);
@@ -1053,7 +1060,8 @@ mod tests {
     fn test_lfs_multiplexer() -> Result<()> {
         let cachedir = TempDir::new()?;
         let localdir = TempDir::new()?;
-        let config = make_lfs_config(&cachedir, "test_lfs_multiplexer");
+        let server = mockito::Server::new();
+        let config = make_lfs_config(&server, &cachedir, "test_lfs_multiplexer");
 
         let k1 = key("a", "2");
         let delta = Delta {
@@ -1076,7 +1084,8 @@ mod tests {
     fn test_repack_one_datapack_lfs() -> Result<()> {
         let cachedir = TempDir::new()?;
         let localdir = TempDir::new()?;
-        let mut config = make_lfs_config(&cachedir, "test_repack_one_datapack_lfs");
+        let server = mockito::Server::new();
+        let mut config = make_lfs_config(&server, &cachedir, "test_repack_one_datapack_lfs");
         setconfig(&mut config, "lfs", "threshold", "10M");
 
         let k1 = key("a", "2");
@@ -1217,9 +1226,10 @@ mod tests {
 
             let cachedir = TempDir::new()?;
             let localdir = TempDir::new()?;
-            let config = make_lfs_config(&cachedir, "test_lfs_remote");
+            let mut server = mockito::Server::new();
+            let config = make_lfs_config(&server, &cachedir, "test_lfs_remote");
             let blob = example_blob();
-            let _lfs_mocks = prepare_lfs_mocks(&blob);
+            let _lfs_mocks = prepare_lfs_mocks(&mut server, &blob);
 
             let k = key("a", "1");
 
@@ -1255,7 +1265,9 @@ mod tests {
         fn test_lfs_fallback_on_missing_blob() -> Result<()> {
             let cachedir = TempDir::new()?;
             let localdir = TempDir::new()?;
-            let mut config = make_lfs_config(&cachedir, "test_lfs_fallback_on_missing_blob");
+            let server = mockito::Server::new();
+            let mut config =
+                make_lfs_config(&server, &cachedir, "test_lfs_fallback_on_missing_blob");
 
             let lfsdir = TempDir::new()?;
             setconfig(
@@ -1323,11 +1335,12 @@ mod tests {
         fn test_lfs_prefetch_once() -> Result<()> {
             let _env_lock = crate::env_lock();
             let blob = example_blob();
-            let _lfs_mocks = prepare_lfs_mocks(&blob);
+            let mut server = mockito::Server::new();
+            let _lfs_mocks = prepare_lfs_mocks(&mut server, &blob);
 
             let cachedir = TempDir::new()?;
             let localdir = TempDir::new()?;
-            let config = make_lfs_config(&cachedir, "test_lfs_prefetch_once");
+            let config = make_lfs_config(&server, &cachedir, "test_lfs_prefetch_once");
 
             let k1 = key("a", "1");
             let k2 = key("a", "2");

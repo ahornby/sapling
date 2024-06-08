@@ -409,7 +409,7 @@ impl Changesets for SqlChangesets {
 
         let fetched_cs = select_many_changesets(
             ctx.fb,
-            ctx.metadata().client_request_info(),
+            ctx.client_request_info(),
             &self.read_connection,
             self.repo_id,
             &cs_ids,
@@ -433,7 +433,7 @@ impl Changesets for SqlChangesets {
                 .increment_counter(PerfCounterType::SqlReadsMaster);
             let mut master_fetched_cs = select_many_changesets(
                 ctx.fb,
-                ctx.metadata().client_request_info(),
+                ctx.client_request_info(),
                 &self.read_master_connection,
                 self.repo_id,
                 &notfetched_cs_ids,
@@ -704,12 +704,14 @@ async fn select_many_changesets(
 
                 let tok: i32 = rand::thread_rng().gen();
 
-                let fetched_changesets = if let Some(cri) = cri {
-                    SelectManyChangesets::traced_query(&conn, &cri, &repo_id, &tok, &cs_ids[..])
-                        .await?
-                } else {
-                    SelectManyChangesets::query(&conn, &repo_id, &tok, &cs_ids[..]).await?
-                };
+                let fetched_changesets = SelectManyChangesets::maybe_traced_query(
+                    &conn,
+                    cri.as_ref(),
+                    &repo_id,
+                    &tok,
+                    &cs_ids[..],
+                )
+                .await?;
 
                 let mut cs_id_to_cs_entry = HashMap::new();
                 for (cs_id, gen, maybe_parent, _, _) in fetched_changesets {

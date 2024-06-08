@@ -1,3 +1,7 @@
+#modern-config-incompatible
+
+#require no-eden
+
 #chg-compatible
   $ setconfig devel.segmented-changelog-rev-compat=true
   $ setconfig experimental.allowfilepeer=True

@@ -30,16 +30,19 @@ use crate::BlobstoreValue;
 use crate::MPathElement;
 use crate::ThriftConvert;
 
-// See docs/basename_suffix_skeleton_manifest.md and mononoke_types_thrift.thrift
+// See docs/basename_suffix_skeleton_manifest.md and serialization/bssm.thrift
 // for more documentation on this.
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(ThriftConvert, Debug, Clone, PartialEq, Eq, Hash)]
+#[thrift(thrift::bssm::BssmV3Entry)]
 pub enum BssmV3Entry {
+    #[thrift(thrift::bssm::BssmV3File)]
     File,
     Directory(BssmV3Directory),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(ThriftConvert, Debug, Clone, PartialEq, Eq, Hash)]
+#[thrift(thrift::bssm::BssmV3Directory)]
 pub struct BssmV3Directory {
     pub subentries: ShardedMapV2Node<BssmV3Entry>,
 }
@@ -70,47 +73,6 @@ impl Loadable for BssmV3Directory {
         _blobstore: &'a B,
     ) -> Result<Self::Value, LoadableError> {
         Ok(self.clone())
-    }
-}
-
-impl ThriftConvert for BssmV3Directory {
-    const NAME: &'static str = "BssmV3Directory";
-    type Thrift = thrift::BssmV3Directory;
-
-    fn from_thrift(t: Self::Thrift) -> Result<Self> {
-        Ok(Self {
-            subentries: ThriftConvert::from_thrift(t.subentries)?,
-        })
-    }
-
-    fn into_thrift(self) -> Self::Thrift {
-        thrift::BssmV3Directory {
-            subentries: self.subentries.into_thrift(),
-        }
-    }
-}
-
-impl ThriftConvert for BssmV3Entry {
-    const NAME: &'static str = "BssmV3Entry";
-    type Thrift = thrift::BssmV3Entry;
-
-    fn from_thrift(t: Self::Thrift) -> Result<Self> {
-        Ok(match t {
-            thrift::BssmV3Entry::file(thrift::BssmV3File {}) => Self::File,
-            thrift::BssmV3Entry::directory(dir) => {
-                Self::Directory(ThriftConvert::from_thrift(dir)?)
-            }
-            thrift::BssmV3Entry::UnknownField(variant) => {
-                anyhow::bail!("Unknown variant: {}", variant)
-            }
-        })
-    }
-
-    fn into_thrift(self) -> Self::Thrift {
-        match self {
-            Self::File => thrift::BssmV3Entry::file(thrift::BssmV3File {}),
-            Self::Directory(dir) => thrift::BssmV3Entry::directory(dir.into_thrift()),
-        }
     }
 }
 
@@ -191,6 +153,18 @@ impl BssmV3Directory {
             .boxed()
     }
 
+    pub fn into_subentries_skip<'a>(
+        self,
+        ctx: &'a CoreContext,
+        blobstore: &'a impl Blobstore,
+        skip: usize,
+    ) -> BoxStream<'a, Result<(MPathElement, BssmV3Entry)>> {
+        self.subentries
+            .into_entries_skip(ctx, blobstore, skip)
+            .and_then(|(k, v)| async move { anyhow::Ok((MPathElement::from_smallvec(k)?, v)) })
+            .boxed()
+    }
+
     pub fn into_prefix_subentries<'a>(
         self,
         ctx: &'a CoreContext,
@@ -199,6 +173,19 @@ impl BssmV3Directory {
     ) -> BoxStream<'a, Result<(MPathElement, BssmV3Entry)>> {
         self.subentries
             .into_prefix_entries(ctx, blobstore, prefix)
+            .map(|res| res.and_then(|(k, v)| anyhow::Ok((MPathElement::from_smallvec(k)?, v))))
+            .boxed()
+    }
+
+    pub fn into_prefix_subentries_after<'a>(
+        self,
+        ctx: &'a CoreContext,
+        blobstore: &'a impl Blobstore,
+        prefix: &'a [u8],
+        after: &'a [u8],
+    ) -> BoxStream<'a, Result<(MPathElement, BssmV3Entry)>> {
+        self.subentries
+            .into_prefix_entries_after(ctx, blobstore, prefix, after)
             .map(|res| res.and_then(|(k, v)| anyhow::Ok((MPathElement::from_smallvec(k)?, v))))
             .boxed()
     }

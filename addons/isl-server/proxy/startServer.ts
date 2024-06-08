@@ -7,7 +7,7 @@
 
 import type {ChildProcessResponse} from './child';
 import type {StartServerArgs, StartServerResult} from './server';
-import type {IOType} from 'child_process';
+import type {IOType} from 'node:child_process';
 import type {PlatformName} from 'isl/src/types';
 
 import {
@@ -16,11 +16,11 @@ import {
   writeExistingServerFile,
 } from './existingServerStateFiles';
 import * as lifecycle from './serverLifecycle';
-import child_process from 'child_process';
-import crypto from 'crypto';
-import fs from 'fs';
-import os from 'os';
-import path from 'path';
+import child_process from 'node:child_process';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 const DEFAULT_PORT = '3001';
 
@@ -250,12 +250,25 @@ function generateToken(): Promise<string> {
 const validPlatforms: Array<PlatformName> = [
   'androidStudio',
   'androidStudioRemote',
-  'standalone',
   'webview',
   'chromelike_app',
 ];
-function isValidCustomPlatform(name: unknown): name is PlatformName {
+function isValidCustomPlatform(name: string): name is PlatformName {
   return validPlatforms.includes(name as PlatformName);
+}
+/** Return the "index" html path like `androidStudio.html`. */
+function getPlatformIndexHtmlPath(name?: string): string {
+  if (name == null || name === 'browser') {
+    return '';
+  }
+  if (name === 'chromelike_app') {
+    // need to match isl/build/.vite/manifest.json
+    return 'chromelikeApp.html';
+  }
+  if (isValidCustomPlatform(name)) {
+    return `${encodeURIComponent(name)}.html`;
+  }
+  return '';
 }
 
 /**
@@ -420,10 +433,7 @@ export async function runProxyMain(args: Args) {
     if (sessionId) {
       urlArgs.sessionId = encodeURIComponent(sessionId);
     }
-    const platformPath =
-      platform && platform !== 'browser' && isValidCustomPlatform(platform)
-        ? `${encodeURIComponent(platform)}.html`
-        : '';
+    const platformPath = getPlatformIndexHtmlPath(platform);
     const url = `http://localhost:${serverPort}/${platformPath}?${Object.entries(urlArgs)
       .map(([key, value]) => `${key}=${value}`)
       .join('&')}`;

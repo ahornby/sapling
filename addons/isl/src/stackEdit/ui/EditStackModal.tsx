@@ -5,24 +5,26 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-import {FlexRow, FlexSpacer, ScrollY} from '../../ComponentUtils';
+import {Row, FlexSpacer, ScrollY, Center} from '../../ComponentUtils';
+import {ErrorNotice} from '../../ErrorNotice';
 import {Modal} from '../../Modal';
 import {tracker} from '../../analytics';
-import {T} from '../../i18n';
+import {T, t} from '../../i18n';
 import {SplitStackEditPanel, SplitStackToolbar} from './SplitStackEditPanel';
 import {StackEditConfirmButtons} from './StackEditConfirmButtons';
 import {StackEditSubTree} from './StackEditSubTree';
 import {loadingStackState, editingStackIntentionHashes} from './stackEditState';
 import {VSCodePanels, VSCodePanelTab, VSCodePanelView} from '@vscode/webview-ui-toolkit/react';
+import {useAtom, useAtomValue} from 'jotai';
 import {useState} from 'react';
-import {useRecoilValue} from 'recoil';
+import {Icon} from 'shared/Icon';
 
 import './EditStackModal.css';
 
 /// Show a <Modal /> when editing a stack.
 export function MaybeEditStackModal() {
-  const loadingState = useRecoilValue(loadingStackState);
-  const [stackIntention, stackHashes] = useRecoilValue(editingStackIntentionHashes);
+  const loadingState = useAtomValue(loadingStackState);
+  const [[stackIntention, stackHashes], setStackIntention] = useAtom(editingStackIntentionHashes);
 
   const isEditing = stackHashes.size > 0;
   const isLoaded = isEditing && loadingState.state === 'hasValue';
@@ -33,17 +35,38 @@ export function MaybeEditStackModal() {
     ) : (
       <LoadedEditStackModal />
     )
+  ) : isEditing ? (
+    <Modal
+      dataTestId="edit-stack-loading"
+      dismiss={() => {
+        // allow dismissing in loading state in case it gets stuck
+        setStackIntention(['general', new Set()]);
+      }}>
+      <Center
+        // add spacing to account for action buttons, so the modal is the same size during and after loading
+        style={{paddingBottom: 'calc(24px + 2 * var(--pad))'}}
+        className={stackIntention === 'split' ? 'interactive-split' : 'edit-stack-modal-panels'}>
+        {loadingState.state === 'hasError' ? (
+          <ErrorNotice error={new Error(loadingState.error)} title={t('Loading stack failed')} />
+        ) : (
+          <Row>
+            <Icon icon="loading" size="M" />
+            {(loadingState.state === 'loading' && loadingState.message) ?? null}
+          </Row>
+        )}
+      </Center>
+    </Modal>
   ) : null;
 }
 
 /** A Modal for dedicated split UI. Subset of `LoadedEditStackModal`. */
 function LoadedSplitModal() {
   return (
-    <Modal>
+    <Modal dataTestId="interactive-split-modal">
       <SplitStackEditPanel />
-      <FlexRow style={{padding: 'var(--pad) 0', justifyContent: 'flex-end'}}>
+      <Row style={{padding: 'var(--pad) 0', justifyContent: 'flex-end'}}>
         <StackEditConfirmButtons />
-      </FlexRow>
+      </Row>
     </Modal>
   );
 }
@@ -106,11 +129,11 @@ function LoadedEditStackModal() {
           {activeTab === 'split' && <SplitStackEditPanel />}
         </VSCodePanelView>
       </VSCodePanels>
-      <FlexRow style={{padding: 'var(--pad) 0', justifyContent: 'flex-end'}}>
+      <Row style={{padding: 'var(--pad) 0', justifyContent: 'flex-end'}}>
         {activeTab === 'split' && <SplitStackToolbar />}
         <FlexSpacer />
         <StackEditConfirmButtons />
-      </FlexRow>
+      </Row>
     </Modal>
   );
 }

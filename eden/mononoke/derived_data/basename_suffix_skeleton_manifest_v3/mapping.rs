@@ -16,7 +16,7 @@ use derived_data_manager::dependencies;
 use derived_data_manager::BonsaiDerivable;
 use derived_data_manager::DerivableType;
 use derived_data_manager::DerivationContext;
-use derived_data_service_if::types as thrift;
+use derived_data_service_if as thrift;
 use futures::stream;
 use futures::StreamExt;
 use futures::TryStreamExt;
@@ -72,7 +72,8 @@ impl RootBssmV3DirectoryId {
 impl BonsaiDerivable for RootBssmV3DirectoryId {
     const VARIANT: DerivableType = DerivableType::BssmV3;
 
-    type Dependencies = dependencies![];
+    type Dependencies = dependencies![RootSkeletonManifestId];
+    type PredecessorDependencies = dependencies![RootSkeletonManifestId];
 
     async fn derive_single(
         ctx: &CoreContext,
@@ -81,7 +82,7 @@ impl BonsaiDerivable for RootBssmV3DirectoryId {
         parents: Vec<Self>,
     ) -> Result<Self> {
         let parent_skeleton_manifests = stream::iter(bonsai.parents())
-            .map(|parent| derivation_ctx.derive_dependency::<RootSkeletonManifestId>(ctx, parent))
+            .map(|parent| derivation_ctx.fetch_dependency::<RootSkeletonManifestId>(ctx, parent))
             .buffered(100)
             .try_collect::<Vec<_>>()
             .await?;
@@ -103,7 +104,7 @@ impl BonsaiDerivable for RootBssmV3DirectoryId {
     ) -> Result<Self> {
         let csid = bonsai.get_changeset_id();
         let skeleton_manifest = derivation_ctx
-            .derive_dependency::<RootSkeletonManifestId>(ctx, csid)
+            .fetch_dependency::<RootSkeletonManifestId>(ctx, csid)
             .await?;
         derive_from_predecessor(ctx, derivation_ctx, skeleton_manifest).await
     }

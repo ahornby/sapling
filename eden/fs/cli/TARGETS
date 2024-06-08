@@ -141,6 +141,7 @@ python_library(
         "doctor/facebook/lib/fake_vscode_extensions_checker.py",
         "doctor/problem.py",
         "doctor/util.py",
+        "file_handler_tools.py",
         "filesystem.py",
         "hg_util.py",
         "logfile.py",
@@ -148,6 +149,7 @@ python_library(
         "overlay.py",
         "prefetch.py",
         "prjfs.py",
+        "prompt.py",
         "rage.py",
         "redirect.py",
         "stats.py",
@@ -170,6 +172,7 @@ python_library(
     ],
     deps = [
         "fbsource//third-party/pypi/filelock:filelock",
+        "fbsource//third-party/pypi/psutil:psutil",
         "fbsource//third-party/pypi/toml:toml",
         "fbsource//third-party/pypi/tqdm:tqdm",
         ":hostname",
@@ -196,10 +199,12 @@ python_library(
         "proc_utils.py",
         "proc_utils_win.py",
     ],
-    os_deps = [(
-        "linux",
-        ["//common/base/pid_info/py:build_info_lib"],
-    )],
+    os_deps = [
+        (
+            "linux",
+            ["//common/base/pid_info/py:build_info_lib"],
+        ),
+    ],
     deps = [
         "//eden/fs/py/eden/thrift:legacy",
     ],

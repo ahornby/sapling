@@ -8,9 +8,11 @@
 import type {ServerSideTracker} from '../analytics/serverSideTracker';
 import type {FullTrackData} from '../analytics/types';
 import type {ServerPlatform} from '../serverPlatform';
+import type {RepositoryContext} from '../serverTypes';
 
-import {Repository, setConfigOverrideForTests} from '../Repository';
+import {Repository} from '../Repository';
 import {makeServerSideTracker} from '../analytics/serverSideTracker';
+import {setConfigOverrideForTests} from '../commands';
 import * as execa from 'execa';
 import {mockLogger} from 'shared/testUtils';
 import {defer} from 'shared/utils';
@@ -24,6 +26,13 @@ const mockTracker = makeServerSideTracker(
   '0.1',
   jest.fn(),
 );
+
+const mockCtx: RepositoryContext = {
+  logger: mockLogger,
+  tracker: mockTracker,
+  cwd: '/test',
+  cmd: 'sl',
+};
 
 jest.mock('../WatchForChanges', () => {
   class MockWatchForChanges {
@@ -140,8 +149,7 @@ describe('track', () => {
         dotdir: '/path/.sl',
         pullRequestDomain: undefined,
       },
-      mockLogger,
-      mockTracker,
+      mockCtx,
     );
     tracker.context.setRepo(repo);
     tracker.track('ClickedRefresh');

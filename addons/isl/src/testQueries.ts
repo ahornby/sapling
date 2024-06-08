@@ -7,25 +7,28 @@
 
 import type {Hash} from './types';
 
-import {
-  commitMessageFieldsSchema,
-  OSSDefaultFieldSchema,
-} from './CommitInfoView/CommitMessageFields';
-import {screen, within, fireEvent, waitFor} from '@testing-library/react';
-import {act} from 'react-dom/test-utils';
-import {snapshot_UNSTABLE} from 'recoil';
-import {unwrap} from 'shared/utils';
+import {commitMessageFieldsSchema} from './CommitInfoView/CommitMessageFields';
+import {OSSCommitMessageFieldSchema} from './CommitInfoView/OSSCommitMessageFieldsSchema';
+import {readAtom} from './jotaiUtils';
+import {individualToggleKey} from './selection';
+import {expectMessageSentToServer} from './testUtils';
+import {screen, within, fireEvent, waitFor, act} from '@testing-library/react';
+import {wait} from '@testing-library/user-event/dist/utils';
+import {nextTick} from 'shared/testUtils';
+import {nullthrows} from 'shared/utils';
 
 export const CommitTreeListTestUtils = {
   withinCommitTree() {
     return within(screen.getByTestId('commit-tree-root'));
   },
 
-  clickGoto(commit: Hash) {
+  async clickGoto(commit: Hash) {
     const myCommit = screen.queryByTestId(`commit-${commit}`);
     const gotoButton = myCommit?.querySelector('.goto-button button');
     expect(gotoButton).toBeDefined();
-    fireEvent.click(gotoButton as Element);
+    await act(async () => {
+      fireEvent.click(gotoButton as Element);
+    });
   },
 };
 
@@ -49,7 +52,7 @@ export const CommitInfoTestUtils = {
     const commit = within(screen.getByTestId(`commit-${hash}`)).queryByTestId('draggable-commit');
     expect(commit).toBeInTheDocument();
     act(() => {
-      fireEvent.click(unwrap(commit), {metaKey: cmdClick === true});
+      fireEvent.click(nullthrows(commit), {[individualToggleKey]: cmdClick === true});
     });
   },
 
@@ -71,14 +74,22 @@ export const CommitInfoTestUtils = {
     });
   },
 
-  clickAmendButton() {
+  async clickAmendButton() {
     const amendButton: HTMLButtonElement | null = within(
       screen.getByTestId('commit-info-actions-bar'),
     ).queryByText('Amend');
     expect(amendButton).toBeInTheDocument();
     act(() => {
-      fireEvent.click(unwrap(amendButton));
+      fireEvent.click(nullthrows(amendButton));
     });
+    await waitFor(() =>
+      expectMessageSentToServer({
+        type: 'runOperation',
+        operation: expect.objectContaining({
+          args: expect.arrayContaining(['amend']),
+        }),
+      }),
+    );
   },
 
   clickAmendMessageButton() {
@@ -87,18 +98,26 @@ export const CommitInfoTestUtils = {
     ).queryByText('Amend Message');
     expect(amendMessageButton).toBeInTheDocument();
     act(() => {
-      fireEvent.click(unwrap(amendMessageButton));
+      fireEvent.click(nullthrows(amendMessageButton));
     });
   },
 
-  clickCommitButton() {
+  async clickCommitButton() {
     const commitButton: HTMLButtonElement | null = within(
       screen.getByTestId('commit-info-actions-bar'),
     ).queryByText('Commit');
     expect(commitButton).toBeInTheDocument();
     act(() => {
-      fireEvent.click(unwrap(commitButton));
+      fireEvent.click(nullthrows(commitButton));
     });
+    await waitFor(() =>
+      expectMessageSentToServer({
+        type: 'runOperation',
+        operation: expect.objectContaining({
+          args: expect.arrayContaining(['commit']),
+        }),
+      }),
+    );
   },
 
   clickCancel() {
@@ -107,7 +126,7 @@ export const CommitInfoTestUtils = {
     expect(cancelButton).toBeInTheDocument();
 
     act(() => {
-      fireEvent.click(unwrap(cancelButton));
+      fireEvent.click(nullthrows(cancelButton));
     });
   },
 
@@ -139,6 +158,14 @@ export const CommitInfoTestUtils = {
   getDescriptionEditor(): HTMLTextAreaElement {
     const textarea = CommitInfoTestUtils.getDescriptionWrapper();
     return (textarea as unknown as {control: HTMLTextAreaElement}).control;
+  },
+
+  /** Get the input element for a given field's editor, according to the field key in the FieldConfig (actually just a div in tests) */
+  getFieldEditor(key: string): HTMLDivElement {
+    const renderKey = key.toLowerCase().replace(/\s/g, '-');
+    const el = screen.getByTestId(`commit-info-${renderKey}-field`) as HTMLDivElement;
+    expect(el).toBeInTheDocument();
+    return el;
   },
 
   descriptionTextContent() {
@@ -222,9 +249,8 @@ export const MergeConflictTestUtils = {
 };
 
 function isInternalMessageFields(): boolean {
-  const snapshot = snapshot_UNSTABLE();
-  const schema = snapshot.getLoadable(commitMessageFieldsSchema).valueOrThrow();
-  return schema !== OSSDefaultFieldSchema;
+  const schema = readAtom(commitMessageFieldsSchema);
+  return schema !== OSSCommitMessageFieldSchema;
 }
 
 /**

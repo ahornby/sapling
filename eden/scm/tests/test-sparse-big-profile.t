@@ -1,6 +1,7 @@
-#debugruntest-compatible
 
-  $ configure modernclient
+#require no-eden
+
+
   $ enable sparse
 
 Don't crash with lots of rules

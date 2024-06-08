@@ -1,4 +1,7 @@
-#debugruntest-compatible
+#modern-config-incompatible
+
+#require no-eden
+
   $ setconfig experimental.allowfilepeer=True
 
   $ configure mutation
@@ -127,7 +130,7 @@ Rebasing G onto H with custom message:
   $ hg clone -q -u $H a a3
   $ cd a3
 
-  $ hg rebase --base 6 -m 'custom message'
+  $ hg rebase --base 6 -m 'custom message' -d .
   abort: message can only be specified with collapse
   [255]
 

@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <tuple>
 
+#include "eden/common/utils/ImmediateFuture.h"
 #include "eden/fs/model/Blob.h"
 #include "eden/fs/model/ObjectId.h"
 #include "eden/fs/model/Tree.h"
@@ -18,14 +19,13 @@
 #include "eden/fs/store/filter/Filter.h"
 #include "eden/fs/store/filter/FilteredObjectId.h"
 #include "eden/fs/utils/FilterUtils.h"
-#include "eden/fs/utils/ImmediateFuture.h"
 
 namespace facebook::eden {
 
 FilteredBackingStore::FilteredBackingStore(
     std::shared_ptr<BackingStore> backingStore,
     std::unique_ptr<Filter> filter)
-    : backingStore_{std::move(backingStore)}, filter_{std::move(filter)} {};
+    : backingStore_{std::move(backingStore)}, filter_{std::move(filter)} {}
 
 FilteredBackingStore::~FilteredBackingStore() = default;
 
@@ -84,23 +84,16 @@ ObjectComparison FilteredBackingStore::compareObjectsById(
   FilteredObjectId filteredTwo = FilteredObjectId::fromObjectId(two);
   auto typeTwo = filteredTwo.objectType();
 
-  // Comparing blob vs tree objects is not valid. However, comparing a normal
-  // tree vs a filtered tree is valid.
+  // We're comparing ObjectIDs of different types. The objects are not equal.
   if (typeOne != typeTwo) {
-    // It doesn't make sense to compare trees and blobs. If this
-    // happens, then the caller must be confused. Throw instead of returning the
-    // obvious answer.
-    if (typeOne == FilteredObjectIdType::OBJECT_TYPE_BLOB ||
-        typeTwo == FilteredObjectIdType::OBJECT_TYPE_BLOB) {
-      throwf<std::invalid_argument>(
-          "Must compare objects of same type. Attempted to compare: {} vs {}",
-          typeOne,
-          typeTwo);
-    } else {
-      // We're comparing a partially filtered tree to a completely filtered
-      // tree. The trees must be different.
-      return ObjectComparison::Different;
-    }
+    XLOGF(
+        DBG2,
+        "Attempted to compare: {} vs {} (types: {} vs {})",
+        filteredOne.getValue(),
+        filteredTwo.getValue(),
+        foidTypeToString(typeOne),
+        foidTypeToString(typeTwo));
+    return ObjectComparison::Different;
   }
 
   // ======= Blob Object Handling =======
@@ -143,7 +136,19 @@ ObjectComparison FilteredBackingStore::compareObjectsById(
         filteredOne.filter(),
         filteredTwo.filter());
     if (pathAffected.isReady()) {
-      return std::move(pathAffected).get();
+      auto filterComparison = std::move(pathAffected).get();
+
+      // If the filters are identical, we need to check whether the underlying
+      // Objects are identical. In other words, the filters being identical is
+      // not enough to confirm that the objects are identical.
+      if (filterComparison == ObjectComparison::Identical) {
+        return backingStore_->compareObjectsById(
+            filteredOne.object(), filteredTwo.object());
+      } else {
+        // If the filter coverage is different, the objects must be filtered
+        // differently (or we can't confirm they're filtered the same way).
+        return filterComparison;
+      }
     } else {
       // We can't immediately tell if the path is affected by the filter
       // change. Instead of chaining the future and queueing up a bunch of
@@ -275,33 +280,32 @@ FilteredBackingStore::getRootTree(
       parsedRootId.value(),
       filterId);
   auto fut = backingStore_->getRootTree(parsedRootId, context);
-  return std::move(fut).thenValue([filterId_2 = std::move(filterId),
-                                   self = shared_from_this()](
-                                      GetRootTreeResult
-                                          rootTreeResult) mutable {
-    // Apply the filter to the root tree. The root tree is always a regular
-    // "unfiltered" tree.
-    auto filterFut = self->filterImpl(
-        rootTreeResult.tree,
-        RelativePath{""},
-        filterId_2,
-        FilteredObjectIdType::OBJECT_TYPE_TREE);
-    return std::move(filterFut).thenValue([self,
-                                           filterId_3 = std::move(filterId_2),
-                                           treeId = std::move(
-                                               rootTreeResult.treeId)](
-                                              std::unique_ptr<
-                                                  PathMap<TreeEntry>> pathMap) {
-      auto rootFOID = FilteredObjectId{RelativePath{""}, filterId_3, treeId};
-      auto res = GetRootTreeResult{
-          std::make_shared<const Tree>(
-              std::move(*pathMap), ObjectId{rootFOID.getValue()}),
-          ObjectId{rootFOID.getValue()},
-      };
-      pathMap.reset();
-      return res;
-    });
-  });
+  return std::move(fut).thenValue(
+      [filterId_2 = std::move(filterId),
+       self = shared_from_this()](GetRootTreeResult rootTreeResult) mutable {
+        // Apply the filter to the root tree. The root tree is always a regular
+        // "unfiltered" tree.
+        auto filterFut = self->filterImpl(
+            rootTreeResult.tree,
+            RelativePath{""},
+            filterId_2,
+            FilteredObjectIdType::OBJECT_TYPE_TREE);
+        return std::move(filterFut).thenValue(
+            [self,
+             filterId_3 = std::move(filterId_2),
+             treeId = std::move(rootTreeResult.treeId)](
+                std::unique_ptr<PathMap<TreeEntry>> pathMap) {
+              auto rootFOID =
+                  FilteredObjectId{RelativePath{""}, filterId_3, treeId};
+              auto res = GetRootTreeResult{
+                  std::make_shared<const Tree>(
+                      std::move(*pathMap), ObjectId{rootFOID.getValue()}),
+                  ObjectId{rootFOID.getValue()},
+              };
+              pathMap.reset();
+              return res;
+            });
+      });
 }
 
 ImmediateFuture<std::shared_ptr<TreeEntry>>
@@ -410,18 +414,16 @@ std::string FilteredBackingStore::renderRootId(const RootId& rootId) {
 }
 
 ObjectId FilteredBackingStore::parseObjectId(folly::StringPiece objectId) {
-  auto oid = ObjectId{objectId};
-  auto foid = FilteredObjectId::fromObjectId(oid);
+  auto foid = FilteredObjectId::parseFilteredObjectId(objectId, backingStore_);
   return ObjectId{foid.getValue()};
 }
 
 std::string FilteredBackingStore::renderObjectId(const ObjectId& id) {
+  XLOGF(DBG8, "Rendering FilteredObjectId: {}", id.asString());
   auto filteredId = FilteredObjectId::fromObjectId(id);
   auto object = filteredId.object();
   auto underlyingOid = backingStore_->renderObjectId(object);
-  auto filterIdString = filteredId.getValue();
-  auto prefix = filterIdString.substr(filterIdString.size() - object.size());
-  return fmt::format("{}{}", folly::hexlify(prefix), underlyingOid);
+  return FilteredObjectId::renderFilteredObjectId(filteredId, underlyingOid);
 }
 
 std::optional<folly::StringPiece> FilteredBackingStore::getRepoName() {

@@ -8,14 +8,6 @@
 import type {Disposable, Hash} from './types';
 import type {ViteHotContext} from 'vite/types/hot';
 
-/**
- * Given a multi-line string, return the first line excluding '\n'.
- * If no newlines in the string, return the whole string.
- */
-export function firstLine(s: string): string {
-  return s.split('\n', 1)[0];
-}
-
 export function firstOfIterable<T>(it: IterableIterator<T>): T | undefined {
   return it.next().value;
 }
@@ -29,6 +21,13 @@ export function assert(shouldBeTrue: boolean, error: string): asserts shouldBeTr
   if (!shouldBeTrue) {
     throw new Error(error);
   }
+}
+
+export function arraysEqual<T>(a: Array<T>, b: Array<T>): boolean {
+  if (a.length !== b.length) {
+    return false;
+  }
+  return a.every((val, i) => b[i] === val);
 }
 
 export type NonNullReactElement = React.ReactElement | React.ReactFragment;
@@ -57,6 +56,8 @@ export function leftPad(val: string | number, len: number, char: string) {
 
 /** Whether running in a test environment. */
 export const isTest = typeof process !== 'undefined' && process.env.NODE_ENV === 'test';
+
+export const isDev = process.env.NODE_ENV === 'development';
 
 const cleanUpRegister = new FinalizationRegistry<() => void>((cleanUp: () => void) => {
   cleanUp();

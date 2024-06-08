@@ -33,6 +33,7 @@ from . import (
     changegroup,
     changelog2,
     color,
+    commitscheme,
     connectionpool,
     context,
     dirstate as dirstatemod,
@@ -369,6 +370,8 @@ class localrepository:
         "windowssymlinks",
         # allows sparse eden (filteredfs) checkouts
         "edensparse",
+        # live inside a ".git"
+        git.DOTGIT_REQUIREMENT,
     }
     _basestoresupported = {
         "visibleheads",
@@ -389,6 +392,8 @@ class localrepository:
         git.GIT_FORMAT_REQUIREMENT,
         # backed by git bare repo
         git.GIT_STORE_REQUIREMENT,
+        # live inside a ".git"
+        git.DOTGIT_REQUIREMENT,
         # lazy commit message (full idmap, partial hgcommits) + edenapi
         "lazytextchangelog",
         # lazy commit message (sparse idmap, partial hgcommits) + edenapi
@@ -399,6 +404,8 @@ class localrepository:
         # backed by Rust eagerepo::EagerRepo. Mainly used in tests or
         # fully local repos.
         eagerepo.EAGEREPO_REQUIREMENT,
+        # explicit requirement for a revlog repo using eager store (i.e. revlog2.py)
+        "eagercompat",
     }
     openerreqs = {"revlogv1", "generaldelta", "treemanifest"}
 
@@ -644,12 +651,23 @@ class localrepository:
 
         # needed by revlog2
         sfmt = self.storage_format()
-        if sfmt == "revlog" or not extensions.isenabled(self.ui, "treemanifest"):
+        if not create and (
+            sfmt == "revlog" or not extensions.isenabled(self.ui, "treemanifest")
+        ):
             from . import revlog2
 
             revlog2.patch_types()
 
             self.svfs._reporef = weakref.ref(self)
+
+            if (
+                "eagercompat" not in self.storerequirements
+                # seems incompatible with legacy lfs extension
+                and not extensions.isenabled(self.ui, "lfs")
+            ):
+                with self.lock(wait=False):
+                    self.storerequirements.add("eagercompat")
+                    self._writestorerequirements()
 
         try:
             self._visibilitymigration()
@@ -1197,7 +1215,7 @@ class localrepository:
 
             fastpathheads = set()
             fastpathcommits, fastpathsegments, fastpathfallbacks = 0, 0, 0
-            for (old, new) in fastpath:
+            for old, new in fastpath:
                 try:
                     commits, segments = bindings.exchange.fastpull(
                         self.ui._rcfg,
@@ -1262,7 +1280,7 @@ class localrepository:
                     "obsolete": False,
                     "updatevisibility": False,
                 }
-                opargs = {"extras": extras}
+                opargs = {"extras": extras, "newpull": True}
                 pullheads = sorted(pullheads)
                 exchange.pull(self, remote, pullheads, opargs=opargs)
 
@@ -1362,11 +1380,6 @@ class localrepository:
             self.ui._rcfg,
         )
 
-    @util.propertycache
-    def _gitcopytrace(self):
-        gitdir = git.readgitdir(self)
-        return bindings.copytrace.gitcopytrace(gitdir)
-
     def _constructmanifest(self):
         # This is a temporary function while we migrate from manifest to
         # manifestlog. It allows bundlerepo to intercept the manifest creation.
@@ -1382,10 +1395,16 @@ class localrepository:
 
     @repofilecache(localpaths=["dirstate"])
     def dirstate(self) -> "dirstatemod.dirstate":
-        if edenfs.requirement in self.requirements:
+        if (
+            edenfs.requirement in self.requirements
+            or git.DOTGIT_REQUIREMENT in self.requirements
+        ):
             return self._eden_dirstate
 
-        if not "treestate" in self.requirements:
+        if (
+            not "treestate" in self.requirements
+            and git.DOTGIT_REQUIREMENT not in self.requirements
+        ):
             raise errormod.RequirementError(
                 "legacy dirstate implementations are no longer supported"
             )
@@ -1438,6 +1457,10 @@ class localrepository:
                 )
 
         return dirstate_reimplementation.eden_dirstate(self, self.ui, self.root)
+
+    @util.propertycache
+    def commitscheme(self):
+        return commitscheme.schemes(self)
 
     def _dirstatevalidate(self, node: bytes) -> bytes:
         self.changelog.rev(node)
@@ -2220,7 +2243,10 @@ class localrepository:
         explicitly read the dirstate again (i.e. restoring it to a previous
         known good state)."""
         # eden_dirstate has its own invalidation logic.
-        if edenfs.requirement in self.requirements:
+        if (
+            edenfs.requirement in self.requirements
+            or git.DOTGIT_REQUIREMENT in self.requirements
+        ):
             self.dirstate.invalidate()
             return
 

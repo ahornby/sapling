@@ -5,30 +5,28 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-import type {Snapshot} from 'recoil';
-
 import {useCommand} from './ISLShortcuts';
 import {Kbd} from './Kbd';
 import {Tooltip} from './Tooltip';
 import {islDrawerState} from './drawerState';
 import {t, T} from './i18n';
-import {writeAtom} from './jotaiUtils';
-import {linearizedCommitHistory, selectedCommits} from './selection';
+import {readAtom, writeAtom} from './jotaiUtils';
+import {dagWithPreviews} from './previews';
+import {selectedCommits} from './selection';
 import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
-import {useRecoilCallback} from 'recoil';
+import {useCallback} from 'react';
 import {Icon} from 'shared/Icon';
 import {KeyCode, Modifier} from 'shared/KeyboardShortcuts';
 
-export function getAllDraftCommits(snapshot: Snapshot): Array<string> {
-  const commits = snapshot.getLoadable(linearizedCommitHistory).valueMaybe();
-  if (commits == null) {
-    return [];
-  }
-  const draftCommits = commits
-    .filter(commit => commit.phase !== 'public' && !commit.hash.startsWith('OPTIMISTIC'))
-    .map(commit => commit.hash);
-  draftCommits.reverse();
-  return draftCommits;
+/** By default, "select all" selects draft, non-obsoleted commits. */
+function getSelectAllCommitHashSet(): Set<string> {
+  const dag = readAtom(dagWithPreviews);
+  return new Set(
+    dag
+      .nonObsolete(dag.draft())
+      .toArray()
+      .filter(hash => !hash.startsWith('OPTIMISTIC')),
+  );
 }
 
 export function useSelectAllCommitsShortcut() {
@@ -37,9 +35,9 @@ export function useSelectAllCommitsShortcut() {
 }
 
 export function useSelectAllCommits() {
-  return useRecoilCallback(({set, snapshot}) => () => {
-    const draftCommits = getAllDraftCommits(snapshot);
-    set(selectedCommits, new Set(draftCommits));
+  return useCallback(() => {
+    const draftCommits = getSelectAllCommitHashSet();
+    writeAtom(selectedCommits, draftCommits);
     // pop open sidebar so you can act on the bulk selection
     writeAtom(islDrawerState, last => ({
       ...last,
@@ -48,7 +46,7 @@ export function useSelectAllCommits() {
         collapsed: false,
       },
     }));
-  });
+  }, []);
 }
 
 export function SelectAllButton({dismiss}: {dismiss: () => unknown}) {

@@ -31,6 +31,7 @@ backfill derived data
   *] Completed derived data command setup for repo repo (glob)
   *] Initiating derived data command execution for repo repo* (glob)
   * using repo "repo" repoid RepositoryId(0)* (glob)
+  * Reloading redacted config from configerator (glob)
   *] Initializing CfgrLiveCommitSyncConfig, repo: repo (glob)
   *] Initialized PushRedirect configerator config, repo: repo (glob)
   *] Initialized all commit sync versions configerator config, repo: repo (glob)
@@ -53,6 +54,7 @@ backfill derived data
   *] Completed derived data command setup for repo repo (glob)
   *] Initiating derived data command execution for repo repo* (glob)
   * using repo "repo" repoid RepositoryId(0)* (glob)
+  * Reloading redacted config from configerator (glob)
   *] Initializing CfgrLiveCommitSyncConfig, repo: repo (glob)
   *] Initialized PushRedirect configerator config, repo: repo (glob)
   *] Initialized all commit sync versions configerator config, repo: repo (glob)
@@ -75,12 +77,13 @@ backfill derived data
   *] Completed derived data command setup for repo repo (glob)
   *] Initiating derived data command execution for repo repo* (glob)
   * using repo "repo" repoid RepositoryId(0)* (glob)
+  * Reloading redacted config from configerator (glob)
   * changeset resolved as: * (glob)
-  *] derive fsnodes for c3384961b16276f2db77df9d7c874bbe981cf0525bd6f84a502f919044f2dabd* (glob)
+  * derive exactly fsnodes batch from c3384961* to c3384961* (glob)
   * derived fsnodes in * (glob)
   *] Finished derived data command execution for repo repo* (glob)
   $ backfill_derived_data single c3384961b16276f2db77df9d7c874bbe981cf0525bd6f84a502f919044f2dabd --all-types 2>&1 | grep 'derived .* in' | wc -l
-  12
+  15
 
   $ testtool_drawdag -R repo <<EOF
   > C-D-E-F-G
@@ -95,5 +98,5 @@ backfill derived data
   G=1c0cf47cdb1ea6e4aa571543bf5047bf8354e354b3b20fa48c16c659df54f26a
   H=ebc9ac5205f2a188f62a5fa43ba092ba4e51744992317aea5b7ee64657c21110
 
-  $ backfill_derived_data backfill-all --parallel --batch-size=10 --changeset $G 2>&1 | grep 'found changesets:'
+  $ backfill_derived_data backfill-all --batch-size=10 --changeset $G 2>&1 | grep 'found changesets:'
   * found changesets: 4 * (glob)

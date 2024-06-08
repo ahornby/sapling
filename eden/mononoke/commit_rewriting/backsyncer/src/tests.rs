@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -21,6 +22,7 @@ use blobstore::Loadable;
 use bonsai_hg_mapping::BonsaiHgMappingRef;
 use bookmarks::BookmarkKey;
 use bookmarks::BookmarkUpdateLogArc;
+use bookmarks::BookmarkUpdateLogId;
 use bookmarks::BookmarkUpdateLogRef;
 use bookmarks::BookmarkUpdateReason;
 use bookmarks::BookmarksArc;
@@ -31,13 +33,14 @@ use cloned::cloned;
 use commit_graph::CommitGraphRef;
 use commit_transformation::upload_commits;
 use context::CoreContext;
-use cross_repo_sync::get_strip_git_submodules_by_version;
+use cross_repo_sync::get_git_submodule_action_by_version;
 use cross_repo_sync::rewrite_commit;
 use cross_repo_sync::CandidateSelectionHint;
 use cross_repo_sync::CommitSyncContext;
 use cross_repo_sync::CommitSyncOutcome;
 use cross_repo_sync::CommitSyncRepos;
 use cross_repo_sync::CommitSyncer;
+use cross_repo_sync::SubmoduleDeps;
 use cross_repo_sync::CHANGE_XREPO_MAPPING_EXTRA;
 use cross_repo_sync_test_utils::TestRepo;
 use fbinit::FacebookInit;
@@ -189,7 +192,12 @@ fn test_sync_entries(fb: FacebookInit) -> Result<(), Error> {
 
         let next_log_entries: Vec<_> = source_repo
             .bookmark_update_log()
-            .read_next_bookmark_log_entries(ctx.clone(), 0, 1000, Freshness::MostRecent)
+            .read_next_bookmark_log_entries(
+                ctx.clone(),
+                BookmarkUpdateLogId(0),
+                1000,
+                Freshness::MostRecent,
+            )
             .try_collect()
             .await?;
 
@@ -200,7 +208,7 @@ fn test_sync_entries(fb: FacebookInit) -> Result<(), Error> {
             &commit_syncer,
             target_repo_dbs.clone(),
             next_log_entries.clone(),
-            0,
+            BookmarkUpdateLogId(0),
             Arc::new(AtomicBool::new(false)),
             CommitSyncContext::Backsyncer,
             false,
@@ -708,6 +716,7 @@ async fn backsync_change_mapping(fb: FacebookInit) -> Result<(), Error> {
     let repos = CommitSyncRepos::LargeToSmall {
         large_repo: source_repo.clone(),
         small_repo: target_repo.clone(),
+        submodule_deps: SubmoduleDeps::ForSync(HashMap::new()),
     };
 
     let current_version = CommitSyncConfigVersion("current_version".to_string());
@@ -726,8 +735,7 @@ async fn backsync_change_mapping(fb: FacebookInit) -> Result<(), Error> {
                     NonRootMPath::new("current_prefix").unwrap(),
                 ),
                 map: hashmap! { },
-                git_submodules_action: Default::default(),
-
+                submodule_config: Default::default(),
             },
         },
         version_name: current_version.clone(),
@@ -744,8 +752,7 @@ async fn backsync_change_mapping(fb: FacebookInit) -> Result<(), Error> {
                     NonRootMPath::new("new_prefix").unwrap(),
                 ),
                 map: hashmap! { },
-                git_submodules_action: Default::default(),
-
+                submodule_config: Default::default(),
             },
         },
         version_name: new_version.clone(),
@@ -919,7 +926,12 @@ async fn backsync_and_verify_master_wc(
     let next_log_entries: Vec<_> = commit_syncer
         .get_source_repo()
         .bookmark_update_log()
-        .read_next_bookmark_log_entries(ctx.clone(), 0, 1000, Freshness::MaybeStale)
+        .read_next_bookmark_log_entries(
+            ctx.clone(),
+            BookmarkUpdateLogId(0),
+            1000,
+            Freshness::MaybeStale,
+        )
         .try_collect()
         .await?;
     let target_repo_dbs = Arc::new(target_repo_dbs);
@@ -1260,7 +1272,7 @@ impl MoverType {
             Noop => SmallRepoCommitSyncConfig {
                 default_action: DefaultSmallToLargeCommitSyncPathAction::Preserve,
                 map: hashmap! {},
-                git_submodules_action: Default::default(),
+                submodule_config: Default::default(),
             },
             Except(files) => {
                 let mut map = hashmap! {};
@@ -1273,7 +1285,7 @@ impl MoverType {
                 SmallRepoCommitSyncConfig {
                     default_action: DefaultSmallToLargeCommitSyncPathAction::Preserve,
                     map,
-                    git_submodules_action: Default::default(),
+                    submodule_config: Default::default(),
                 }
             }
             Only(path) => SmallRepoCommitSyncConfig {
@@ -1283,7 +1295,7 @@ impl MoverType {
                 map: hashmap! {
                     NonRootMPath::new(path).unwrap() => NonRootMPath::new(path).unwrap(),
                 },
-                git_submodules_action: Default::default(),
+                submodule_config: Default::default(),
             },
         }
     }
@@ -1308,7 +1320,7 @@ async fn init_repos(
     let mut factory = TestRepoFactory::new(fb)?;
     let source_repo_id = RepositoryId::new(1);
     let source_repo: TestRepo = factory.with_id(source_repo_id).build().await?;
-    Linear::initrepo(fb, &source_repo).await;
+    Linear::init_repo(fb, &source_repo).await?;
 
     let target_repo_id = RepositoryId::new(2);
     let target_repo: TestRepo = factory.with_id(target_repo_id).build().await?;
@@ -1325,6 +1337,7 @@ async fn init_repos(
     let repos = CommitSyncRepos::LargeToSmall {
         large_repo: source_repo.clone(),
         small_repo: target_repo.clone(),
+        submodule_deps: SubmoduleDeps::ForSync(HashMap::new()),
     };
 
     let empty: BTreeMap<_, Option<&str>> = BTreeMap::new();
@@ -1358,10 +1371,12 @@ async fn init_repos(
 
     let live_commit_sync_config = Arc::new(lv_cfg);
 
-    let git_submodules_action = get_strip_git_submodules_by_version(
+    let git_submodules_action = get_git_submodule_action_by_version(
+        &ctx,
         live_commit_sync_config.clone(),
         &version,
         source_repo_id,
+        target_repo_id,
     )
     .await?;
 
@@ -1369,7 +1384,7 @@ async fn init_repos(
         &ctx,
         mapping.clone(),
         repos,
-        live_commit_sync_config,
+        live_commit_sync_config.clone(),
     );
 
     // Sync first commit manually
@@ -1384,9 +1399,20 @@ async fn init_repos(
     let first_bcs = initial_bcs_id
         .load(&ctx, source_repo.repo_blobstore())
         .await?;
-    upload_commits(&ctx, vec![first_bcs.clone()], &source_repo, &target_repo).await?;
+
+    // No submodules are expanded in backsyncing
+    let submodule_content_ids = Vec::<(Arc<TestRepo>, HashSet<_>)>::new();
+    upload_commits(
+        &ctx,
+        vec![first_bcs.clone()],
+        &source_repo,
+        &target_repo,
+        submodule_content_ids,
+    )
+    .await?;
     let first_bcs_mut = first_bcs.into_mut();
-    let maybe_rewritten = {
+
+    let rewrite_res = {
         let empty_map = HashMap::new();
         cloned!(ctx, source_repo);
         rewrite_commit(
@@ -1397,10 +1423,12 @@ async fn init_repos(
             &source_repo,
             Default::default(),
             git_submodules_action,
+            None, // Submodule expansion data not needed here
         )
         .await
     }?;
-    let rewritten_first_bcs_id = match maybe_rewritten {
+
+    let rewritten_first_bcs_id = match rewrite_res.rewritten {
         Some(mut rewritten) => {
             rewritten.parents.push(initial_commit_in_target);
 
@@ -1649,7 +1677,7 @@ async fn init_merged_repos(
                         NonRootMPath::new(format!("smallrepo{}", small_repo.repo_identity().id().id())).unwrap(),
                     ),
                     map: hashmap! { },
-                    git_submodules_action: Default::default(),
+                    submodule_config: Default::default(),
                 },
             },
             version_name: after_merge_version.clone(),
@@ -1684,6 +1712,7 @@ async fn init_merged_repos(
         let repos = CommitSyncRepos::LargeToSmall {
             large_repo: large_repo.clone(),
             small_repo: small_repo.clone(),
+            submodule_deps: SubmoduleDeps::ForSync(HashMap::new()),
         };
 
         let commit_syncer = CommitSyncer::new_with_live_commit_sync_config(
@@ -1939,6 +1968,7 @@ async fn preserve_premerge_commit(
         let repos = CommitSyncRepos::SmallToLarge {
             large_repo: large_repo.clone(),
             small_repo: small_repo.clone(),
+            submodule_deps: SubmoduleDeps::ForSync(HashMap::new()),
         };
 
         let (lv_cfg, lv_cfg_src) = TestLiveCommitSyncConfig::new_with_source();
@@ -2022,6 +2052,6 @@ async fn move_bookmark(
         }
     }
 
-    assert!(txn.commit().await?);
+    assert!(txn.commit().await?.is_some());
     Ok(())
 }

@@ -27,6 +27,7 @@ use futures::TryStreamExt;
 use nonblocking::non_blocking_result;
 
 use crate::clone::CloneData;
+use crate::default_impl;
 use crate::errors::bug;
 use crate::errors::programming;
 use crate::errors::DagError;
@@ -166,16 +167,13 @@ where
 #[async_trait::async_trait]
 impl<IS, M, P, S> DagPersistent for AbstractNameDag<IdDag<IS>, M, P, S>
 where
-    IS: IdDagStore + Persist,
+    IS: IdDagStore + Persist + StorageVersion,
     IdDag<IS>: TryClone + 'static,
     M: TryClone + IdMapAssignHead + Persist + Send + Sync + 'static,
     P: Open<OpenTarget = Self> + Send + Sync + 'static,
     S: TryClone + StorageVersion + Persist + Send + Sync + 'static,
 {
-    /// Add vertexes and their ancestors to the on-disk DAG.
-    ///
-    /// This is similar to calling `add_heads` followed by `flush`.
-    /// But is faster.
+    // See docstring in ops.rs for details.
     async fn add_heads_and_flush(
         &mut self,
         parents: &dyn Parents,
@@ -363,16 +361,21 @@ where
 impl<IS, M, P, S> AbstractNameDag<IdDag<IS>, M, P, S>
 where
     IS: Send + Sync + 'static,
+    IdDag<IS>: StorageVersion,
     M: Send + Sync + 'static,
     P: Send + Sync + 'static,
-    S: StorageVersion + Send + Sync + 'static,
+    S: Send + Sync + 'static,
 {
     /// Attempt to reuse caches from `other` if two `NameDag`s are compatible.
     /// Usually called when `self` is newly created.
     fn maybe_reuse_caches_from(&mut self, other: &Self) {
-        if self.state.storage_version() != other.state.storage_version()
-            || self.persisted_id_set.as_spans() != other.persisted_id_set.as_spans()
-        {
+        // No need to check IdMap (or "state" which includes both IdDag and IdMap).
+        // If IdMap is changed (ex. by flush_cached_idmap), the cache states
+        // (missing_vertexes_confirmed_by_remote, overlay_map) are still reusable.
+        let dag_version_mismatch = self.dag.storage_version() != other.dag.storage_version();
+        let persisted_id_mismatch =
+            self.persisted_id_set.as_spans() != other.persisted_id_set.as_spans();
+        if dag_version_mismatch || persisted_id_mismatch {
             tracing::debug!(target: "dag::cache", "cannot reuse cache");
             return;
         }
@@ -396,16 +399,7 @@ where
     P: TryClone + Send + Sync + 'static,
     S: TryClone + Send + Sync + 'static,
 {
-    /// Add vertexes and their ancestors to the in-memory DAG.
-    ///
-    /// This does not write to disk. Use `add_heads_and_flush` to add heads
-    /// and write to disk more efficiently.
-    ///
-    /// The added vertexes are immediately query-able.
-    ///
-    /// Note: heads with `reserve_size > 0` must be passed in even if they
-    /// already exist and are not being added to the graph for the id
-    /// reservation to work correctly.
+    // See docstring in ops.rs for details.
     async fn add_heads(
         &mut self,
         parents: &dyn Parents,
@@ -417,18 +411,33 @@ where
         self.populate_missing_vertexes_for_add_heads(parents, &heads.vertexes())
             .await?;
 
-        // heads might require highest_group = MASTER. That might trigger
-        // id re-assigning if the NON_MASTER group is not empty. For simplicity,
-        // we don't want to deal with id reassignment here.
+        // This API takes `heads` with "desired_group"s. When a head already exists in a lower
+        // group than its "desired_group" we need to remove the higher-group id and re-assign
+        // the head and its ancestors to the lower group.
         //
-        // Practically, there are 2 use-cases:
-        // - Server wants highest_group = MASTER and it does not use NON_MASTER.
-        // - Client only needs highest_group = NON_MASTER (default) here.
+        // For simplicity, add_heads is *append-only* and does not want to deal with the
+        // reassignment. So if you have code like:
         //
-        // Support both cases. That is:
-        // - If highest_group = MASTER is specified, then NON_MASTER group
-        //   must be empty to ensure no id reassignment (checked below).
-        // - If highest_group = MASTER is not used, then it's okay whatever.
+        //    let set1 = dag.range(x, y); // set1 is associated with the current dag, "dag v1".
+        //    dag.add_heads(...);
+        //    let set2 = dag.range(p, q); // set2 is associated with the updated dag, "dag v2".
+        //    let set3 = set2 & set1;
+        //
+        // The `set3` understands that the "dag v2" is a superset of "dag v1" (because add_heads
+        // does not strip ids), and can use fast paths - it can assume same ids in set2 and set3
+        // mean the same vertexes and ensure set3 is associated with "dag v2". If `add_heads`
+        // strips out commits, then the fast paths (note: not just for set3, also p and q) cannot
+        // be used.
+        //
+        // Practically, `heads` match one of these patterns:
+        // - (This use-case is going away): desired_group = MASTER for all heads. This is used by
+        //   old Mononoke server-side logic. The server only indexes the "main" branch. All vertexes
+        //   are in the MASTER group. To avoid misuse by the client-side, we check that there
+        //   is nothing outisde the MASTER group.
+        // - desired_group = NON_MASTER for all heads. This is used by Sapling client.
+        //   It might use desired_group = MASTER on add_heads_and_flush, but not here.
+        //
+        // In the future, desired_group might be VIRTUAL and needs special care.
         let master_heads = heads.vertexes_by_group(Group::MASTER);
         if !master_heads.is_empty() {
             let all = self.dag.all()?;
@@ -438,9 +447,9 @@ where
             };
             if has_non_master {
                 return programming(concat!(
-                    "add_heads() called with highest_group = MASTER but NON_MASTER group is not empty. ",
+                    "add_heads() called with desired_group = MASTER but NON_MASTER group is not empty. ",
                     "To avoid id reassignment this is not supported. ",
-                    "Pass highest_group = NON_MASTER, and call flush() (common on client use-case), ",
+                    "Pass desired_group = NON_MASTER, and call flush() (common on client use-case), ",
                     "or avoid inserting to NON_MASTER group (common on server use-case).",
                 ));
             }
@@ -463,14 +472,14 @@ where
         let mut reserved = calculate_initial_reserved(self, &covered, heads).await?;
         for (head, opts) in heads.vertex_options() {
             let need_assigning = match self
-                .vertex_id_with_max_group(&head, opts.highest_group)
+                .vertex_id_with_max_group(&head, opts.desired_group)
                 .await?
             {
                 Some(id) => !self.dag.contains_id(id)?,
                 None => true,
             };
             if need_assigning {
-                let group = opts.highest_group;
+                let group = opts.desired_group;
                 let prepared_segments = self
                     .assign_head(head.clone(), parents, group, &mut covered, &reserved)
                     .await?;
@@ -495,10 +504,10 @@ where
 impl<IS, M, P, S> DagStrip for AbstractNameDag<IdDag<IS>, M, P, S>
 where
     IS: IdDagStore + Persist,
-    IdDag<IS>: TryClone,
+    IdDag<IS>: TryClone + StorageVersion,
     M: TryClone + Persist + IdMapWrite + IdConvert + Send + Sync + 'static,
     P: TryClone + Open<OpenTarget = Self> + Send + Sync + 'static,
-    S: TryClone + StorageVersion + Persist + Send + Sync + 'static,
+    S: TryClone + Persist + Send + Sync + 'static,
 {
     async fn strip(&mut self, set: &NameSet) -> Result<()> {
         if !self.pending_heads.is_empty() {
@@ -684,11 +693,12 @@ where
 impl<IS, M, P, S> DagImportPullData for AbstractNameDag<IdDag<IS>, M, P, S>
 where
     IS: IdDagStore + Persist,
-    IdDag<IS>: TryClone,
+    IdDag<IS>: TryClone + StorageVersion,
     M: TryClone + IdMapAssignHead + Persist + Send + Sync + 'static,
     P: Open<OpenTarget = Self> + TryClone + Send + Sync + 'static,
-    S: StorageVersion + TryClone + Persist + Send + Sync + 'static,
+    S: TryClone + Persist + Send + Sync + 'static,
 {
+    // See docstring in ops.py for details.
     async fn import_pull_data(
         &mut self,
         clone_data: CloneData<VertexName>,
@@ -1511,7 +1521,7 @@ where
         let overlay = self.overlay_map.read().unwrap();
         let mut names = Vec::with_capacity(ids.len());
         for &id in ids {
-            if let Some(name) = overlay.lookup_vertex_name(id) {
+            if let Some(name) = overlay.lookup_vertex_name(id).cloned() {
                 names.push(name);
             } else {
                 return id.not_found();
@@ -1986,6 +1996,15 @@ where
         Ok(result)
     }
 
+    async fn suggest_bisect(
+        &self,
+        roots: NameSet,
+        heads: NameSet,
+        skip: NameSet,
+    ) -> Result<(Option<VertexName>, NameSet, NameSet)> {
+        default_impl::suggest_bisect(self, roots, heads, skip).await
+    }
+
     /// Vertexes buffered in memory, not yet written to disk.
     async fn dirty(&self) -> Result<NameSet> {
         let all = self.dag().all()?;
@@ -2137,7 +2156,13 @@ where
         match self.map.vertex_name(id).await {
             Ok(name) => Ok(name),
             Err(crate::Error::IdNotFound(_)) if self.is_vertex_lazy() => {
-                if let Some(name) = self.overlay_map.read().unwrap().lookup_vertex_name(id) {
+                if let Some(name) = self
+                    .overlay_map
+                    .read()
+                    .unwrap()
+                    .lookup_vertex_name(id)
+                    .cloned()
+                {
                     return Ok(name);
                 }
                 // Only ids <= max(MASTER group) can be lazy.
@@ -2223,7 +2248,7 @@ where
             {
                 let map = self.overlay_map.read().unwrap();
                 for (r, id) in list.iter_mut().zip(ids) {
-                    if let Some(name) = map.lookup_vertex_name(*id) {
+                    if let Some(name) = map.lookup_vertex_name(*id).cloned() {
                         *r = Ok(name);
                     }
                 }
@@ -2393,7 +2418,7 @@ where
             let mut reserved = calculate_initial_reserved(self, &covered, heads).await?;
             for group in [Group::MASTER, Group::NON_MASTER] {
                 for (vertex, opts) in heads.vertex_options() {
-                    if opts.highest_group != group {
+                    if opts.desired_group != group {
                         continue;
                     }
                     // Important: do not call self.map.assign_head. It does not trigger
@@ -2483,7 +2508,7 @@ async fn calculate_initial_reserved(
             continue;
         }
         if let Some(id) = map
-            .vertex_id_with_max_group(&vertex, opts.highest_group)
+            .vertex_id_with_max_group(&vertex, opts.desired_group)
             .await?
         {
             update_reserved(&mut reserved, covered, id + 1, opts.reserve_size);

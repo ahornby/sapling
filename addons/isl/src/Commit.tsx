@@ -7,18 +7,19 @@
 
 import type {DagCommitInfo} from './dag/dag';
 import type {CommitInfo, SuccessorInfo} from './types';
-import type {Snapshot} from 'recoil';
+import type {ReactNode} from 'react';
 import type {ContextMenuItem} from 'shared/ContextMenu';
 
-import {globalRecoil} from './AccessGlobalRecoil';
-import {Avatar} from './Avatar';
-import {BranchIndicator} from './BranchIndicator';
-import {commitMode, hasUnsavedEditedCommitMessage} from './CommitInfoView/CommitInfoState';
+import {Bookmarks} from './Bookmark';
+import {openBrowseUrlForHash, supportsBrowseUrlForHash} from './BrowseRepo';
+import {hasUnsavedEditedCommitMessage} from './CommitInfoView/CommitInfoState';
 import {currentComparisonMode} from './ComparisonView/atoms';
-import {FlexRow} from './ComponentUtils';
+import {Row} from './ComponentUtils';
+import {DragToRebase} from './DragToRebase';
 import {EducationInfoTip} from './Education';
-import {HighlightCommitsWhileHovering, isHighlightedCommit} from './HighlightedCommits';
-import {InlineBadge} from './InlineBadge';
+import {HighlightCommitsWhileHovering} from './HighlightedCommits';
+import {Internal} from './Internal';
+import {SubmitSelectionButton} from './SubmitSelectionButton';
 import {Subtle} from './Subtle';
 import {latestSuccessorUnlessExplicitlyObsolete} from './SuccessionTracker';
 import {getSuggestedRebaseOperation, suggestedRebaseDestinations} from './SuggestedRebase';
@@ -26,69 +27,52 @@ import {Tooltip} from './Tooltip';
 import {UncommitButton} from './UncommitButton';
 import {UncommittedChanges} from './UncommittedChanges';
 import {tracker} from './analytics';
-import {codeReviewProvider, latestCommitMessageTitle} from './codeReview/CodeReviewInfo';
-import {DiffInfo} from './codeReview/DiffBadge';
+import {clipboardLinkHtml} from './clipboard';
+import {
+  codeReviewProvider,
+  diffSummary,
+  latestCommitMessageTitle,
+} from './codeReview/CodeReviewInfo';
+import {DiffFollower, DiffInfo} from './codeReview/DiffBadge';
 import {SyncStatus, syncStatusAtom} from './codeReview/syncStatus';
-import {islDrawerState} from './drawerState';
 import {FoldButton, useRunFoldPreview} from './fold';
+import {findPublicBaseAncestor} from './getCommitTree';
 import {t, T} from './i18n';
 import {IconStack} from './icons/IconStack';
-import {writeAtom} from './jotaiUtils';
+import {atomFamilyWeak, readAtom, writeAtom} from './jotaiUtils';
+import {CONFLICT_SIDE_LABELS} from './mergeConflicts/state';
 import {getAmendToOperation, isAmendToAllowedForCommit} from './operationUtils';
 import {GotoOperation} from './operations/GotoOperation';
 import {HideOperation} from './operations/HideOperation';
-import {RebaseOperation} from './operations/RebaseOperation';
-import {CommitPreview, uncommittedChangesWithPreviews} from './previews';
-import {RelativeDate} from './relativeDate';
-import {isNarrowCommitTree} from './responsive';
-import {selectedCommits, useCommitSelection} from './selection';
 import {
-  inlineProgressByHash,
-  isFetchingUncommittedChanges,
-  latestDag,
-  latestUncommittedChanges,
   operationBeingPreviewed,
   useRunOperation,
   useRunPreviewedOperation,
-} from './serverAPIState';
+  inlineProgressByHash,
+} from './operationsState';
+import platform from './platform';
+import {CommitPreview, dagWithPreviews, uncommittedChangesWithPreviews} from './previews';
+import {RelativeDate, relativeDate} from './relativeDate';
+import {isNarrowCommitTree} from './responsive';
+import {selectedCommits, useCommitCallbacks} from './selection';
+import {inMergeConflicts, mergeConflicts} from './serverAPIState';
 import {useConfirmUnsavedEditsBeforeSplit} from './stackEdit/ui/ConfirmUnsavedEditsBeforeSplit';
 import {SplitButton} from './stackEdit/ui/SplitButton';
 import {editingStackIntentionHashes} from './stackEdit/ui/stackEditState';
-import {useShowToast} from './toast';
+import {copyAndShowToast} from './toast';
 import {succeedableRevset} from './types';
 import {short} from './utils';
-import {VSCodeButton, VSCodeTag} from '@vscode/webview-ui-toolkit/react';
-import {useAtomValue} from 'jotai';
-import React, {memo, useEffect, useState} from 'react';
-import {useRecoilCallback, useRecoilValue, useSetRecoilState} from 'recoil';
+import * as stylex from '@stylexjs/stylex';
+import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
+import {atom, useAtomValue, useSetAtom} from 'jotai';
+import {useAtomCallback} from 'jotai/utils';
+import React, {memo} from 'react';
 import {ComparisonType} from 'shared/Comparison';
 import {useContextMenu} from 'shared/ContextMenu';
 import {Icon} from 'shared/Icon';
+import {MS_PER_DAY} from 'shared/constants';
 import {useAutofocusRef} from 'shared/hooks';
 import {notEmpty} from 'shared/utils';
-
-function isDraggablePreview(previewType?: CommitPreview): boolean {
-  switch (previewType) {
-    // dragging preview descendants would be confusing (it would reset part of your drag),
-    // you probably meant to drag the root.
-    case CommitPreview.REBASE_DESCENDANT:
-    // old commits are already being dragged
-    case CommitPreview.REBASE_OLD:
-    case CommitPreview.HIDDEN_ROOT:
-    case CommitPreview.HIDDEN_DESCENDANT:
-      return false;
-
-    // you CAN let go of the preview and drag it again
-    case CommitPreview.REBASE_ROOT:
-    // optimistic rebase commits act like normal, they can be dragged just fine
-    case CommitPreview.REBASE_OPTIMISTIC_DESCENDANT:
-    case CommitPreview.REBASE_OPTIMISTIC_ROOT:
-    case undefined:
-    // other unrelated previews are draggable
-    default:
-      return true;
-  }
-}
 
 /**
  * Some preview types should not allow actions on top of them
@@ -110,67 +94,54 @@ function previewPreventsActions(preview?: CommitPreview): boolean {
   return false;
 }
 
+const commitLabelForCommit = atomFamilyWeak((hash: string) =>
+  atom(get => {
+    const conflicts = get(mergeConflicts);
+    const {localShort, incomingShort} = CONFLICT_SIDE_LABELS;
+    const hashes = conflicts?.hashes;
+    if (hash === hashes?.other) {
+      return incomingShort;
+    } else if (hash === hashes?.local) {
+      return localShort;
+    }
+    return null;
+  }),
+);
+
 export const Commit = memo(
   ({
     commit,
     previewType,
     hasChildren,
-    bodyOnly = false,
   }: {
     commit: DagCommitInfo | CommitInfo;
     previewType?: CommitPreview;
     hasChildren: boolean;
-    bodyOnly?: boolean;
   }) => {
     const isPublic = commit.phase === 'public';
     const isObsoleted = commit.successorInfo != null;
 
     const handlePreviewedOperation = useRunPreviewedOperation();
     const runOperation = useRunOperation();
-    const setEditStackIntentionHashes = useSetRecoilState(editingStackIntentionHashes);
+    const setEditStackIntentionHashes = useSetAtom(editingStackIntentionHashes);
 
-    const isHighlighted = useAtomValue(isHighlightedCommit(bodyOnly ? '' : commit.hash));
+    const inlineProgress = useAtomValue(inlineProgressByHash(commit.hash));
 
-    const inlineProgress = useRecoilValue(inlineProgressByHash(commit.hash));
-
-    const {isSelected, onClickToSelect, overrideSelection} = useCommitSelection(commit.hash);
+    const {isSelected, onDoubleClickToShowDrawer} = useCommitCallbacks(commit);
     const actionsPrevented = previewPreventsActions(previewType);
+
+    const inConflicts = useAtomValue(inMergeConflicts);
 
     const isNarrow = useAtomValue(isNarrowCommitTree);
 
-    const title = useRecoilValue(latestCommitMessageTitle(commit.hash));
+    const title = useAtomValue(latestCommitMessageTitle(commit.hash));
 
-    const toast = useShowToast();
-    const clipboardCopy = (text: string) => toast.copyAndShowToast(text);
+    const commitLabel = useAtomValue(commitLabelForCommit(commit.hash));
 
-    const isNonActionable = previewType === CommitPreview.NON_ACTIONABLE_COMMIT;
+    const clipboardCopy = (text: string, url?: string) =>
+      copyAndShowToast(text, url == null ? undefined : clipboardLinkHtml(text, url));
 
-    const onDoubleClickToShowDrawer = useRecoilCallback(
-      ({set}) =>
-        () => {
-          // Select the commit if it was deselected.
-          if (!isSelected) {
-            overrideSelection([commit.hash]);
-          }
-          // Show the drawer.
-          writeAtom(islDrawerState, state => ({
-            ...state,
-            right: {
-              ...state.right,
-              collapsed: false,
-            },
-          }));
-          if (commit.isHead) {
-            // if we happened to be in commit mode, swap to amend mode so you see the details instead
-            set(commitMode, 'amend');
-          }
-        },
-      [overrideSelection, isSelected, commit.hash, commit.isHead],
-    );
-
-    const setOperationBeingPreviewed = useSetRecoilState(operationBeingPreviewed);
-
-    const viewChangesCallback = useRecoilCallback(({set}) => () => {
+    const viewChangesCallback = useAtomCallback((_get, set) => {
       set(currentComparisonMode, {
         comparison: {type: ComparisonType.Committed, hash: commit.hash},
         visible: true,
@@ -186,10 +157,9 @@ export const Commit = memo(
       tracker.track('SplitOpenFromCommitContextMenu');
     }
 
-    const makeContextMenuOptions = useRecoilCallback(({snapshot, set}) => () => {
-      const hasUncommittedChanges =
-        (snapshot.getLoadable(uncommittedChangesWithPreviews).valueMaybe()?.length ?? 0) > 0;
-      const syncStatus = snapshot.getLoadable(syncStatusAtom).valueMaybe()?.get(commit.hash);
+    const makeContextMenuOptions = () => {
+      const hasUncommittedChanges = (readAtom(uncommittedChangesWithPreviews).length ?? 0) > 0;
+      const syncStatus = readAtom(syncStatusAtom)?.get(commit.hash);
 
       const items: Array<ContextMenuItem> = [
         {
@@ -197,10 +167,27 @@ export const Commit = memo(
           onClick: () => clipboardCopy(commit.hash),
         },
       ];
+      if (isPublic && readAtom(supportsBrowseUrlForHash)) {
+        items.push({
+          label: (
+            <Row>
+              <T>Browse Repo At This Commit</T>
+              <Icon icon="link-external" />
+            </Row>
+          ),
+          onClick: () => {
+            openBrowseUrlForHash(commit.hash);
+          },
+        });
+      }
       if (!isPublic && commit.diffId != null) {
         items.push({
           label: <T replace={{$number: commit.diffId}}>Copy Diff Number "$number"</T>,
-          onClick: () => clipboardCopy(commit.diffId ?? ''),
+          onClick: () => {
+            const info = readAtom(diffSummary(commit.diffId));
+            const url = info?.value?.url;
+            clipboardCopy(commit.diffId ?? '', url);
+          },
         });
       }
       if (!isPublic) {
@@ -209,16 +196,13 @@ export const Commit = memo(
           onClick: viewChangesCallback,
         });
       }
-      if (
-        !isPublic &&
-        (syncStatus === SyncStatus.LocalIsNewer || syncStatus === SyncStatus.RemoteIsNewer)
-      ) {
-        const provider = snapshot.getLoadable(codeReviewProvider).valueMaybe();
+      if (!isPublic && syncStatus != null && syncStatus !== SyncStatus.InSync) {
+        const provider = readAtom(codeReviewProvider);
         if (provider?.supportsComparingSinceLastSubmit) {
           items.push({
             label: <T replace={{$provider: provider?.label ?? 'remote'}}>Compare with $provider</T>,
             onClick: () => {
-              set(currentComparisonMode, {
+              writeAtom(currentComparisonMode, {
                 comparison: {type: ComparisonType.SinceLastCodeReviewSubmit, hash: commit.hash},
                 visible: true,
               });
@@ -226,9 +210,8 @@ export const Commit = memo(
           });
         }
       }
-      if (!isPublic && !actionsPrevented) {
-        bodyOnly || items.push({type: 'divider'});
-        const suggestedRebases = snapshot.getLoadable(suggestedRebaseDestinations).valueMaybe();
+      if (!isPublic && !actionsPrevented && !inConflicts) {
+        const suggestedRebases = readAtom(suggestedRebaseDestinations);
         items.push({
           label: 'Rebase onto',
           type: 'submenu',
@@ -244,10 +227,10 @@ export const Commit = memo(
               },
             })) ?? [],
         });
-        if (isAmendToAllowedForCommit(commit, snapshot)) {
+        if (isAmendToAllowedForCommit(commit)) {
           items.push({
             label: <T>Amend changes to here</T>,
-            onClick: () => runOperation(getAmendToOperation(commit, snapshot)),
+            onClick: () => runOperation(getAmendToOperation(commit)),
           });
         }
         if (!isObsoleted) {
@@ -268,13 +251,14 @@ export const Commit = memo(
         items.push({
           label: hasChildren ? <T>Hide Commit and Descendants</T> : <T>Hide Commit</T>,
           onClick: () =>
-            setOperationBeingPreviewed(
+            writeAtom(
+              operationBeingPreviewed,
               new HideOperation(latestSuccessorUnlessExplicitlyObsolete(commit)),
             ),
         });
       }
       return items;
-    });
+    };
 
     const contextMenu = useContextMenu(makeContextMenuOptions);
 
@@ -290,7 +274,20 @@ export const Commit = memo(
           </VSCodeButton>
           <VSCodeButton
             appearance="primary"
-            onClick={() => handlePreviewedOperation(/* cancel */ false)}>
+            onClick={() => {
+              handlePreviewedOperation(/* cancel */ false);
+
+              const dag = readAtom(dagWithPreviews);
+              const onto = dag.get(commit.parents[0]);
+              if (onto) {
+                tracker.track('ConfirmDragAndDropRebase', {
+                  extras: {
+                    remoteBookmarks: onto.remoteBookmarks,
+                    locations: onto.stableCommitMetadata?.map(s => s.value),
+                  },
+                });
+              }
+            }}>
             <T>Run Rebase</T>
           </VSCodeButton>
         </React.Fragment>,
@@ -311,10 +308,13 @@ export const Commit = memo(
     }
 
     if (!isPublic && !actionsPrevented && isSelected) {
-      commitActions.push(<FoldButton key="fold-button" commit={commit} />);
+      commitActions.push(
+        <SubmitSelectionButton key="submit-selection-btn" commit={commit} />,
+        <FoldButton key="fold-button" commit={commit} />,
+      );
     }
 
-    if (!actionsPrevented && !commit.isHead) {
+    if (!actionsPrevented && !commit.isDot) {
       commitActions.push(
         <span className="goto-button" key="goto-button">
           <Tooltip
@@ -325,20 +325,24 @@ export const Commit = memo(
             <VSCodeButton
               appearance="secondary"
               aria-label={t('Go to commit "$title"', {replace: {$title: commit.title}})}
-              onClick={event => {
-                runOperation(
-                  new GotoOperation(
-                    // If the commit has a remote bookmark, use that instead of the hash. This is easier to read in the command history
-                    // and works better with optimistic state
-                    commit.remoteBookmarks.length > 0
-                      ? succeedableRevset(commit.remoteBookmarks[0])
-                      : latestSuccessorUnlessExplicitlyObsolete(commit),
-                  ),
-                );
+              onClick={async event => {
                 event.stopPropagation(); // don't toggle selection by letting click propagate onto selection target.
-                // Instead, ensure we remove the selection, so we view the new head commit by default
+
+                const dest =
+                  // If the commit has a remote bookmark, use that instead of the hash. This is easier to read in the command history
+                  // and works better with optimistic state
+                  commit.remoteBookmarks.length > 0
+                    ? succeedableRevset(commit.remoteBookmarks[0])
+                    : latestSuccessorUnlessExplicitlyObsolete(commit);
+                const shouldContinue = await maybeWarnAboutOldDestination(commit);
+                if (!shouldContinue) {
+                  return;
+                }
+                runOperation(new GotoOperation(dest));
+
+                // Instead of propagating, ensure we remove the selection, so we view the new head commit by default
                 // (since the head commit is the default thing shown in the sidebar)
-                globalRecoil().reset(selectedCommits);
+                writeAtom(selectedCommits, new Set());
               }}>
               <T>Goto</T> <Icon icon="newline" />
             </VSCodeButton>
@@ -347,11 +351,13 @@ export const Commit = memo(
       );
     }
 
-    if (!isPublic && !actionsPrevented && commit.isHead) {
+    if (!isPublic && !actionsPrevented && commit.isDot && !inConflicts) {
       commitActions.push(<UncommitButton key="uncommit" />);
     }
-    if (!isPublic && !actionsPrevented && commit.isHead && !isObsoleted) {
-      commitActions.push(<SplitButton key="split" commit={commit} />);
+    if (!isPublic && !actionsPrevented && commit.isDot && !isObsoleted && !inConflicts) {
+      commitActions.push(
+        <SplitButton icon key="split" trackerEventName="SplitOpenFromHeadCommit" commit={commit} />,
+      );
     }
 
     if (!isPublic && !actionsPrevented) {
@@ -364,7 +370,7 @@ export const Commit = memo(
       );
     }
 
-    if (bodyOnly && (commit as DagCommitInfo).isYouAreHere) {
+    if ((commit as DagCommitInfo).isYouAreHere) {
       return (
         <div className="head-commit-info">
           <UncommittedChanges place="main" />
@@ -376,58 +382,34 @@ export const Commit = memo(
       <div
         className={
           'commit' +
-          (commit.isHead ? ' head-commit' : '') +
-          (commit.successorInfo != null ? ' obsolete' : '') +
-          (isHighlighted ? ' highlighted' : '') +
-          (isPublic || hasChildren || bodyOnly ? '' : ' topmost')
+          (commit.isDot ? ' head-commit' : '') +
+          (commit.successorInfo != null ? ' obsolete' : '')
         }
         onContextMenu={contextMenu}
         data-testid={`commit-${commit.hash}`}>
-        {!isNonActionable &&
-        !bodyOnly &&
-        (commit.isHead || previewType === CommitPreview.GOTO_PREVIOUS_LOCATION) ? (
-          <HeadCommitInfo commit={commit} previewType={previewType} hasChildren={hasChildren} />
-        ) : null}
-        <div className={'commit-rows' + (isSelected ? ' selected-commit' : '')}>
-          {isSelected ? (
-            <div className="selected-commit-background" data-testid="selected-commit" />
-          ) : null}
-          <DraggableCommit
+        <div className={'commit-rows'} data-testid={isSelected ? 'selected-commit' : undefined}>
+          <DragToRebase
             className={
               'commit-details' + (previewType != null ? ` commit-preview-${previewType}` : '')
             }
             commit={commit}
-            draggable={!isPublic && isDraggablePreview(previewType)}
-            onClick={onClickToSelect}
-            onDoubleClick={onDoubleClickToShowDrawer}>
-            {bodyOnly || <Avatar username={commit.author} />}
+            previewType={previewType}>
             {isPublic ? null : (
               <span className="commit-title">
+                {commitLabel && <CommitLabel>{commitLabel}</CommitLabel>}
                 <span>{title}</span>
                 <CommitDate date={commit.date} />
               </span>
             )}
             <UnsavedEditedMessageIndicator commit={commit} />
-            {commit.bookmarks.map(bookmark => (
-              <VSCodeTag key={bookmark}>{bookmark}</VSCodeTag>
-            ))}
-            {commit.remoteBookmarks.map(remoteBookmarks => (
-              <VSCodeTag key={remoteBookmarks}>{remoteBookmarks}</VSCodeTag>
-            ))}
+            <Bookmarks bookmarks={commit.bookmarks} kind="local" />
+            <Bookmarks bookmarks={commit.remoteBookmarks} kind="remote" />
             {commit?.stableCommitMetadata != null ? (
-              <>
-                {commit.stableCommitMetadata.map(stable => (
-                  <Tooltip title={stable.description} key={stable.value}>
-                    <div className="stable-commit-metadata">
-                      <VSCodeTag>{stable.value}</VSCodeTag>
-                    </div>
-                  </Tooltip>
-                ))}
-              </>
+              <Bookmarks bookmarks={commit.stableCommitMetadata} kind="stable" />
             ) : null}
             {isPublic ? <CommitDate date={commit.date} /> : null}
             {isNarrow ? commitActions : null}
-          </DraggableCommit>
+          </DragToRebase>
           <DivIfChildren className="commit-second-row">
             {commit.diffId && !isPublic ? (
               <DiffInfo commit={commit} hideActions={actionsPrevented || inlineProgress != null} />
@@ -435,11 +417,8 @@ export const Commit = memo(
             {commit.successorInfo != null ? (
               <SuccessorInfoToDisplay successorInfo={commit.successorInfo} />
             ) : null}
-            {inlineProgress && (
-              <span className="commit-inline-operation-progress">
-                <Icon icon="loading" /> <T>{inlineProgress}</T>
-              </span>
-            )}
+            {inlineProgress && <InlineProgressSpan message={inlineProgress} />}
+            {commit.isFollower ? <DiffFollower commit={commit} /> : null}
           </DivIfChildren>
           {!isNarrow ? commitActions : null}
         </div>
@@ -454,11 +433,31 @@ export const Commit = memo(
     return (
       commitEqual &&
       nextProps.previewType === prevProps.previewType &&
-      nextProps.bodyOnly === prevProps.bodyOnly &&
       nextProps.hasChildren === prevProps.hasChildren
     );
   },
 );
+
+const styles = stylex.create({
+  commitLabel: {
+    fontVariant: 'all-petite-caps',
+    opacity: '0.8',
+    fontWeight: 'bold',
+    fontSize: '90%',
+  },
+});
+
+function CommitLabel({children}: {children?: ReactNode}) {
+  return <div {...stylex.props(styles.commitLabel)}>{children}</div>;
+}
+
+export function InlineProgressSpan(props: {message: string}) {
+  return (
+    <span className="commit-inline-operation-progress">
+      <Icon icon="loading" /> <T>{props.message}</T>
+    </span>
+  );
+}
 
 function OpenCommitInfoButton({
   commit,
@@ -529,7 +528,7 @@ function DivIfChildren({
 }
 
 function UnsavedEditedMessageIndicator({commit}: {commit: CommitInfo}) {
-  const isEdted = useRecoilValue(hasUnsavedEditedCommitMessage(commit.hash));
+  const isEdted = useAtomValue(hasUnsavedEditedCommitMessage(commit.hash));
   if (!isEdted) {
     return null;
   }
@@ -542,244 +541,6 @@ function UnsavedEditedMessageIndicator({commit}: {commit: CommitInfo}) {
         </IconStack>
       </Tooltip>
     </div>
-  );
-}
-
-function HeadCommitInfo({
-  commit,
-  previewType,
-  hasChildren,
-}: {
-  commit: CommitInfo;
-  previewType?: CommitPreview;
-  hasChildren: boolean;
-}) {
-  const uncommittedChanges = useRecoilValue(latestUncommittedChanges);
-
-  // render head info indented when:
-  //  - we have uncommitted changes, so we're showing files
-  // and EITHER
-  //    - we're on a public commit (you'll create a new "branch" by committing)
-  //    - the commit we're rendering has children (we'll render the current child as new branch after committing)
-  const indent = uncommittedChanges.length > 0 && (commit.phase === 'public' || hasChildren);
-
-  return (
-    <div className={`head-commit-info-container${indent ? ' head-commit-info-indented' : ''}`}>
-      <YouAreHere previewType={previewType} />
-      {
-        commit.isHead ? (
-          <div className="head-commit-info">
-            <UncommittedChanges place="main" />
-          </div>
-        ) : null // don't show uncommitted changes twice while checking out
-      }
-      {indent ? <BranchIndicator /> : null}
-    </div>
-  );
-}
-
-export function YouAreHere({
-  previewType,
-  hideSpinner,
-}: {
-  previewType?: CommitPreview;
-  hideSpinner?: boolean;
-}) {
-  const isFetching = useRecoilValue(isFetchingUncommittedChanges) && !hideSpinner;
-
-  let text;
-  let spinner = false;
-  switch (previewType) {
-    case CommitPreview.GOTO_DESTINATION:
-      text = <T>You're moving here...</T>;
-      spinner = true;
-      break;
-    case CommitPreview.GOTO_PREVIOUS_LOCATION:
-      text = <T>You were here...</T>;
-      break;
-    default:
-      text = <T>You are here</T>;
-      break;
-  }
-  return (
-    <div className="you-are-here-container">
-      <InlineBadge kind="primary">
-        {spinner ? <Icon icon="loading" /> : null}
-        {text}
-      </InlineBadge>
-      {isFetching &&
-      // don't show fetch spinner on previous location
-      previewType !== CommitPreview.GOTO_PREVIOUS_LOCATION ? (
-        <Icon icon="loading" />
-      ) : null}
-    </div>
-  );
-}
-
-let commitBeingDragged: CommitInfo | undefined = undefined;
-
-// This is a global state outside React because commit DnD is a global
-// concept: there won't be 2 DnD happening at once in the same window.
-let lastDndId = 0;
-
-function preventDefault(e: Event) {
-  e.preventDefault();
-}
-function handleDragEnd(event: Event) {
-  event.preventDefault();
-
-  commitBeingDragged = undefined;
-  const draggedDOMNode = event.target;
-  draggedDOMNode?.removeEventListener('dragend', handleDragEnd);
-  document.removeEventListener('drop', preventDefault);
-  document.removeEventListener('dragover', preventDefault);
-}
-
-function DraggableCommit({
-  commit,
-  children,
-  className,
-  draggable,
-  onClick,
-  onDoubleClick,
-  onContextMenu,
-}: {
-  commit: CommitInfo;
-  children: React.ReactNode;
-  className: string;
-  draggable: boolean;
-  onClick?: (e: React.MouseEvent<HTMLDivElement> | React.KeyboardEvent<HTMLDivElement>) => unknown;
-  onDoubleClick?: (e: React.MouseEvent<HTMLDivElement>) => unknown;
-  onContextMenu?: React.MouseEventHandler<HTMLDivElement>;
-}) {
-  const [dragDisabledMessage, setDragDisabledMessage] = useState<string | null>(null);
-  const handleDragEnter = useRecoilCallback(
-    ({snapshot, set}) =>
-      () => {
-        // Capture the environment.
-        const currentBeingDragged = commitBeingDragged;
-        const currentDndId = ++lastDndId;
-        const release = snapshot.retain();
-
-        const handleDnd = () => {
-          // Skip handling if there was a new "DragEnter" event that invalidates this one.
-          if (lastDndId != currentDndId) {
-            return;
-          }
-          const loadable = snapshot.getLoadable(latestDag);
-          if (loadable.state !== 'hasValue') {
-            return;
-          }
-          const dag = loadable.contents;
-
-          if (currentBeingDragged != null && commit.hash !== currentBeingDragged.hash) {
-            const beingDragged = currentBeingDragged;
-            if (dag.has(beingDragged.hash)) {
-              if (
-                // can't rebase a commit onto its descendants
-                !dag.isAncestor(beingDragged.hash, commit.hash) &&
-                // can't rebase a commit onto its parent... it's already there!
-                !(beingDragged.parents as Array<string>).includes(commit.hash)
-              ) {
-                // if the dest commit has a remote bookmark, use that instead of the hash.
-                // this is easier to understand in the command history and works better with optimistic state
-                const destination =
-                  commit.remoteBookmarks.length > 0
-                    ? succeedableRevset(commit.remoteBookmarks[0])
-                    : latestSuccessorUnlessExplicitlyObsolete(commit);
-                set(operationBeingPreviewed, op => {
-                  const newRebase = new RebaseOperation(
-                    latestSuccessorUnlessExplicitlyObsolete(beingDragged),
-                    destination,
-                  );
-                  const isEqual = newRebase.equals(op);
-                  return isEqual ? op : newRebase;
-                });
-              }
-            }
-          }
-        };
-
-        // This allows us to recieve a list of "queued" DragEnter events
-        // before actually handling them. This way we can skip "invalidated"
-        // events and only handle the last (valid) one.
-        window.setTimeout(() => {
-          try {
-            handleDnd();
-          } finally {
-            release();
-          }
-        }, 1);
-      },
-    [commit],
-  );
-
-  const handleDragStart = useRecoilCallback(
-    ({snapshot}) =>
-      (event: React.DragEvent<HTMLDivElement>) => {
-        // can't rebase with uncommitted changes
-        if (hasUncommittedChanges(snapshot)) {
-          setDragDisabledMessage(t('Cannot drag to rebase with uncommitted changes.'));
-          event.preventDefault();
-        }
-        if (commit.successorInfo != null) {
-          setDragDisabledMessage(t('Cannot rebase obsoleted commits.'));
-          event.preventDefault();
-        }
-
-        commitBeingDragged = commit;
-        event.dataTransfer.dropEffect = 'none';
-
-        const draggedDOMNode = event.target;
-        // prevent animation of commit returning to drag start location on drop
-        draggedDOMNode.addEventListener('dragend', handleDragEnd);
-        document.addEventListener('drop', preventDefault);
-        document.addEventListener('dragover', preventDefault);
-      },
-    [commit],
-  );
-
-  useEffect(() => {
-    if (dragDisabledMessage) {
-      const timeout = setTimeout(() => setDragDisabledMessage(null), 1500);
-      return () => clearTimeout(timeout);
-    }
-  }, [dragDisabledMessage]);
-
-  return (
-    <div
-      className={className}
-      onDragStart={handleDragStart}
-      onDragEnter={handleDragEnter}
-      draggable={draggable}
-      onClick={onClick}
-      onDoubleClick={onDoubleClick}
-      onKeyPress={event => {
-        if (event.key === 'Enter') {
-          onClick?.(event);
-        }
-      }}
-      onContextMenu={onContextMenu}
-      data-testid={'draggable-commit'}>
-      <div className="commit-wide-drag-target" onDragEnter={handleDragEnter} />
-      {dragDisabledMessage != null ? (
-        <Tooltip trigger="manual" shouldShow title={dragDisabledMessage}>
-          {children}
-        </Tooltip>
-      ) : (
-        children
-      )}
-    </div>
-  );
-}
-
-function hasUncommittedChanges(snapshot: Snapshot): boolean {
-  const loadable = snapshot.getLoadable(uncommittedChangesWithPreviews);
-  return (
-    loadable.state === 'hasValue' &&
-    loadable.contents.filter(
-      commit => commit.status !== '?', // untracked files are ok
-    ).length > 0
   );
 }
 
@@ -796,14 +557,14 @@ export function SuccessorInfoToDisplay({successorInfo}: {successorInfo: Successo
   }[successorType] ?? <T>Rewritten as a newer commit</T>;
   const isSuccessorPublic = successorType === 'land' || successorType === 'pushrebase';
   return (
-    <FlexRow style={{gap: 'var(--halfpad)'}}>
+    <Row style={{gap: 'var(--halfpad)'}}>
       <HighlightCommitsWhileHovering toHighlight={[successorInfo.hash]}>
         {inner}
       </HighlightCommitsWhileHovering>
       <EducationInfoTip>
         <ObsoleteTip isSuccessorPublic={isSuccessorPublic} />
       </EducationInfoTip>
-    </FlexRow>
+    </Row>
   );
 }
 
@@ -837,6 +598,41 @@ function ObsoleteTipInner(props: {isSuccessorPublic?: boolean}) {
         ))}
       </ul>
     </div>
+  );
+}
+
+function maybeWarnAboutOldDestination(dest: CommitInfo): Promise<boolean> {
+  const provider = readAtom(codeReviewProvider);
+  // Cutoff age is determined by the code review provider since internal repos have different requirements than GitHub-backed repos.
+  const MAX_AGE_CUTOFF_MS = provider?.gotoDistanceWarningAgeCutoff ?? 30 * MS_PER_DAY;
+
+  const dag = readAtom(dagWithPreviews);
+  const currentBase = findPublicBaseAncestor(dag);
+  const destBase = findPublicBaseAncestor(dag, dest.hash);
+  if (!currentBase || !destBase) {
+    // can't determine if we can show warning
+    return Promise.resolve(true);
+  }
+
+  const ageDiff = currentBase.date.valueOf() - destBase.date.valueOf();
+  if (ageDiff < MAX_AGE_CUTOFF_MS) {
+    // Either destination base is within time limit or destination base is newer than the current base.
+    // No need to warn.
+    return Promise.resolve(true);
+  }
+
+  return platform.confirm(
+    t(
+      Internal.warnAboutOldGotoReason ??
+        'The destination commit is $age older than the current commit. ' +
+          "Going here may be slow. It's often faster to rebase the commit to a newer base before going. " +
+          'Do you want to `goto` anyway?',
+      {
+        replace: {
+          $age: relativeDate(destBase.date, {reference: currentBase.date, useRelativeForm: true}),
+        },
+      },
+    ),
   );
 }
 

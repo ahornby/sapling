@@ -21,6 +21,14 @@
 #include <folly/system/Pid.h>
 #include <folly/system/ThreadName.h>
 
+#include "eden/common/telemetry/StructuredLogger.h"
+#include "eden/common/utils/Bug.h"
+#include "eden/common/utils/FaultInjector.h"
+#include "eden/common/utils/Future.h"
+#include "eden/common/utils/ImmediateFuture.h"
+#include "eden/common/utils/PathFuncs.h"
+#include "eden/common/utils/SpawnedProcess.h"
+#include "eden/common/utils/UnboundedQueueExecutor.h"
 #include "eden/fs/config/EdenConfig.h"
 #include "eden/fs/config/MountProtocol.h"
 #include "eden/fs/config/ReloadableConfig.h"
@@ -54,19 +62,12 @@
 #include "eden/fs/store/ScmStatusDiffCallback.h"
 #include "eden/fs/store/StatsFetchContext.h"
 #include "eden/fs/store/TreeLookupProcessor.h"
-#include "eden/fs/telemetry/StructuredLogger.h"
-#include "eden/fs/utils/Bug.h"
+#include "eden/fs/telemetry/LogEvent.h"
 #include "eden/fs/utils/Clock.h"
 #include "eden/fs/utils/EdenError.h"
-#include "eden/fs/utils/FaultInjector.h"
 #include "eden/fs/utils/FsChannelTypes.h"
-#include "eden/fs/utils/Future.h"
-#include "eden/fs/utils/ImmediateFuture.h"
 #include "eden/fs/utils/NfsSocket.h"
 #include "eden/fs/utils/NotImplemented.h"
-#include "eden/fs/utils/PathFuncs.h"
-#include "eden/fs/utils/SpawnedProcess.h"
-#include "eden/fs/utils/UnboundedQueueExecutor.h"
 
 #include <chrono>
 
@@ -77,7 +78,6 @@ using folly::Unit;
 using std::make_unique;
 using std::shared_ptr;
 
-DEFINE_int32(fuseNumThreads, 16, "how many fuse dispatcher threads to spawn");
 DEFINE_string(
     edenfsctlPath,
     "edenfsctl",
@@ -140,7 +140,7 @@ constexpr PathComponentPiece kNfsdSocketName{"nfsd.socket"_pc};
 class EdenMount::JournalDiffCallback : public DiffCallback {
  public:
   explicit JournalDiffCallback()
-      : data_{folly::in_place, std::unordered_set<RelativePath>()} {}
+      : data_{std::in_place, std::unordered_set<RelativePath>()} {}
 
   void ignoredPath(RelativePathPiece, dtype_t) override {}
 
@@ -823,7 +823,7 @@ ImmediateFuture<SetPathObjectIdResultAndTimes> EdenMount::setPathsToObjectIds(
         ? objectStore_->getTree(objs.at(0).id, ctx->getFetchContext())
         : collectAllSafe(std::move(getTreeEntryFutures))
               .thenValue(
-                  [objs = std::move(objs),
+                  [objs_2 = std::move(objs),
                    caseSensitive = getCheckoutConfig()->getCaseSensitive()](
                       std::vector<shared_ptr<TreeEntry>> entries) {
                     // Make up a fake ObjectId for this tree.
@@ -834,7 +834,7 @@ ImmediateFuture<SetPathObjectIdResultAndTimes> EdenMount::setPathsToObjectIds(
                     Tree::container treeEntries{caseSensitive};
                     for (size_t i = 0; i < entries.size(); ++i) {
                       treeEntries.emplace(
-                          PathComponent{objs.at(i).path.basename()},
+                          PathComponent{objs_2.at(i).path.basename()},
                           std::move(*entries.at(i)));
                     }
 
@@ -1774,15 +1774,22 @@ ImmediateFuture<Unit> EdenMount::diff(
     }
 
     if (parentInfo->workingCopyParentRootId != commitHash) {
+      // TODO: We should really add a method to FilteredBackingStore that
+      // allows us to render a FOID as the underlying ObjectId. This would
+      // avoid the round trip we're doing here.
+      auto renderedParentRootId =
+          objectStore_->renderRootId(parentInfo->workingCopyParentRootId);
+      auto renderedCommitHash = objectStore_->renderRootId(commitHash);
+
       // Log this occurrence to Scuba
       getServerState()->getStructuredLogger()->logEvent(ParentMismatch{
           commitHash.value(), parentInfo->workingCopyParentRootId.value()});
       return makeImmediateFuture<Unit>(newEdenError(
           EdenErrorType::OUT_OF_DATE_PARENT,
           "error computing status: requested parent commit is out-of-date: requested ",
-          commitHash,
+          folly::hexlify(renderedCommitHash),
           ", but current parent commit is ",
-          parentInfo->workingCopyParentRootId,
+          folly::hexlify(renderedParentRootId),
           ".\nTry running `eden doctor` to remediate"));
     }
 
@@ -1914,17 +1921,22 @@ std::unique_ptr<FuseChannel, FsChannelDeleter> makeFuseChannel(
       std::move(fuseFd),
       mount->getPath(),
       mount->getServerState()->getFsChannelThreadPool(),
-      FLAGS_fuseNumThreads,
+      mount->getServerState()
+          ->getEdenConfig()
+          ->fuseNumDispatcherThreads.getValue(),
       EdenDispatcherFactory::makeFuseDispatcher(mount),
       &mount->getStraceLogger(),
       mount->getServerState()->getProcessInfoCache(),
       mount->getServerState()->getFsEventLogger(),
+      mount->getServerState()->getStructuredLogger(),
       std::chrono::duration_cast<folly::Duration>(
           edenConfig->fuseRequestTimeout.getValue()),
       mount->getServerState()->getNotifier(),
       mount->getCheckoutConfig()->getCaseSensitive(),
       mount->getCheckoutConfig()->getRequireUtf8Path(),
-      edenConfig->fuseMaximumRequests.getValue(),
+      edenConfig->fuseMaximumBackgroundRequests.getValue(),
+      edenConfig->maxFsChannelInflightRequests.getValue(),
+      edenConfig->highFsRequestsLogInterval.getValue(),
       mount->getCheckoutConfig()->getUseWriteBackCache(),
       mount->getServerState()
           ->getEdenConfig()
@@ -2023,18 +2035,21 @@ folly::Future<folly::Unit> EdenMount::fsChannelMount(bool readOnly) {
                   NfsServer::NfsMountInfo mountInfo) mutable {
                 auto [channel, mountdAddr] = std::move(mountInfo);
 #ifndef _WIN32
+                // Channel is later moved. We must assign addr to a local var
+                // to avoid the possibility of a use-after-move bug.
+                auto addr = channel->getAddr();
                 // TODO: teach privhelper or something to mount on Windows
                 return serverState_->getPrivHelper()
                     ->nfsMount(
                         mountPath.view(),
                         mountdAddr,
-                        channel->getAddr(),
+                        addr,
                         readOnly,
                         iosize,
                         useReaddirplus)
                     .thenTry([this,
                               mountPromise = std::move(mountPromise),
-                              channel = std::move(channel)](
+                              channel_2 = std::move(channel)](
                                  Try<folly::Unit>&& try_) mutable {
                       if (try_.hasException()) {
                         mountPromise->setException(try_.exception());
@@ -2042,7 +2057,7 @@ folly::Future<folly::Unit> EdenMount::fsChannelMount(bool readOnly) {
                       }
 
                       mountPromise->setValue();
-                      channel_ = std::move(channel);
+                      channel_ = std::move(channel_2);
                       return makeFuture(folly::unit);
                     });
 #else
@@ -2066,10 +2081,13 @@ folly::Future<folly::Unit> EdenMount::fsChannelMount(bool readOnly) {
                          EdenDispatcherFactory::makePrjfsDispatcher(this),
                          serverState_->getReloadableConfig(),
                          &getStraceLogger(),
+                         serverState_->getStructuredLogger(),
+                         serverState_->getFaultInjector(),
                          serverState_->getProcessInfoCache(),
                          getCheckoutConfig()->getRepoGuid(),
                          getCheckoutConfig()->getEnableWindowsSymlinks(),
-                         this->getServerState()->getNotifier()));
+                         this->getServerState()->getNotifier(),
+                         this->getInvalidationThreadPool()));
                  return FsChannelPtr{std::move(channel)};
                })
             .thenTry([this, mountPromise](Try<FsChannelPtr>&& channel) {
@@ -2087,7 +2105,11 @@ folly::Future<folly::Unit> EdenMount::fsChannelMount(bool readOnly) {
             });
 #else
         return serverState_->getPrivHelper()
-            ->fuseMount(mountPath.view(), readOnly)
+            ->fuseMount(
+                mountPath.view(),
+                readOnly,
+                std::make_optional<folly::StringPiece>(
+                    edenConfig->fuseVfsType.getValue()))
             .thenTry(
                 [mountPath, mountPromise, this](Try<folly::File>&& fuseDevice)
                     -> folly::Future<folly::Unit> {

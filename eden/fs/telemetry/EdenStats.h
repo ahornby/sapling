@@ -9,12 +9,13 @@
 
 #include <memory>
 
-#include <fb303/detail/QuantileStatWrappers.h>
 #include <folly/ThreadLocal.h>
-#include <folly/stop_watch.h>
 
+#include "eden/common/telemetry/DurationScope.h"
+#include "eden/common/telemetry/Stats.h"
+#include "eden/common/telemetry/StatsGroup.h"
+#include "eden/common/utils/RefPtr.h"
 #include "eden/fs/eden-config.h"
-#include "eden/fs/utils/RefPtr.h"
 
 namespace facebook::eden {
 
@@ -23,63 +24,15 @@ struct NfsStats;
 struct PrjfsStats;
 struct ObjectStoreStats;
 struct LocalStoreStats;
-struct HgBackingStoreStats;
-struct HgImporterStats;
+struct SaplingBackingStoreStats;
 struct JournalStats;
 struct ThriftStats;
-struct TelemetryStats;
 struct OverlayStats;
 struct InodeMapStats;
 struct InodeMetadataTableStats;
-
-/**
- * StatsGroupBase is a base class for a group of thread-local stats
- * structures.
- *
- * Each StatsGroupBase object should only be used from a single thread. The
- * EdenStats object should be used to maintain one StatsGroupBase object
- * for each thread that needs to access/update the stats.
- */
-class StatsGroupBase {
-  using Stat = fb303::detail::QuantileStatWrapper;
-
- public:
-  /**
-   * Counter is used to record events.
-   */
-  class Counter : private Stat {
-   public:
-    explicit Counter(std::string_view name);
-
-    using Stat::addValue;
-  };
-
-  /**
-   * Duration is used for stats that measure elapsed times.
-   *
-   * In general, EdenFS measures latencies in units of microseconds.
-   * Duration enforces that its stat names end in "_us".
-   */
-  class Duration : private Stat {
-   public:
-    explicit Duration(std::string_view name);
-
-    /**
-     * Record a duration in microseconds to the QuantileStatWrapper. Also
-     * increments the .count statistic.
-     */
-    template <typename Rep, typename Period>
-    void addDuration(std::chrono::duration<Rep, Period> elapsed) {
-      // TODO: Implement a general overflow check when converting from seconds
-      // or milliseconds to microseconds. Fortunately, this use case deals with
-      // short durations.
-      addDuration(
-          std::chrono::duration_cast<std::chrono::microseconds>(elapsed));
-    }
-
-    void addDuration(std::chrono::microseconds elapsed);
-  };
-};
+struct BlobCacheStats;
+struct TreeCacheStats;
+struct FakeStats;
 
 class EdenStats : public RefCounted {
  public:
@@ -120,14 +73,16 @@ class EdenStats : public RefCounted {
   ThreadLocal<PrjfsStats> prjfsStats_;
   ThreadLocal<ObjectStoreStats> objectStoreStats_;
   ThreadLocal<LocalStoreStats> localStoreStats_;
-  ThreadLocal<HgBackingStoreStats> hgBackingStoreStats_;
-  ThreadLocal<HgImporterStats> hgImporterStats_;
+  ThreadLocal<SaplingBackingStoreStats> saplingBackingStoreStats_;
   ThreadLocal<JournalStats> journalStats_;
   ThreadLocal<ThriftStats> thriftStats_;
   ThreadLocal<TelemetryStats> telemetryStats_;
   ThreadLocal<OverlayStats> overlayStats_;
   ThreadLocal<InodeMapStats> inodeMapStats_;
   ThreadLocal<InodeMetadataTableStats> inodeMetadataTableStats_;
+  ThreadLocal<BlobCacheStats> blobCacheStats_;
+  ThreadLocal<TreeCacheStats> treeCacheStats_;
+  ThreadLocal<FakeStats> fakeStats_;
 };
 
 using EdenStatsPtr = RefPtr<EdenStats>;
@@ -159,14 +114,9 @@ inline LocalStoreStats& EdenStats::getStatsForCurrentThread<LocalStoreStats>() {
 }
 
 template <>
-inline HgBackingStoreStats&
-EdenStats::getStatsForCurrentThread<HgBackingStoreStats>() {
-  return *hgBackingStoreStats_.get();
-}
-
-template <>
-inline HgImporterStats& EdenStats::getStatsForCurrentThread<HgImporterStats>() {
-  return *hgImporterStats_.get();
+inline SaplingBackingStoreStats&
+EdenStats::getStatsForCurrentThread<SaplingBackingStoreStats>() {
+  return *saplingBackingStoreStats_.get();
 }
 
 template <>
@@ -200,17 +150,20 @@ EdenStats::getStatsForCurrentThread<InodeMetadataTableStats>() {
   return *inodeMetadataTableStats_.get();
 }
 
-template <typename T>
-class StatsGroup : public StatsGroupBase {
- public:
-  /**
-   * Statistics are often updated on a thread separate from the thread that
-   * started a request. Since stat objects are thread-local, we cannot hold
-   * pointers directly to them. Instead, we store a pointer-to-member and look
-   * up the calling thread's object.
-   */
-  using DurationPtr = Duration T::*;
-};
+template <>
+inline BlobCacheStats& EdenStats::getStatsForCurrentThread<BlobCacheStats>() {
+  return *blobCacheStats_.get();
+}
+
+template <>
+inline TreeCacheStats& EdenStats::getStatsForCurrentThread<TreeCacheStats>() {
+  return *treeCacheStats_.get();
+}
+
+template <>
+inline FakeStats& EdenStats::getStatsForCurrentThread<FakeStats>() {
+  return *fakeStats_.get();
+}
 
 struct FuseStats : StatsGroup<FuseStats> {
   Duration lookup{"fuse.lookup_us"};
@@ -307,22 +260,27 @@ struct ObjectStoreStats : StatsGroup<ObjectStoreStats> {
   Duration getTree{"store.get_tree_us"};
   Duration getBlob{"store.get_blob_us"};
   Duration getBlobMetadata{"store.get_blob_metadata_us"};
+  Duration getRootTree{"store.get_root_tree_us"};
 
   Counter getBlobFromMemory{"object_store.get_blob.memory"};
   Counter getBlobFromLocalStore{"object_store.get_blob.local_store"};
   Counter getBlobFromBackingStore{"object_store.get_blob.backing_store"};
+  Counter getBlobFailed{"object_store.get_blob_failed"};
 
   Counter getTreeFromMemory{"object_store.get_tree.memory"};
   Counter getTreeFromLocalStore{"object_store.get_tree.local_store"};
   Counter getTreeFromBackingStore{"object_store.get_tree.backing_store"};
+  Counter getTreeFailed{"object_store.get_tree_failed"};
+
+  Counter getRootTreeFromBackingStore{
+      "object_store.get_root_tree.backing_store"};
+  Counter getRootTreeFailed{"object_store.get_root_tree_failed"};
 
   Counter getBlobMetadataFromMemory{"object_store.get_blob_metadata.memory"};
   Counter getBlobMetadataFromLocalStore{
       "object_store.get_blob_metadata.local_store"};
   Counter getBlobMetadataFromBackingStore{
       "object_store.get_blob_metadata.backing_store"};
-  Counter getLocalBlobMetadataFromBackingStore{
-      "object_store.get_blob_metadata.backing_store_cache"};
   Counter getBlobMetadataFromBlob{"object_store.get_blob_metadata.blob"};
   Counter getBlobMetadataFailed{"object_store.get_blob_metadata_failed"};
 };
@@ -343,50 +301,69 @@ struct LocalStoreStats : StatsGroup<LocalStoreStats> {
 };
 
 /**
- * @see HgBackingStore
+ * @see SaplingBackingStore
  *
  * Terminology:
  *   get = entire lookup process, including both Sapling disk hits and fetches
  *   fetch = includes asynchronous retrieval from Mononoke
- *   import = fall back process
  */
-struct HgBackingStoreStats : StatsGroup<HgBackingStoreStats> {
-  Duration getTree{"store.hg.get_tree_us"};
-  Duration fetchTree{"store.hg.fetch_tree_us"};
-  Counter fetchTreeRetrySuccess{"store.hg.fetch_tree_retry_success"};
-  Counter fetchTreeRetryFailure{"store.hg.fetch_tree_retry_failure"};
-  Duration importTreeDuration{"store.hg.import_tree_us"};
-  Counter importTreeSuccess{"store.hg.import_tree_success"};
-  Counter importTreeFailure{"store.hg.import_tree_failure"};
-  Counter importTreeError{"store.hg.import_tree_error"};
-  Duration getBlob{"store.hg.get_blob_us"};
-  Duration fetchBlob{"store.hg.fetch_blob_us"};
-  Counter fetchBlobRetrySuccess{"store.hg.fetch_blob_retry_success"};
-  Counter fetchBlobRetryFailure{"store.hg.fetch_blob_retry_failure"};
-  Duration importBlobDuration{"store.hg.import_blob_us"};
-  Counter importBlobSuccess{"store.hg.import_blob_success"};
-  Counter importBlobFailure{"store.hg.import_blob_failure"};
-  Counter importBlobError{"store.hg.import_blob_error"};
-  Duration getBlobMetadata{"store.hg.get_blob_metadata_us"};
-  Duration fetchBlobMetadata{"store.hg.fetch_blob_metadata_us"};
-  Counter loadProxyHash{"store.hg.load_proxy_hash"};
-};
-
-/**
- * @see HgImporter
- * @see HgBackingStore
- */
-struct HgImporterStats : StatsGroup<HgImporterStats> {
-  Counter catFile{"hg_importer.cat_file"};
-  Counter fetchTree{"hg_importer.fetch_tree"};
-  Counter manifest{"hg_importer.manifest"};
-  Counter manifestNodeForCommit{"hg_importer.manifest_node_for_commit"};
-  Counter prefetchFiles{"hg_importer.prefetch_files"};
+struct SaplingBackingStoreStats : StatsGroup<SaplingBackingStoreStats> {
+  Duration getTree{"store.sapling.get_tree_us"};
+  Duration fetchTree{"store.sapling.fetch_tree_us"};
+  Duration getRootTree{"store.sapling.get_root_tree_us"};
+  Duration importManifestForRoot{"store.sapling.import_manifest_for_root_us"};
+  Counter fetchTreeLocal{"store.sapling.fetch_tree_local"};
+  Counter fetchTreeRemote{"store.sapling.fetch_tree_remote"};
+  Counter fetchTreeSuccess{"store.sapling.fetch_tree_success"};
+  Counter fetchTreeFailure{"store.sapling.fetch_tree_failure"};
+  Counter fetchTreeRetrySuccess{"store.sapling.fetch_tree_retry_success"};
+  Counter fetchTreeRetryFailure{"store.sapling.fetch_tree_retry_failure"};
+  Counter getRootTreeLocal{"store.sapling.get_root_tree_local"};
+  Counter getRootTreeRemote{"store.sapling.get_root_tree_remote"};
+  Counter getRootTreeSuccess{"store.sapling.get_root_tree_success"};
+  Counter getRootTreeFailure{"store.sapling.get_root_tree_failure"};
+  Counter getRootTreeRetrySuccess{"store.sapling.get_root_tree_retry_success"};
+  Counter getRootTreeRetryFailure{"store.sapling.get_root_tree_retry_failure"};
+  Counter importManifestForRootLocal{
+      "store.sapling.import_manifest_for_root_local"};
+  Counter importManifestForRootRemote{
+      "store.sapling.import_manifest_for_root_remote"};
+  Counter importManifestForRootSuccess{
+      "store.sapling.import_manifest_for_root_success"};
+  Counter importManifestForRootFailure{
+      "store.sapling.import_manifest_for_root_failure"};
+  Counter importManifestForRootRetrySuccess{
+      "store.sapling.import_manifest_for_root_retry_success"};
+  Counter importManifestForRootRetryFailure{
+      "store.sapling.import_manifest_for_root_retry_failure"};
+  Duration getBlob{"store.sapling.get_blob_us"};
+  Duration fetchBlob{"store.sapling.fetch_blob_us"};
+  Counter fetchBlobLocal{"store.sapling.fetch_blob_local"};
+  Counter fetchBlobRemote{"store.sapling.fetch_blob_remote"};
+  Counter fetchBlobSuccess{"store.sapling.fetch_blob_success"};
+  Counter fetchBlobFailure{"store.sapling.fetch_blob_failure"};
+  Counter fetchBlobRetrySuccess{"store.sapling.fetch_blob_retry_success"};
+  Counter fetchBlobRetryFailure{"store.sapling.fetch_blob_retry_failure"};
+  Duration prefetchBlob{"store.sapling.prefetch_blob_us"};
+  Counter prefetchBlobLocal{"store.sapling.prefetch_blob_local"};
+  Counter prefetchBlobRemote{"store.sapling.prefetch_blob_remote"};
+  Counter prefetchBlobSuccess{"store.sapling.prefetch_blob_success"};
+  Counter prefetchBlobFailure{"store.sapling.prefetch_blob_failure"};
+  Counter prefetchBlobRetrySuccess{"store.sapling.prefetch_blob_retry_success"};
+  Counter prefetchBlobRetryFailure{"store.sapling.prefetch_blob_retry_failure"};
+  Duration getBlobMetadata{"store.sapling.get_blob_metadata_us"};
+  Duration fetchBlobMetadata{"store.sapling.fetch_blob_metadata_us"};
+  Counter fetchBlobMetadataLocal{"store.sapling.fetch_blob_metadata_local"};
+  Counter fetchBlobMetadataRemote{"store.sapling.fetch_blob_metadata_remote"};
+  Counter fetchBlobMetadataSuccess{"store.sapling.fetch_blob_metadata_success"};
+  Counter fetchBlobMetadataFailure{"store.sapling.fetch_blob_metadata_failure"};
+  Counter loadProxyHash{"store.sapling.load_proxy_hash"};
 };
 
 struct JournalStats : StatsGroup<JournalStats> {
   Counter truncatedReads{"journal.truncated_reads"};
   Counter filesAccumulated{"journal.files_accumulated"};
+  Duration accumulateRange{"journal.accumulate_range_us"};
 };
 
 struct ThriftStats : StatsGroup<ThriftStats> {
@@ -397,23 +374,49 @@ struct ThriftStats : StatsGroup<ThriftStats> {
       "thrift.StreamingEdenService.streamSelectedChangesSince.streaming_time_us"};
 };
 
-struct TelemetryStats : StatsGroup<TelemetryStats> {
-  Counter subprocessLoggerFailure{"telemetry.subprocess_logger_failure"};
-};
-
 struct OverlayStats : StatsGroup<OverlayStats> {
   Duration saveOverlayDir{"overlay.save_overlay_dir_us"};
   Duration loadOverlayDir{"overlay.load_overlay_dir_us"};
+  Duration openOverlayFile{"overlay.open_overlay_file_us"};
+  Duration createOverlayFile{"overlay.create_overlay_file_us"};
   Duration removeOverlayFile{"overlay.remove_overlay_file_us"};
   Duration removeOverlayDir{"overlay.remove_overlay_dir_us"};
+  Duration recursivelyRemoveOverlayDir{
+      "overlay.recursively_remove_overlay_dir_us"};
   Duration hasOverlayDir{"overlay.has_overlay_dir_us"};
   Duration hasOverlayFile{"overlay.has_overlay_file_us"};
   Duration addChild{"overlay.add_child_us"};
   Duration removeChild{"overlay.remove_child_us"};
   Duration removeChildren{"overlay.remove_children_us"};
   Duration renameChild{"overlay.rename_child_us"};
-  Counter loadOverlayDirHit{"overlay.load_overlay_dir_hit"};
-  Counter loadOverlayDirMiss{"overlay.load_overlay_dir_miss"};
+  Counter loadOverlayDirSuccessful{"overlay.load_overlay_dir_successful"};
+  Counter loadOverlayDirFailure{"overlay.load_overlay_dir_failure"};
+  Counter saveOverlayDirSuccessful{"overlay.save_overlay_dir_successful"};
+  Counter saveOverlayDirFailure{"overlay.save_overlay_dir_failure"};
+  Counter openOverlayFileSuccessful{"overlay.open_overlay_file_successful"};
+  Counter openOverlayFileFailure{"overlay.open_overlay_file_failure"};
+  Counter createOverlayFileSuccessful{"overlay.create_overlay_file_successful"};
+  Counter createOverlayFileFailure{"overlay.create_overlay_file_failure"};
+  Counter removeOverlayFileSuccessful{"overlay.remove_overlay_file_successful"};
+  Counter removeOverlayFileFailure{"overlay.remove_overlay_file_failure"};
+  Counter removeOverlayDirSuccessful{"overlay.remove_overlay_dir_successful"};
+  Counter removeOverlayDirFailure{"overlay.remove_overlay_dir_failure"};
+  Counter recursivelyRemoveOverlayDirSuccessful{
+      "overlay.recursively_remove_overlay_dir_successful"};
+  Counter recursivelyRemoveOverlayDirFailure{
+      "overlay.recursively_remove_overlay_dir_failure"};
+  Counter hasOverlayDirSuccessful{"overlay.has_overlay_dir_successful"};
+  Counter hasOverlayDirFailure{"overlay.has_overlay_dir_failure"};
+  Counter hasOverlayFileSuccessful{"overlay.has_overlay_file_successful"};
+  Counter hasOverlayFileFailure{"overlay.has_overlay_file_failure"};
+  Counter addChildSuccessful{"overlay.add_child_successful"};
+  Counter addChildFailure{"overlay.add_child_failure"};
+  Counter removeChildSuccessful{"overlay.remove_child_successful"};
+  Counter removeChildFailure{"overlay.remove_child_failure"};
+  Counter removeChildrenSuccessful{"overlay.remove_children_successful"};
+  Counter removeChildrenFailure{"overlay.remove_children_failure"};
+  Counter renameChildSuccessful{"overlay.rename_child_successful"};
+  Counter renameChildFailure{"overlay.rename_child_failure"};
 };
 
 struct InodeMapStats : StatsGroup<InodeMapStats> {
@@ -429,47 +432,30 @@ struct InodeMetadataTableStats : StatsGroup<InodeMetadataTableStats> {
   Counter getMiss{"inode_metadata_table.get_miss"};
 };
 
-/**
- * On construction, notes the current time. On destruction, records the elapsed
- * time in the specified EdenStats Duration.
- *
- * Moveable, but not copyable.
+struct BlobCacheStats : StatsGroup<BlobCacheStats> {
+  Counter getHit{"blob_cache.get_hit"};
+  Counter getMiss{"blob_cache.get_miss"};
+  Counter insertEviction{"blob_cache.insert_eviction"};
+  Counter objectDrop{"blob_cache.object_drop"};
+};
+
+struct TreeCacheStats : StatsGroup<TreeCacheStats> {
+  Counter getHit{"tree_cache.get_hit"};
+  Counter getMiss{"tree_cache.get_miss"};
+  Counter insertEviction{"tree_cache.insert_eviction"};
+  Counter objectDrop{"tree_cache.object_drop"};
+};
+
+/*
+ * This is a fake stats object that is used for testing. Counter/Duration
+ * objects can be added here to mirror variables used in real stats object as
+ * needed
  */
-class DurationScope {
- public:
-  DurationScope() = delete;
-
-  template <typename T>
-  DurationScope(EdenStatsPtr&& edenStats, StatsGroupBase::Duration T::*duration)
-      : edenStats_{std::move(edenStats)},
-        // This use of std::function won't allocate on libstdc++,
-        // libc++, or Microsoft STL. All three have a couple pointers
-        // worth of small buffer inline storage.
-        updateScope_{[duration](EdenStats& stats, StopWatch::duration elapsed) {
-          stats.addDuration(duration, elapsed);
-        }} {
-    assert(edenStats_);
-  }
-
-  template <typename T>
-  DurationScope(
-      const EdenStatsPtr& edenStats,
-      StatsGroupBase::Duration T::*duration)
-      : DurationScope{edenStats.copy(), duration} {}
-
-  ~DurationScope() noexcept;
-
-  DurationScope(DurationScope&& that) = default;
-  DurationScope& operator=(DurationScope&& that) = default;
-
-  DurationScope(const DurationScope&) = delete;
-  DurationScope& operator=(const DurationScope&) = delete;
-
- private:
-  using StopWatch = folly::stop_watch<>;
-  StopWatch stopWatch_;
-  EdenStatsPtr edenStats_;
-  std::function<void(EdenStats& stats, StopWatch::duration)> updateScope_;
+struct FakeStats : StatsGroup<FakeStats> {
+  Counter getHit{"do_not_export_0"};
+  Counter getMiss{"do_not_export_1"};
+  Counter insertEviction{"do_not_export_2"};
+  Counter objectDrop{"do_not_export_3"};
 };
 
 } // namespace facebook::eden

@@ -5,35 +5,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-.head-commit-info-container {
-  margin-left: -22px;
-  z-index: 1;
-  position: relative;
-}
-.head-commit-info-container:before {
-  border-left: 2px solid var(--button-primary-hover-background);
-  content: ' ';
-  display: block;
-  position: absolute;
-  left: 12px;
-  top: 0;
-  bottom: calc(-1.5 * var(--pad));
-  z-index: -1;
-}
 .head-commit-info {
-  margin-left: 28px;
-}
-.head-commit-info-container.head-commit-info-indented {
-  margin-left: 0px;
-  margin-bottom: 15px;
-}
-.head-commit-info-indented .branch-indicator {
-  stroke: var(--button-primary-hover-background);
-  left: -8px;
-  bottom: -25px;
-}
-.isl-root .head-commit-info-container.head-commit-info-indented:before {
-  bottom: 0px;
+  margin-left: var(--halfpad);
 }
 .you-are-here-container {
   display: flex;
@@ -60,7 +33,8 @@
   margin-left: var(--file-tree-indent);
   position: relative;
 }
-.file-tree > .file-tree-level {
+.changed-files > .file-tree > .file-tree-level {
+  /* Override the top-level to not have indent */
   margin-left: 0;
 }
 .file-tree-level > .changed-file {
@@ -197,6 +171,8 @@
 .file-actions {
   display: flex;
   flex-wrap: nowrap;
+  align-items: center;
+  gap: var(--halfpad);
 }
 
 .file-actions .tooltip-creator {
@@ -263,7 +239,7 @@
 .uncommitted-changes .button-row {
   display: flex;
   flex-wrap: wrap;
-  gap: 0 var(--pad);
+  gap: var(--halfpad) var(--pad);
   align-items: center;
 }
 

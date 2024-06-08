@@ -7,6 +7,7 @@
 
 import type {ValueObject} from 'immutable';
 
+import {isPromise} from './utils';
 import deepEqual from 'fast-deep-equal';
 import {isValueObject, is, List} from 'immutable';
 
@@ -253,6 +254,12 @@ function cachedFunction<T, F extends AnyFunction<T>>(func: F, opts?: CacheOpts<T
       stats.miss = (stats.miss ?? 0) + 1;
     }
     const result = func.apply(this, args) as ReturnType<F>;
+    if (isPromise(result)) {
+      return result.then((value: unknown) => {
+        cache.set(cacheKey, value);
+        return value;
+      });
+    }
     cache.set(cacheKey, result);
     return result;
   };
@@ -280,6 +287,25 @@ function cacheDecorator<T>(opts?: CacheOpts<T>) {
     const originalFunc = descriptor.value;
     descriptor.value = cachedFunction(originalFunc, {...opts, getExtraKeys});
   };
+}
+
+/** Cache an "instance" function like `this.foo`. */
+export function cachedMethod<T, F extends AnyFunction<T>>(originalFunc: F, opts?: CacheOpts<T>): F {
+  const getExtraKeys =
+    opts?.getExtraKeys ??
+    function (this: T): unknown[] {
+      // Use `this` as extra key if it's a value object (hash + eq).
+      if (isValueObject(this)) {
+        return [this];
+      }
+      // Scan through cachable properties.
+      if (this != null && typeof this === 'object') {
+        return Object.values(this).filter(isCachable);
+      }
+      // Give up - do not add extra cache keys.
+      return [];
+    };
+  return cachedFunction(originalFunc, {...opts, getExtraKeys});
 }
 
 const cachableTypeNames = new Set([

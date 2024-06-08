@@ -8,10 +8,11 @@
 #pragma once
 
 #include <tuple>
+
+#include "eden/common/utils/CaseSensitivity.h"
 #include "eden/fs/inodes/FsChannel.h"
 #include "eden/fs/nfs/Mountd.h"
 #include "eden/fs/nfs/rpc/RpcServer.h"
-#include "eden/fs/utils/CaseSensitivity.h"
 
 namespace folly {
 class Executor;
@@ -45,7 +46,9 @@ class NfsServer {
       folly::EventBase* evb,
       std::shared_ptr<folly::Executor> threadPool,
       bool shouldRunOurOwnRpcbindServer,
-      const std::shared_ptr<StructuredLogger>& structuredLogger);
+      const std::shared_ptr<StructuredLogger>& structuredLogger,
+      size_t maximumInFlightRequests,
+      std::chrono::nanoseconds highNfsRequestsLogInterval);
 
   /**
    * Bind the NfsServer to the passed in socket.
@@ -122,6 +125,8 @@ class NfsServer {
   std::shared_ptr<folly::Executor> threadPool_;
   std::shared_ptr<Rpcbindd> rpcbindd_;
   Mountd mountd_;
+  size_t maximumInFlightRequests_;
+  std::chrono::nanoseconds highNfsRequestsLogInterval_;
 };
 
 } // namespace facebook::eden

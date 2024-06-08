@@ -28,6 +28,7 @@ mod tests {
     use context::CoreContext;
     use cross_repo_sync::create_commit_syncers;
     use cross_repo_sync::CommitSyncContext;
+    use cross_repo_sync::SubmoduleDeps;
     use derived_data_manager::BonsaiDerivable;
     use derived_data_utils::derived_data_utils;
     use fbinit::FacebookInit;
@@ -106,12 +107,12 @@ mod tests {
             .with_config_override(|config| {
                 let config = config
                     .derived_data_config
-                    .get_active_config()
+                    .get_active_config_mut()
                     .expect("No enabled derived data types config");
                 // Repo import has no need of these derived data types
-                config.types.remove(TreeHandle::NAME);
-                config.types.remove(MappedGitCommitId::NAME);
-                config.types.remove(RootGitDeltaManifestId::NAME);
+                config.types.remove(&TreeHandle::VARIANT);
+                config.types.remove(&MappedGitCommitId::VARIANT);
+                config.types.remove(&RootGitDeltaManifestId::VARIANT);
             })
             .with_id(RepositoryId::new(id))
             .build()
@@ -529,7 +530,7 @@ mod tests {
             map: hashmap! {
                 mp("dest_path_prefix/B") => mp("random_dir/B"),
             },
-            git_submodules_action: Default::default(),
+            submodule_config: Default::default(),
         }
     }
 
@@ -542,7 +543,7 @@ mod tests {
                 mp("dest_path_prefix/B") => mp("random_dir/B"),
                 mp("dest_path_prefix/C") => mp("random_dir/C"),
             },
-            git_submodules_action: Default::default(),
+            submodule_config: Default::default(),
         }
     }
 
@@ -552,7 +553,7 @@ mod tests {
             map: hashmap! {
                 mp("dest_path_prefix_2") => mp("dpp2"),
             },
-            git_submodules_action: Default::default(),
+            submodule_config: Default::default(),
         }
     }
 
@@ -634,6 +635,7 @@ mod tests {
             &ctx,
             small_repo_1.clone(),
             large_repo.clone(),
+            SubmoduleDeps::ForSync(HashMap::new()),
             mapping.clone(),
             live_commit_sync_config.clone(),
             Arc::new(InProcessLease::new()),
@@ -660,6 +662,7 @@ mod tests {
             &ctx,
             small_repo_2.clone(),
             large_repo.clone(),
+            SubmoduleDeps::ForSync(HashMap::new()),
             mapping.clone(),
             live_commit_sync_config,
             Arc::new(InProcessLease::new()),
@@ -713,6 +716,7 @@ mod tests {
             &ctx,
             small_repo.clone(),
             large_repo.clone(),
+            SubmoduleDeps::ForSync(HashMap::new()),
             mapping.clone(),
             live_commit_sync_config,
             Arc::new(InProcessLease::new()),
@@ -750,6 +754,7 @@ mod tests {
             &combined_mover,
             &cs_ids,
             cs_ids.last().unwrap(),
+            SubmoduleDeps::ForSync(HashMap::new()),
         )
         .await?;
 
@@ -801,7 +806,7 @@ mod tests {
         let blob_repo = repo.as_blob_repo();
 
         for derived_data_type in derived_data_types {
-            let derived_utils = derived_data_utils(ctx.fb, blob_repo, derived_data_type)?;
+            let derived_utils = derived_data_utils(ctx.fb, blob_repo, *derived_data_type)?;
             let pending = derived_utils
                 .pending(ctx.clone(), repo.repo_derived_data_arc(), cs_ids.to_vec())
                 .await?;
@@ -878,6 +883,7 @@ mod tests {
             &ctx,
             small_repo.clone(),
             large_repo.clone(),
+            SubmoduleDeps::ForSync(HashMap::new()),
             mapping.clone(),
             live_commit_sync_config,
             Arc::new(InProcessLease::new()),
@@ -915,6 +921,7 @@ mod tests {
             &combined_mover,
             &cs_ids,
             cs_ids.last().unwrap(),
+            SubmoduleDeps::ForSync(HashMap::new()),
         )
         .await?;
         let small_repo_cs_ids = back_sync_commits_to_small_repo(
@@ -960,6 +967,7 @@ mod tests {
             &ctx,
             small_repo.clone(),
             large_repo.clone(),
+            SubmoduleDeps::ForSync(HashMap::new()),
             mapping.clone(),
             live_commit_sync_config,
             Arc::new(InProcessLease::new()),

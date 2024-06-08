@@ -63,8 +63,8 @@ impl CoreMemIdMap {
         self.name2id.get(name).copied()
     }
 
-    pub fn lookup_vertex_name(&self, id: Id) -> Option<VertexName> {
-        self.id2name.get(&id).cloned()
+    pub fn lookup_vertex_name(&self, id: Id) -> Option<&VertexName> {
+        self.id2name.get(&id)
     }
 
     pub fn lookup_vertexes_by_hex_prefix(
@@ -84,6 +84,10 @@ impl CoreMemIdMap {
             }
         }
         Ok(result)
+    }
+
+    pub fn lookup_range(&self, low: Id, high: Id) -> impl Iterator<Item = (&Id, &VertexName)> {
+        self.id2name.range(low..=high)
     }
 
     pub fn has_vertex_name(&self, name: &VertexName) -> bool {
@@ -137,6 +141,7 @@ impl IdConvert for MemIdMap {
     async fn vertex_name(&self, id: Id) -> Result<VertexName> {
         self.core
             .lookup_vertex_name(id)
+            .cloned()
             .ok_or_else(|| id.not_found_error())
     }
     async fn contains_vertex_name(&self, name: &VertexName) -> Result<bool> {

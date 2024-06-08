@@ -247,17 +247,37 @@ impl AsyncNameSetQuery for SliceSet {
             trace!("iter_rev({:0.6?}): use inner.iter_rev()", self,);
             let count = self.count().await?;
             let iter = self.inner.iter_rev().await?;
+            let count = count.try_into()?;
             Ok(Box::pin(iter.take(count)))
         }
     }
 
-    async fn count(&self) -> Result<usize> {
+    async fn count(&self) -> Result<u64> {
         let count = self.inner.count().await?;
         // consider skip_count
         let count = (count as u64).max(self.skip_count) - self.skip_count;
         // consider take_count
         let count = count.min(self.take_count.unwrap_or(u64::MAX));
-        Ok(count as _)
+        Ok(count)
+    }
+
+    async fn size_hint(&self) -> (u64, Option<u64>) {
+        let (min, max) = self.inner.size_hint().await;
+        // [0 .. min .. max]
+        // [ skip ][--- take ---]
+        let skip = self.skip_count;
+        let take = self.take_count;
+        let min = match take {
+            None => min.saturating_sub(skip),
+            Some(take) => min.saturating_sub(skip).min(take),
+        };
+        let max = match (max, take) {
+            (Some(max), Some(take)) => Some(max.saturating_sub(skip).min(take)),
+            (Some(max), None) => Some(max.saturating_sub(skip)),
+            (None, Some(take)) => Some(take),
+            (None, None) => None,
+        };
+        (min, max)
     }
 
     async fn contains(&self, name: &VertexName) -> Result<bool> {
@@ -413,6 +433,23 @@ mod tests {
             format!("{:?}", set),
             "<slice <static [a, b, c] + 6 more> [..4]>"
         );
+    }
+
+    #[test]
+    fn test_size_hint_sets() {
+        let bytes = b"\x11\x22\x33";
+        for skip in 0..(bytes.len() + 2) {
+            for size_hint_adjust in 0..7 {
+                let vec_set = VecQuery::from_bytes(&bytes[..]).adjust_size_hint(size_hint_adjust);
+                let vec_set = NameSet::from_query(vec_set);
+                for take in 0..(bytes.len() + 2) {
+                    let set = SliceSet::new(vec_set.clone(), skip as _, Some(take as _));
+                    check_invariants(&set).unwrap();
+                }
+                let set = SliceSet::new(vec_set, skip as _, None);
+                check_invariants(&set).unwrap();
+            }
+        }
     }
 
     quickcheck::quickcheck! {

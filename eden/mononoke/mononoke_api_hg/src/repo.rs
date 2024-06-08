@@ -28,9 +28,14 @@ use bytes::Bytes;
 use changeset_fetcher::ChangesetFetcherRef;
 use changesets::ChangesetInsert;
 use changesets::ChangesetsRef;
+use commit_cloud::sql::versions_ops::WorkspaceVersion;
+use commit_cloud::CommitCloudRef;
 use commit_graph::CommitGraphRef;
 use context::CoreContext;
 use edenapi_types::AnyId;
+use edenapi_types::GetReferencesParams;
+use edenapi_types::ReferencesData;
+use edenapi_types::UpdateReferencesParams;
 use edenapi_types::UploadToken;
 use ephemeral_blobstore::Bubble;
 use ephemeral_blobstore::BubbleId;
@@ -564,7 +569,7 @@ impl HgRepoContext {
     }
 
     /// This provides the same functionality as
-    /// `mononke_api::RepoContext::many_changeset_ids_to_locations`. It just translates to
+    /// `mononoke_api::RepoContext::many_changeset_ids_to_locations`. It just translates to
     /// and from Mercurial types.
     pub async fn many_changeset_ids_to_locations(
         &self,
@@ -816,10 +821,7 @@ impl HgRepoContext {
 
     /// Check if all changesets in the list are public.
     /// This may treat commits that "recently" became public as draft.
-    pub async fn is_all_public(
-        &self,
-        changesets: &Vec<HgChangesetId>,
-    ) -> Result<bool, MononokeError> {
+    pub async fn is_all_public(&self, changesets: &[HgChangesetId]) -> Result<bool, MononokeError> {
         let len = changesets.len();
         let public_phases = self
             .blob_repo()
@@ -907,7 +909,7 @@ impl HgRepoContext {
                     })
                 })))
             })
-            .buffered(10)
+            .buffered(25)
             .try_flatten())
     }
 
@@ -936,7 +938,7 @@ impl HgRepoContext {
             .ancestors_difference_stream(&ctx, bonsai_heads, bonsai_common)
             .await?
             .map_err(MononokeError::from)
-            .and_then(move |bcs_id| {
+            .map_ok(move |bcs_id| {
                 let ctx = ctx.clone();
                 let blob_repo = blob_repo.clone();
                 async move {
@@ -945,7 +947,8 @@ impl HgRepoContext {
                         .await
                         .map_err(MononokeError::from)
                 }
-            });
+            })
+            .try_buffered(100);
         Ok(commit_graph_stream)
     }
 
@@ -1009,7 +1012,7 @@ impl HgRepoContext {
 
         let bonsai_hg_mapping = stream::iter(all_cs_ids)
             .chunks(map_chunk_size)
-            .then(move |chunk| async move {
+            .map(move |chunk| async move {
                 let mapping = self
                     .blob_repo()
                     .get_hg_bonsai_mapping(self.ctx().clone(), chunk.to_vec())
@@ -1017,6 +1020,7 @@ impl HgRepoContext {
                     .context("error fetching hg bonsai mapping")?;
                 Ok::<_, Error>(mapping)
             })
+            .buffered(25)
             .try_collect::<Vec<Vec<(HgChangesetId, ChangesetId)>>>()
             .await?
             .into_iter()
@@ -1046,6 +1050,40 @@ impl HgRepoContext {
             .collect::<Result<Vec<_>, MononokeError>>()?;
 
         Ok(hg_parent_mapping)
+    }
+
+    pub async fn cloud_workspace(
+        &self,
+        workspace: &str,
+        reponame: &str,
+    ) -> Result<Vec<WorkspaceVersion>, MononokeError> {
+        Ok(self
+            .blob_repo()
+            .commit_cloud()
+            .get_workspace(workspace, reponame)
+            .await?)
+    }
+
+    pub async fn cloud_references(
+        &self,
+        params: GetReferencesParams,
+    ) -> Result<ReferencesData, MononokeError> {
+        Ok(self
+            .blob_repo()
+            .commit_cloud()
+            .get_references(params)
+            .await?)
+    }
+
+    pub async fn cloud_update_references(
+        &self,
+        params: UpdateReferencesParams,
+    ) -> Result<ReferencesData, MononokeError> {
+        Ok(self
+            .blob_repo()
+            .commit_cloud()
+            .update_references(params)
+            .await?)
     }
 }
 

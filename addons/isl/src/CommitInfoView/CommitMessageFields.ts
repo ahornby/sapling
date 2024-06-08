@@ -10,8 +10,10 @@ import type {CommitMessageFields, FieldConfig, FieldsBeingEdited} from './types'
 
 import {temporaryCommitTitle} from '../CommitTitle';
 import {Internal} from '../Internal';
-import {clearOnCwdChange} from '../recoilUtils';
-import {atom} from 'recoil';
+import {codeReviewProvider} from '../codeReview/CodeReviewInfo';
+import {arraysEqual} from '../utils';
+import {OSSCommitMessageFieldSchema} from './OSSCommitMessageFieldsSchema';
+import {atom} from 'jotai';
 import {notEmpty} from 'shared/utils';
 
 export function emptyCommitMessageFields(schema: Array<FieldConfig>): CommitMessageFields {
@@ -32,13 +34,20 @@ export function allFieldsBeingEdited(schema: Array<FieldConfig>): FieldsBeingEdi
   return Object.fromEntries(schema.map(config => [config.key, true]));
 }
 
+function trimEmpty(a: Array<string>): Array<string> {
+  return a.filter(s => s.trim() !== '');
+}
+
 function fieldEqual(
   config: FieldConfig,
   a: Partial<CommitMessageFields>,
   b: Partial<CommitMessageFields>,
 ): boolean {
   return config.type === 'field'
-    ? arraysEqual((a[config.key] ?? []) as Array<string>, (b[config.key] ?? []) as Array<string>)
+    ? arraysEqual(
+        trimEmpty((a[config.key] ?? []) as Array<string>),
+        trimEmpty((b[config.key] ?? []) as Array<string>),
+      )
     : a[config.key] === b[config.key];
 }
 
@@ -187,6 +196,31 @@ export function mergeCommitMessageFields(
   );
 }
 
+/**
+ * Merge two message fields, but always take A's fields if both are non-empty.
+ */
+export function mergeOnlyEmptyMessageFields(
+  schema: Array<FieldConfig>,
+  a: CommitMessageFields,
+  b: CommitMessageFields,
+): CommitMessageFields {
+  return Object.fromEntries(
+    schema
+      .map(config => {
+        const isANonEmpty = isFieldNonEmpty(a[config.key]);
+        const isBNonEmpty = isFieldNonEmpty(b[config.key]);
+        if (!isANonEmpty && !isBNonEmpty) {
+          return undefined;
+        } else if (!isANonEmpty || !isBNonEmpty) {
+          return [config.key, isANonEmpty ? a[config.key] : b[config.key]];
+        } else {
+          return [config.key, a[config.key]];
+        }
+      })
+      .filter(notEmpty),
+  );
+}
+
 export function mergeManyCommitMessageFields(
   schema: Array<FieldConfig>,
   fields: Array<CommitMessageFields>,
@@ -224,7 +258,10 @@ function joinWithComma(tokens: Array<string>): string {
  * Look through the message fields for a diff number
  */
 export function findEditedDiffNumber(field: CommitMessageFields): string | undefined {
-  const found = field['Differential Revision'];
+  if (Internal.diffFieldTag == null) {
+    return undefined;
+  }
+  const found = field[Internal.diffFieldTag];
   if (Array.isArray(found)) {
     return found[0];
   }
@@ -296,31 +333,17 @@ export function parseCommitMessageFields(
   return result;
 }
 
-export const OSSDefaultFieldSchema: Array<FieldConfig> = [
-  {key: 'Title', type: 'title', icon: 'milestone'},
-  {key: 'Description', type: 'textarea', icon: 'note'},
-];
-
-function arraysEqual<T>(a: Array<T>, b: Array<T>): boolean {
-  if (a.length !== b.length) {
-    return false;
-  }
-  return a.every((val, i) => b[i] === val);
-}
-
 /**
  * Schema defining what fields we expect to be in a CommitMessageFields object,
  * and some information about those fields.
- * This is determined by an sl config on the server, hence it lives as an atom.
  */
-export const commitMessageFieldsSchema = atom<Array<FieldConfig>>({
-  key: 'commitMessageFieldsSchema',
-  default: getDefaultCommitMessageSchema(),
-  effects: [clearOnCwdChange()],
+export const commitMessageFieldsSchema = atom(get => {
+  const provider = get(codeReviewProvider);
+  return provider?.commitMessageFieldsSchema ?? getDefaultCommitMessageSchema();
 });
 
 export function getDefaultCommitMessageSchema() {
-  return Internal.CommitMessageFieldSchema ?? OSSDefaultFieldSchema;
+  return Internal.CommitMessageFieldSchemaForGitHub ?? OSSCommitMessageFieldSchema;
 }
 
 export function editedMessageSubset(
@@ -330,7 +353,7 @@ export function editedMessageSubset(
   const fields = Object.fromEntries(
     Object.entries(message).filter(([k]) => fieldsBeingEdited[k] ?? false),
   );
-  return {fields};
+  return fields;
 }
 
 export function applyEditedFields(

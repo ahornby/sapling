@@ -1,5 +1,5 @@
 #chg-compatible
-#require chg
+#require chg no-eden
 
 Use any random Python command - make sure we see tracing events.
   $ LOG=commands=info hg hint

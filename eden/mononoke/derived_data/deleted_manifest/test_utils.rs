@@ -14,10 +14,10 @@ use blobstore::Loadable;
 use bonsai_hg_mapping::BonsaiHgMapping;
 use bookmarks::Bookmarks;
 use bounded_traversal::bounded_traversal_stream;
-use changeset_fetcher::ChangesetFetcher;
 use changesets::Changesets;
 use changesets_creation::save_changesets;
 use cloned::cloned;
+use commit_graph::CommitGraph;
 use context::CoreContext;
 use derived_data_test_utils::bonsai_changeset_from_hg;
 use fbinit::FacebookInit;
@@ -49,6 +49,7 @@ use repo_derived_data::RepoDerivedData;
 use repo_derived_data::RepoDerivedDataRef;
 use sorted_vector_map::SortedVectorMap;
 use tests_utils::CreateCommitContext;
+use unodes::RootUnodeManifestId;
 
 use crate::derive::get_unodes;
 use crate::derive::DeletedManifestDeriver;
@@ -69,7 +70,7 @@ pub(crate) struct TestRepo {
     #[facet]
     filestore_config: FilestoreConfig,
     #[facet]
-    changeset_fetcher: dyn ChangesetFetcher,
+    commit_graph: CommitGraph,
     #[facet]
     changesets: dyn Changesets,
 }
@@ -283,7 +284,7 @@ pub(crate) async fn many_file_dirs_test<Root: RootDeletedManifestIdCommon>(
     fb: FacebookInit,
 ) -> Result<(), Error> {
     let repo: TestRepo = build_repo(fb).await.unwrap();
-    ManyFilesDirs::initrepo(fb, &repo).await;
+    ManyFilesDirs::init_repo(fb, &repo).await?;
     let ctx = CoreContext::test_mock(fb);
 
     let mf_id_1 = {
@@ -799,6 +800,11 @@ async fn derive_manifest<Root: RootDeletedManifestIdCommon>(
 ) -> Result<(ChangesetId, Root::Id, Vec<(MPath, Status)>), Error> {
     let blobstore = repo.repo_blobstore_arc() as Arc<dyn Blobstore>;
     let bcs_id = bcs.get_changeset_id();
+
+    repo.repo_derived_data()
+        .manager()
+        .derive::<RootUnodeManifestId>(ctx, bcs.get_changeset_id(), None)
+        .await?;
 
     let (current_unode, parent_unodes) = get_unodes(
         ctx,

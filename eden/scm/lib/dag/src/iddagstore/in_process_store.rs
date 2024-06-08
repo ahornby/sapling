@@ -25,6 +25,7 @@ use crate::errors::bug;
 use crate::id::Group;
 use crate::id::Id;
 use crate::ops::Persist;
+use crate::ops::StorageVersion;
 use crate::segment::Segment;
 use crate::spanset::Span;
 use crate::IdSet;
@@ -312,6 +313,12 @@ impl IdDagStore for InProcessStore {
     }
 }
 
+impl StorageVersion for InProcessStore {
+    fn storage_version(&self) -> (u64, u64) {
+        (0, 0)
+    }
+}
+
 impl Persist for InProcessStore {
     type Lock = ();
 
@@ -363,7 +370,7 @@ impl InProcessStore {
             non_master_segments: Vec::new(),
             level_head_index: Vec::new(),
             parent_index: BTreeMap::new(),
-            id_set_by_group: [IdSet::empty(), IdSet::empty()],
+            id_set_by_group: [IdSet::empty(), IdSet::empty(), IdSet::empty()],
             removed_store_ids: Default::default(),
         }
     }

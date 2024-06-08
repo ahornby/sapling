@@ -14,12 +14,12 @@ import {Tooltip} from './Tooltip';
 import {codeReviewProvider, allDiffSummaries} from './codeReview/CodeReviewInfo';
 import {t, T} from './i18n';
 import {HideOperation} from './operations/HideOperation';
+import {useRunOperation} from './operationsState';
 import {type Dag, dagWithPreviews} from './previews';
-import {useRunOperation} from './serverAPIState';
 import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
-import {useRecoilValue} from 'recoil';
+import {useAtomValue} from 'jotai';
 import {Icon} from 'shared/Icon';
-import {unwrap} from 'shared/utils';
+import {nullthrows} from 'shared/utils';
 
 export function isStackEligibleForCleanup(
   hash: Hash,
@@ -32,13 +32,23 @@ export function isStackEligibleForCleanup(
     .toSeq()
     .every(h => {
       const info = dag.get(h);
-      return !(
-        info == null ||
-        info.diffId == null ||
-        info.isHead || // don't allow hiding a stack you're checked out on
-        diffMap.get(info.diffId) == null ||
-        !provider.isDiffEligibleForCleanup(unwrap(diffMap.get(info.diffId)))
-      );
+      // don't allow hiding a stack you're checked out on
+      if (info == null || info.isDot) {
+        return false;
+      }
+      // allow clean up obsoleted commits regardless of review state
+      if (info.successorInfo != null) {
+        return true;
+      }
+      // if not obsoleted, still allow cleanup for "Closed" diffs
+      if (info.diffId != null) {
+        const diffInfo = diffMap.get(info.diffId);
+        if (diffInfo != null && provider.isDiffEligibleForCleanup(diffInfo)) {
+          return true;
+        }
+      }
+      // no cleanup otherwise
+      return false;
     });
 }
 
@@ -65,9 +75,9 @@ export function CleanupButton({commit, hasChildren}: {commit: CommitInfo; hasChi
 }
 
 export function CleanupAllButton() {
-  const dag = useRecoilValue(dagWithPreviews);
-  const reviewProvider = useRecoilValue(codeReviewProvider);
-  const diffMap = useRecoilValue(allDiffSummaries)?.value;
+  const dag = useAtomValue(dagWithPreviews);
+  const reviewProvider = useAtomValue(codeReviewProvider);
+  const diffMap = useAtomValue(allDiffSummaries)?.value;
   if (diffMap == null || reviewProvider == null) {
     return null;
   }
@@ -89,7 +99,7 @@ export function CleanupAllButton() {
         contextKey="cleanup-all"
         runOperation={() => {
           return cleanableStacks.map(hash => {
-            const info = unwrap(dag.get(hash));
+            const info = nullthrows(dag.get(hash));
             return new HideOperation(latestSuccessorUnlessExplicitlyObsolete(info));
           });
         }}

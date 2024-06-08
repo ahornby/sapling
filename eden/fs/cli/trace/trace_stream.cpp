@@ -16,10 +16,11 @@
 #include <thrift/lib/cpp2/async/RocketClientChannel.h>
 #include <thrift/lib/cpp2/protocol/Serializer.h>
 #include <unordered_set>
+
+#include "eden/common/utils/PathFuncs.h"
+#include "eden/common/utils/TimeUtil.h"
 #include "eden/fs/service/gen-cpp2/StreamingEdenServiceAsyncClient.h"
 #include "eden/fs/service/gen-cpp2/streamingeden_constants.h"
-#include "eden/fs/utils/PathFuncs.h"
-#include "eden/fs/utils/TimeUtil.h"
 
 using namespace facebook::eden;
 using namespace std::string_view_literals;
@@ -28,7 +29,7 @@ DEFINE_string(mountRoot, "", "Root of the EdenFS mount");
 DEFINE_string(trace, "", "Trace mode");
 DEFINE_bool(writes, false, "Limit trace to write operations");
 DEFINE_bool(reads, false, "Limit trace to write operations");
-DEFINE_bool(verbose, false, "Show import priority and cause");
+DEFINE_bool(verbose, false, "Show import priority, cause and fetched source");
 DEFINE_bool(
     retroactive,
     false,
@@ -37,28 +38,41 @@ DEFINE_bool(
 namespace {
 constexpr auto kTimeout = std::chrono::seconds{1};
 constexpr size_t kStartingInodeWidth = 5;
-static const auto kTreeEmoji = reinterpret_cast<const char*>(u8"\U0001F332");
-static const auto kBlobEmoji = reinterpret_cast<const char*>(u8"\U0001F954");
+static const auto kTreeEmoji =
+    reinterpret_cast<const char*>(u8"\U0001F332"); // 🌲
+static const auto kBlobEmoji =
+    reinterpret_cast<const char*>(u8"\U0001F4C4"); // 📄
 static const auto kBlobMetaEmoji =
-    reinterpret_cast<const char*>(u8"\U0001F4DB");
+    reinterpret_cast<const char*>(u8"\U0001F5C2\U00000020"); // 🗂️
 static const auto kRequestStartEmoji =
-    reinterpret_cast<const char*>(u8"\u2193");
+    reinterpret_cast<const char*>(u8"\u2193"); // ↓
 static const auto kRequestCompleteEmoji =
-    reinterpret_cast<const char*>(u8"\u2714");
+    reinterpret_cast<const char*>(u8"\u2714"); // ✔
+static const auto kWarningSignEmoji =
+    reinterpret_cast<const char*>(u8"\u26A0"); // ⚠
 
-static const auto kWarningSignEmoji = reinterpret_cast<const char*>(u8"\u26A0");
-static const auto kRedSquareEmoji =
-    reinterpret_cast<const char*>(u8"\U0001F7E5");
-static const auto kOrangeDiamondEmoji =
-    reinterpret_cast<const char*>(u8"\U0001F536");
-static const auto kGreenCircleEmoji =
-    reinterpret_cast<const char*>(u8"\U0001F7E2");
-static const auto kQuestionEmoji = reinterpret_cast<const char*>(u8"\u2753");
-static const auto kFolderEmoji = reinterpret_cast<const char*>(u8"\U0001F4C1");
+static const auto kLowPriorityEmoji =
+    reinterpret_cast<const char*>(u8"\U0001F535"); // 🔵
+static const auto kNormalPriorityEmoji =
+    reinterpret_cast<const char*>(u8"\U0001F7E1"); // 🟡
+static const auto kHighPriorityEmoji =
+    reinterpret_cast<const char*>(u8"\U0001F534"); // 🔴
+static const auto kQuestionEmoji =
+    reinterpret_cast<const char*>(u8"\u2753"); // ❓
+static const auto kFolderEmoji =
+    reinterpret_cast<const char*>(u8"\U0001F4C1"); // 📁
 static const auto kFaxMachineEmoji =
-    reinterpret_cast<const char*>(u8"\U0001F4E0");
+    reinterpret_cast<const char*>(u8"\U0001F4E0"); // 📠
 static const auto kCalendarEmoji =
-    reinterpret_cast<const char*>(u8"\U0001F4C5");
+    reinterpret_cast<const char*>(u8"\U0001F4C5"); // 📆
+static const auto kLocalFetchedEmoji =
+    reinterpret_cast<const char*>(u8"\U0001F4BB"); // 💻
+static const auto kRemoteFetchedEmoji =
+    reinterpret_cast<const char*>(u8"\U0001F310"); // 🌐
+static const auto kUnknownFetchedEmoji =
+    reinterpret_cast<const char*>(u8"\U0001F937"); // 🤷
+static const auto kNotAvailableYetFetchedEmoji = reinterpret_cast<const char*>(
+    u8"\U00000020\U00000020"); // double blank space "  "
 
 static const std::unordered_map<HgEventType, const char*> kHgEventTypes = {
     {HgEventType::QUEUE, " "},
@@ -88,9 +102,9 @@ static const std::unordered_map<HgResourceType, const char*> kResourceTypes = {
 
 static const std::unordered_map<HgImportPriority, const char*>
     kImportPriorities = {
-        {HgImportPriority::LOW, kRedSquareEmoji},
-        {HgImportPriority::NORMAL, kOrangeDiamondEmoji},
-        {HgImportPriority::HIGH, kGreenCircleEmoji},
+        {HgImportPriority::LOW, kLowPriorityEmoji},
+        {HgImportPriority::NORMAL, kNormalPriorityEmoji},
+        {HgImportPriority::HIGH, kHighPriorityEmoji},
 };
 
 static const std::unordered_map<HgImportCause, const char*> kImportCauses = {
@@ -98,6 +112,13 @@ static const std::unordered_map<HgImportCause, const char*> kImportCauses = {
     {HgImportCause::FS, kFolderEmoji},
     {HgImportCause::THRIFT, kFaxMachineEmoji},
     {HgImportCause::PREFETCH, kCalendarEmoji},
+};
+
+static const std::unordered_map<FetchedSource, const char*> kFetchedSource = {
+    {FetchedSource::LOCAL, kLocalFetchedEmoji},
+    {FetchedSource::REMOTE, kRemoteFetchedEmoji},
+    {FetchedSource::UNKNOWN, kUnknownFetchedEmoji},
+    {FetchedSource::NOT_AVAILABLE_YET, kNotAvailableYetFetchedEmoji},
 };
 
 /**
@@ -180,6 +201,7 @@ void print_hg_event(
   const HgResourceType resourceType = *evt.resourceType();
   const HgImportPriority importPriority = *evt.importPriority();
   const HgImportCause importCause = *evt.importCause();
+  const FetchedSource fetchedSource = *evt.fetchedSource();
   const uint64_t unique = *evt.unique();
 
   switch (eventType) {
@@ -240,6 +262,8 @@ void print_hg_event(
       folly::get_default(kImportPriorities, importPriority, "?");
   const char* importCauseStr =
       folly::get_default(kImportCauses, importCause, "?");
+  const char* fetchedSourceStr =
+      folly::get_default(kFetchedSource, fetchedSource, "?");
 
   std::string processInfo;
   if (auto requestInfo = evt.requestInfo()) {
@@ -259,11 +283,12 @@ void print_hg_event(
 
   if (FLAGS_verbose) {
     fmt::print(
-        "{} {} {} {} {}{}{}\n",
+        "{} {} {} {} {} {}{}{}\n",
         eventTypeStr,
         resourceTypeStr,
         importPriorityStr,
         importCauseStr,
+        fetchedSourceStr,
         *evt.path(),
         timeAnnotation,
         processInfo);

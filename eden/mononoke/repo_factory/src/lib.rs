@@ -16,6 +16,8 @@ use std::sync::Arc;
 
 use acl_regions::build_acl_regions;
 use acl_regions::ArcAclRegions;
+#[cfg(fbcode_build)]
+use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Result;
 use async_once_cell::AsyncOnceCell;
@@ -35,6 +37,7 @@ use bonsai_blob_mapping::ArcBonsaiBlobMapping;
 use bonsai_blob_mapping::BonsaiBlobMapping;
 use bonsai_blob_mapping::SqlBonsaiBlobMapping;
 use bonsai_git_mapping::ArcBonsaiGitMapping;
+use bonsai_git_mapping::CachingBonsaiGitMapping;
 use bonsai_git_mapping::SqlBonsaiGitMappingBuilder;
 use bonsai_globalrev_mapping::ArcBonsaiGlobalrevMapping;
 use bonsai_globalrev_mapping::CachingBonsaiGlobalrevMapping;
@@ -69,6 +72,9 @@ use changeset_fetcher::SimpleChangesetFetcher;
 use changesets::ArcChangesets;
 use changesets_impl::CachingChangesets;
 use changesets_impl::SqlChangesetsBuilder;
+use commit_cloud::sql::builder::SqlCommitCloudBuilder;
+use commit_cloud::ArcCommitCloud;
+use commit_cloud::CommitCloud;
 use commit_graph::ArcCommitGraph;
 use commit_graph::CommitGraph;
 use commit_graph_compat::ChangesetsCommitGraphCompat;
@@ -145,10 +151,9 @@ use repo_bookmark_attrs::ArcRepoBookmarkAttrs;
 use repo_bookmark_attrs::RepoBookmarkAttrs;
 use repo_cross_repo::ArcRepoCrossRepo;
 use repo_cross_repo::RepoCrossRepo;
+use repo_derivation_queues::ArcRepoDerivationQueues;
 use repo_derived_data::ArcRepoDerivedData;
 use repo_derived_data::RepoDerivedData;
-use repo_derived_data_service::ArcDerivedDataManagerSet;
-use repo_derived_data_service::DerivedDataManagerSet;
 use repo_hook_file_content_provider::RepoHookFileContentProvider;
 use repo_identity::ArcRepoIdentity;
 use repo_identity::RepoIdentity;
@@ -192,6 +197,8 @@ use wireproto_handler::PushRedirectorMode;
 use wireproto_handler::PushRedirectorMode::Enabled;
 use wireproto_handler::RepoHandlerBase;
 use wireproto_handler::TargetRepoDbs;
+#[cfg(fbcode_build)]
+use zelos_queue::zelos_derivation_queues;
 
 const DERIVED_DATA_LEASE: &str = "derived-data-lease";
 
@@ -720,6 +727,9 @@ pub enum RepoFactoryError {
 
     #[error("Error openning deletion log DB")]
     SqlDeletionLog,
+
+    #[error("Error openning commit cloud DB")]
+    SqlCommitCloud,
 }
 
 #[facet::factory(name: String, repo_config_param: RepoConfig, common_config_param: CommonConfig)]
@@ -865,7 +875,14 @@ impl RepoFactory {
             .await
             .context(RepoFactoryError::BonsaiGitMapping)?
             .build(repo_identity.id());
-        Ok(Arc::new(bonsai_git_mapping))
+        if let Some(cache_handler_factory) = self.cache_handler_factory("bonsai_git_mapping")? {
+            Ok(Arc::new(CachingBonsaiGitMapping::new(
+                Arc::new(bonsai_git_mapping),
+                cache_handler_factory,
+            )?))
+        } else {
+            Ok(Arc::new(bonsai_git_mapping))
+        }
     }
 
     pub async fn long_running_requests_queue(
@@ -888,7 +905,7 @@ impl RepoFactory {
             .open_sql::<SqlBonsaiGlobalrevMappingBuilder>(repo_config)
             .await
             .context(RepoFactoryError::BonsaiGlobalrevMapping)?
-            .build(repo_identity.id());
+            .build(self.env.rendezvous_options, repo_identity.id());
         if let Some(cache_handler_factory) =
             self.cache_handler_factory("bonsai_globalrev_mapping")?
         {
@@ -1025,11 +1042,17 @@ impl RepoFactory {
         repo_config: &ArcRepoConfig,
         repo_identity: &ArcRepoIdentity,
     ) -> Result<ArcHgMutationStore> {
-        let hg_mutation_store = self
+        let mut builder = self
             .open_sql::<SqlHgMutationStoreBuilder>(repo_config)
             .await
-            .context(RepoFactoryError::HgMutationStore)?
-            .with_repo_id(repo_identity.id());
+            .context(RepoFactoryError::HgMutationStore)?;
+        if let Ok(mutation_limit) = justknobs::get_as::<usize>(
+            "scm/mononoke:mutation_chain_length_limit",
+            Some(repo_identity.name()),
+        ) {
+            builder = builder.with_mutation_limit(mutation_limit);
+        }
+        let hg_mutation_store = builder.with_repo_id(repo_identity.id());
 
         if let Some(cache_handler_factory) = self.cache_handler_factory("hg_mutation_store")? {
             Ok(Arc::new(CachedHgMutationStore::new(
@@ -1235,7 +1258,7 @@ impl RepoFactory {
         )?))
     }
 
-    pub fn derived_data_manager_set(
+    pub async fn repo_derivation_queues(
         &self,
         repo_identity: &ArcRepoIdentity,
         repo_config: &ArcRepoConfig,
@@ -1245,33 +1268,52 @@ impl RepoFactory {
         bonsai_git_mapping: &ArcBonsaiGitMapping,
         filenodes: &ArcFilenodes,
         repo_blobstore: &ArcRepoBlobstore,
-    ) -> Result<ArcDerivedDataManagerSet> {
-        let config = repo_config.derived_data_config.clone();
-        let lease = self.lease(DERIVED_DATA_LEASE)?;
-        let ctx = self.ctx(Some(repo_identity));
-        let logger = ctx.logger().clone();
-        let derived_data_scuba = build_scuba(
-            self.env.fb,
-            config.scuba_table.clone(),
-            repo_identity.name(),
-        )?;
-        let derivation_service_client =
-            get_derivation_client(self.env.fb, self.env.remote_derivation_options.clone())?;
-        anyhow::Ok(Arc::new(DerivedDataManagerSet::new(
-            repo_identity.id(),
-            repo_identity.name().to_string(),
-            changesets.clone(),
-            commit_graph.clone(),
-            bonsai_hg_mapping.clone(),
-            bonsai_git_mapping.clone(),
-            filenodes.clone(),
-            repo_blobstore.as_ref().clone(),
-            lease,
-            logger,
-            derived_data_scuba,
-            config,
-            derivation_service_client,
-        )?))
+    ) -> Result<ArcRepoDerivationQueues> {
+        #[cfg(not(fbcode_build))]
+        {
+            let _ = (
+                repo_identity,
+                repo_config,
+                changesets,
+                commit_graph,
+                bonsai_hg_mapping,
+                bonsai_git_mapping,
+                repo_blobstore,
+                filenodes,
+            );
+            anyhow::bail!("RepoDerivationQueues is not supported in non-fbcode builds")
+        }
+        #[cfg(fbcode_build)]
+        {
+            let config = repo_config.derived_data_config.clone();
+            let zelos_config = repo_config.zelos_config.as_ref().ok_or_else(|| {
+                anyhow!("Missing zelos config while trying to construct repo_derivation_queues")
+            })?;
+            let lease = self.lease(DERIVED_DATA_LEASE)?;
+            let derived_data_scuba = build_scuba(
+                self.env.fb,
+                config.scuba_table.clone(),
+                repo_identity.name(),
+            )?;
+            anyhow::Ok(Arc::new(
+                zelos_derivation_queues(
+                    self.env.fb,
+                    repo_identity.id(),
+                    repo_identity.name().to_string(),
+                    changesets.clone(),
+                    commit_graph.clone(),
+                    bonsai_hg_mapping.clone(),
+                    bonsai_git_mapping.clone(),
+                    filenodes.clone(),
+                    repo_blobstore.as_ref().clone(),
+                    lease,
+                    derived_data_scuba,
+                    config,
+                    zelos_config,
+                )
+                .await?,
+            ))
+        }
     }
 
     /// The commit mapping bettween repos for synced commits.
@@ -1468,11 +1510,14 @@ impl RepoFactory {
     ) -> Result<ArcBookmarksCache> {
         match &self.env.bookmark_cache_options.cache_kind {
             BookmarkCacheKind::Local => {
-                let mut scuba = self.env.warm_bookmarks_cache_scuba_sample_builder.clone();
-                scuba.add("repo", repo_identity.name());
+                let scuba_sample_builder =
+                    self.env.warm_bookmarks_cache_scuba_sample_builder.clone();
+                let ctx = self
+                    .ctx(Some(repo_identity))
+                    .with_mutated_scuba(|_| scuba_sample_builder);
 
                 let mut wbc_builder = WarmBookmarksCacheBuilder::new(
-                    self.ctx(Some(repo_identity)),
+                    ctx,
                     bookmarks.clone(),
                     bookmark_update_log.clone(),
                     repo_identity.clone(),
@@ -1481,6 +1526,9 @@ impl RepoFactory {
                 match self.env.bookmark_cache_options.derived_data {
                     BookmarkCacheDerivedData::HgOnly => {
                         wbc_builder.add_hg_warmers(repo_derived_data, phases)?;
+                    }
+                    BookmarkCacheDerivedData::GitOnly => {
+                        wbc_builder.add_git_warmers(repo_derived_data, phases)?;
                     }
                     BookmarkCacheDerivedData::AllKinds => {
                         wbc_builder.add_all_warmers(repo_derived_data, phases)?;
@@ -1679,6 +1727,27 @@ impl RepoFactory {
             .await
             .context(RepoFactoryError::SqlDeletionLog)?;
         Ok(Arc::new(DeletionLog { sql_deletion_log }))
+    }
+
+    pub async fn commit_cloud(
+        &self,
+        repo_config: &ArcRepoConfig,
+        bonsai_hg_mapping: &ArcBonsaiHgMapping,
+        repo_derived_data: &ArcRepoDerivedData,
+    ) -> Result<ArcCommitCloud> {
+        let sql_commit_cloud = self
+            .open_sql::<SqlCommitCloudBuilder>(repo_config)
+            .await
+            .context(RepoFactoryError::SqlCommitCloud)?;
+        Ok(Arc::new(CommitCloud {
+            storage: sql_commit_cloud.new(matches!(
+                &repo_config.storage_config.metadata,
+                MetadataDatabaseConfig::Remote(_)
+            )),
+            bonsai_hg_mapping: bonsai_hg_mapping.clone(),
+            repo_derived_data: repo_derived_data.clone(),
+            core_ctx: self.ctx(None),
+        }))
     }
 }
 

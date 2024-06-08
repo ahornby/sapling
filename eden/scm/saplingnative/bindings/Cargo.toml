@@ -21,6 +21,7 @@ pyclientinfo = { version = "0.1.0", path = "modules/pyclientinfo" }
 pycliparser = { version = "0.1.0", path = "modules/pycliparser" }
 pyconchparser = { version = "0.1.0", path = "modules/pyconchparser" }
 pyconfigloader = { version = "0.1.0", path = "modules/pyconfigloader" }
+pycontext = { version = "0.1.0", path = "modules/pycontext" }
 pycopytrace = { version = "0.1.0", path = "modules/pycopytrace" }
 pydag = { version = "0.1.0", path = "modules/pydag" }
 pydiffhelpers = { version = "0.1.0", path = "modules/pydiffhelpers" }
@@ -29,11 +30,11 @@ pydoctor = { version = "0.1.0", path = "modules/pydoctor" }
 pydrawdag = { version = "0.1.0", path = "modules/pydrawdag" }
 pyeagerepo = { version = "0.1.0", path = "modules/pyeagerepo" }
 pyedenapi = { version = "0.1.0", path = "modules/pyedenapi" }
-pyedenclient = { version = "0.1.0", path = "modules/pyedenclient" }
 pyerror = { version = "0.1.0", path = "modules/pyerror" }
 pyexchange = { version = "0.1.0", path = "modules/pyexchange" }
 pyfail = { version = "0.1.0", path = "modules/pyfail" }
 pyfs = { version = "0.1.0", path = "modules/pyfs" }
+pygitcompat = { version = "0.1.0", path = "modules/pygitcompat" }
 pygitstore = { version = "0.1.0", path = "modules/pygitstore" }
 pyhgmetrics = { version = "0.1.0", path = "modules/pyhgmetrics" }
 pyhgtime = { version = "0.1.0", path = "modules/pyhgtime" }
@@ -72,6 +73,7 @@ pyvlq = { version = "0.1.0", path = "modules/pyvlq" }
 pywebview = { version = "0.1.0", path = "modules/pywebview" }
 pyworker = { version = "0.1.0", path = "modules/pyworker" }
 pyworkingcopy = { version = "0.1.0", path = "modules/pyworkingcopy" }
+pyworkingcopyclient = { version = "0.1.0", path = "modules/pyworkingcopyclient" }
 pyxdiff = { version = "0.1.0", path = "modules/pyxdiff" }
 pyzstd = { version = "0.1.0", path = "modules/pyzstd" }
 pyzstore = { version = "0.1.0", path = "modules/pyzstore" }

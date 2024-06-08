@@ -14,92 +14,63 @@ use serde_derive::Deserialize;
 use serde_derive::Serialize;
 use type_macros::auto_wire;
 
+use crate::FileAuxData;
 use crate::ServerError;
 
 /// Directory entry metadata
 #[auto_wire]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[cfg_attr(any(test, feature = "for-tests"), derive(Arbitrary))]
 pub struct DirectoryMetadata {
+    // Expected to match the hash of the directory's encoded augmented mf.
     #[id(0)]
-    pub fsnode_id: Option<FsnodeId>,
+    pub augmented_manifest_id: Blake3,
+    // Expected to match the size of the directory's encoded augmented mf.
     #[id(1)]
-    pub simple_format_sha1: Option<Sha1>,
-    #[id(2)]
-    pub simple_format_sha256: Option<Sha256>,
-    #[id(3)]
-    pub child_files_count: Option<u64>,
-    #[id(4)]
-    pub child_files_total_size: Option<u64>,
-    #[id(5)]
-    pub child_dirs_count: Option<u64>,
-    #[id(6)]
-    pub descendant_files_count: Option<u64>,
-    #[id(7)]
-    pub descendant_files_total_size: Option<u64>,
-}
-
-#[auto_wire]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(any(test, feature = "for-tests"), derive(Arbitrary))]
-pub struct DirectoryMetadataRequest {
-    #[id(0)]
-    pub with_fsnode_id: bool,
-    #[id(1)]
-    pub with_simple_format_sha1: bool,
-    #[id(2)]
-    pub with_simple_format_sha256: bool,
-    #[id(3)]
-    pub with_child_files_count: bool,
-    #[id(4)]
-    pub with_child_files_total_size: bool,
-    #[id(5)]
-    pub with_child_dirs_count: bool,
-    #[id(6)]
-    pub with_descendant_files_count: bool,
-    #[id(7)]
-    pub with_descendant_files_total_size: bool,
+    pub augmented_manifest_size: u64,
 }
 
 /// File entry metadata
 #[auto_wire]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 #[cfg_attr(any(test, feature = "for-tests"), derive(Arbitrary))]
 pub struct FileMetadata {
-    #[id(0)]
-    pub revisionstore_flags: Option<u64>,
-    #[id(1)]
-    pub content_id: Option<ContentId>,
-    #[id(2)]
-    pub file_type: Option<FileType>,
+    // #[id(0)] # deprecated
+    #[id(1)] //  deprecated, the field to be removed after 06/15/2024
+    #[no_default]
+    pub content_id: ContentId,
+    // #[id(2)] # deprecated
     #[id(3)]
-    pub size: Option<u64>,
+    #[no_default] // for compatibility, to be removed after 06/15/2024
+    pub size: u64,
     #[id(4)]
-    pub content_sha1: Option<Sha1>,
-    #[id(5)]
-    pub content_sha256: Option<Sha256>,
+    pub content_sha1: Sha1,
+    #[id(5)] // deprecated, the field to be removed after 06/15/2024
+    #[no_default]
+    pub content_sha256: Sha256,
     #[id(6)]
-    pub content_seeded_blake3: Option<Blake3>,
+    pub content_blake3: Blake3,
 }
 
-#[auto_wire]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(any(test, feature = "for-tests"), derive(Arbitrary))]
-pub struct FileMetadataRequest {
-    #[id(0)]
-    pub with_revisionstore_flags: bool,
-    #[id(1)]
-    pub with_content_id: bool,
-    #[id(2)]
-    pub with_file_type: bool,
-    #[id(3)]
-    pub with_size: bool,
-    #[id(4)]
-    pub with_content_sha1: bool,
-    #[id(5)]
-    pub with_content_sha256: bool,
-    #[id(6)]
-    pub with_content_seeded_blake3: bool,
+impl From<FileMetadata> for FileAuxData {
+    fn from(val: FileMetadata) -> Self {
+        FileAuxData {
+            total_size: val.size,
+            sha1: val.content_sha1,
+            blake3: val.content_blake3,
+        }
+    }
+}
+
+impl From<FileAuxData> for FileMetadata {
+    fn from(aux: FileAuxData) -> Self {
+        Self {
+            size: aux.total_size,
+            content_sha1: aux.sha1,
+            content_blake3: aux.blake3,
+            ..Default::default()
+        }
+    }
 }
 
 sized_hash!(Sha1, 20);

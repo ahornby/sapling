@@ -5,6 +5,7 @@
  * GNU General Public License version 2.
  */
 
+use std::borrow::Cow;
 use std::env;
 use std::path::Path;
 use std::sync::Arc;
@@ -16,6 +17,7 @@ use cliparser::parser::ParseError;
 use cliparser::parser::ParseOptions;
 use cliparser::parser::ParseOutput;
 use cliparser::parser::StructFlags;
+use cliparser::parser::Value;
 use configloader::config::ConfigSet;
 use configloader::hg::set_pinned;
 use configmodel::Config;
@@ -146,6 +148,7 @@ pub fn parse_global_opts(args: &[String]) -> Result<HgGlobalOpts> {
 }
 
 pub struct Dispatcher {
+    orig_args: Vec<String>,
     args: Vec<String>,
     early_result: ParseOutput,
     early_global_opts: HgGlobalOpts,
@@ -159,6 +162,8 @@ fn version_args(binary_path: &str) -> Vec<String> {
 impl Dispatcher {
     /// Load configs. Prepare to run a command.
     pub fn from_args(mut args: Vec<String>) -> Result<Self> {
+        let orig_args = args.clone();
+
         if args.get(1).map(|s| s.as_ref()) == Some("--version") {
             args[1] = "version".to_string();
         }
@@ -186,6 +191,7 @@ impl Dispatcher {
         // Load repo and configuration.
         match OptionalRepo::from_global_opts(&global_opts, cwd) {
             Ok(optional_repo) => Ok(Self {
+                orig_args,
                 args,
                 early_result,
                 early_global_opts: global_opts,
@@ -201,6 +207,10 @@ impl Dispatcher {
                 }
             }
         }
+    }
+
+    pub fn orig_args(&self) -> &[String] {
+        &self.orig_args
     }
 
     pub fn args(&self) -> &[String] {
@@ -313,7 +323,7 @@ impl Dispatcher {
         // - args are unchanged arguments provided by the user, unless only global options are provided.
         //   args can have global flags before command name.
         //   for example, ["--traceback", "log", "-Gvr", "master"]
-        //                                      ^^^^^ first_arg_index, "log" is "command_name"
+        //                                ^^^^^ first_arg_index, "log" is "command_name"
         // - expanded: includes alias expansion result
         //   no global flags before command name.
         //   for example, with alias "log = log -f", ["log", "-Gvr", "master"]
@@ -359,7 +369,7 @@ impl Dispatcher {
         // the config yet, and in general don't know which command is being run yet.
         let pinned_configs = pinned_configs(&global_opts);
         if !pinned_configs.is_empty() {
-            let mut config = ConfigSet::wrap(self.config().clone());
+            let mut config = ConfigSet::wrap(self.config().clone()).named("root:pin");
             set_pinned(&mut config, &pinned_configs)?;
             self.set_config(Arc::new(config));
         }
@@ -384,13 +394,21 @@ impl Dispatcher {
             Err(e) => return (None, Err(e)),
         };
 
-        sampling::append_sample("command_info", "positional_args", parsed.args());
+        // Logged directly to sampling since `tracing` doesn't support structured data.
+        {
+            sampling::append_sample("command_info", "positional_args", parsed.args());
 
-        let opt_names = parsed.specified_opts();
-        sampling::append_sample("command_info", "option_names", opt_names);
+            let opt_names = parsed.specified_opts();
+            sampling::append_sample("command_info", "option_names", opt_names);
 
-        let opt_values: Vec<_> = opt_names.iter().map(|n| parsed.opts().get(n)).collect();
-        sampling::append_sample("command_info", "option_values", &opt_values);
+            let opt_values: Vec<_> = opt_names
+                .iter()
+                .map(|n| opt_value_to_str(parsed.opts().get(n)))
+                .collect();
+            sampling::append_sample("command_info", "option_values", &opt_values);
+        }
+
+        tracing::debug!(target: "command_info", command=handler.legacy_alias().unwrap_or_else(|| handler.main_alias()));
 
         let res = || -> Result<u8> {
             // This may trigger Python fallback if there are Python hooks.
@@ -452,4 +470,19 @@ impl Dispatcher {
             OptionalRepo::None(old) => *old = new,
         }
     }
+}
+
+fn opt_value_to_str(value: Option<&Value>) -> Cow<str> {
+    let opt_str: Option<Cow<str>> = value.and_then(|v| match v {
+        Value::Bool(b) => b.map(|b| Cow::Borrowed(if b { "true" } else { "false" })),
+        Value::Str(s) => s.as_ref().map(|s| Cow::Borrowed(s.as_ref())),
+        Value::Int(i) => i.map(|i| Cow::Owned(i.to_string())),
+        Value::List(l) => match l.len() {
+            0 => None,
+            1 => Some(Cow::Borrowed(&l[0])),
+            _ => Some(Cow::Owned(l.join(","))),
+        },
+    });
+
+    opt_str.unwrap_or(Cow::Borrowed("<unset>"))
 }

@@ -39,6 +39,7 @@ use mononoke_app::args::McrouterAppExtension;
 use mononoke_app::args::ReadonlyArgs;
 use mononoke_app::args::RepoFilterAppExtension;
 use mononoke_app::args::ShutdownTimeoutArgs;
+use mononoke_app::args::TLSArgs;
 use mononoke_app::args::WarmBookmarksCacheExtension;
 use mononoke_app::fb303::Fb303AppExtension;
 use mononoke_app::fb303::ReadyFlagService;
@@ -75,15 +76,18 @@ struct MononokeServerArgs {
     /// If provided the thrift server will start on this port
     #[clap(long, short = 'p')]
     thrift_port: Option<String>,
+    /// TLS parameters for this service
+    #[clap(flatten)]
+    tls_args: Option<TLSArgs>,
     /// Path to a file with server certificate
     #[clap(long)]
-    cert: String,
+    cert: Option<String>,
     /// Path to a file with server private key
     #[clap(long)]
-    private_key: String,
+    private_key: Option<String>,
     /// Path to a file with CA certificate
     #[clap(long)]
-    ca_pem: String,
+    ca_pem: Option<String>,
     /// Path to a file with encryption keys for SSL tickets
     #[clap(long)]
     ssl_ticket_seeds: Option<String>,
@@ -202,7 +206,7 @@ impl MononokeServerProcessExecutor {
         // sharded repos need to be present on each host.
         let is_deep_sharded = config
             .deep_sharding_config
-            .and_then(|c| c.status.get(&ShardedService::EdenApi).copied())
+            .and_then(|c| c.status.get(&ShardedService::SaplingRemoteApi).copied())
             .unwrap_or(false);
         if is_deep_sharded {
             self.repos_mgr.remove_repo(repo_name);
@@ -259,6 +263,8 @@ fn main(fb: FacebookInit) -> Result<()> {
     let cslb_config = args.cslb_config.clone();
     info!(root_log, "Starting up");
 
+    let (ca_pem, cert, private_key, ssl_ticket_seeds) = extract_tls_values(app.args()?)?;
+
     #[cfg(fbcode_build)]
     if let (Some(land_service_cert_path), Some(land_service_key_path)) = (
         &args.land_service_client_cert,
@@ -267,21 +273,17 @@ fn main(fb: FacebookInit) -> Result<()> {
         pushrebase_client::land_service_override_certificate_paths(
             land_service_cert_path,
             land_service_key_path,
-            &args.ca_pem,
+            &ca_pem,
         );
     }
 
     let configs = app.repo_configs();
 
     let acceptor = {
-        let mut builder = secure_utils::SslConfig::new(
-            args.ca_pem,
-            args.cert,
-            args.private_key,
-            args.ssl_ticket_seeds,
-        )
-        .tls_acceptor_builder(root_log.clone())
-        .context("Failed to instantiate TLS Acceptor builder")?;
+        let mut builder =
+            secure_utils::SslConfig::new(&ca_pem, cert, private_key, ssl_ticket_seeds)
+                .tls_acceptor_builder(root_log.clone())
+                .context("Failed to instantiate TLS Acceptor builder")?;
 
         builder.set_alpn_protos(ALPN_MONONOKE_PROTOS_OFFERS)?;
         builder.set_alpn_select_callback(|_, list| {
@@ -310,7 +312,7 @@ fn main(fb: FacebookInit) -> Result<()> {
         .sharded_executor_args
         .sharded_service_name
         .as_ref()
-        .map(|_| ShardedService::EdenApi);
+        .map(|_| ShardedService::SaplingRemoteApi);
     app.start_monitoring("mononoke_server", service.clone())?;
     app.start_stats_aggregation()?;
 
@@ -371,6 +373,7 @@ fn main(fb: FacebookInit) -> Result<()> {
             }
             repo_listener::create_repo_listeners(
                 fb,
+                app.configs(),
                 common,
                 mononoke.clone(),
                 root_log,
@@ -403,4 +406,24 @@ fn main(fb: FacebookInit) -> Result<()> {
         },
         args.shutdown_timeout_args.shutdown_timeout,
     )
+}
+
+fn extract_tls_values(
+    args: MononokeServerArgs,
+) -> Result<(String, String, String, Option<String>)> {
+    match args.tls_args {
+        Some(tls_args) => Ok((
+            tls_args.tls_ca,
+            tls_args.tls_certificate,
+            tls_args.tls_private_key,
+            tls_args.tls_ticket_seeds.clone(),
+        )),
+
+        None => Ok((
+            args.ca_pem.unwrap_or_default(),
+            args.cert.unwrap_or_default(),
+            args.private_key.unwrap_or_default(),
+            args.ssl_ticket_seeds.clone(),
+        )),
+    }
 }

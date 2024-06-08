@@ -590,22 +590,13 @@ effect and style see :prog:`help color`.
     (default: False)
 
 ``update.check``
-    Determines what level of checking :prog:`goto` will perform before moving
-    to a destination revision. Valid values are ``abort``, ``none``,
-    ``linear``, and ``noconflict``. ``abort`` always fails if the working
-    directory has uncommitted changes. ``none`` performs no checking, and may
-    result in a merge with uncommitted changes. ``linear`` allows any update
-    as long as it follows a straight line in the revision history, and may
-    trigger a merge with uncommitted changes. ``noconflict`` will allow any
-    update which would not trigger a merge with uncommitted changes, if any
-    are present.
-    (default: ``linear``)
-
-``update.requiredest``
-    Require that the user pass a destination when running :prog:`goto`.
-    For example, :prog:`goto .::` will be allowed, but a plain :prog:`goto`
-    will be disallowed.
-    (default: False)
+    Determines what level of checking :prog:`goto` will perform before moving to
+    a destination revision. Valid values are ``abort``, ``none``, and
+    ``noconflict``. ``abort`` always fails if the working directory has
+    uncommitted changes. ``none`` performs no checking, and may result in a
+    merge with uncommitted changes. ``noconflict`` will allow any update which
+    would not trigger a merge with uncommitted changes, if any are present.
+    (default: ``noconflict``)
 
 ``commit``
 ----------
@@ -4530,6 +4521,7 @@ The following config sections control the behavior of automerge::
   # the following algorithms:
   #   - adjacent-changes
   #   - subset-changes
+  #   - sort-inserts
   #   - word-merge (advanced)
   # See the `Merge Algorithms` section for more information.
   merge-algos = adjacent-changes,subset-changes
@@ -4562,26 +4554,44 @@ Merge Algorithms
 
 subset-changes
     If the changes of one side is the subset of the other side, then the conflict will
-    be resolved and the other side changes are kept.
+    be resolved and the other side changes are kept. Currently, we limit this to addtions
+    on both sides.
 
     Here is an example of the conflict::
 
-        merging a.txt
         <<<<<<< dest
-        - ? t('Cannot edit penging changes')
-        + ? t('Cannot edit pending changes')
+        +
+        +   if (ignore_funny && 45 < len && !memcmp(name, "refs/", 5) &&
+        +       check_ref_format(name + 5))
+        +     continue;
+        +
         =======
-        - ? t('Cannot edit penging changes')
-        + ? t('Cannot edit pending changes')
-        + : hasPublic
-        + ? t('Cannot edit public commits')
+        +
+        +   if (ignore_funny && 45 < len && !memcmp(name, "refs/", 5) &&
+        +       check_ref_format(name + 5))
+        +     continue;
+        +
+        +   name_len = strlen(name);
+        +   if (len != name_len + 41) {
+        +     if (server_capabilities)
+        +       free(server_capabilities);
+        +     server_capabilities = strdup(name + name_len + 1);
+        +   }
+        +
         >>>>>>> source
 
     It will be resolved to::
 
-          ? t('Cannot edit pending changes')
-          : hasPublic
-          ? t('Cannot edit public commits')
+          if (ignore_funny && 45 < len && !memcmp(name, "refs/", 5) &&
+              check_ref_format(name + 5))
+          continue;
+
+          name_len = strlen(name);
+          if (len != name_len + 41) {
+          if (server_capabilities)
+              free(server_capabilities);
+          server_capabilities = strdup(name + name_len + 1);
+          }
 
 adjacent-changes
     Merge adjacent, non-overlapping modifications on both sides. The idea comes from
@@ -4623,4 +4633,22 @@ word-merge (advanced)
 
           That is a first line.
 
+sort-inserts
+    If both sides insert items in the same position of a "sorted array"
+    (e.g.: import statements, buck dependencies), then union them and sort them.
+
+    Here is an example of the conflict::
+
+          import a
+        <<<<<<< dest
+        + import b
+        ======= base
+        + import c
+        >>>>>>> source
+
+    It will be resolved to::
+
+          import a
+          import b
+          import c
 """

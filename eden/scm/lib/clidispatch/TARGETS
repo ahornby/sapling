@@ -10,6 +10,7 @@ rust_library(
             "dependencies_override": {
                 "dependencies": {
                     "indexedlog": {"features": ["configurable"]},
+                    "repo": {"features": ["wdir"]},
                     "thrift-types": {"optional": True},
                 },
             },
@@ -18,8 +19,8 @@ rust_library(
                     "workingcopy/eden",
                     "thrift-types",
                 ],
-                "sl_only": [
-                    "identity/sl_only",
+                "sl_oss": [
+                    "identity/sl_oss",
                 ],
             },
             "package": {
@@ -32,7 +33,6 @@ rust_library(
     ],
     deps = [
         "fbsource//third-party/rust:anyhow",
-        "fbsource//third-party/rust:shell-escape",
         "fbsource//third-party/rust:thiserror",
         "fbsource//third-party/rust:tracing",
         "//common/rust/shed/hostname:hostname",
@@ -42,6 +42,7 @@ rust_library(
         "//eden/scm/lib/config/model:configmodel",
         "//eden/scm/lib/context:context",
         "//eden/scm/lib/doctor/network:network-doctor",
+        "//eden/scm/lib/gitcompat:gitcompat",
         "//eden/scm/lib/hook:hook",
         "//eden/scm/lib/identity:identity",
         "//eden/scm/lib/indexedlog:indexedlog",

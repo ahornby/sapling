@@ -6,6 +6,7 @@
  */
 
 import App from '../../App';
+import {CommitInfoTestUtils} from '../../testQueries';
 import {
   resetTestMessages,
   expectMessageSentToServer,
@@ -13,13 +14,12 @@ import {
   COMMIT,
   simulateUncommittedChangedFiles,
   simulateMessageFromServer,
+  openCommitInfoSidebar,
 } from '../../testUtils';
 import {CommandRunner} from '../../types';
-import {fireEvent, render, screen, waitFor, within} from '@testing-library/react';
+import {fireEvent, render, screen, waitFor, within, act} from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import {act} from 'react-dom/test-utils';
-
-jest.mock('../../MessageBus');
+import * as utils from 'shared/utils';
 
 describe('CommitOperation', () => {
   beforeEach(() => {
@@ -43,15 +43,23 @@ describe('CommitOperation', () => {
           COMMIT('2', 'master', '00', {phase: 'public', remoteBookmarks: ['remote/master']}),
           COMMIT('1', 'Commit 1', '0', {phase: 'public'}),
           COMMIT('a', 'Commit A', '1'),
-          COMMIT('b', 'Commit B', 'a', {isHead: true}),
+          COMMIT('b', 'Commit B', 'a', {isDot: true}),
         ],
       });
     });
   });
 
-  const clickQuickCommit = () => {
+  const clickQuickCommit = async () => {
     const quickCommitButton = screen.queryByTestId('quick-commit-button');
     fireEvent.click(quickCommitButton as Element);
+    await waitFor(() =>
+      expectMessageSentToServer({
+        type: 'runOperation',
+        operation: expect.objectContaining({
+          args: expect.arrayContaining(['commit']),
+        }),
+      }),
+    );
   };
 
   const clickCheckboxForFile = (inside: HTMLElement, fileName: string) => {
@@ -64,8 +72,8 @@ describe('CommitOperation', () => {
     });
   };
 
-  it('runs commit', () => {
-    clickQuickCommit();
+  it('runs commit', async () => {
+    await clickQuickCommit();
 
     expectMessageSentToServer({
       type: 'runOperation',
@@ -83,11 +91,11 @@ describe('CommitOperation', () => {
     });
   });
 
-  it('runs commit with subset of files selected', () => {
+  it('runs commit with subset of files selected', async () => {
     const commitTree = screen.getByTestId('commit-tree-root');
     clickCheckboxForFile(commitTree, 'file2.txt');
 
-    clickQuickCommit();
+    await clickQuickCommit();
 
     expectMessageSentToServer({
       type: 'runOperation',
@@ -107,7 +115,7 @@ describe('CommitOperation', () => {
     });
   });
 
-  it('changed files are shown in commit info view', () => {
+  it('changed files are shown in commit info view', async () => {
     const commitTree = screen.getByTestId('commit-tree-root');
     clickCheckboxForFile(commitTree, 'file2.txt');
 
@@ -117,7 +125,7 @@ describe('CommitOperation', () => {
       userEvent.type(quickInput, 'My Commit');
     });
 
-    clickQuickCommit();
+    await clickQuickCommit();
 
     expect(
       within(screen.getByTestId('changes-to-amend')).queryByText(/file1.txt/),
@@ -151,7 +159,7 @@ describe('CommitOperation', () => {
       });
     });
 
-    clickQuickCommit();
+    await clickQuickCommit();
 
     expectMessageSentToServer({
       type: 'runOperation',
@@ -161,6 +169,102 @@ describe('CommitOperation', () => {
         runner: CommandRunner.Sapling,
         trackEventName: 'CommitOperation',
       },
+    });
+  });
+
+  it('clears quick commit title after committing', async () => {
+    const commitTree = screen.getByTestId('commit-tree-root');
+    clickCheckboxForFile(commitTree, 'file2.txt'); // partial commit, so the quick input box isn't unmounted
+
+    const quickInput = screen.getByTestId('quick-commit-title');
+    act(() => {
+      userEvent.type(quickInput, 'My Commit');
+    });
+
+    await clickQuickCommit();
+
+    expect(quickInput).toHaveValue('');
+  });
+
+  it('on error, restores edited commit message to try again', async () => {
+    act(() => openCommitInfoSidebar());
+    act(() => CommitInfoTestUtils.clickCommitMode());
+
+    act(() => {
+      const title = CommitInfoTestUtils.getTitleEditor();
+      userEvent.type(title, 'My Commit');
+      const desc = CommitInfoTestUtils.getDescriptionEditor();
+      userEvent.type(desc, 'My description');
+    });
+
+    jest.spyOn(utils, 'randomId').mockImplementationOnce(() => '1111');
+    await CommitInfoTestUtils.clickCommitButton();
+
+    CommitInfoTestUtils.expectIsNOTEditingTitle();
+
+    act(() => {
+      simulateMessageFromServer({
+        type: 'operationProgress',
+        kind: 'exit',
+        exitCode: 1,
+        id: '1111',
+        timestamp: 0,
+      });
+    });
+
+    await waitFor(() => {
+      CommitInfoTestUtils.expectIsEditingTitle();
+      const title = CommitInfoTestUtils.getTitleEditor();
+      expect(title).toHaveValue('My Commit');
+      CommitInfoTestUtils.expectIsEditingDescription();
+      const desc = CommitInfoTestUtils.getDescriptionEditor();
+      expect(desc.value).toContain('My description');
+    });
+  });
+
+  it('on error, merges messages when restoring edited commit message to try again', async () => {
+    act(() => openCommitInfoSidebar());
+    act(() => CommitInfoTestUtils.clickCommitMode());
+
+    act(() => {
+      const title = CommitInfoTestUtils.getTitleEditor();
+      userEvent.type(title, 'My Commit');
+      const desc = CommitInfoTestUtils.getDescriptionEditor();
+      userEvent.type(desc, 'My description');
+    });
+
+    jest.spyOn(utils, 'randomId').mockImplementationOnce(() => '2222');
+    await CommitInfoTestUtils.clickCommitButton();
+    CommitInfoTestUtils.expectIsNOTEditingTitle();
+
+    act(() => {
+      openCommitInfoSidebar();
+      CommitInfoTestUtils.clickCommitMode();
+    });
+    act(() => {
+      const title = CommitInfoTestUtils.getTitleEditor();
+      userEvent.type(title, 'other title');
+      const desc = CommitInfoTestUtils.getDescriptionEditor();
+      userEvent.type(desc, 'other description');
+    });
+
+    act(() => {
+      simulateMessageFromServer({
+        type: 'operationProgress',
+        kind: 'exit',
+        exitCode: 1,
+        id: '2222',
+        timestamp: 0,
+      });
+    });
+
+    waitFor(() => {
+      CommitInfoTestUtils.expectIsEditingTitle();
+      const title = CommitInfoTestUtils.getTitleEditor();
+      expect(title).toHaveValue('other title, My Commit');
+      CommitInfoTestUtils.expectIsEditingDescription();
+      const desc = CommitInfoTestUtils.getDescriptionEditor();
+      expect(desc).toHaveValue('other description, My description');
     });
   });
 });

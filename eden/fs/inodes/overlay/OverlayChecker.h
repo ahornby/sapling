@@ -12,12 +12,12 @@
 
 #include <folly/CppAttributes.h>
 
+#include "eden/common/utils/ImmediateFuture.h"
+#include "eden/common/utils/PathFuncs.h"
 #include "eden/fs/inodes/InodeCatalog.h"
 #include "eden/fs/inodes/InodeNumber.h"
 #include "eden/fs/inodes/overlay/OverlayCheckerUtil.h"
 #include "eden/fs/model/Tree.h"
-#include "eden/fs/utils/ImmediateFuture.h"
-#include "eden/fs/utils/PathFuncs.h"
 
 namespace folly {
 class File;

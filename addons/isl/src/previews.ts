@@ -8,28 +8,28 @@
 import type {Dag} from './dag/dag';
 import type {CommitTreeWithPreviews} from './getCommitTree';
 import type {Operation} from './operations/Operation';
-import type {OperationInfo, OperationList} from './serverAPIState';
+import type {OperationInfo, OperationList} from './operationsState';
 import type {ChangedFile, CommitInfo, Hash, MergeConflicts, UncommittedChanges} from './types';
 
-import {latestSuccessorsMap} from './SuccessionTracker';
+import {latestSuccessorsMapAtom} from './SuccessionTracker';
 import {getTracker} from './analytics/globalTracker';
+import {focusMode} from './atoms/FocusModeState';
+import {YOU_ARE_HERE_VIRTUAL_COMMIT} from './dag/virtualCommit';
 import {getCommitTree, walkTreePostorder} from './getCommitTree';
 import {getOpName} from './operations/Operation';
+import {operationBeingPreviewed, queuedOperations, operationList} from './operationsState';
 import {
-  operationBeingPreviewed,
+  latestUncommittedChanges,
   latestCommits,
-  latestCommitsData,
-  latestUncommittedChangesData,
-  mergeConflicts,
   latestDag,
   latestHeadCommit,
-  latestUncommittedChanges,
-  operationList,
-  queuedOperations,
+  mergeConflicts,
+  latestUncommittedChangesData,
+  latestCommitsData,
 } from './serverAPIState';
+import {atom, useAtom, useAtomValue} from 'jotai';
 import {useEffect} from 'react';
-import {selector, useRecoilState, useRecoilValue} from 'recoil';
-import {notEmpty, unwrap} from 'shared/utils';
+import {notEmpty, nullthrows} from 'shared/utils';
 
 export enum CommitPreview {
   REBASE_ROOT = 'rebase-root',
@@ -206,29 +206,23 @@ function applyPreviewsToMergeConflicts(
   return conflicts;
 }
 
-export const uncommittedChangesWithPreviews = selector({
-  key: 'uncommittedChangesWithPreviews',
-  get: ({get}): Array<ChangedFile> => {
-    const list = get(operationList);
-    const queued = get(queuedOperations);
-    const uncommittedChanges = get(latestUncommittedChanges);
+export const uncommittedChangesWithPreviews = atom<Array<ChangedFile>>(get => {
+  const list = get(operationList);
+  const queued = get(queuedOperations);
+  const uncommittedChanges = get(latestUncommittedChanges);
 
-    return applyPreviewsToChangedFiles(uncommittedChanges, list, queued);
-  },
+  return applyPreviewsToChangedFiles(uncommittedChanges, list, queued);
 });
 
-export const optimisticMergeConflicts = selector<MergeConflicts | undefined>({
-  key: 'optimisticMergeConflicts',
-  get: ({get}) => {
-    const list = get(operationList);
-    const queued = get(queuedOperations);
-    const conflicts = get(mergeConflicts);
-    if (conflicts?.files == null) {
-      return conflicts;
-    }
+export const optimisticMergeConflicts = atom(get => {
+  const list = get(operationList);
+  const queued = get(queuedOperations);
+  const conflicts = get(mergeConflicts);
+  if (conflicts?.files == null) {
+    return conflicts;
+  }
 
-    return applyPreviewsToMergeConflicts(conflicts, list, queued);
-  },
+  return applyPreviewsToMergeConflicts(conflicts, list, queued);
 });
 
 export type TreeWithPreviews = {
@@ -250,46 +244,59 @@ export type WithPreviewType = {
 
 export type {Dag};
 
-export const dagWithPreviews = selector<Dag>({
-  key: 'dagWithPreviews',
-  get: ({get}) => {
-    const originalDag = get(latestDag);
-    const list = get(operationList);
-    const queued = get(queuedOperations);
-    const currentOperation = list.currentOperation;
-    const history = list.operationHistory;
-    const currentPreview = get(operationBeingPreviewed);
-    let dag = originalDag;
-    for (const op of optimisticOperations({history, queued, currentOperation})) {
-      dag = op.optimisticDag(dag);
+export const dagWithPreviews = atom(get => {
+  const originalDag = get(latestDag);
+  const list = get(operationList);
+  const queued = get(queuedOperations);
+  const currentOperation = list.currentOperation;
+  const history = list.operationHistory;
+  const currentPreview = get(operationBeingPreviewed);
+  let dag = originalDag;
+
+  const focus = get(focusMode);
+  if (focus) {
+    const current = dag.resolve('.');
+    if (current) {
+      const currentStack = dag.descendants(
+        dag.ancestors(dag.draft(current.hash), {within: dag.draft()}),
+      );
+      const related = dag.descendants(
+        dag.successors(currentStack).union(dag.predecessors(currentStack)),
+      );
+      const toKeep = currentStack
+        .union(YOU_ARE_HERE_VIRTUAL_COMMIT.hash) // ensure we always show "You Are Here"
+        .union(related);
+      const toRemove = dag.draft().subtract(toKeep);
+      dag = dag.remove(toRemove);
     }
-    if (currentPreview) {
-      dag = currentPreview.previewDag(dag);
-    }
-    return dag;
-  },
+  }
+
+  for (const op of optimisticOperations({history, queued, currentOperation})) {
+    dag = op.optimisticDag(dag);
+  }
+  if (currentPreview) {
+    dag = currentPreview.previewDag(dag);
+  }
+  return dag;
 });
 
-export const treeWithPreviews = selector({
-  key: 'treeWithPreviews',
-  get: ({get}): TreeWithPreviews => {
-    const dag = get(dagWithPreviews);
-    const commits = [...dag.values()];
-    const trees = getCommitTree(commits);
+export const treeWithPreviews = atom(get => {
+  const dag = get(dagWithPreviews);
+  const commits = [...dag.values()];
+  const trees = getCommitTree(commits);
 
-    let headCommit = get(latestHeadCommit);
-    // The headCommit might be changed by dag previews. Double check.
-    if (headCommit && !dag.get(headCommit.hash)?.isHead) {
-      headCommit = dag.resolve('.');
-    }
-    // Open-code latestCommitTreeMap to pick up tree changes done by `dag`.
-    const treeMap = new Map<Hash, CommitTreeWithPreviews>();
-    for (const tree of walkTreePostorder(trees)) {
-      treeMap.set(tree.info.hash, tree);
-    }
+  let headCommit = get(latestHeadCommit);
+  // The headCommit might be changed by dag previews. Double check.
+  if (headCommit && !dag.get(headCommit.hash)?.isDot) {
+    headCommit = dag.resolve('.');
+  }
+  // Open-code latestCommitTreeMap to pick up tree changes done by `dag`.
+  const treeMap = new Map<Hash, CommitTreeWithPreviews>();
+  for (const tree of walkTreePostorder(trees)) {
+    treeMap.set(tree.info.hash, tree);
+  }
 
-    return {trees, treeMap, headCommit};
-  },
+  return {trees, treeMap, headCommit};
 });
 
 /** Yield operations that might need optimistic state. */
@@ -332,13 +339,13 @@ function* optimisticOperations(props: {
  * when ongoingOperation is used elsewhere in the tree
  */
 export function useMarkOperationsCompleted(): void {
-  const fetchedCommits = useRecoilValue(latestCommitsData);
-  const commits = useRecoilValue(latestCommits);
-  const uncommittedChanges = useRecoilValue(latestUncommittedChangesData);
-  const conflicts = useRecoilValue(mergeConflicts);
-  const successorMap = useRecoilValue(latestSuccessorsMap);
+  const fetchedCommits = useAtomValue(latestCommitsData);
+  const commits = useAtomValue(latestCommits);
+  const uncommittedChanges = useAtomValue(latestUncommittedChangesData);
+  const conflicts = useAtomValue(mergeConflicts);
+  const successorMap = useAtomValue(latestSuccessorsMapAtom);
 
-  const [list, setOperationList] = useRecoilState(operationList);
+  const [list, setOperationList] = useAtom(operationList);
 
   // Mark operations as completed when their optimistic applier is no longer needed
   // n.b. this must be a useEffect since React doesn't like setCurrentOperation getting called during render
@@ -416,7 +423,7 @@ export function useMarkOperationsCompleted(): void {
             if (optimisticApplier == null || operation.exitCode !== 0) {
               files = true;
             } else if (
-              uncommittedChanges.fetchStartTimestamp > unwrap(operation.endTime).valueOf()
+              uncommittedChanges.fetchStartTimestamp > nullthrows(operation.endTime).valueOf()
             ) {
               getTracker()?.track('OptimisticFilesStateForceResolved', {extras: {}});
               files = true;
@@ -436,7 +443,7 @@ export function useMarkOperationsCompleted(): void {
               conflicts = true;
             } else if (
               (mergeConflictsContext.conflicts?.fetchStartTimestamp ?? 0) >
-              unwrap(operation.endTime).valueOf()
+              nullthrows(operation.endTime).valueOf()
             ) {
               getTracker()?.track('OptimisticConflictsStateForceResolved', {
                 extras: {operation: getOpName(operation.operation)},
@@ -492,8 +499,8 @@ type Class<T> = new (...args: any[]) => T;
 export function useIsOperationRunningOrQueued(
   cls: Class<Operation>,
 ): 'running' | 'queued' | undefined {
-  const list = useRecoilValue(operationList);
-  const queued = useRecoilValue(queuedOperations);
+  const list = useAtomValue(operationList);
+  const queued = useAtomValue(queuedOperations);
   if (list.currentOperation?.operation instanceof cls && list.currentOperation?.exitCode == null) {
     return 'running';
   } else if (queued.some(op => op instanceof cls)) {
@@ -503,8 +510,8 @@ export function useIsOperationRunningOrQueued(
 }
 
 export function useMostRecentPendingOperation(): Operation | undefined {
-  const list = useRecoilValue(operationList);
-  const queued = useRecoilValue(queuedOperations);
+  const list = useAtomValue(operationList);
+  const queued = useAtomValue(queuedOperations);
   if (queued.length > 0) {
     return queued.at(-1);
   }

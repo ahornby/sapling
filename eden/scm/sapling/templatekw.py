@@ -422,21 +422,12 @@ def showactivebookmark(**args):
     return ""
 
 
-def _date_from_extra(ctx, extra_name: str) -> Tuple[int, int]:
-    d = ctx.extra().get(extra_name)
-    if d:
-        try:
-            sec_str, tz_str = d.split(" ", 1)
-            return int(sec_str), int(tz_str)
-        except ValueError:
-            pass
-    return ctx.date()
-
-
 @templatekeyword("authordate")
 def showauthordate(repo, ctx, templ, **args):
     """Date information. The "author" date. Fallback to "date"."""
-    return _date_from_extra(ctx, "author_date")
+    if author_date := git.author_date_from_extras(ctx.extra()):
+        return author_date
+    return ctx.date()
 
 
 @templatekeyword("committerdate")
@@ -733,6 +724,15 @@ def shownode(repo, ctx, templ, **args):
     digit string.
     """
     return ctx.hex()
+
+
+@templatekeyword("nodescheme")
+def nodescheme(repo, ctx, templ, **args):
+    """String. The changeset id scheme, e.g. "hg" or "git"."""
+    if git.isgitformat(repo):
+        return "git"
+    else:
+        return "hg"
 
 
 @templatekeyword("obsolete")

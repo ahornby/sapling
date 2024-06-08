@@ -11,9 +11,9 @@ import type {RecordOf} from 'immutable';
 
 import {HashSet} from './set';
 import {Map as ImMap, Record, List} from 'immutable';
-import {cached} from 'shared/LRU';
+import {LRU, cachedMethod} from 'shared/LRU';
 import {SelfUpdate} from 'shared/immutableExt';
-import {unwrap} from 'shared/utils';
+import {nullthrows} from 'shared/utils';
 
 /**
  * Hash-map like container with graph related queries.
@@ -131,8 +131,8 @@ export class BaseDag<C extends HashWithParents> extends SelfUpdate<BaseDagRecord
    * set + parents(set) + parents(parents(set)) + ...
    * If `within` is set, change `parents` to only return hashes within `within`.
    */
-  @cached({cacheSize: 500})
-  ancestors(set: SetLike, props?: {within?: SetLike}): HashSet {
+  ancestors = cachedMethod(this.ancestorsImpl, {cache: ancestorsCache});
+  ancestorsImpl(set: SetLike, props?: {within?: SetLike}): HashSet {
     const filter = nullableWithinContains(props?.within);
     return unionFlatMap(set, h => this.parentHashes(h).filter(filter));
   }
@@ -263,7 +263,8 @@ export class BaseDag<C extends HashWithParents> extends SelfUpdate<BaseDagRecord
     const filledSet = gap ? this.range(hashSet, hashSet) : hashSet;
     const alreadyVisited = new Set<Hash>();
     // We use concat and pop (not unshift) so the order is reversed.
-    const compareHash = (a: Hash, b: Hash) => -compare(unwrap(this.get(a)), unwrap(this.get(b)));
+    const compareHash = (a: Hash, b: Hash) =>
+      -compare(nullthrows(this.get(a)), nullthrows(this.get(b)));
     // The number of parents remaining to be visited. This ensures merges are not
     // outputted until all parents are outputted.
     const remaining = new Map<Hash, number>(
@@ -316,6 +317,8 @@ export class BaseDag<C extends HashWithParents> extends SelfUpdate<BaseDagRecord
     return this.filter(c => c.parents.length > 1, set);
   }
 }
+
+const ancestorsCache = new LRU(1000);
 
 function flatMap(set: SetLike, f: (h: Hash) => List<Hash> | Readonly<Array<Hash>>): HashSet {
   return new HashSet(

@@ -15,32 +15,26 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::Error;
+use context::CoreContext;
 use cpython::*;
+use cpython_ext::convert::ImplInto;
 use cpython_ext::convert::Serde;
 use cpython_ext::error::ResultPyErrExt;
 use cpython_ext::ExtractInnerRef;
 use cpython_ext::PyPathBuf;
-use io::IO;
 use parking_lot::RwLock;
 use pathmatcher::Matcher;
-use pyconfigloader::config;
-#[cfg(feature = "eden")]
-use pyedenclient::feature_eden::EdenFsClient as PyEdenClient;
 use pypathmatcher::extract_matcher;
 use pypathmatcher::extract_option_matcher;
 use pypathmatcher::treematcher;
 use pytreestate::treestate;
+use pyworkingcopyclient::WorkingCopyClient as PyWorkingCopyClient;
 use repostate::command_state::Operation;
+use rsworkingcopy::client::WorkingCopyClient;
 use rsworkingcopy::walker::WalkError;
 use rsworkingcopy::walker::Walker;
 use rsworkingcopy::workingcopy::WorkingCopy;
-use termlogger::TermLogger;
 use types::HgId;
-
-#[cfg(not(feature = "eden"))]
-py_class!(pub class PyEdenClient |py| {
-    data inner: Arc<rsworkingcopy::workingcopy::EdenFsClient>;
-});
 
 mod impl_into;
 
@@ -72,7 +66,7 @@ py_class!(class walker |py| {
         pymatcher: PyObject,
         include_directories: bool,
     ) -> PyResult<walker> {
-        let matcher = extract_matcher(py, pymatcher)?;
+        let matcher = extract_matcher(py, pymatcher)?.0;
         let walker = Walker::new(
             root.to_path_buf(),
             dot_dir.clone(),
@@ -116,17 +110,16 @@ py_class!(pub class workingcopy |py| {
 
     def status(
         &self,
+        ctx: ImplInto<CoreContext>,
         pymatcher: Option<PyObject>,
         include_ignored: bool,
-        config: &config,
     ) -> PyResult<PyObject> {
         let wc = self.inner(py).write();
         let matcher = extract_option_matcher(py, pymatcher)?;
-        let io = IO::main().map_pyerr(py)?;
-        let config = config.get_cfg(py);
+
         pystatus::to_python_status(py,
             &py.allow_threads(|| {
-                wc.status(matcher, include_ignored, &config, &TermLogger::new(&io))
+                wc.status(&ctx.into(), matcher, include_ignored)
             }).map_pyerr(py)?
         )
     }
@@ -178,9 +171,10 @@ py_class!(pub class workingcopy |py| {
             .collect::<PyResult<Vec<_>>>()
     }
 
-    def edenclient(&self) -> PyResult<PyEdenClient> {
+    def working_copy_client(&self) -> PyResult<PyWorkingCopyClient> {
         let wc = self.inner(py).read();
-        PyEdenClient::create_instance(py, wc.eden_client().map_pyerr(py)?)
+        let client = wc.working_copy_client().map_pyerr(py)?;
+        PyWorkingCopyClient::create_instance(py, client as Arc<dyn WorkingCopyClient>)
     }
 
     def mergestate(&self) -> PyResult<mergestate> {

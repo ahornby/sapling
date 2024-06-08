@@ -14,9 +14,9 @@
 #include <string_view>
 #include <typeindex>
 
+#include "eden/common/utils/Throw.h"
 #include "eden/fs/config/FieldConverter.h"
 #include "eden/fs/config/gen-cpp2/eden_config_types.h"
-#include "eden/fs/utils/Throw.h"
 
 namespace facebook::eden {
 
@@ -268,7 +268,7 @@ class ConfigSetting final : private ConfigSettingBase {
    *  Get the index of the highest priority source that is populated.
    */
   size_t getHighestPriorityIdx() const {
-    getIdx(getHighestPriorityConfigSource());
+    return getIdx(getHighestPriorityConfigSource());
   }
 
   /**

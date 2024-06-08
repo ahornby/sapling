@@ -1,6 +1,7 @@
 #chg-compatible
+#debugruntest-incompatible
 
-#require unix-permissions no-root no-windows
+#require unix-permissions no-root no-windows no-eden
 
   $ configure modernclient
 
@@ -65,13 +66,11 @@ One process waiting for another for a significant period of time (longer than th
   $ hg -R b ci -A -m b --config hooks.precommit="python:`pwd`/hooks.py:sleeplong" > stdout &
 Wait until bg process has entered critical section.
   $ while [ ! -f sleeping ]; do sleep 0.01; done
-  $ hg -R b up -q --config ui.timeout.warn=0 > preup-stdout 2>preup-stderr
+  $ LOG=repolock=warn hg -R b up -q --config ui.timeout.warn=0 . > preup-stdout 2>preup-stderr
   $ wait
   $ cat preup-stdout
-  $ cat preup-stderr
-  waiting for lock on working directory of b held by process '*' on host '*' (glob)
-  (hint: run 'hg debugprocesstree *' to see related processes) (glob)
-  got lock after * seconds (glob) (?)
+  $ grep repolock preup-stderr | head -1
+   WARN repolock: lock contended name="wlock" contents="*" (glob)
   $ cat stdout
   adding b
 
@@ -84,7 +83,7 @@ One process waiting for another for short period of time. No warning.
   > EOF
   $ echo b > b/c
   $ hg -R b ci -A -m b --config hooks.precommit="python:`pwd`/hooks.py:sleepone" > stdout &
-  $ hg -R b up -q --config hooks.pre-update="python:`pwd`/hooks.py:sleephalf" \
+  $ hg -R b up -q --config hooks.pre-update="python:`pwd`/hooks.py:sleephalf" . \
   > > preup-stdout 2>preup-stderr
   $ wait
   $ cat preup-stdout
@@ -96,7 +95,7 @@ On processs waiting on another, warning after a long time.
 
   $ echo b > b/d
   $ hg -R b ci -A -m b --config hooks.precommit="python:`pwd`/hooks.py:sleepone" > stdout &
-  $ hg -R b up -q --config hooks.pre-update="python:`pwd`/hooks.py:sleephalf" \
+  $ hg -R b up -q --config hooks.pre-update="python:`pwd`/hooks.py:sleephalf" . \
   > --config ui.timeout.warn=250 \
   > > preup-stdout 2>preup-stderr
   $ wait
@@ -109,7 +108,7 @@ On processs waiting on another, warning disabled.
 
   $ echo b > b/e
   $ hg -R b ci -A -m b --config hooks.precommit="python:`pwd`/hooks.py:sleepone" > stdout &
-  $ hg -R b up -q --config hooks.pre-update="python:`pwd`/hooks.py:sleephalf" \
+  $ hg -R b up -q --config hooks.pre-update="python:`pwd`/hooks.py:sleephalf" . \
   > --config ui.timeout.warn=-1 \
   > > preup-stdout 2>preup-stderr
   $ wait
@@ -124,7 +123,7 @@ On processs waiting on another, warning after a long time (debug output on)
 
   $ echo b > b/f
   $ hg -R b ci -A -m b --config hooks.precommit="python:`pwd`/hooks.py:sleepone" > stdout &
-  $ hg -R b up --config hooks.pre-update="python:`pwd`/hooks.py:sleephalf" \
+  $ hg -R b up --config hooks.pre-update="python:`pwd`/hooks.py:sleephalf" . \
   > --config ui.timeout.warn=250 --debug\
   > > preup-stdout 2>preup-stderr
   $ wait
@@ -142,7 +141,7 @@ On processs waiting on another, warning disabled, (debug output on)
 
   $ echo b > b/g
   $ hg -R b ci -A -m b --config hooks.precommit="python:`pwd`/hooks.py:sleepone" > stdout &
-  $ hg -R b up --config hooks.pre-update="python:`pwd`/hooks.py:sleephalf" \
+  $ hg -R b up --config hooks.pre-update="python:`pwd`/hooks.py:sleephalf" . \
   > --config ui.timeout.warn=-1 --debug\
   > > preup-stdout 2>preup-stderr
   $ wait

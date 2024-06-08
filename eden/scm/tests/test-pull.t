@@ -1,10 +1,9 @@
-#debugruntest-compatible
+#modern-config-incompatible
 #inprocess-hg-incompatible
   $ setconfig experimental.allowfilepeer=True
 
-  $ disable treemanifest
   $ configure dummyssh
-#require serve
+#require serve no-eden
 
   $ hg init test
   $ cd test
@@ -31,7 +30,7 @@
   $ hg verify
   warning: verify does not actually check anything in this repo
 
-  $ hg co
+  $ hg co tip
   0 files updated, 0 files merged, 0 files removed, 0 files unresolved
   $ cat foo
   foo
@@ -61,7 +60,7 @@ Issue622: hg init && hg pull -u URL doesn't checkout default branch
   $ cd ..
   $ hg init empty
   $ cd empty
-  $ hg pull -u ../test
+  $ hg pull -u ../test -d tip
   pulling from ../test
   requesting all changes
   adding changesets

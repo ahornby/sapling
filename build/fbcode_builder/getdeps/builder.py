@@ -4,6 +4,8 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-unsafe
+
 import glob
 import json
 import os
@@ -62,7 +64,18 @@ class BuilderBase(object):
                 # the cmd quoting rules to assemble a command that calls the script
                 # to prep the environment and then triggers the actual command that
                 # we wanted to run.
-                return [vcvarsall, "amd64", "&&"]
+
+                # Due to changes in vscrsall.bat, it now reports an ERRORLEVEL of 1
+                # even when succeeding. This occurs when an extension is not present.
+                # To continue, we must ignore the ERRORLEVEL returned. We do this by
+                # wrapping the call in a batch file that always succeeds.
+                wrapper = os.path.join(self.build_dir, "succeed.bat")
+                with open(wrapper, "w") as f:
+                    f.write("@echo off\n")
+                    f.write(f'call "{vcvarsall}" amd64\n')
+                    f.write("set ERRORLEVEL=0\n")
+                    f.write("exit /b 0\n")
+                return [wrapper, "&&"]
         return []
 
     def _run_cmd(
@@ -129,6 +142,16 @@ class BuilderBase(object):
         self._apply_patchfile()
         self._prepare(install_dirs=install_dirs, reconfigure=reconfigure)
 
+    def debug(self, install_dirs, reconfigure: bool) -> None:
+        reconfigure = self._reconfigure(reconfigure)
+        self._apply_patchfile()
+        self._prepare(install_dirs=install_dirs, reconfigure=reconfigure)
+        env = self._compute_env(install_dirs)
+        print("Starting a shell in %s, ^D to exit..." % self.build_dir)
+        # TODO: print the command to run the build
+        shell = ["powershell.exe"] if sys.platform == "win32" else ["/bin/sh", "-i"]
+        self._run_cmd(shell, cwd=self.build_dir, env=env)
+
     def build(self, install_dirs, reconfigure: bool) -> None:
         print("Building %s..." % self.manifest.name)
         reconfigure = self._reconfigure(reconfigure)
@@ -145,12 +168,11 @@ class BuilderBase(object):
                     os.remove(self.build_dir)
                 else:
                     shutil.rmtree(self.build_dir)
-
-        # On Windows, emit a wrapper script that can be used to run build artifacts
-        # directly from the build directory, without installing them.  On Windows $PATH
-        # needs to be updated to include all of the directories containing the runtime
-        # library dependencies in order to run the binaries.
-        if self.build_opts.is_windows():
+        elif self.build_opts.is_windows():
+            # On Windows, emit a wrapper script that can be used to run build artifacts
+            # directly from the build directory, without installing them.  On Windows $PATH
+            # needs to be updated to include all of the directories containing the runtime
+            # library dependencies in order to run the binaries.
             script_path = self.get_dev_run_script_path()
             dep_munger = create_dyn_dep_munger(self.build_opts, install_dirs)
             dep_dirs = self.get_dev_run_extra_path_dirs(install_dirs, dep_munger)
@@ -323,7 +345,7 @@ class AutoconfBuilder(BuilderBase):
         env = self._compute_env(install_dirs)
 
         # Some configure scripts need additional env values passed derived from cmds
-        for (k, cmd_args) in self.conf_env_args.items():
+        for k, cmd_args in self.conf_env_args.items():
             out = (
                 subprocess.check_output(cmd_args, env=dict(env.items()))
                 .decode("utf-8")
@@ -350,7 +372,9 @@ class AutoconfBuilder(BuilderBase):
                 self._run_cmd(["autoreconf", "-ivf"], cwd=self.src_dir, env=env)
         configure_cmd = [configure_path, "--prefix=" + self.inst_dir] + self.args
         self._run_cmd(configure_cmd, env=env)
-        self._run_cmd([self._make_binary, "-j%s" % self.num_jobs], env=env)
+        only_install = self.manifest.get("build", "only_install", "false", ctx=self.ctx)
+        if not only_install:
+            self._run_cmd([self._make_binary, "-j%s" % self.num_jobs], env=env)
         self._run_cmd([self._make_binary, "install"], env=env)
 
 

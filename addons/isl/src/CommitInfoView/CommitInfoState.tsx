@@ -5,78 +5,65 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-import type {CommitInfo, Hash} from '../types';
-import type {CommitMessageFields, FieldsBeingEdited} from './types';
+import type {Hash} from '../types';
+import type {CommitMessageFields} from './types';
 
-import {globalRecoil} from '../AccessGlobalRecoil';
 import serverAPI from '../ClientToServerAPI';
 import {successionTracker} from '../SuccessionTracker';
 import {latestCommitMessageFields} from '../codeReview/CodeReviewInfo';
+import {atomFamilyWeak, readAtom, writeAtom} from '../jotaiUtils';
+import {AmendMessageOperation} from '../operations/AmendMessageOperation';
+import {AmendOperation, PartialAmendOperation} from '../operations/AmendOperation';
+import {CommitOperation, PartialCommitOperation} from '../operations/CommitOperation';
+import {onOperationExited} from '../operationsState';
 import {dagWithPreviews} from '../previews';
-import {selectedCommitInfos} from '../selection';
-import {firstLine} from '../utils';
+import {selectedCommitInfos, selectedCommits} from '../selection';
+import {latestHeadCommit} from '../serverAPIState';
+import {registerCleanup, registerDisposable} from '../utils';
 import {
-  commitMessageFieldsSchema,
   parseCommitMessageFields,
   allFieldsBeingEdited,
-  noFieldsBeingEdited,
   anyEditsMade,
   applyEditedFields,
+  commitMessageFieldsSchema,
+  mergeCommitMessageFields,
 } from './CommitMessageFields';
-import {atomFamily, selectorFamily, atom, selector} from 'recoil';
+import {atom} from 'jotai';
+import {firstLine} from 'shared/utils';
 
-export type EditedMessage = {fields: Partial<CommitMessageFields>};
+export type EditedMessage = Partial<CommitMessageFields>;
 
 export type CommitInfoMode = 'commit' | 'amend';
-export type EditedMessageUnlessOptimistic =
-  | (EditedMessage & {type?: undefined})
-  | {type: 'optimistic'; fields?: CommitMessageFields};
 
-/**
- * Throw if the edited message is of optimistic type.
- * We expect:
- *  - editedCommitMessage('head') should never be optimistic
- *  - editedCommitMessage(hashForCommitInTheTree) should not be optimistic
- *  - editedCommitMessage(hashForCommitNotInTheTree) should be optimistic
- */
-export function assertNonOptimistic(editedMessage: EditedMessageUnlessOptimistic): EditedMessage {
-  if (editedMessage.type === 'optimistic') {
-    throw new Error('Expected edited message to not be for optimistic commit');
-  }
-  return editedMessage;
-}
-
-export const commitMessageTemplate = atom<EditedMessage | undefined>({
-  key: 'commitMessageTemplate',
-  default: undefined,
-  effects: [
-    ({setSelf, getLoadable}) => {
-      const disposable = serverAPI.onMessageOfType('fetchedCommitMessageTemplate', event => {
-        const title = firstLine(event.template);
-        const description = event.template.slice(title.length + 1);
-        const schema = getLoadable(commitMessageFieldsSchema).valueOrThrow();
-        const fields = parseCommitMessageFields(schema, title, description);
-        setSelf({fields});
-      });
-      return () => disposable.dispose();
-    },
-    () =>
-      serverAPI.onSetup(() =>
-        serverAPI.postMessage({
-          type: 'fetchCommitMessageTemplate',
-        }),
-      ),
-  ],
-});
+export const commitMessageTemplate = atom<EditedMessage | undefined>(undefined);
+registerDisposable(
+  commitMessageTemplate,
+  serverAPI.onMessageOfType('fetchedCommitMessageTemplate', event => {
+    const title = firstLine(event.template);
+    const description = event.template.slice(title.length + 1);
+    const schema = readAtom(commitMessageFieldsSchema);
+    const fields = parseCommitMessageFields(schema, title, description);
+    writeAtom(commitMessageTemplate, fields);
+  }),
+  import.meta.hot,
+);
+registerCleanup(
+  commitMessageTemplate,
+  serverAPI.onSetup(() =>
+    serverAPI.postMessage({
+      type: 'fetchCommitMessageTemplate',
+    }),
+  ),
+  import.meta.hot,
+);
 
 /** Typed update messages when submitting a commit or set of commits.
  * Unlike editedCommitMessages, you can't provide an update message when committing the first time,
  * so we don't need to track this state for 'head'.
  */
-export const diffUpdateMessagesState = atomFamily<string, Hash>({
-  key: 'diffUpdateMessagesState',
-  default: '',
-});
+export const diffUpdateMessagesState = atomFamilyWeak((_hash: Hash) => atom<string>(''));
+
+export const getDefaultEditedCommitMessage = (): EditedMessage => ({});
 
 /**
  * Map of hash -> latest edited commit message, representing any changes made to the commit's message fields.
@@ -88,33 +75,21 @@ export const diffUpdateMessagesState = atomFamily<string, Hash>({
  * When you begin editing a field, that field must be initialized in the EditedMessage with the latest value.
  * This also stores the state of new commit messages being written, keyed by "head" instead of a commit hash.
  * Note: this state should be cleared when amending / committing / meta-editing.
- *
- * TODO: This state has a separate field for if it's optimistic, but this is no longer really needed. Remove this.
  */
-export const editedCommitMessages = atomFamily<EditedMessageUnlessOptimistic, Hash | 'head'>({
-  key: 'editedCommitMessages',
-  default: () => ({fields: {}}),
+export const editedCommitMessages = atomFamilyWeak((_hashOrHead: Hash | 'head') => {
+  return atom<EditedMessage>(getDefaultEditedCommitMessage());
 });
 
 function updateEditedCommitMessagesFromSuccessions() {
   return successionTracker.onSuccessions(successions => {
     for (const [oldHash, newHash] of successions) {
-      const existing = globalRecoil().getLoadable(editedCommitMessages(oldHash));
-      if (
-        existing.state === 'hasValue' &&
-        // Never copy an "optimistic" message during succession, we have no way to clear it out.
-        // "optimistic" may also correspond to a message which was not edited,
-        // for which the hash no longer exists in the tree.
-        // We should just use the atom's default, which lets it populate correctly.
-        existing.valueOrThrow().type !== 'optimistic'
-      ) {
-        globalRecoil().set(editedCommitMessages(newHash), existing.valueOrThrow());
-      }
+      const existing = readAtom(editedCommitMessages(oldHash));
+      writeAtom(editedCommitMessages(newHash), existing);
 
-      const existingUpdateMessage = globalRecoil().getLoadable(diffUpdateMessagesState(oldHash));
-      if (existingUpdateMessage.state === 'hasValue') {
+      const existingUpdateMessage = readAtom(diffUpdateMessagesState(oldHash));
+      if (existingUpdateMessage && existingUpdateMessage !== '') {
         // TODO: this doesn't work if you have multiple commits selected...
-        globalRecoil().set(diffUpdateMessagesState(oldHash), existingUpdateMessage.valueOrThrow());
+        writeAtom(diffUpdateMessagesState(newHash), existingUpdateMessage);
       }
     }
   });
@@ -126,22 +101,63 @@ export const __TEST__ = {
     editedCommitMessageSuccessionDisposable = updateEditedCommitMessagesFromSuccessions();
   },
 };
+registerCleanup(successionTracker, updateEditedCommitMessagesFromSuccessions, import.meta.hot);
 
-export const latestCommitMessageFieldsWithEdits = selectorFamily<
-  CommitMessageFields,
-  Hash | 'head'
->({
-  key: 'latestCommitMessageFieldsWithEdits',
-  get:
-    hash =>
-    ({get}) => {
-      const edited = get(editedCommitMessages(hash));
-      const latest = get(latestCommitMessageFields(hash));
-      if (edited.type === 'optimistic') {
-        return latest;
-      }
-      return applyEditedFields(latest, edited.fields);
-    },
+registerDisposable(
+  serverAPI,
+  onOperationExited((progress, operation) => {
+    if (progress.exitCode === 0) {
+      return;
+    }
+    const isCommit =
+      operation instanceof CommitOperation || operation instanceof PartialCommitOperation;
+    const isAmend =
+      operation instanceof AmendOperation || operation instanceof PartialAmendOperation;
+    const isMetaedit = operation instanceof AmendMessageOperation;
+    if (!(isCommit || isAmend || isMetaedit)) {
+      return;
+    }
+
+    // Operation involving commit message failed, let's restore your edited commit message so you might save it or try again
+    const message = operation.message;
+    if (message == null) {
+      return;
+    }
+
+    const headOrHash = isCommit
+      ? 'head'
+      : isMetaedit
+      ? operation.getCommitHash()
+      : readAtom(latestHeadCommit)?.hash;
+
+    if (!headOrHash) {
+      return;
+    }
+
+    const [title] = message.split(/\n+/, 1);
+    const description = message.slice(title.length);
+
+    const schema = readAtom(commitMessageFieldsSchema);
+    const fields = parseCommitMessageFields(schema, title, description);
+    const currentMessage = readAtom(editedCommitMessages(headOrHash));
+    writeAtom(
+      editedCommitMessages(headOrHash),
+      mergeCommitMessageFields(schema, currentMessage as CommitMessageFields, fields),
+    );
+    writeAtom(commitMode, isCommit ? 'commit' : 'amend');
+    if (!isCommit) {
+      writeAtom(selectedCommits, new Set([headOrHash]));
+    }
+  }),
+  import.meta.hot,
+);
+
+export const latestCommitMessageFieldsWithEdits = atomFamilyWeak((hashOrHead: Hash | 'head') => {
+  return atom(get => {
+    const edited = get(editedCommitMessages(hashOrHead));
+    const latest = get(latestCommitMessageFields(hashOrHead));
+    return applyEditedFields(latest, edited);
+  });
 });
 
 /**
@@ -151,66 +167,77 @@ export const latestCommitMessageFieldsWithEdits = selectorFamily<
  * which allows all fields to be edited for example when clicking "amend...",
  * but without actually changing the underlying edited messages.
  */
-export const forceNextCommitToEditAllFields = atom({
-  key: 'forceNextCommitToEditAllFields',
-  default: false,
-});
+export const forceNextCommitToEditAllFields = atom<boolean>(false);
 
-export const unsavedFieldsBeingEdited = selectorFamily<FieldsBeingEdited, Hash | 'head'>({
-  key: 'unsavedFieldsBeingEdited',
-  get:
-    hash =>
-    ({get}) => {
-      const edited = get(editedCommitMessages(hash));
-      const schema = get(commitMessageFieldsSchema);
-      if (edited.type === 'optimistic') {
-        return noFieldsBeingEdited(schema);
-      }
-      if (hash === 'head') {
-        return allFieldsBeingEdited(schema);
-      }
-      return Object.fromEntries(schema.map(field => [field.key, field.key in edited.fields]));
-    },
-});
-
-export const hasUnsavedEditedCommitMessage = selectorFamily<boolean, Hash | 'head'>({
-  key: 'hasUnsavedEditedCommitMessage',
-  get:
-    hash =>
-    ({get}) => {
-      const beingEdited = get(unsavedFieldsBeingEdited(hash));
-      if (Object.values(beingEdited).some(Boolean)) {
-        // Some fields are being edited, let's look more closely to see if anything is actually different.
-        const edited = get(editedCommitMessages(hash));
-        if (edited.type === 'optimistic') {
-          return false;
-        }
-        const latest = get(latestCommitMessageFields(hash));
-        const schema = get(commitMessageFieldsSchema);
-        return anyEditsMade(schema, latest, assertNonOptimistic(edited).fields);
-      }
-      return false;
-    },
-});
-
-export const commitMode = atom<CommitInfoMode>({
-  key: 'commitMode',
-  default: 'amend',
-});
-
-export const commitInfoViewCurrentCommits = selector<Array<CommitInfo> | null>({
-  key: 'commitInfoViewCurrentCommits',
-  get: ({get}) => {
-    const selected = get(selectedCommitInfos);
-
-    // show selected commit, if there's exactly 1
-    const selectedCommit = selected.length === 1 ? selected[0] : undefined;
-    const commit = selectedCommit ?? get(dagWithPreviews).resolve('.');
-
-    if (commit == null) {
-      return null;
-    } else {
-      return selected.length > 1 ? selected : [commit];
+export const unsavedFieldsBeingEdited = atomFamilyWeak((hashOrHead: Hash | 'head') => {
+  return atom(get => {
+    const edited = get(editedCommitMessages(hashOrHead));
+    const schema = get(commitMessageFieldsSchema);
+    if (hashOrHead === 'head') {
+      return allFieldsBeingEdited(schema);
     }
+    return Object.fromEntries(schema.map(field => [field.key, field.key in edited]));
+  });
+});
+
+export const hasUnsavedEditedCommitMessage = atomFamilyWeak((hashOrHead: Hash | 'head') => {
+  return atom(get => {
+    const beingEdited = get(unsavedFieldsBeingEdited(hashOrHead));
+    if (Object.values(beingEdited).some(Boolean)) {
+      // Some fields are being edited, let's look more closely to see if anything is actually different.
+      const edited = get(editedCommitMessages(hashOrHead));
+      const latest = get(latestCommitMessageFields(hashOrHead));
+      const schema = get(commitMessageFieldsSchema);
+      return anyEditsMade(schema, latest, edited);
+    }
+    return false;
+  });
+});
+
+/**
+ * Toggle state between commit/amend modes. Note that this may be "commit" even if
+ * the commit info is not looking at the head commit (this allows persistance as you select other commits and come back).
+ * We should only behave in "commit" mode when in commit mode AND looking at the head commit.
+ * Prefer using `commitMode` atom.
+ */
+const rawCommitMode = atom<CommitInfoMode>('amend');
+
+/**
+ * Whether the commit info view is in "commit" or "amend" mode.
+ * It may only be in the "commit" mode when the commit being viewed is the head commit,
+ * though it may be set to "commit" mode even when looking at a non-head commit,
+ * and it'll be in commit when when you do look at the head commit.
+ */
+export const commitMode = atom(
+  get => {
+    const commitInfoCommit = get(commitInfoViewCurrentCommits);
+    const rawMode = get(rawCommitMode);
+    if (commitInfoCommit == null) {
+      // loading state
+      return 'amend';
+    }
+    if (commitInfoCommit.length === 1 && commitInfoCommit[0].isDot) {
+      // allow using "commit" mode only if looking at exactly the single head commit
+      return rawMode;
+    }
+    // otherwise, it's a non-head commit or multi-selection, so only show "amend" mode
+    return 'amend';
   },
+  (_get, set, newMode: CommitInfoMode | ((m: CommitInfoMode) => CommitInfoMode)) => {
+    set(rawCommitMode, newMode);
+  },
+);
+
+export const commitInfoViewCurrentCommits = atom(get => {
+  const selected = get(selectedCommitInfos);
+
+  // show selected commit, if there's exactly 1
+  const selectedCommit = selected.length === 1 ? selected[0] : undefined;
+  const commit = selectedCommit ?? get(dagWithPreviews).resolve('.');
+
+  if (commit == null) {
+    return null;
+  } else {
+    return selected.length > 1 ? selected : [commit];
+  }
 });

@@ -15,6 +15,7 @@ use bookmarks::BookmarkKey;
 use context::CoreContext;
 use futures::future::try_join_all;
 use futures::Future;
+use futures::TryFutureExt;
 use live_commit_sync_config::LiveCommitSyncConfig;
 use metaconfig_types::CommitSyncConfigVersion;
 use metaconfig_types::CommitSyncDirection;
@@ -24,10 +25,10 @@ use slog::debug;
 use synced_commit_mapping::SyncedCommitMapping;
 use synced_commit_mapping::WorkingCopyEquivalence;
 
-use crate::get_small_repos_for_version;
+use crate::commit_sync_config_utils::get_small_repos_for_version;
+use crate::types::Repo;
 use crate::types::Source;
 use crate::types::Target;
-use crate::Repo;
 
 /// The state of a source repo commit in a target repo, assuming
 /// that any multiple `RewrittenAs` options have been resolved
@@ -44,7 +45,7 @@ pub enum CommitSyncOutcome {
 
 /// The state of a source repo commit in a target repo, which
 /// allows for multiple `RewrittenAs` options
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum PluralCommitSyncOutcome {
     /// Not suitable for syncing to this repo
     NotSyncCandidate(CommitSyncConfigVersion),
@@ -55,6 +56,9 @@ pub enum PluralCommitSyncOutcome {
 }
 
 /// A hint to the synced commit selection algorithm
+/// Most often used to disambiguate the mapping that has many commits corresponding to the same commit in
+/// the source repo. If there's a single option it's usually the one used (hence it's "hint", not "requirement")
+///
 /// See the docstring for `get_plural_commit_sync_outcome`
 /// for why this is needed.
 #[derive(Clone)]
@@ -63,18 +67,14 @@ pub enum CandidateSelectionHint<R: Repo> {
     Only,
     /// Selected candidate should be a given changeset
     Exact(Target<ChangesetId>),
-    /// Selected candidate should either be the only candidate
-    /// or be an ancestor of a given bookmark
-    OnlyOrAncestorOfBookmark(Target<BookmarkKey>, Target<R>),
-    /// Selected candidate should either be the only candidate
-    /// or be a descendant of a given bookmark
-    OnlyOrDescendantOfBookmark(Target<BookmarkKey>, Target<R>),
-    /// Selected candidate should either be the only candidate
-    /// or be an ancestor of a given changeset
-    OnlyOrAncestorOfCommit(Target<ChangesetId>, Target<R>),
-    /// Selected candidate should either be the only candidate
-    /// or be a descendant of a given changeset
-    OnlyOrDescendantOfCommit(Target<ChangesetId>, Target<R>),
+    /// Selected candidate should be an ancestor of a given bookmark
+    AncestorOfBookmark(Target<BookmarkKey>, Target<R>),
+    /// Selected candidate should be a descendant of a given bookmark
+    DescendantOfBookmark(Target<BookmarkKey>, Target<R>),
+    /// Selected candidate should be an ancestor of a given changeset
+    AncestorOfCommit(Target<ChangesetId>, Target<R>),
+    /// Selected candidate should be a descendant of a given changeset
+    DescendantOfCommit(Target<ChangesetId>, Target<R>),
 }
 
 impl<R: Repo> fmt::Debug for CandidateSelectionHint<R> {
@@ -82,24 +82,18 @@ impl<R: Repo> fmt::Debug for CandidateSelectionHint<R> {
         match self {
             Self::Only => write!(f, "CandidateSelectionHint::Only"),
             Self::Exact(cs_id) => write!(f, "CandidateSelectionHint::Exact({})", cs_id.0),
-            Self::OnlyOrAncestorOfBookmark(bn, _) => {
-                write!(f, "DesiredRelationship::OnlyOrAncestorOfBookmark({})", bn.0)
+            Self::AncestorOfBookmark(bn, _) => {
+                write!(f, "CandidateSelectionHint::AncestorOfBookmark({})", bn.0)
             }
-            Self::OnlyOrDescendantOfBookmark(bn, _) => write!(
-                f,
-                "DesiredRelationship::OnlyOrDescendantOfBookmark({})",
-                bn.0
-            ),
-            Self::OnlyOrAncestorOfCommit(cs_id, _) => write!(
-                f,
-                "DesiredRelationship::OnlyOrAncestorOfCommit({})",
-                cs_id.0
-            ),
-            Self::OnlyOrDescendantOfCommit(cs_id, _) => write!(
-                f,
-                "DesiredRelationship::OnlyOrDescendantOfCommit({})",
-                cs_id.0
-            ),
+            Self::DescendantOfBookmark(bn, _) => {
+                write!(f, "CandidateSelectionHint::DescendantOfBookmark({})", bn.0)
+            }
+            Self::AncestorOfCommit(cs_id, _) => {
+                write!(f, "CandidateSelectionHint::AncestorOfCommit({})", cs_id.0)
+            }
+            Self::DescendantOfCommit(cs_id, _) => {
+                write!(f, "CandidateSelectionHint::DescendantOfCommit({})", cs_id.0)
+            }
         }
     }
 }
@@ -110,9 +104,9 @@ impl<R: Repo> CandidateSelectionHint<R> {
     /// - `Only` variant does not represent a topological relationship, so cannot
     ///  be converted into `DesiredRelationship`
     /// - `Exact` variant represents `DesiredRelationship::EqualTo`
-    /// - `OnlyOrAncestorOfCommit` and `OnlyOrDescendantOfCommit` translate into
+    /// - `AncestorOfCommit` and `DescendantOfCommit` translate into
     ///  corresponding `DesiredRelationship` variants
-    /// - `OnlyOrAncestorOfBookmark` and `OnlyOrDescendantOfBookmark` behave either
+    /// - `AncestorOfBookmark` and `DescendantOfBookmark` behave either
     ///  as their commit counterparts (if the bookmark exists), or as `Only` (otherwise)
     ///
     /// Note that hints, which refer to bookmarks may not be fully valid at the time
@@ -120,14 +114,14 @@ impl<R: Repo> CandidateSelectionHint<R> {
     /// a "hard failure", as a hint may be used for bookmark creation, or at the time when
     /// bookmark was already deleted. Instead, for these cases the idea is to just
     /// "downgrade" a hint to be an equivalent of `Only` and fail on multiple candidates.
-    async fn try_into_desired_relationship(
+    pub async fn try_into_desired_relationship(
         self,
         ctx: &CoreContext,
     ) -> Result<Option<DesiredRelationship<R>>, Error> {
         match self {
             Self::Only => Ok(None),
             Self::Exact(cs_id) => Ok(Some(DesiredRelationship::EqualTo(cs_id))),
-            Self::OnlyOrAncestorOfBookmark(bookmark, target_repo) => {
+            Self::AncestorOfBookmark(bookmark, target_repo) => {
                 // Bookmark absence is not a failure, see doctring
                 let maybe_target_cs_id: Option<Target<ChangesetId>> = target_repo
                     .0
@@ -139,7 +133,7 @@ impl<R: Repo> CandidateSelectionHint<R> {
                 Ok(maybe_target_cs_id
                     .map(|target_cs_id| DesiredRelationship::AncestorOf(target_cs_id, target_repo)))
             }
-            Self::OnlyOrDescendantOfBookmark(bookmark, target_repo) => {
+            Self::DescendantOfBookmark(bookmark, target_repo) => {
                 // Bookmark absence is not a failure, see doctring
                 let maybe_target_cs_id: Option<Target<ChangesetId>> = target_repo
                     .0
@@ -152,10 +146,10 @@ impl<R: Repo> CandidateSelectionHint<R> {
                     DesiredRelationship::DescendantOf(target_cs_id, target_repo)
                 }))
             }
-            Self::OnlyOrAncestorOfCommit(target_cs_id, target_repo) => Ok(Some(
+            Self::AncestorOfCommit(target_cs_id, target_repo) => Ok(Some(
                 DesiredRelationship::AncestorOf(target_cs_id, target_repo),
             )),
-            Self::OnlyOrDescendantOfCommit(target_cs_id, target_repo) => Ok(Some(
+            Self::DescendantOfCommit(target_cs_id, target_repo) => Ok(Some(
                 DesiredRelationship::DescendantOf(target_cs_id, target_repo),
             )),
         }
@@ -412,8 +406,8 @@ fn get_only_item_selector<'a>(
 /// while iterating over the list of candidate changesets
 /// This struct is a simplified version of `CandidateSelectionHint`:
 /// - it does not deal with bookmarks
-/// - it deos not deal with the expectation of having only one candidate in the list
-enum DesiredRelationship<R: Repo> {
+/// - it does not deal with the expectation of having only one candidate in the list
+pub enum DesiredRelationship<R: Repo> {
     /// Changeset should be an ancestor of this variant's payload
     /// Note: in this case any changeset is an ancestor of itself
     AncestorOf(Target<ChangesetId>, Target<R>),
@@ -428,7 +422,7 @@ impl<R: Repo> fmt::Debug for DesiredRelationship<R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::AncestorOf(cs_id, _) => {
-                write!(f, "DesiredRelationship::AncsetorOf({})", cs_id.0)
+                write!(f, "DesiredRelationship::AncestorOf({})", cs_id.0)
             }
             Self::DescendantOf(cs_id, _) => {
                 write!(f, "DesiredRelationship::DescendantOf({})", cs_id.0)
@@ -613,6 +607,32 @@ impl PluralCommitSyncOutcome {
             .await
     }
 
+    /// Filters the plural sync results to those conforming to desired relationship.
+    pub async fn filter_by_desired_relationship<R: Repo>(
+        self,
+        ctx: &CoreContext,
+        desired_relationship: &DesiredRelationship<R>,
+    ) -> Result<Self, Error> {
+        use PluralCommitSyncOutcome::*;
+        Ok(match self {
+            NotSyncCandidate(version) => Self::NotSyncCandidate(version),
+            EquivalentWorkingCopyAncestor(cs_id, version) => {
+                Self::EquivalentWorkingCopyAncestor(cs_id, version)
+            }
+            RewrittenAs(v) => RewrittenAs(
+                try_join_all(v.into_iter().map(|(cs_id, version)| {
+                    desired_relationship
+                        .holds_for(ctx, Target(cs_id))
+                        .map_ok(move |res| res.then_some((cs_id, version)))
+                }))
+                .await?
+                .into_iter()
+                .filter_map(|x| x)
+                .collect(),
+            ),
+        })
+    }
+
     async fn try_into_commit_sync_outcome_with_desired_relationship<R: Repo>(
         self,
         ctx: &CoreContext,
@@ -776,7 +796,7 @@ mod tests {
             &ctx,
             vec![c, f],
             c,
-            OnlyOrAncestorOfCommit(Target(e), Target(blob_repo.clone())),
+            AncestorOfCommit(Target(e), Target(blob_repo.clone())),
         )
         .await?;
 
@@ -786,7 +806,7 @@ mod tests {
             &ctx,
             vec![c, f],
             f,
-            OnlyOrAncestorOfCommit(Target(g), Target(blob_repo.clone())),
+            AncestorOfCommit(Target(g), Target(blob_repo.clone())),
         )
         .await?;
 
@@ -796,7 +816,7 @@ mod tests {
             &ctx,
             vec![c, f],
             c,
-            OnlyOrAncestorOfCommit(Target(c), Target(blob_repo.clone())),
+            AncestorOfCommit(Target(c), Target(blob_repo.clone())),
         )
         .await?;
 
@@ -806,7 +826,7 @@ mod tests {
             &ctx,
             vec![c],
             c,
-            OnlyOrAncestorOfCommit(Target(f), Target(blob_repo.clone())),
+            AncestorOfCommit(Target(f), Target(blob_repo.clone())),
         )
         .await?;
 
@@ -815,7 +835,7 @@ mod tests {
             &ctx,
             vec![c, e],
             "does not rewrite into any ancestor of",
-            OnlyOrAncestorOfCommit(Target(g), Target(blob_repo.clone())),
+            AncestorOfCommit(Target(g), Target(blob_repo.clone())),
         )
         .await?;
 
@@ -824,7 +844,7 @@ mod tests {
             &ctx,
             vec![c, e],
             "rewrites into multiple ancestors of",
-            OnlyOrAncestorOfCommit(Target(e), Target(blob_repo.clone())),
+            AncestorOfCommit(Target(e), Target(blob_repo.clone())),
         )
         .await?;
 
@@ -861,7 +881,7 @@ mod tests {
             &ctx,
             vec![e, j],
             e,
-            OnlyOrDescendantOfCommit(Target(d), Target(blob_repo.clone())),
+            DescendantOfCommit(Target(d), Target(blob_repo.clone())),
         )
         .await?;
 
@@ -871,7 +891,7 @@ mod tests {
             &ctx,
             vec![e, g],
             g,
-            OnlyOrDescendantOfCommit(Target(f), Target(blob_repo.clone())),
+            DescendantOfCommit(Target(f), Target(blob_repo.clone())),
         )
         .await?;
 
@@ -880,7 +900,7 @@ mod tests {
             &ctx,
             vec![e, g],
             g,
-            OnlyOrDescendantOfCommit(Target(g), Target(blob_repo.clone())),
+            DescendantOfCommit(Target(g), Target(blob_repo.clone())),
         )
         .await?;
 
@@ -890,7 +910,7 @@ mod tests {
             &ctx,
             vec![e],
             e,
-            OnlyOrDescendantOfCommit(Target(g), Target(blob_repo.clone())),
+            DescendantOfCommit(Target(g), Target(blob_repo.clone())),
         )
         .await?;
 
@@ -899,7 +919,7 @@ mod tests {
             &ctx,
             vec![e, j],
             "does not rewrite into any descendant of",
-            OnlyOrDescendantOfCommit(Target(f), Target(blob_repo.clone())),
+            DescendantOfCommit(Target(f), Target(blob_repo.clone())),
         )
         .await?;
 
@@ -908,7 +928,7 @@ mod tests {
             &ctx,
             vec![e, d],
             "rewrites into multiple descendants of",
-            OnlyOrDescendantOfCommit(Target(b), Target(blob_repo.clone())),
+            DescendantOfCommit(Target(b), Target(blob_repo.clone())),
         )
         .await?;
 
@@ -993,7 +1013,7 @@ mod tests {
             &ctx,
             vec![c, f],
             c,
-            OnlyOrAncestorOfBookmark(Target(book_e.clone()), Target(blob_repo.clone())),
+            AncestorOfBookmark(Target(book_e.clone()), Target(blob_repo.clone())),
         )
         .await?;
 
@@ -1002,7 +1022,7 @@ mod tests {
             &ctx,
             vec![f],
             f,
-            OnlyOrAncestorOfBookmark(Target(book_g.clone()), Target(blob_repo.clone())),
+            AncestorOfBookmark(Target(book_g.clone()), Target(blob_repo.clone())),
         )
         .await?;
 
@@ -1011,7 +1031,7 @@ mod tests {
             &ctx,
             vec![f, g],
             "does not rewrite into any ancestor of",
-            OnlyOrAncestorOfBookmark(Target(book_e), Target(blob_repo.clone())),
+            AncestorOfBookmark(Target(book_e), Target(blob_repo.clone())),
         )
         .await?;
 

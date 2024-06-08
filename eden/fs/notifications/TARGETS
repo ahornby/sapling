@@ -33,7 +33,7 @@ cpp_library(
     srcs = ["Notifier.cpp"],
     headers = ["Notifier.h"],
     deps = [
-        "//eden/fs/utils:system_error",
+        "//eden/common/utils:system_error",
         "//folly/futures:core",
     ],
     exported_deps = [
@@ -43,19 +43,26 @@ cpp_library(
 )
 
 cpp_library(
+    name = "null_notifier",
+    headers = ["NullNotifier.h"],
+    exported_deps = [
+        ":notifier",
+    ],
+)
+
+cpp_library(
     name = "windows_notifier",
     srcs = ["WindowsNotifier.cpp"],
-    headers = [
-        "NullNotifier.h",
-        "WindowsNotifier.h",
+    headers = ["WindowsNotifier.h"],
+    os_deps = [
+        (
+            "windows",
+            [
+                "fbsource//third-party/toolchains/win:ComCtl32.Lib",
+                "fbsource//third-party/toolchains/win:shell32.lib",
+            ],
+        ),
     ],
-    os_deps = [(
-        "windows",
-        [
-            "fbsource//third-party/toolchains/win:ComCtl32.Lib",
-            "fbsource//third-party/toolchains/win:shell32.lib",
-        ],
-    )],
     os_linker_flags = [
         (
             "windows",
@@ -65,16 +72,16 @@ cpp_library(
     deps = [
         "fbsource//third-party/fmt:fmt",
         ":constants",
+        "//eden/common/utils:process",
         "//eden/common/utils:stringconv",
+        "//eden/common/utils:system_error",
         "//eden/fs/config:config",
-        "//eden/fs/utils:process",
-        "//eden/fs/utils:system_error",
         "//folly/futures:core",
         "//folly/portability:windows",
     ],
     exported_deps = [
         ":notifier",
-        "//eden/fs/utils:utils",
+        "//eden/common/utils:utils",
         "//folly:synchronized",
     ],
 )
@@ -84,9 +91,9 @@ cpp_library(
     srcs = ["CommandNotifier.cpp"],
     headers = ["CommandNotifier.h"],
     deps = [
+        "//eden/common/utils:process",
+        "//eden/common/utils:system_error",
         "//eden/fs/config:config",
-        "//eden/fs/utils:process",
-        "//eden/fs/utils:system_error",
         "//folly/futures:core",
     ],
     exported_deps = [

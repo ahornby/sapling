@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 
 hide outer repo
   $ hg init
@@ -143,7 +145,6 @@ Test "%unset"
   $ hg showconfig unsettest.both -Tjson
   [
   ]
-  [1]
   $ hg showconfig unsettest.both -Tjson --debug
   [
   {
@@ -152,6 +153,60 @@ Test "%unset"
     "value": null
   }
   ]
+
+Read multiple values with -Tjson
+
+  $ hg config --config=a.1=1 --config=a.2=2 --config=a.3=3 a.1 a.3 -Tjson
+  [
+  {
+    "name": "a.1",
+    "source": "--config",
+    "value": "1"
+  },
+  {
+    "name": "a.3",
+    "source": "--config",
+    "value": "3"
+  }
+  ]
+
+  $ hg config --config=a.1=1 --config=a.2=2 --config=a.3=3 --config=b.1=4 --config=b.2=5 a.3 b a.1 -Tjson
+  [
+  {
+    "name": "a.3",
+    "source": "--config",
+    "value": "3"
+  },
+  {
+    "name": "b.1",
+    "source": "--config",
+    "value": "4"
+  },
+  {
+    "name": "b.2",
+    "source": "--config",
+    "value": "5"
+  },
+  {
+    "name": "a.1",
+    "source": "--config",
+    "value": "1"
+  }
+  ]
+
+Config order is preserved:
+
+  $ cat <<EOF >> $HGRCPATH
+  > [ordertest]
+  > a = 1
+  > c = 3
+  > b = 2
+  > EOF
+
+  $ hg config ordertest
+  ordertest.a=1
+  ordertest.c=3
+  ordertest.b=2
 
 Test exit code when no config matches
 

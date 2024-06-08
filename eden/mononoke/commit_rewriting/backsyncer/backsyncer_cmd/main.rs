@@ -108,6 +108,8 @@ impl BacksyncProcess {
             .with_source_and_target_repos()
             .with_dynamic_repos()
             .with_scribe_args()
+            .with_default_scuba_dataset(SCUBA_TABLE)
+            .with_scuba_logging_args()
             .build();
         let backsync_forever_subcommand = SubCommand::with_name(ARG_MODE_BACKSYNC_FOREVER)
             .about("Backsyncs all new bookmark moves");
@@ -377,15 +379,17 @@ where
 
     let counter_name = format_counter(&source_repo_id);
     let maybe_counter = counters.get_counter(ctx, &counter_name).await?;
-    let counter = maybe_counter.ok_or_else(|| format_err!("{} counter not found", counter_name))?;
+    let counter = maybe_counter
+        .ok_or_else(|| format_err!("{} counter not found", counter_name))?
+        .try_into()?;
     let source_repo = commit_syncer.get_source_repo();
     let next_entry = source_repo
         .bookmark_update_log()
-        .read_next_bookmark_log_entries(ctx.clone(), counter as u64, 1, Freshness::MostRecent)
+        .read_next_bookmark_log_entries(ctx.clone(), counter, 1, Freshness::MostRecent)
         .try_collect::<Vec<_>>();
     let remaining_entries = source_repo
         .bookmark_update_log()
-        .count_further_bookmark_log_entries(ctx.clone(), counter as u64, None);
+        .count_further_bookmark_log_entries(ctx.clone(), counter, None);
 
     let (next_entry, remaining_entries) = try_join!(next_entry, remaining_entries)?;
     let delay_secs = next_entry
@@ -554,7 +558,7 @@ async fn run(
                     .await?,
             );
 
-            let mut scuba_sample = MononokeScubaSampleBuilder::new(fb, SCUBA_TABLE)?;
+            let mut scuba_sample = matches.scuba_sample_builder();
             scuba_sample.add("source_repo", source_repo.id.id());
             scuba_sample.add("source_repo_name", source_repo.name.clone());
             scuba_sample.add("target_repo", target_repo.id.id());

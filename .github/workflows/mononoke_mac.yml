@@ -3,12 +3,8 @@
 name: Mononoke Mac
 
 on:
-  push:
-    branches:
-    - main
-  pull_request:
-    branches:
-    - main
+  schedule:
+    - cron: '0 2 * * MON'
 
 permissions:
   contents: read  #  to fetch code (actions/checkout)
@@ -50,6 +46,8 @@ jobs:
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages fetch --no-tests gflags
     - name: Fetch glog
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages fetch --no-tests glog
+    - name: Fetch libdwarf
+      run: python3 build/fbcode_builder/getdeps.py --allow-system-packages fetch --no-tests libdwarf
     - name: Fetch libevent
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages fetch --no-tests libevent
     - name: Fetch lz4
@@ -104,6 +102,8 @@ jobs:
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages build --free-up-disk --no-tests gflags
     - name: Build glog
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages build --free-up-disk --no-tests glog
+    - name: Build libdwarf
+      run: python3 build/fbcode_builder/getdeps.py --allow-system-packages build --free-up-disk --no-tests libdwarf
     - name: Build libevent
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages build --free-up-disk --no-tests libevent
     - name: Build lz4

@@ -5,7 +5,6 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-import type {ClientToServerAPI} from './ClientToServerAPI';
 import type {ThemeColor} from './theme';
 import type {
   Disposable,
@@ -29,27 +28,29 @@ export interface Platform {
   platformName: PlatformName;
   confirm(message: string, details?: string): Promise<boolean>;
   openFile(path: RepoRelativePath, options?: {line?: OneIndexedLineNumber}): void;
+  openFiles(paths: Array<RepoRelativePath>, options?: {line?: OneIndexedLineNumber}): void;
+  canCustomizeFileOpener: boolean;
   openContainingFolder?(path: RepoRelativePath): void;
   openDiff?(path: RepoRelativePath, comparison: Comparison): void;
   openExternalLink(url: string): void;
-  clipboardCopy(value: string): void;
+  clipboardCopy(text: string, html?: string): void;
   chooseFile?(title: string, multi: boolean): Promise<Array<File>>;
-  onCommitFormSubmit?: () => void;
+  /** Whether to ask to configure an external merge tool. Useful for standalone platforms, but not embedded ones like vscode. */
+  upsellExternalMergeTool: boolean;
   /**
    * Get stored data from local persistant cache (usually browser local storage).
    * Note: Some platforms may not support this (e.g. browser with localStorage disabled),
    * or it may not be persisted indefinitely---usual localStorage caveats apply.
    */
-  getTemporaryState<T extends Json>(key: string): T | null;
-  /** see getTemporaryState  */
-  setTemporaryState<T extends Json>(key: string, value: T): void;
+  getPersistedState<T extends Json>(key: string): T | null;
+  /** see getPersistedState  */
+  setPersistedState<T extends Json>(key: string, value: T): void;
+  /** see getPersistedState  */
+  clearPersistedState(): void;
+  /** see getPersistedState  */
+  getAllPersistedState(): Json | undefined;
 
   handleServerMessage?: (message: ServerToClientMessage) => void;
-
-  /** Called once (if provided) when the ClientToServerAPI is initialized,
-   * so platform-specific server events can be listened to.
-   */
-  registerServerListeners?: (api: ClientToServerAPI) => Disposable;
 
   /**
    * Component representing additional buttons/info in the help menu.
@@ -70,6 +71,7 @@ export interface Platform {
 
   theme?: {
     getTheme(): ThemeColor;
+    getThemeName?(): string | undefined;
     onDidChangeTheme(callback: (theme: ThemeColor) => unknown): Disposable;
     resetCSS?: string;
   };

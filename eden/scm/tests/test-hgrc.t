@@ -1,6 +1,7 @@
-#debugruntest-compatible
 
-  $ configure modernclient
+#require no-eden
+
+
 
 Use hgrc within $TESTTMP
 
@@ -64,18 +65,19 @@ issue1829: wrong indentation
 make sure global options given on the cmdline take precedence
 
   $ hg showconfig --config ui.verbose=True --quiet ui
+  ui.timeout=600
   ui.color=auto
-  ui.debug=false
-  ui.ignore.test=$RUNTESTDIR/gitignore
+  ui.paginate=true
+  ui.ignorerevnum=True
+  ui.slash=True
   ui.interactive=False
   ui.mergemarkers=detailed
-  ui.paginate=true
   ui.promptecho=True
-  ui.quiet=true
-  ui.slash=True
+  ui.ignore.test=$RUNTESTDIR/gitignore
   ui.ssh=* (glob)
-  ui.timeout=600
   ui.verbose=false
+  ui.debug=false
+  ui.quiet=true
 
   $ touch foobar/untracked
   $ cat >> foobar/.hg/hgrc <<EOF
@@ -167,10 +169,10 @@ plain hgrc
 with environment variables
 
   $ PAGER=p1 EDITOR=e1 VISUAL=e2 hg showconfig --debug
+  $VISUAL: ui.editor=e2
   --verbose: ui.verbose=False
   --debug: ui.debug=True
   --quiet: ui.quiet=False
-  $VISUAL: ui.editor=e2
 
 don't set editor to empty string
 

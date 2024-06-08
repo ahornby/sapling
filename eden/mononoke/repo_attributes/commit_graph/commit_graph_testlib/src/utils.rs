@@ -16,6 +16,9 @@ use cloned::cloned;
 use commit_graph::AncestorsStreamBuilder;
 use commit_graph::CommitGraph;
 use commit_graph_types::edges::ChangesetNode;
+use commit_graph_types::segments::BoundaryChangesets;
+use commit_graph_types::segments::SegmentDescription;
+use commit_graph_types::segments::SegmentedSliceDescription;
 use context::CoreContext;
 use futures::stream::StreamExt;
 use futures::stream::TryStreamExt;
@@ -32,6 +35,23 @@ pub fn name_cs_id(name: &str) -> ChangesetId {
     let mut bytes = [0; 32];
     bytes[..name.len()].copy_from_slice(name.as_bytes());
     ChangesetId::from_bytes(bytes).expect("Changeset ID should be valid")
+}
+
+pub fn cs_id_name(cs_id: ChangesetId) -> String {
+    cs_id
+        .to_string()
+        .chars()
+        .array_chunks::<2>()
+        .filter_map(|chunk| match chunk {
+            ['0', '0'] => None,
+            _ => {
+                let chunk = chunk.into_iter().collect::<String>();
+                Some(char::from(
+                    u8::from_str_radix(&chunk, 16).expect("Changeset Id should come from ASCII"),
+                ))
+            }
+        })
+        .collect::<String>()
 }
 
 /// Generate a fake changeset node for graph testing purposes by using the raw
@@ -210,6 +230,34 @@ pub async fn assert_ancestors_difference(
             .into_iter()
             .map(name_cs_id)
             .collect::<HashSet<_>>()
+    );
+    Ok(())
+}
+
+pub async fn assert_ancestors_difference_segment_slices(
+    graph: &CommitGraph,
+    ctx: &CoreContext,
+    heads: &[&str],
+    common: &[&str],
+    slice_size: u64,
+    ancestors_difference_segment_slices: &[&[&str]],
+) -> Result<()> {
+    let heads = heads.iter().copied().map(name_cs_id).collect();
+    let common = common.iter().copied().map(name_cs_id).collect();
+
+    assert_eq!(
+        graph
+            .ancestors_difference_segment_slices(ctx, heads, common, slice_size)
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?
+            .into_iter()
+            .map(|slice| { slice.into_iter().map(cs_id_name).collect::<Vec<_>>() })
+            .collect::<Vec<_>>(),
+        ancestors_difference_segment_slices
+            .iter()
+            .map(|slice| { slice.iter().map(|s| s.to_string()).collect::<Vec<_>>() })
+            .collect::<Vec<_>>()
     );
     Ok(())
 }
@@ -396,6 +444,45 @@ where
     Ok(())
 }
 
+pub async fn assert_segmented_slice_ancestors(
+    graph: &CommitGraph,
+    ctx: &CoreContext,
+    heads: Vec<&str>,
+    common: Vec<&str>,
+    slice_size: u64,
+    expected_slices: Vec<Vec<(&str, &str)>>,
+    expected_boundary_changesets: Vec<&str>,
+) -> Result<()> {
+    let heads = heads.into_iter().map(name_cs_id).collect();
+    let common = common.into_iter().map(name_cs_id).collect();
+
+    let expected_slices: Vec<_> = expected_slices
+        .into_iter()
+        .map(|segments| SegmentedSliceDescription {
+            segments: segments
+                .into_iter()
+                .map(|(head, base)| SegmentDescription {
+                    head: name_cs_id(head),
+                    base: name_cs_id(base),
+                })
+                .collect(),
+        })
+        .collect();
+    let expected_boundary_changesets = expected_boundary_changesets
+        .into_iter()
+        .map(name_cs_id)
+        .collect::<BoundaryChangesets>();
+
+    let (slices, boundary_changesets) = graph
+        .segmented_slice_ancestors(ctx, heads, common, slice_size)
+        .await?;
+
+    assert_eq!(slices, expected_slices);
+    assert_eq!(boundary_changesets, expected_boundary_changesets);
+
+    Ok(())
+}
+
 pub async fn assert_children(
     graph: &CommitGraph,
     ctx: &CoreContext,
@@ -409,6 +496,26 @@ pub async fn assert_children(
             .into_iter()
             .collect::<HashSet<_>>(),
         children.into_iter().map(name_cs_id).collect::<HashSet<_>>(),
+    );
+    Ok(())
+}
+
+pub async fn assert_descendants(
+    graph: &CommitGraph,
+    ctx: &CoreContext,
+    cs_ids: Vec<&str>,
+    descendants: Vec<&str>,
+) -> Result<()> {
+    assert_eq!(
+        graph
+            .descendants(ctx, cs_ids.into_iter().map(name_cs_id).collect())
+            .await?
+            .into_iter()
+            .collect::<HashSet<_>>(),
+        descendants
+            .into_iter()
+            .map(name_cs_id)
+            .collect::<HashSet<_>>(),
     );
     Ok(())
 }
@@ -581,6 +688,62 @@ pub async fn assert_minimize_frontier(
             .ancestors_difference(ctx, minimal_frontier, vec![])
             .await?
             .into_iter()
+            .collect::<HashSet<_>>()
+    );
+
+    Ok(())
+}
+
+pub async fn assert_ancestors_within_distance(
+    ctx: &CoreContext,
+    graph: &CommitGraph,
+    cs_ids: Vec<&str>,
+    max_distance: u64,
+    expected_ancestors_and_distances: Vec<(&str, u64)>,
+) -> Result<()> {
+    let cs_ids: Vec<_> = cs_ids.into_iter().map(name_cs_id).collect();
+    let ancestors_and_distances = graph
+        .ancestors_within_distance_stream(ctx, cs_ids.clone(), max_distance)
+        .await?
+        .try_collect::<HashSet<_>>()
+        .await?;
+
+    let expected_ancestors_and_distances: HashSet<_> = expected_ancestors_and_distances
+        .into_iter()
+        .map(|(name, distance)| (name_cs_id(name), distance))
+        .collect();
+
+    assert_eq!(ancestors_and_distances, expected_ancestors_and_distances);
+
+    let ancestors_and_boundaries = graph
+        .ancestors_within_distance(ctx, cs_ids, max_distance)
+        .await?;
+    let boundaries = ancestors_and_boundaries
+        .boundaries
+        .clone()
+        .into_iter()
+        .collect::<HashSet<_>>();
+    let all_ancestors = ancestors_and_boundaries
+        .ancestors
+        .into_iter()
+        .chain(ancestors_and_boundaries.boundaries)
+        .collect::<HashSet<_>>();
+
+    assert_eq!(
+        all_ancestors,
+        expected_ancestors_and_distances
+            .iter()
+            .map(|(cs_id, _)| cs_id)
+            .copied()
+            .collect::<HashSet<_>>()
+    );
+    assert_eq!(
+        boundaries,
+        expected_ancestors_and_distances
+            .iter()
+            .filter(|(_, distance)| *distance == max_distance)
+            .map(|(cs_id, _)| cs_id)
+            .copied()
             .collect::<HashSet<_>>()
     );
 

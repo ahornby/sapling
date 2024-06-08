@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 #inprocess-hg-incompatible
 
 Test native objects attached to the "repo" object gets properly released at the

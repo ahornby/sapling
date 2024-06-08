@@ -82,6 +82,8 @@ fn main() {
             return;
         }
         Some(name) => {
+            #[cfg(windows)]
+            let name = name.strip_suffix(".exe").unwrap_or(name);
             if name.ends_with("python") || name.ends_with("python3") {
                 // Translate to the "debugpython" command.
                 // ex. "python foo.py" => "hg debugpython -- foo.py"
@@ -123,6 +125,7 @@ fn main() {
     }
 
     tracing::debug!(target: "atexit", "calling atexit from main()");
+    tracing::debug!(target: "command_info", chg="off");
 
     // Run atexit handlers.
     atexit::drop_queued();

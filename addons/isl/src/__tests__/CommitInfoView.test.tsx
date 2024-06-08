@@ -5,12 +5,14 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-import type {Hash} from '../types';
+import type {MutAtom} from '../jotaiUtils';
 
 import App from '../App';
-import * as commitMessageFields from '../CommitInfoView/CommitMessageFields';
+import {Internal} from '../Internal';
+import {featureFlag} from '../featureFlags';
+import {writeAtom} from '../jotaiUtils';
 import platform from '../platform';
-import {CommitInfoTestUtils, ignoreRTL} from '../testQueries';
+import {CommitInfoTestUtils, CommitTreeListTestUtils, ignoreRTL} from '../testQueries';
 import {
   resetTestMessages,
   expectMessageSentToServer,
@@ -20,15 +22,14 @@ import {
   simulateUncommittedChangedFiles,
   simulateMessageFromServer,
   openCommitInfoSidebar,
+  waitForWithTick,
+  getLastMessagesSentToServer,
 } from '../testUtils';
 import {CommandRunner, succeedableRevset} from '../types';
-import {fireEvent, render, screen, waitFor, within} from '@testing-library/react';
+import {fireEvent, render, screen, waitFor, within, act} from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import {act} from 'react-dom/test-utils';
 
 /* eslint-disable @typescript-eslint/no-non-null-assertion */
-
-jest.mock('../MessageBus');
 
 const {
   withinCommitInfo,
@@ -50,10 +51,6 @@ const {
 describe('CommitInfoView', () => {
   beforeEach(() => {
     resetTestMessages();
-    // Use OSS message fields for tests, even internally for consistency
-    jest
-      .spyOn(commitMessageFields, 'getDefaultCommitMessageSchema')
-      .mockImplementation(() => commitMessageFields.OSSDefaultFieldSchema);
   });
 
   it('shows loading spinner on mount', () => {
@@ -76,7 +73,7 @@ describe('CommitInfoView', () => {
           value: [
             COMMIT('1', 'some public base', '0', {phase: 'public'}),
             COMMIT('a', 'My Commit', '1'),
-            COMMIT('b', 'Head Commit', 'a', {isHead: true}),
+            COMMIT('b', 'Head Commit', 'a', {isDot: true}),
           ],
         });
       });
@@ -124,7 +121,7 @@ describe('CommitInfoView', () => {
               COMMIT('1', 'some public base', '0', {phase: 'public'}),
               COMMIT('a', 'My Commit', '1', {filesSample: [{path: 'src/ca.js', status: 'M'}]}),
               COMMIT('b', 'Head Commit', 'a', {
-                isHead: true,
+                isDot: true,
                 filesSample: [{path: 'src/cb.js', status: 'M'}],
                 totalFileCount: 1,
               }),
@@ -142,6 +139,94 @@ describe('CommitInfoView', () => {
       it('shows uncommitted changes for head commit', () => {
         expect(withinCommitInfo().queryByText(ignoreRTL('file1.js'))).toBeInTheDocument();
         expect(withinCommitInfo().queryByText(ignoreRTL('file2.js'))).toBeInTheDocument();
+      });
+
+      it('shows diff stats on uncommitted changes', async () => {
+        act(() => {
+          writeAtom(
+            featureFlag(Internal.featureFlags?.ShowSplitSuggestion) as MutAtom<boolean>,
+            true,
+          );
+        });
+
+        expectMessageSentToServer({
+          type: 'fetchPendingSignificantLinesOfCode',
+          hash: 'b',
+          includedFiles: ['src/file1.js', 'src/file2.js'],
+          requestId: expect.anything(),
+        });
+
+        const [json] = getLastMessagesSentToServer(2);
+        const msg = JSON.parse(json as string) as {requestId: number};
+        let {requestId} = msg;
+
+        act(() => {
+          simulateMessageFromServer({
+            type: 'fetchedPendingSignificantLinesOfCode',
+            requestId,
+            hash: 'b',
+            linesOfCode: {value: 123},
+          });
+        });
+        let diffStats = await screen.findByText(/123 lines/);
+        expect(diffStats).toBeInTheDocument();
+        fireEvent.click(withinCommitInfo().getByRole('checkbox', {name: /unselect src\/file1/i}));
+
+        requestId += 1;
+        expectMessageSentToServer({
+          type: 'fetchPendingSignificantLinesOfCode',
+          hash: 'b',
+          includedFiles: ['src/file2.js'],
+          requestId,
+        });
+        act(() => {
+          simulateMessageFromServer({
+            type: 'fetchedPendingSignificantLinesOfCode',
+            requestId,
+            hash: 'b',
+            linesOfCode: {value: 48},
+          });
+        });
+
+        diffStats = await screen.findByText(/48 lines/);
+        expect(diffStats).toBeInTheDocument();
+
+        //testing that quick and slow requests are handled correctly
+        fireEvent.click(withinCommitInfo().getByRole('checkbox', {name: /select src\/file1/i}));
+        fireEvent.click(withinCommitInfo().getByRole('checkbox', {name: /unselect src\/file1/i}));
+
+        const slowRequestId = requestId + 1;
+        expectMessageSentToServer({
+          type: 'fetchPendingSignificantLinesOfCode',
+          hash: 'b',
+          includedFiles: ['src/file1.js', 'src/file2.js'],
+          requestId: slowRequestId,
+        });
+
+        const fastRequestId = requestId + 2;
+        expectMessageSentToServer({
+          type: 'fetchPendingSignificantLinesOfCode',
+          hash: 'b',
+          includedFiles: ['src/file2.js'],
+          requestId: fastRequestId,
+        });
+        act(() => {
+          simulateMessageFromServer({
+            type: 'fetchedPendingSignificantLinesOfCode',
+            requestId: fastRequestId,
+            hash: 'b',
+            linesOfCode: {value: 55},
+          });
+          simulateMessageFromServer({
+            type: 'fetchedPendingSignificantLinesOfCode',
+            requestId: slowRequestId,
+            hash: 'b',
+            linesOfCode: {value: 66}, // the slow one should never be rendered
+          });
+        });
+
+        diffStats = await screen.findByText(/55 lines/);
+        expect(diffStats).toBeInTheDocument();
       });
 
       it('shows file actions on uncommitted changes in commit info view', () => {
@@ -189,7 +274,7 @@ describe('CommitInfoView', () => {
             value: [
               COMMIT('1', 'some public base', '0', {phase: 'public'}),
               COMMIT('a', 'Head Commit', '1', {
-                isHead: true,
+                isDot: true,
                 filesSample: new Array(25)
                   .fill(null)
                   .map((_, i) => ({path: `src/file${i}.txt`, status: 'M'})),
@@ -296,7 +381,7 @@ describe('CommitInfoView', () => {
               COMMIT('a', 'My Commit', '1', {description: 'Summary: First commit in the stack'}),
               COMMIT('b', 'Head Commit', 'a', {
                 description: 'Summary: stacked commit',
-                isHead: true,
+                isDot: true,
               }),
             ],
           });
@@ -454,8 +539,20 @@ describe('CommitInfoView', () => {
           });
         });
 
-        it('focuses topmost field (title) when both title and description start being edited simultaneously', async () => {
+        it('focuses topmost field when all fields start being edited', async () => {
+          act(() => {
+            simulateUncommittedChangedFiles({value: [{path: 'src/file1.js', status: 'M'}]});
+          });
           // edit fields, then switch selected commit and switch back to edit both fields together
+          fireEvent.click(screen.getByText('Amend as...', {exact: false}));
+
+          await waitFor(() => {
+            expect(getTitleEditor()).toHaveFocus();
+            expect(getDescriptionEditor()).not.toHaveFocus();
+          });
+        });
+
+        it('focuses topmost edited field when loading from saved state', async () => {
           clickToEditTitle();
           clickToEditDescription();
           {
@@ -588,7 +685,9 @@ describe('CommitInfoView', () => {
               fireEvent.click(amendMessageButton!);
             });
 
-            await waitFor(() => expect(amendMessageButton).toBeDisabled());
+            await waitForWithTick(() => {
+              expect(amendMessageButton).toBeDisabled();
+            });
           });
         });
 
@@ -1122,7 +1221,7 @@ describe('CommitInfoView', () => {
 
           clickAmendButton();
 
-          await waitFor(() => {
+          await waitForWithTick(() => {
             expectIsNOTEditingTitle();
             expectIsNOTEditingDescription();
             expect(confirmSpy).not.toHaveBeenCalled();
@@ -1131,22 +1230,17 @@ describe('CommitInfoView', () => {
       });
 
       describe('optimistic state', () => {
-        const clickGotoCommit = (hash: Hash) => {
-          const gotoButton = within(screen.getByTestId(`commit-${hash}`)).getByText('Goto');
-          fireEvent.click(gotoButton);
-        };
-
-        it('takes previews into account when rendering head', () => {
-          clickGotoCommit('a');
+        it('takes previews into account when rendering head', async () => {
+          await CommitTreeListTestUtils.clickGoto('a');
           // while optimistic state happening...
           // show new commit in commit info without clicking it (because head is auto-selected)
           expect(withinCommitInfo().queryByText('My Commit')).toBeInTheDocument();
           expect(withinCommitInfo().queryByText('You are here')).toBeInTheDocument();
         });
 
-        it('shows new head when running goto', () => {
+        it('shows new head when running goto', async () => {
           clickToSelectCommit('b'); // explicitly select
-          clickGotoCommit('a');
+          await CommitTreeListTestUtils.clickGoto('a');
 
           expect(withinCommitInfo().queryByText('My Commit')).toBeInTheDocument();
           expect(withinCommitInfo().queryByText('You are here')).toBeInTheDocument();
@@ -1217,7 +1311,7 @@ describe('CommitInfoView', () => {
                 COMMIT('a', 'My Commit', '1'),
                 COMMIT('b', 'Head Commit', 'a'),
                 COMMIT('c', 'New Commit', 'b', {
-                  isHead: true,
+                  isDot: true,
                   description: 'Summary: Message!',
                 }),
               ],
@@ -1264,7 +1358,7 @@ describe('CommitInfoView', () => {
                 COMMIT('1', 'some public base', '0', {phase: 'public'}),
                 COMMIT('a', 'My Commit', '1'),
                 COMMIT('b', 'Head Commit', 'a'),
-                COMMIT('c', 'New Commit', 'b', {isHead: true, description: 'Summary: Message!'}),
+                COMMIT('c', 'New Commit', 'b', {isDot: true, description: 'Summary: Message!'}),
               ],
             });
           });
@@ -1315,7 +1409,7 @@ describe('CommitInfoView', () => {
                 COMMIT('1', 'some public base', '0', {phase: 'public'}),
                 COMMIT('a', 'My Commit', '1'),
                 COMMIT('b2', 'Head Commit Hey', 'a', {
-                  isHead: true,
+                  isDot: true,
                   description: 'Summary: stacked commit\nHello',
                 }),
               ],
@@ -1490,7 +1584,7 @@ describe('CommitInfoView', () => {
         act(() => {
           simulateCommits({
             value: [
-              COMMIT('1', 'some public base', '0', {phase: 'public', isHead: true}),
+              COMMIT('1', 'some public base', '0', {phase: 'public', isDot: true}),
               COMMIT('a', 'My Commit', '1'),
               COMMIT('b', 'Head Commit', 'a'),
             ],
@@ -1513,7 +1607,7 @@ describe('CommitInfoView', () => {
               COMMIT('1', 'some public base', '0', {phase: 'public'}),
               COMMIT('a', 'My Commit V1', '1', {
                 successorInfo: {hash: 'b', type: 'amend'},
-                isHead: true,
+                isDot: true,
               }),
               COMMIT('b', 'Head Commit', '1'),
             ],

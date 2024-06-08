@@ -1,4 +1,5 @@
 #chg-compatible
+#debugruntest-incompatible
 
   $ remove() {
   >     hg rm $@
@@ -6,7 +7,7 @@
   >     hg st
   >     # do not use ls -R, which recurses in .hg subdirs on Mac OS X 10.5
   >     find . -name .hg -prune -o -type f -print | sort
-  >     hg up -C
+  >     hg up -C .
   > }
 
   $ configure modernclient

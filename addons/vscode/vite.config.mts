@@ -8,8 +8,8 @@
 import type {Plugin} from 'vite';
 
 import react from '@vitejs/plugin-react';
-import fs from 'fs';
-import path from 'path';
+import fs from 'node:fs';
+import path from 'node:path';
 import {defineConfig} from 'vite';
 import styleX from 'vite-plugin-stylex';
 import viteTsconfigPaths from 'vite-tsconfig-paths';
@@ -43,11 +43,39 @@ function moveStylexFilenamePlugin(): Plugin {
   };
 }
 
+// Normalize `c:\foo\index.html` to `c:/foo/index.html`.
+// This affects Rollup's `facadeModuleId` (which expects the `c:/foo/bar` format),
+// and is important for Vite to replace the script tags in HTML files.
+// See https://github.com/vitejs/vite/blob/7440191715b07a50992fcf8c90d07600dffc375e/packages/vite/src/node/plugins/html.ts#L804
+// Without this, building on Windows might produce HTML entry points with
+// missing `<script>` tags, resulting in a blank page.
+function normalizeInputPath(inputPath: string) {
+  return process.platform === 'win32' ? path.resolve(inputPath).replace(/\\/g, '/') : inputPath;
+}
+
 export default defineConfig(({mode}) => ({
   base: '',
   plugins: [
     react({
-      include: '**/*.tsx',
+      babel: {
+        plugins: [
+          [
+            'jotai/babel/plugin-debug-label',
+            {
+              customAtomNames: [
+                'atomFamilyWeak',
+                'atomLoadableWithRefresh',
+                'atomWithOnChange',
+                'atomWithRefresh',
+                'configBackedAtom',
+                'jotaiAtom',
+                'lazyAtom',
+                'localStorageBackedAtom',
+              ],
+            },
+          ],
+        ],
+      },
     }),
     styleX(),
     viteTsconfigPaths(),
@@ -57,7 +85,7 @@ export default defineConfig(({mode}) => ({
     outDir: 'dist/webview',
     manifest: true,
     rollupOptions: {
-      input: 'webview.html',
+      input: normalizeInputPath('webview.html'),
       output: {
         // Don't use hashed names, so ISL webview panel can pre-define what filename to load
         entryFileNames: '[name].js',
@@ -68,6 +96,16 @@ export default defineConfig(({mode}) => ({
     copyPublicDir: true,
     // No need for source maps in production. We can always build them locally to understand a wild stack trace.
     sourcemap: mode === 'development',
+  },
+  worker: {
+    rollupOptions: {
+      output: {
+        // Don't use hashed names, so ISL webview panel can pre-define what filename to load
+        entryFileNames: 'worker/[name].js',
+        chunkFileNames: 'worker/[name].js',
+        assetFileNames: 'worker/[name].[ext]',
+      },
+    },
   },
   publicDir: '../isl/public',
   server: {

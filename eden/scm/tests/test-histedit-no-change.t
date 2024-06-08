@@ -1,4 +1,5 @@
 #chg-compatible
+#debugruntest-incompatible
 
 test for old histedit issue #6:
 editing a changeset without any actual change would corrupt the repository
@@ -7,6 +8,7 @@ editing a changeset without any actual change would corrupt the repository
 
   $ enable histedit
   $ configure modern
+  $ setconfig commands.update.check=none
 
   $ initrepo ()
   > {
@@ -203,7 +205,7 @@ modified files should survive the abort when we've moved away already
   @  cb9a9f314b8b07ba71012fcdbc544b5a4d82ff5b "a"
   
 aborting and not changing files can skip mentioning updating (no) files
-  $ hg up
+  $ hg up 'desc(f)'
   5 files updated, 0 files merged, 0 files removed, 0 files unresolved
   $ hg commit -m 'closebranch' --config ui.allowemptycommit=1
   $ startediting 1 1 "(not changing anything)" # edit the 3rd of 3 changesets

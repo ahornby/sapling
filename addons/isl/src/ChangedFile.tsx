@@ -11,64 +11,47 @@ import type {ChangedFileType, GeneratedStatus} from './types';
 import type {ReactNode} from 'react';
 import type {Comparison} from 'shared/Comparison';
 
+import {copyUrlForFile, supportsBrowseUrlForHash} from './BrowseRepo';
 import {type ChangedFilesDisplayType} from './ChangedFileDisplayTypePicker';
 import {generatedStatusToLabel, generatedStatusDescription} from './GeneratedFile';
 import {PartialFileSelectionWithMode} from './PartialFileSelection';
+import {Subtle} from './Subtle';
 import {SuspenseBoundary} from './SuspenseBoundary';
 import {Tooltip} from './Tooltip';
+import {holdingAltAtom, holdingCtrlAtom} from './atoms/keyboardAtoms';
+import {Checkbox} from './components/Checkbox';
+import {externalMergeToolAtom} from './externalMergeTool';
 import {T, t} from './i18n';
-import {writeAtom} from './jotaiUtils';
+import {readAtom} from './jotaiUtils';
+import {CONFLICT_SIDE_LABELS} from './mergeConflicts/state';
 import {AddOperation} from './operations/AddOperation';
 import {ForgetOperation} from './operations/ForgetOperation';
 import {PurgeOperation} from './operations/PurgeOperation';
+import {ResolveInExternalMergeToolOperation} from './operations/ResolveInExternalMergeToolOperation';
 import {ResolveOperation, ResolveTool} from './operations/ResolveOperation';
 import {RevertOperation} from './operations/RevertOperation';
+import {RmOperation} from './operations/RmOperation';
+import {useRunOperation} from './operationsState';
 import {useUncommittedSelection} from './partialSelection';
 import platform from './platform';
 import {optimisticMergeConflicts} from './previews';
-import {useRunOperation} from './serverAPIState';
-import {useShowToast} from './toast';
-import {succeedableRevset} from './types';
+import {copyAndShowToast} from './toast';
+import {ConflictType, succeedableRevset} from './types';
 import {usePromise} from './usePromise';
-import {registerCleanup} from './utils';
-import {VSCodeButton, VSCodeCheckbox} from '@vscode/webview-ui-toolkit/react';
-import {atom, useAtomValue} from 'jotai';
+import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
+import {useAtomValue} from 'jotai';
 import React from 'react';
-import {useRecoilValue} from 'recoil';
 import {labelForComparison, revsetForComparison, ComparisonType} from 'shared/Comparison';
 import {useContextMenu} from 'shared/ContextMenu';
 import {Icon} from 'shared/Icon';
 import {isMac} from 'shared/OperatingSystem';
-import {basename} from 'shared/utils';
+import {basename, notEmpty} from 'shared/utils';
 
-const platformAltKey = (e: KeyboardEvent) => (isMac ? e.altKey : e.ctrlKey);
 /**
  * Is the alt key currently held down, used to show full file paths.
  * On windows, this actually uses the ctrl key instead to avoid conflicting with OS focus behaviors.
  */
-const holdingAltAtom = atom<boolean>(false);
-
-const keydown = (e: KeyboardEvent) => {
-  if (platformAltKey(e)) {
-    writeAtom(holdingAltAtom, true);
-  }
-};
-const keyup = (e: KeyboardEvent) => {
-  if (!platformAltKey(e)) {
-    writeAtom(holdingAltAtom, false);
-  }
-};
-document.addEventListener('keydown', keydown);
-document.addEventListener('keyup', keyup);
-
-registerCleanup(
-  holdingAltAtom,
-  () => {
-    document.removeEventListener('keydown', keydown);
-    document.removeEventListener('keyup', keyup);
-  },
-  import.meta.hot,
-);
+const holdingModifiedKeyAtom = isMac ? holdingAltAtom : holdingCtrlAtom;
 
 export function File({
   file,
@@ -85,8 +68,7 @@ export function File({
   place?: Place;
   generatedStatus?: GeneratedStatus;
 }) {
-  const toast = useShowToast();
-  const clipboardCopy = (text: string) => toast.copyAndShowToast(text);
+  const clipboardCopy = (text: string) => copyAndShowToast(text);
 
   // Renamed files are files which have a copy field, where that path was also removed.
 
@@ -101,6 +83,7 @@ export function File({
       {label: t('Copy Filename'), onClick: () => clipboardCopy(basename(file.path))},
       {label: t('Open File'), onClick: () => platform.openFile(file.path)},
     ];
+
     if (platform.openContainingFolder != null) {
       options.push({
         label: t('Open Containing Folder'),
@@ -115,15 +98,39 @@ export function File({
         onClick: () => platform.openDiff?.(file.path, comparison),
       });
     }
+
+    if (readAtom(supportsBrowseUrlForHash)) {
+      options.push({
+        label: t('Copy file URL'),
+        onClick: () => {
+          copyUrlForFile(file.path, comparison);
+        },
+      });
+    }
     return options;
   });
+
+  const runOperation = useRunOperation();
 
   // Hold "alt" key to show full file paths instead of short form.
   // This is a quick way to see where a file comes from without
   // needing to go through the menu to change the rendering type.
-  const isHoldingAlt = useAtomValue(holdingAltAtom);
+  const isHoldingAlt = useAtomValue(holdingModifiedKeyAtom);
 
-  const tooltip = file.tooltip + '\n\n' + generatedStatusDescription(generatedStatus);
+  const tooltip = [file.tooltip, generatedStatusDescription(generatedStatus)]
+    .filter(notEmpty)
+    .join('\n\n');
+
+  const openFile = () => {
+    if (file.visualStatus === 'U') {
+      const tool = readAtom(externalMergeToolAtom);
+      if (tool != null) {
+        runOperation(new ResolveInExternalMergeToolOperation(tool, file.path));
+        return;
+      }
+    }
+    platform.openFile(file.path);
+  };
 
   return (
     <>
@@ -133,17 +140,13 @@ export function File({
         onContextMenu={contextMenu}
         key={file.path}
         tabIndex={0}
-        onKeyPress={e => {
+        onKeyUp={e => {
           if (e.key === 'Enter') {
-            platform.openFile(file.path);
+            openFile();
           }
         }}>
         <FileSelectionCheckbox file={file} selection={selection} />
-        <span
-          className="changed-file-path"
-          onClick={() => {
-            platform.openFile(file.path);
-          }}>
+        <span className="changed-file-path" onClick={openFile}>
           <Icon icon={icon} />
           <Tooltip title={tooltip} delayMs={2_000} placement="right">
             <span
@@ -196,7 +199,14 @@ function FileActions({
   place?: Place;
 }) {
   const runOperation = useRunOperation();
-  const conflicts = useRecoilValue(optimisticMergeConflicts);
+  const conflicts = useAtomValue(optimisticMergeConflicts);
+
+  const conflictData = conflicts?.files?.find(f => f.path === file.path);
+  const label = labelForConflictType(conflictData?.conflictType);
+  let conflictLabel = null;
+  if (label) {
+    conflictLabel = <Subtle>{label}</Subtle>;
+  }
 
   const actions: Array<React.ReactNode> = [];
 
@@ -336,34 +346,74 @@ function FileActions({
             <Icon icon="check" />
           </VSCodeButton>
         </Tooltip>,
-        <Tooltip title={t('Take local version')} key="resolve-local">
-          <VSCodeButton
-            className="file-show-on-hover"
-            key={file.path}
-            appearance="icon"
-            onClick={() => runOperation(new ResolveOperation(file.path, ResolveTool.local))}>
-            <Icon icon="fold-up" />
-          </VSCodeButton>
-        </Tooltip>,
-        <Tooltip title={t('Take incoming version')} key="resolve-other">
-          <VSCodeButton
-            className="file-show-on-hover"
-            key={file.path}
-            appearance="icon"
-            onClick={() => runOperation(new ResolveOperation(file.path, ResolveTool.other))}>
-            <Icon icon="fold-down" />
-          </VSCodeButton>
-        </Tooltip>,
-        <Tooltip title={t('Combine both incoming and local')} key="resolve-both">
-          <VSCodeButton
-            className="file-show-on-hover"
-            key={file.path}
-            appearance="icon"
-            onClick={() => runOperation(new ResolveOperation(file.path, ResolveTool.both))}>
-            <Icon icon="fold" />
-          </VSCodeButton>
-        </Tooltip>,
       );
+      if (
+        conflictData?.conflictType &&
+        [ConflictType.DeletedInSource, ConflictType.DeletedInDest].includes(
+          conflictData.conflictType,
+        )
+      ) {
+        actions.push(
+          <Tooltip title={t('Delete file')} key="resolve-delete">
+            <VSCodeButton
+              className="file-show-on-hover"
+              data-testid="file-action-resolve-delete"
+              appearance="icon"
+              onClick={() => {
+                runOperation(new RmOperation(file.path, /* force */ true));
+                // then explicitly mark the file as resolved
+                runOperation(new ResolveOperation(file.path, ResolveTool.mark));
+              }}>
+              <Icon icon="trash" />
+            </VSCodeButton>
+          </Tooltip>,
+        );
+      } else {
+        actions.push(
+          <Tooltip
+            title={t('Take $local', {
+              replace: {$local: CONFLICT_SIDE_LABELS.local},
+            })}
+            key="resolve-local">
+            <VSCodeButton
+              className="file-show-on-hover"
+              key={file.path}
+              appearance="icon"
+              onClick={() => runOperation(new ResolveOperation(file.path, ResolveTool.local))}>
+              <Icon icon="fold-up" />
+            </VSCodeButton>
+          </Tooltip>,
+          <Tooltip
+            title={t('Take $incoming', {
+              replace: {$incoming: CONFLICT_SIDE_LABELS.incoming},
+            })}
+            key="resolve-other">
+            <VSCodeButton
+              className="file-show-on-hover"
+              key={file.path}
+              appearance="icon"
+              onClick={() => runOperation(new ResolveOperation(file.path, ResolveTool.other))}>
+              <Icon icon="fold-down" />
+            </VSCodeButton>
+          </Tooltip>,
+          <Tooltip
+            title={t('Combine both $incoming and $local', {
+              replace: {
+                $local: CONFLICT_SIDE_LABELS.local,
+                $incoming: CONFLICT_SIDE_LABELS.incoming,
+              },
+            })}
+            key="resolve-both">
+            <VSCodeButton
+              className="file-show-on-hover"
+              key={file.path}
+              appearance="icon"
+              onClick={() => runOperation(new ResolveOperation(file.path, ResolveTool.both))}>
+              <Icon icon="fold" />
+            </VSCodeButton>
+          </Tooltip>,
+        );
+      }
     }
 
     if (place === 'main' && conflicts == null) {
@@ -372,9 +422,24 @@ function FileActions({
   }
   return (
     <div className="file-actions" data-testid="file-actions">
+      {conflictLabel}
       {actions}
     </div>
   );
+}
+
+function labelForConflictType(type?: ConflictType) {
+  switch (type) {
+    case ConflictType.DeletedInSource:
+      return t('(Deleted in $incoming)', {
+        replace: {$incoming: CONFLICT_SIDE_LABELS.incoming},
+      });
+
+    case ConflictType.DeletedInDest:
+      return t('(Deleted in $local)', {replace: {$local: CONFLICT_SIDE_LABELS.local}});
+    default:
+      return null;
+  }
 }
 
 /**
@@ -394,15 +459,16 @@ function FileSelectionCheckbox({
   file: UIChangedFile;
   selection?: UseUncommittedSelection;
 }) {
+  const checked = selection?.isFullyOrPartiallySelected(file.path) ?? false;
   return selection == null ? null : (
-    <VSCodeCheckbox
-      checked={selection.isFullyOrPartiallySelected(file.path)}
+    <Checkbox
+      aria-label={t('$label $file', {
+        replace: {$label: checked ? 'unselect' : 'select', $file: file.path},
+      })}
+      checked={checked}
       indeterminate={selection.isPartiallySelected(file.path)}
       data-testid={'file-selection-checkbox'}
-      // Note: Using `onClick` instead of `onChange` since onChange apparently fires when the controlled `checked` value changes,
-      // which means this fires when using "select all" / "deselect all"
-      onClick={e => {
-        const checked = (e.target as HTMLInputElement).checked;
+      onChange={checked => {
         if (checked) {
           if (file.renamedFrom != null) {
             // Selecting a renamed file also selects the original, so they are committed/amended together

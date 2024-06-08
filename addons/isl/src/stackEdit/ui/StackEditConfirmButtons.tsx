@@ -7,12 +7,17 @@
 
 import type {Hash} from '../../types';
 
-import {editedCommitMessages} from '../../CommitInfoView/CommitInfoState';
+import {
+  editedCommitMessages,
+  getDefaultEditedCommitMessage,
+} from '../../CommitInfoView/CommitInfoState';
 import {Tooltip, DOCUMENTATION_DELAY} from '../../Tooltip';
 import {T, t} from '../../i18n';
+import {writeAtom} from '../../jotaiUtils';
 import {ImportStackOperation} from '../../operations/ImportStackOperation';
 import {RebaseOperation} from '../../operations/RebaseOperation';
-import {latestDag, latestHeadCommit, useRunOperation} from '../../serverAPIState';
+import {useRunOperation} from '../../operationsState';
+import {latestDag, latestHeadCommit} from '../../serverAPIState';
 import {exactRevset, succeedableRevset} from '../../types';
 import {UndoDescription} from './StackEditSubTree';
 import {
@@ -22,13 +27,14 @@ import {
   useStackEditState,
 } from './stackEditState';
 import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
-import {useRecoilCallback, useRecoilState, useRecoilValue} from 'recoil';
+import {useAtom, useAtomValue} from 'jotai';
+import {useCallback} from 'react';
 import {Icon} from 'shared/Icon';
 
 export function StackEditConfirmButtons(): React.ReactElement {
-  const [[stackIntention], setStackIntentionHashes] = useRecoilState(editingStackIntentionHashes);
-  const originalHead = useRecoilValue(latestHeadCommit);
-  const dag = useRecoilValue(latestDag);
+  const [[stackIntention], setStackIntentionHashes] = useAtom(editingStackIntentionHashes);
+  const originalHead = useAtomValue(latestHeadCommit);
+  const dag = useAtomValue(latestDag);
   const runOperation = useRunOperation();
   const stackEdit = useStackEditState();
 
@@ -54,15 +60,11 @@ export function StackEditConfirmButtons(): React.ReactElement {
    * but we actually need to delete them now that we're really
    * doing the split/edit stack.
    */
-  const invalidateUnsavedCommitMessages = useRecoilCallback(
-    ({reset}) =>
-      (commits: Array<Hash>) => {
-        for (const hash of commits) {
-          reset(editedCommitMessages(hash));
-        }
-      },
-    [],
-  );
+  const invalidateUnsavedCommitMessages = useCallback((commits: Array<Hash>) => {
+    for (const hash of commits) {
+      writeAtom(editedCommitMessages(hash), getDefaultEditedCommitMessage());
+    }
+  }, []);
 
   const handleSaveChanges = () => {
     const originalHash = originalHead?.hash;
@@ -153,6 +155,7 @@ export function StackEditConfirmButtons(): React.ReactElement {
         placement="bottom">
         <VSCodeButton
           className="confirm-edit-stack-button"
+          data-testid="confirm-edit-stack-button"
           appearance="primary"
           onClick={handleSaveChanges}>
           {stackIntention === 'split' ? <T>Split</T> : <T>Save changes</T>}

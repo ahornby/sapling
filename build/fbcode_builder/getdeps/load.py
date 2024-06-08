@@ -3,6 +3,8 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-unsafe
+
 import base64
 import copy
 import hashlib
@@ -19,7 +21,7 @@ class Loader(object):
 
     def _list_manifests(self, build_opts):
         """Returns a generator that iterates all the available manifests"""
-        for (path, _, files) in os.walk(build_opts.manifests_dir):
+        for path, _, files in os.walk(build_opts.manifests_dir):
             for name in files:
                 # skip hidden files
                 if name.startswith("."):
@@ -249,7 +251,7 @@ class ManifestLoader(object):
             return override
 
         ctx = self.ctx_gen.get_context(manifest.name)
-        return manifest.create_fetcher(self.build_opts, ctx)
+        return manifest.create_fetcher(self.build_opts, self, ctx)
 
     def get_project_hash(self, manifest):
         h = self._project_hashes.get(manifest.name)

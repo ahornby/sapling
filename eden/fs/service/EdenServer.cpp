@@ -39,7 +39,17 @@
 #include <thrift/lib/cpp2/server/ThriftServer.h>
 #include <csignal>
 
+#include "eden/common/telemetry/RequestMetricsScope.h"
+#include "eden/common/telemetry/SessionInfo.h"
+#include "eden/common/telemetry/StructuredLoggerFactory.h"
+#include "eden/common/utils/EnumValue.h"
+#include "eden/common/utils/FaultInjector.h"
+#include "eden/common/utils/FileUtils.h"
+#include "eden/common/utils/PathFuncs.h"
 #include "eden/common/utils/ProcessInfoCache.h"
+#include "eden/common/utils/TimeUtil.h"
+#include "eden/common/utils/UnboundedQueueExecutor.h"
+#include "eden/common/utils/UserInfo.h"
 #include "eden/fs/config/CheckoutConfig.h"
 #include "eden/fs/config/MountProtocol.h"
 #include "eden/fs/config/TomlConfig.h"
@@ -64,35 +74,24 @@
 #include "eden/fs/store/BlobCache.h"
 #include "eden/fs/store/EmptyBackingStore.h"
 #include "eden/fs/store/LocalStore.h"
-#include "eden/fs/store/LocalStoreCachedBackingStore.h"
 #include "eden/fs/store/MemoryLocalStore.h"
 #include "eden/fs/store/ObjectStore.h"
 #include "eden/fs/store/RocksDbLocalStore.h"
 #include "eden/fs/store/SqliteLocalStore.h"
 #include "eden/fs/store/TreeCache.h"
-#include "eden/fs/store/hg/HgBackingStore.h"
-#include "eden/fs/store/hg/HgQueuedBackingStore.h"
+#include "eden/fs/store/hg/SaplingBackingStore.h"
 #include "eden/fs/takeover/TakeoverData.h"
 #include "eden/fs/telemetry/EdenStats.h"
+#include "eden/fs/telemetry/EdenStructuredLogger.h"
 #include "eden/fs/telemetry/IHiveLogger.h"
-#include "eden/fs/telemetry/RequestMetricsScope.h"
-#include "eden/fs/telemetry/SessionInfo.h"
-#include "eden/fs/telemetry/StructuredLogger.h"
-#include "eden/fs/telemetry/StructuredLoggerFactory.h"
+#include "eden/fs/telemetry/LogEvent.h"
 #include "eden/fs/utils/Clock.h"
 #include "eden/fs/utils/EdenError.h"
 #include "eden/fs/utils/EdenTaskQueue.h"
-#include "eden/fs/utils/EnumValue.h"
-#include "eden/fs/utils/FaultInjector.h"
-#include "eden/fs/utils/FileUtils.h"
 #include "eden/fs/utils/FsChannelTypes.h"
 #include "eden/fs/utils/NfsSocket.h"
 #include "eden/fs/utils/NotImplemented.h"
-#include "eden/fs/utils/PathFuncs.h"
 #include "eden/fs/utils/ProcUtil.h"
-#include "eden/fs/utils/TimeUtil.h"
-#include "eden/fs/utils/UnboundedQueueExecutor.h"
-#include "eden/fs/utils/UserInfo.h"
 
 #ifdef EDEN_HAVE_USAGE_SERVICE
 #include "eden/fs/service/facebook/EdenFSSmartPlatformServiceEndpoint.h" // @manual
@@ -138,10 +137,6 @@ DEFINE_string(
     "lose state across restarts and graceful restarts! "
     "This flag will only be used on the first invocation");
 
-DEFINE_int64(
-    unload_interval_minutes,
-    0,
-    "Frequency in minutes of background inode unloading");
 DEFINE_int64(
     start_delay_minutes,
     10,
@@ -205,7 +200,7 @@ std::shared_ptr<Notifier> getPlatformNotifier(
 
 constexpr StringPiece kRocksDBPath{"storage/rocks-db"};
 constexpr StringPiece kSqlitePath{"storage/sqlite.db"};
-constexpr StringPiece kHgStorePrefix{"store.hg"};
+constexpr StringPiece kSlStorePrefix{"store.sapling"};
 #ifndef _WIN32
 constexpr StringPiece kFuseRequestPrefix{"fuse"};
 #endif
@@ -220,21 +215,22 @@ std::optional<std::string> getUnixDomainSocketPath(
 std::string getCounterNameForImportMetric(
     RequestMetricsScope::RequestStage stage,
     RequestMetricsScope::RequestMetric metric,
-    std::optional<HgBackingStore::HgImportObject> object = std::nullopt) {
+    std::optional<SaplingBackingStore::SaplingImportObject> object =
+        std::nullopt) {
   if (object.has_value()) {
     // base prefix . stage . object . metric
     return folly::to<std::string>(
-        kHgStorePrefix,
+        kSlStorePrefix,
         ".",
         RequestMetricsScope::stringOfHgImportStage(stage),
         ".",
-        HgBackingStore::stringOfHgImportObject(object.value()),
+        SaplingBackingStore::stringOfSaplingImportObject(object.value()),
         ".",
         RequestMetricsScope::stringOfRequestMetric(metric));
   }
   // base prefix . stage . metric
   return folly::to<std::string>(
-      kHgStorePrefix,
+      kSlStorePrefix,
       ".",
       RequestMetricsScope::stringOfHgImportStage(stage),
       ".",
@@ -289,6 +285,19 @@ size_t getNumberPendingFuseRequests(const EdenMount* mount) {
       : 0;
 }
 #endif // __linux__
+
+std::shared_ptr<folly::Executor> makeFsChannelThreads(
+    std::shared_ptr<const EdenConfig>& edenConfig) {
+  if (edenConfig->unboundedFsChannel.getValue()) {
+    return std::make_shared<UnboundedQueueExecutor>(
+        edenConfig->numFsChannelThreads.getValue(), "FsChannelThreadPool");
+  }
+  return std::make_shared<folly::CPUThreadPoolExecutor>(
+      edenConfig->numFsChannelThreads.getValue(),
+      std::make_unique<EdenTaskQueue>(
+          edenConfig->maxFsChannelInflightRequests.getValue()),
+      std::make_unique<folly::NamedThreadFactory>("FsChannelThreadPool"));
+}
 
 } // namespace
 
@@ -348,12 +357,13 @@ class EdenServer::ThriftServerEventHandler
   folly::Promise<Unit> runningPromise_;
 };
 
-static constexpr folly::StringPiece kBlobCacheMemory{"blob_cache.memory"};
 static constexpr folly::StringPiece kNfsReadCount60{"nfs.read_us.count.60"};
 static constexpr folly::StringPiece kNfsReadDirCount60{
     "nfs.readdir_us.count.60"};
 static constexpr folly::StringPiece kNfsReadDirPlusCount60{
     "nfs.readdirplus_us.count.60"};
+
+static constexpr folly::StringPiece kFsChannelTaskCount{"fs.task.count"};
 
 EdenServer::EdenServer(
     std::vector<std::string> originalCommandLine,
@@ -378,21 +388,18 @@ EdenServer::EdenServer(
       // the main thread.  The runServer() code will end up driving this
       // EventBase.
       mainEventBase_{folly::EventBaseManager::get()->getEventBase()},
-      structuredLogger_{makeDefaultStructuredLogger(
-          *edenConfig,
-          std::move(sessionInfo),
-          edenStats.copy())},
+      structuredLogger_{
+          makeDefaultStructuredLogger<EdenStructuredLogger, EdenStatsPtr>(
+              edenConfig->scribeLogger.getValue(),
+              edenConfig->scribeCategory.getValue(),
+              std::move(sessionInfo),
+              edenStats.copy())},
       serverState_{make_shared<ServerState>(
           std::move(userInfo),
           std::move(edenStats),
           std::move(privHelper),
           std::make_shared<EdenCPUThreadPool>(),
-          std::make_shared<folly::CPUThreadPoolExecutor>(
-              edenConfig->numFsChannelThreads.getValue(),
-              std::make_unique<EdenTaskQueue>(
-                  edenConfig->maxFsChannelInflightRequests.getValue()),
-              std::make_unique<folly::NamedThreadFactory>(
-                  "FsChannelThreadPool")),
+          makeFsChannelThreads(edenConfig),
           std::make_shared<UnixClock>(),
           std::make_shared<ProcessInfoCache>(),
           structuredLogger_,
@@ -405,25 +412,24 @@ EdenServer::EdenServer(
       blobCache_{BlobCache::create(
           serverState_->getReloadableConfig(),
           serverState_->getStats().copy())},
-      treeCache_{TreeCache::create(serverState_->getReloadableConfig())},
+      treeCache_{TreeCache::create(
+          serverState_->getReloadableConfig(),
+          serverState_->getStats().copy())},
       version_{std::move(version)},
       progressManager_{
           std::make_unique<folly::Synchronized<EdenServer::ProgressManager>>()},
       startupStatusChannel_{std::move(startupStatusChannel)} {
   auto counters = fb303::ServiceData::get()->getDynamicCounters();
-  counters->registerCallback(kBlobCacheMemory, [this] {
-    return this->getBlobCache()->getStats().totalSizeInBytes;
-  });
 
   registerInodePopulationReportsCallback();
 
   for (auto stage : RequestMetricsScope::requestStages) {
     for (auto metric : RequestMetricsScope::requestMetrics) {
-      for (auto object : HgBackingStore::hgImportObjects) {
+      for (auto object : SaplingBackingStore::saplingImportObjects) {
         auto counterName = getCounterNameForImportMetric(stage, metric, object);
         counters->registerCallback(counterName, [this, stage, object, metric] {
-          auto individual_counters = this->collectHgQueuedBackingStoreCounters(
-              [stage, object, metric](const HgQueuedBackingStore& store) {
+          auto individual_counters = this->collectSaplingBackingStoreCounters(
+              [stage, object, metric](const SaplingBackingStore& store) {
                 return store.getImportMetric(stage, object, metric);
               });
           return RequestMetricsScope::aggregateMetricCounters(
@@ -433,9 +439,9 @@ EdenServer::EdenServer(
       auto summaryCounterName = getCounterNameForImportMetric(stage, metric);
       counters->registerCallback(summaryCounterName, [this, stage, metric] {
         std::vector<size_t> individual_counters;
-        for (auto object : HgBackingStore::hgImportObjects) {
-          auto more_counters = this->collectHgQueuedBackingStoreCounters(
-              [stage, object, metric](const HgQueuedBackingStore& store) {
+        for (auto object : SaplingBackingStore::saplingImportObjects) {
+          auto more_counters = this->collectSaplingBackingStoreCounters(
+              [stage, object, metric](const SaplingBackingStore& store) {
                 return store.getImportMetric(stage, object, metric);
               });
           individual_counters.insert(
@@ -448,17 +454,29 @@ EdenServer::EdenServer(
       });
     }
   }
+
+  counters->registerCallback(kFsChannelTaskCount, [this] {
+    auto fsChannelExecutor = this->getServerState()->getFsChannelThreadPool();
+    if (auto ex = std::dynamic_pointer_cast<folly::CPUThreadPoolExecutor>(
+            fsChannelExecutor)) {
+      return ex->getTaskQueueSize();
+    }
+    if (auto ex = std::dynamic_pointer_cast<UnboundedQueueExecutor>(
+            fsChannelExecutor)) {
+      return ex->getTaskQueueSize();
+    }
+    return (size_t)0;
+  });
 }
 
 EdenServer::~EdenServer() {
   auto counters = fb303::ServiceData::get()->getDynamicCounters();
-  counters->unregisterCallback(kBlobCacheMemory);
 
   unregisterInodePopulationReportsCallback();
 
   for (auto stage : RequestMetricsScope::requestStages) {
     for (auto metric : RequestMetricsScope::requestMetrics) {
-      for (auto object : HgBackingStore::hgImportObjects) {
+      for (auto object : SaplingBackingStore::saplingImportObjects) {
         auto counterName = getCounterNameForImportMetric(stage, metric, object);
         counters->unregisterCallback(counterName);
       }
@@ -466,6 +484,7 @@ EdenServer::~EdenServer() {
       counters->unregisterCallback(summaryCounterName);
     }
   }
+  counters->unregisterCallback(kFsChannelTaskCount);
 }
 
 namespace cursor_helper {
@@ -725,7 +744,7 @@ void EdenServer::startPeriodicTasks() {
   // so using unloadChildrenNow just to validate the behaviour. We will have to
   // modify current unloadChildrenNow function to unload inodes based on the
   // last access time.
-  if (FLAGS_unload_interval_minutes > 0) {
+  if (config->periodicUnloadIntervalMinutes.getValue() > 0) {
     scheduleInodeUnload(std::chrono::minutes(FLAGS_start_delay_minutes));
   }
 #endif
@@ -854,8 +873,10 @@ void EdenServer::unloadInodes() {
       mount.getInodeMap()->recordPeriodicInodeUnload(unloaded);
     }
   }
-
-  scheduleInodeUnload(std::chrono::minutes(FLAGS_unload_interval_minutes));
+  scheduleInodeUnload(
+      std::chrono::minutes(serverState_->getReloadableConfig()
+                               ->getEdenConfig()
+                               ->periodicUnloadIntervalMinutes.getValue()));
 }
 
 void EdenServer::scheduleInodeUnload(std::chrono::milliseconds timeout) {
@@ -1509,8 +1530,8 @@ void EdenServer::unregisterInodePopulationReportsCallback() {
 }
 
 Future<Unit> EdenServer::performTakeoverStart(
-    FOLLY_MAYBE_UNUSED std::shared_ptr<EdenMount> edenMount,
-    FOLLY_MAYBE_UNUSED TakeoverData::MountInfo&& info) {
+    [[maybe_unused]] std::shared_ptr<EdenMount> edenMount,
+    [[maybe_unused]] TakeoverData::MountInfo&& info) {
 #ifndef _WIN32
   auto mountPath = info.mountPath;
 
@@ -1531,8 +1552,8 @@ Future<Unit> EdenServer::performTakeoverStart(
 }
 
 Future<Unit> EdenServer::completeTakeoverStart(
-    FOLLY_MAYBE_UNUSED std::shared_ptr<EdenMount> edenMount,
-    FOLLY_MAYBE_UNUSED TakeoverData::MountInfo&& info) {
+    [[maybe_unused]] std::shared_ptr<EdenMount> edenMount,
+    [[maybe_unused]] TakeoverData::MountInfo&& info) {
   if (auto channelData = std::get_if<FuseChannelData>(&info.channelInfo)) {
     // Start up the fuse workers.
     return folly::makeFutureWith(
@@ -1555,12 +1576,13 @@ ImmediateFuture<std::shared_ptr<EdenMount>> EdenServer::mount(
 
   auto bsType = toBackingStoreType(initialConfig->getRepoType());
   XLOGF(
-      DBG4, "Creating backing store of type: {}", toBackingStoreString(bsType));
+      INFO, "Creating backing store of type: {}", toBackingStoreString(bsType));
   auto backingStore =
       getBackingStore(bsType, initialConfig->getRepoSource(), *initialConfig);
 
   auto objectStore = ObjectStore::create(
       backingStore,
+      localStore_,
       treeCache_,
       getStats().copy(),
       serverState_->getProcessInfoCache(),
@@ -1654,6 +1676,8 @@ ImmediateFuture<std::shared_ptr<EdenMount>> EdenServer::mount(
             .thenTry([this, mountStopWatch, doTakeover, edenMount](auto&& t) {
               FinishedMount event;
               event.repo_type = edenMount->getCheckoutConfig()->getRepoType();
+              event.backing_store_type = toBackingStoreString(
+                  edenMount->getCheckoutConfig()->getRepoBackingStoreType());
               event.repo_source =
                   basename(edenMount->getCheckoutConfig()->getRepoSource());
               auto* fsChannel = edenMount->getFsChannel();
@@ -1838,73 +1862,105 @@ ImmediateFuture<CheckoutResult> EdenServer::checkOutRevision(
   // the +1 is so we count the current checkout that hasn't quite started yet
   getServerState()->getNotifier()->signalCheckout(
       enumerateInProgressCheckouts() + 1);
-  return edenMount
-      .checkout(
-          mountHandle.getRootInode(),
-          rootId,
-          fetchContext,
-          callerName,
-          checkoutMode)
-      .thenValue([this, checkoutMode, isNfs, mountPath = mountPath.copy()](
-                     CheckoutResult&& result) {
-        getServerState()->getNotifier()->signalCheckout(
-            enumerateInProgressCheckouts());
-        if (checkoutMode == CheckoutMode::DRY_RUN) {
-          return std::move(result);
-        }
 
-        // In NFSv3 the kernel never tells us when its safe to unload
-        // inodes ("safe" meaning all file handles to the inode have been
-        // closed).
-        //
-        // To avoid unbounded memory and disk use we need to periodically
-        // clean them up. Checkout will likely create a lot of stale innodes
-        // so we run a delayed cleanup after checkout.
-        if (isNfs &&
-            serverState_->getReloadableConfig()
-                ->getEdenConfig()
-                ->unloadUnlinkedInodes.getValue()) {
-          // During whole Eden Process shutdown, this function can only be run
-          // before the mount is destroyed.
-          // This is because the function is either run before the server
-          // event base is destroyed or it is not run at all, and the server
-          // event base is destroyed before the mountPoints. Since the function
-          // must be run before the eventbase is destroyed and the eventbase is
-          // destroyed before the mountPoints, this function can only be called
-          // before the mount points are destroyed during normal destruction.
-          // However, the mount pont might have been unmounted before this
-          // function is run outside of shutdown.
-          auto delay = serverState_->getReloadableConfig()
-                           ->getEdenConfig()
-                           ->postCheckoutDelayToUnloadInodes.getValue();
-          XLOG(DBG9) << "Scheduling unlinked inode cleanup for mount "
-                     << mountPath << " in " << durationStr(delay)
-                     << " seconds.";
-          this->scheduleCallbackOnMainEventBase(
-              std::chrono::duration_cast<std::chrono::milliseconds>(delay),
-              [this, mountPath = mountPath.copy()]() {
-                try {
-                  // TODO: This might be a pretty expensive operation to run on
-                  // an EventBase. Maybe we should debounce onto a different
-                  // executor.
-                  auto mountHandle = this->getMount(mountPath);
-                  mountHandle.getEdenMount().forgetStaleInodes();
-                } catch (EdenError& err) {
-                  // This is an expected error if the mount has been
-                  // unmounted before this callback ran.
-                  if (err.errorCode_ref() == ENOENT) {
-                    XLOG(DBG3)
-                        << "Callback to clear inodes: Mount cannot be found. "
-                        << (*err.message());
-                  } else {
-                    throw;
-                  }
-                }
-              });
-        }
-        return std::move(result);
-      })
-      .ensure([mountHandle] {});
+  auto checkoutFuture =
+      edenMount
+          .checkout(
+              mountHandle.getRootInode(),
+              rootId,
+              fetchContext,
+              callerName,
+              checkoutMode)
+          .thenValue([this, checkoutMode, isNfs, mountPath = mountPath.copy()](
+                         CheckoutResult&& result) {
+            getServerState()->getNotifier()->signalCheckout(
+                enumerateInProgressCheckouts());
+            if (checkoutMode == CheckoutMode::DRY_RUN) {
+              return std::move(result);
+            }
+
+            // In NFSv3 the kernel never tells us when its safe to unload
+            // inodes ("safe" meaning all file handles to the inode have been
+            // closed).
+            //
+            // To avoid unbounded memory and disk use we need to periodically
+            // clean them up. Checkout will likely create a lot of stale innodes
+            // so we run a delayed cleanup after checkout.
+            if (isNfs &&
+                serverState_->getReloadableConfig()
+                    ->getEdenConfig()
+                    ->unloadUnlinkedInodes.getValue()) {
+              // During whole Eden Process shutdown, this function can only be
+              // run before the mount is destroyed. This is because the function
+              // is either run before the server event base is destroyed or it
+              // is not run at all, and the server event base is destroyed
+              // before the mountPoints. Since the function must be run before
+              // the eventbase is destroyed and the eventbase is destroyed
+              // before the mountPoints, this function can only be called before
+              // the mount points are destroyed during normal destruction.
+              // However, the mount pont might have been unmounted before this
+              // function is run outside of shutdown.
+              auto delay = serverState_->getReloadableConfig()
+                               ->getEdenConfig()
+                               ->postCheckoutDelayToUnloadInodes.getValue();
+              XLOG(DBG9) << "Scheduling unlinked inode cleanup for mount "
+                         << mountPath << " in " << durationStr(delay)
+                         << " seconds.";
+              this->scheduleCallbackOnMainEventBase(
+                  std::chrono::duration_cast<std::chrono::milliseconds>(delay),
+                  [this, mountPath = mountPath.copy()]() {
+                    try {
+                      // TODO: This might be a pretty expensive operation to run
+                      // on an EventBase. Maybe we should debounce onto a
+                      // different executor.
+                      auto mountHandle = this->getMount(mountPath);
+                      mountHandle.getEdenMount().forgetStaleInodes();
+                    } catch (EdenError& err) {
+                      // This is an expected error if the mount has been
+                      // unmounted before this callback ran.
+                      if (err.errorCode_ref() == ENOENT) {
+                        XLOG(DBG3)
+                            << "Callback to clear inodes: Mount cannot be found. "
+                            << (*err.message());
+                      } else {
+                        throw;
+                      }
+                    }
+                  });
+            }
+            return std::move(result);
+          });
+
+  if (config_->getEdenConfig()->runCheckoutOnEdenCPUThreadpool.getValue()) {
+    // This is a temporary workaround for S399431: The checkoutFuture is
+    // scheduled on the EdenServer's EdenCPUThreadPool threadpool. This is a
+    // UnboundedQueueExecutor, which is guaranteed to never block. nor throw
+    // (except OOM), nor execute inline from `add()`. At the time of writing, it
+    // has a default threadpool size of 12.
+    //
+    // Thrift documentation states that "it is almost never a good idea to send
+    // work off Thrift’s CPU worker". However, it also notes that "user code may
+    // delegate the rest of the work to other thread pools, thus shifting load
+    // off Thrift’s CPU Workers thread and letting the thread pick up new
+    // incoming work" but warns that "if there is work offloaded to other thread
+    // pools, there should be backpressure mechanism that would block Thrift CPU
+    // Workers thread when those internal thread pools are overloaded."
+    //
+    // Without backpressure, EdenFS would see an increase in memory pressure.
+    // potential slowdowns, and/or OOMS. EdenFS only allows one checkout at a
+    // time (https://fburl.com/code/a6eoy8wu), which acts as the aformentioned
+    // backpressure mechanism.
+    //
+    // Futher investigation is needed to understand the underlying performance
+    // issues that are causing S399431, likely due to Overlay slowness and
+    // contention of the contents_ lock that is held while doing Overlay IO in
+    // TreeInode::childMaterialized (https://fburl.com/code/gxpaifv3).
+    checkoutFuture = std::move(checkoutFuture)
+                         .semi()
+                         .via(getServerState()->getThreadPool().get());
+  }
+
+  return std::move(checkoutFuture).ensure([mountHandle] {});
 }
 
 shared_ptr<BackingStore> EdenServer::getBackingStore(
@@ -1936,37 +1992,26 @@ EdenServer::getBackingStores() {
   return backingStores;
 }
 
-std::unordered_set<shared_ptr<HgQueuedBackingStore>>
-EdenServer::getHgQueuedBackingStores() {
-  std::unordered_set<std::shared_ptr<HgQueuedBackingStore>> hgBackingStores{};
+std::unordered_set<shared_ptr<SaplingBackingStore>>
+EdenServer::getSaplingBackingStores() {
+  std::unordered_set<std::shared_ptr<SaplingBackingStore>>
+      saplingBackingStores{};
   {
     auto lockedStores = this->backingStores_.rlock();
     for (const auto& entry : *lockedStores) {
-      // TODO: remove these dynamic casts in favor of a QueryInterface method
-      if (auto hgQueuedBackingStore =
-              std::dynamic_pointer_cast<HgQueuedBackingStore>(entry.second)) {
-        hgBackingStores.emplace(std::move(hgQueuedBackingStore));
-      } else if (
-          auto localStoreCachedBackingStore =
-              std::dynamic_pointer_cast<LocalStoreCachedBackingStore>(
-                  entry.second)) {
-        auto inner_store = std::dynamic_pointer_cast<HgQueuedBackingStore>(
-            localStoreCachedBackingStore->getBackingStore());
-        if (inner_store) {
-          // dynamic_pointer_cast returns a copy of the shared pointer, so it is
-          // safe to be moved
-          hgBackingStores.emplace(std::move(inner_store));
-        }
+      if (auto saplingBackingStore =
+              std::dynamic_pointer_cast<SaplingBackingStore>(entry.second)) {
+        saplingBackingStores.emplace(std::move(saplingBackingStore));
       }
     }
   }
-  return hgBackingStores;
+  return saplingBackingStores;
 }
 
-std::vector<size_t> EdenServer::collectHgQueuedBackingStoreCounters(
-    std::function<size_t(const HgQueuedBackingStore&)> getCounterFromStore) {
+std::vector<size_t> EdenServer::collectSaplingBackingStoreCounters(
+    std::function<size_t(const SaplingBackingStore&)> getCounterFromStore) {
   std::vector<size_t> counters;
-  for (const auto& store : this->getHgQueuedBackingStores()) {
+  for (const auto& store : this->getSaplingBackingStores()) {
     counters.emplace_back(getCounterFromStore(*store));
   }
   return counters;

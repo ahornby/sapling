@@ -17,7 +17,7 @@ class Alert(NamedTuple):
     description: str
     key: str
     show_in_isl: bool
-    show_after_crashes_regex: Optional[re.Pattern[str]]
+    show_after_crashes_regex: Optional[re.Pattern]
 
 
 def parse_alert(ui, key: str, raw_alert: dict) -> Optional[Alert]:
@@ -111,6 +111,9 @@ def print_active_alerts(ui):
 
 
 def print_matching_alerts_for_exception(ui, crash: str):
+    if ui.plain():
+        return
+
     related_alerts = []
 
     alerts = get_alerts(ui)

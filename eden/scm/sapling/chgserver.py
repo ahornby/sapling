@@ -52,7 +52,7 @@ import time
 from typing import BinaryIO, Callable, Dict, List, Optional
 
 from bindings import commands, hgtime
-from sapling import prefork
+from sapling import prefork, tracing
 
 from . import commandserver, encoding, error, pycompat, ui as uimod, util
 from .i18n import _
@@ -63,8 +63,8 @@ _log = commandserver.log
 
 def _newchgui(srcui, csystem, attachio):
     class chgui(srcui.__class__):
-        def __init__(self, src=None, rcfg=None):
-            super(chgui, self).__init__(src, rcfg)
+        def __init__(self, src=None, rctx=None):
+            super(chgui, self).__init__(src, rctx)
             if src:
                 self._csystem = getattr(src, "_csystem", csystem)
             else:
@@ -253,6 +253,7 @@ class chgcmdserver(commandserver.server):
         uimod.ui = self.ui.__class__
         try:
             ret = commands.run([pycompat.sysargv[0]] + args)
+            tracing.debug(target="command_info", chg="on")
             self.cresult.write(struct.pack(">i", int(ret & 255)))
         finally:
             uimod.ui = origui

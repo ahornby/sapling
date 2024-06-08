@@ -22,17 +22,18 @@ use cmdlib::args;
 use cmdlib::args::MononokeMatches;
 use cmdlib::helpers;
 use cmdlib_x_repo::create_commit_syncer_from_matches;
+use cmdlib_x_repo::get_all_possible_small_repo_submodule_deps_from_matches;
 use context::CoreContext;
 use cross_repo_sync::create_commit_syncer_lease;
 use cross_repo_sync::find_toposorted_unsynced_ancestors;
-use cross_repo_sync::types::Source;
-use cross_repo_sync::types::Target;
-use cross_repo_sync::validation::verify_working_copy_with_version_fast_path;
+use cross_repo_sync::verify_working_copy_with_version;
 use cross_repo_sync::CandidateSelectionHint;
 use cross_repo_sync::CommitSyncContext;
 use cross_repo_sync::CommitSyncOutcome;
 use cross_repo_sync::CommitSyncer;
 use cross_repo_sync::ConcreteRepo as CrossRepo;
+use cross_repo_sync::Source;
+use cross_repo_sync::Target;
 use derived_data::BonsaiDerived;
 use fbinit::FacebookInit;
 use fsnodes::RootFsnodeId;
@@ -91,6 +92,7 @@ use bookmarks::Bookmarks;
 use changeset_fetcher::ChangesetFetcher;
 use changesets::Changesets;
 use commit_graph::CommitGraph;
+use filenodes::Filenodes;
 use filestore::FilestoreConfig;
 use megarepolib::chunking::even_chunker_with_max_size;
 use megarepolib::chunking::parse_chunking_hint;
@@ -197,6 +199,7 @@ pub struct Repo(
     RepoDerivedData,
     RepoIdentity,
     CommitGraph,
+    dyn Filenodes,
 );
 
 async fn run_move<'a>(
@@ -333,14 +336,24 @@ async fn run_sync_diamond_merge<'a>(
     let caching = matches.caching();
     let x_repo_syncer_lease = create_commit_syncer_lease(ctx.fb, caching)?;
 
+    let live_commit_sync_config = Arc::new(live_commit_sync_config);
+    let submodule_deps = get_all_possible_small_repo_submodule_deps_from_matches(
+        ctx,
+        matches,
+        &source_repo,
+        live_commit_sync_config.clone(),
+    )
+    .await?;
+
     sync_diamond_merge::do_sync_diamond_merge(
         ctx,
         &source_repo,
         &target_repo,
+        submodule_deps,
         source_merge_cs_id,
         mapping,
         bookmark,
-        Arc::new(live_commit_sync_config),
+        live_commit_sync_config,
         x_repo_syncer_lease,
     )
     .await
@@ -771,7 +784,7 @@ async fn run_check_push_redirection_prereqs<'a>(
 
     let config_store = matches.config_store();
     let live_commit_sync_config = CfgrLiveCommitSyncConfig::new(ctx.logger(), config_store)?;
-    verify_working_copy_with_version_fast_path(
+    verify_working_copy_with_version(
         ctx,
         &commit_syncer,
         Source(source_cs_id),
@@ -1232,7 +1245,7 @@ async fn run_sync_commit_and_ancestors<'a>(
         helpers::csid_resolve(ctx, commit_syncer.get_source_repo(), source_commit_hash).await?;
 
     let (unsynced_ancestors, _) =
-        find_toposorted_unsynced_ancestors(ctx, &commit_syncer, source_cs_id).await?;
+        find_toposorted_unsynced_ancestors(ctx, &commit_syncer, source_cs_id, None).await?;
 
     for ancestor in unsynced_ancestors {
         commit_syncer

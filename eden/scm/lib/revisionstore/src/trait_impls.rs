@@ -15,11 +15,11 @@ use edenapi_types::FileAuxData;
 use hgstore::strip_hg_file_metadata;
 use minibytes::Bytes;
 use storemodel::BoxIterator;
+use types::fetch_mode::FetchMode;
 use types::HgId;
 use types::Key;
 use types::RepoPath;
 
-use crate::scmstore::fetch::FetchMode;
 use crate::scmstore::FileAttributes;
 use crate::scmstore::FileStore;
 use crate::RemoteDataStore;
@@ -39,6 +39,7 @@ where
     fn get_content_iter(
         &self,
         keys: Vec<Key>,
+        _fetch_mode: FetchMode,
     ) -> anyhow::Result<BoxIterator<anyhow::Result<(Key, Bytes)>>> {
         let store = Arc::clone(&self.0);
         for chunk in keys.chunks(PREFETCH_CHUNK_SIZE) {
@@ -99,12 +100,11 @@ impl storemodel::KeyStore for ArcFileStore {
     fn get_content_iter(
         &self,
         keys: Vec<Key>,
+        fetch_mode: FetchMode,
     ) -> anyhow::Result<BoxIterator<anyhow::Result<(Key, Bytes)>>> {
-        let fetched = self.0.fetch(
-            keys.into_iter(),
-            FileAttributes::CONTENT,
-            FetchMode::AllowRemote,
-        );
+        let fetched = self
+            .0
+            .fetch(keys.into_iter(), FileAttributes::CONTENT, fetch_mode);
         let iter = fetched
             .into_iter()
             .map(|result| -> anyhow::Result<(Key, Bytes)> {
@@ -159,11 +159,7 @@ impl storemodel::FileStore for ArcFileStore {
         Ok(Box::new(iter))
     }
 
-    fn get_local_aux(
-        &self,
-        path: &RepoPath,
-        id: HgId,
-    ) -> anyhow::Result<Option<edenapi_types::FileAuxData>> {
+    fn get_local_aux(&self, path: &RepoPath, id: HgId) -> anyhow::Result<Option<FileAuxData>> {
         // PERF: This could be made faster by changes like D50935733.
         let key = Key::new(path.to_owned(), id);
         let fetched = self.0.fetch(
@@ -181,12 +177,11 @@ impl storemodel::FileStore for ArcFileStore {
     fn get_aux_iter(
         &self,
         keys: Vec<Key>,
+        fetch_mode: FetchMode,
     ) -> anyhow::Result<BoxIterator<anyhow::Result<(Key, FileAuxData)>>> {
-        let fetched = self.0.fetch(
-            keys.into_iter(),
-            FileAttributes::AUX,
-            FetchMode::AllowRemote,
-        );
+        let fetched = self
+            .0
+            .fetch(keys.into_iter(), FileAttributes::AUX, fetch_mode);
         let iter = fetched
             .into_iter()
             .map(|entry| -> anyhow::Result<(Key, FileAuxData)> {

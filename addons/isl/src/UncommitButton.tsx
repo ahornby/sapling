@@ -9,19 +9,19 @@ import {DOCUMENTATION_DELAY, Tooltip} from './Tooltip';
 import {codeReviewProvider, diffSummary} from './codeReview/CodeReviewInfo';
 import {t, T} from './i18n';
 import {UncommitOperation} from './operations/Uncommit';
+import {useRunOperation} from './operationsState';
 import foundPlatform from './platform';
 import {dagWithPreviews} from './previews';
-import {useRunOperation} from './serverAPIState';
 import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
-import {useRecoilValue} from 'recoil';
+import {useAtomValue} from 'jotai';
 import {Icon} from 'shared/Icon';
 
 export function UncommitButton() {
-  const dag = useRecoilValue(dagWithPreviews);
+  const dag = useAtomValue(dagWithPreviews);
   const headCommit = dag.resolve('.');
 
-  const provider = useRecoilValue(codeReviewProvider);
-  const diff = useRecoilValue(diffSummary(headCommit?.diffId));
+  const provider = useAtomValue(codeReviewProvider);
+  const diff = useAtomValue(diffSummary(headCommit?.diffId));
   const isClosed = provider != null && diff.value != null && provider?.isDiffClosed(diff.value);
 
   const runOperation = useRunOperation();

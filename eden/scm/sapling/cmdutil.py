@@ -1500,7 +1500,11 @@ def copy(ui, repo, pats, opts, rename=False):
             continue
         copylist.append((tfn(pat, dest, srcs), srcs))
     if not copylist and not to_amend:
-        raise error.Abort(_("no files to copy"))
+        hint = _("use '--amend --mark' if you want to amend the current commit")
+        raise error.Abort(
+            _("no files to copy"),
+            hint=hint,
+        )
 
     errors = 0
     for targetpath, srcs in copylist:
@@ -1569,7 +1573,7 @@ def amend_copy(repo, to_amend, rename, force):
         # Actual amend
         from . import context
 
-        mctx = context.memctx.mirror(ctx)
+        mctx = context.memctx.mirrorformutation(ctx, "amend")
         for src_path, dst_path in to_amend:
             mctx[dst_path] = context.overlayfilectx(
                 mctx[dst_path], copied=(src_path, pctx.node())
@@ -2038,6 +2042,7 @@ class changeset_printer:
         self.lastheader = None
         self.footer = None
         self._columns = templatekw.getlogcolumns()
+        self.use_committer_date = ui.configbool("log", "use-committer-date")
 
     def flush(self, ctx):
         rev = ctx.rev()
@@ -2111,7 +2116,11 @@ class changeset_printer:
                 columns["manifest"] % hex(mnode), label="ui.debug log.manifest"
             )
         self.ui.write(columns["user"] % ctx.user(), label="log.user")
-        self.ui.write(columns["date"] % util.datestr(ctx.date()), label="log.date")
+        date = ctx.date()
+        if self.use_committer_date:
+            if committer_info := git.committer_and_date_from_extras(ctx.extra()):
+                date = committer_info[1:]
+        self.ui.write(columns["date"] % util.datestr(date), label="log.date")
 
         if self.ui.debugflag:
             files = ctx.p1().status(ctx)[:3]
@@ -2229,7 +2238,15 @@ class jsonchangeset(changeset_printer):
         self.ui.write(_x(',\n  "branch": %s') % j(ctx.branch()))
         self.ui.write(_x(',\n  "phase": "%s"') % ctx.phasestr())
         self.ui.write(_x(',\n  "user": %s') % j(ctx.user()))
-        self.ui.write(_x(',\n  "date": [%d, %d]') % ctx.date())
+        date = ctx.date()
+        if author_date := git.author_date_from_extras(ctx.extra()):
+            self.ui.write(_x(',\n  "author_date": [%d, %d]') % author_date)
+        if committer_info := git.committer_and_date_from_extras(ctx.extra()):
+            self.ui.write(_x(',\n  "committer": %s') % j(committer_info[0]))
+            self.ui.write(_x(',\n  "committer_date": [%d, %d]') % committer_info[1:])
+            if self.use_committer_date:
+                date = committer_info[1:]
+        self.ui.write(_x(',\n  "date": [%d, %d]') % date)
         self.ui.write(_x(',\n  "desc": %s') % j(ctx.description()))
 
         self.ui.write(
@@ -3045,8 +3062,14 @@ def _makelogrevset(repo, pats, opts, revs):
                     if os.path.exists(repo.wjoin(f)):
                         continue
                     else:
+                        hint = None
+                        if len(pats) == 1 and pats[0] in repo:
+                            hint = _(
+                                """did you mean "@prog@ log -r '%s'", or "@prog@ log -r '%s' -f" to follow history?"""
+                            ) % (pats[0], pats[0])
                         raise error.Abort(
-                            _("cannot follow file not in parent " 'revision: "%s"') % f
+                            _("cannot follow file not in parent " 'revision: "%s"') % f,
+                            hint=hint,
                         )
 
             # follow() revset interprets its file argument as a
@@ -3402,7 +3425,7 @@ def displaygraph(
             renderer.reserve(rev)
 
     show_abbreviated_ancestors = ShowAbbreviatedAncestorsWhen.load_from_config(repo.ui)
-    for (rev, _type, ctx, parents) in dag:
+    for rev, _type, ctx, parents in dag:
         char = formatnode(repo, ctx)
         copies = None
         if getrenamed and ctx.rev():
@@ -4541,7 +4564,6 @@ def revert(ui, repo, ctx, parents, *pats, match=None, **opts):
                 actions,
                 interactive,
                 tobackup,
-                forcecopytracing=opts.get("forcecopytracing"),
             )
 
 
@@ -4556,7 +4578,6 @@ def _performrevert(
     actions,
     interactive=False,
     tobackup=None,
-    forcecopytracing=False,
 ):
     """function that actually perform all the actions computed for revert
 
@@ -4691,15 +4712,10 @@ def _performrevert(
         checkout(f)
         normal(f)
 
-    if forcecopytracing or repo.ui.config("experimental", "copytrace") != "off":
-        # When reverting a change, always enable copy tracing so we don't
-        # accidentally lose any data.
-        with repo.ui.configoverride({("experimental", "copytrace"): "on"}):
-            copied = copies.pathcopies(repo[parent], ctx)
-
-        for f in actions["add"][0] + actions["undelete"][0] + actions["revert"][0]:
-            if f in copied:
-                repo.dirstate.copy(copied[f], f)
+    copied = copies.pathcopies(repo[parent], ctx)
+    for f in actions["add"][0] + actions["undelete"][0] + actions["revert"][0]:
+        if f in copied:
+            repo.dirstate.copy(copied[f], f)
 
 
 class command(registrar.command):

@@ -34,10 +34,10 @@ import type {LRUWithStats} from 'shared/LRU';
 
 import {assert} from './utils';
 import {hash, List, Record, Set as ImSet} from 'immutable';
-import {cached, LRU} from 'shared/LRU';
+import {cached, cachedMethod, LRU} from 'shared/LRU';
 import {diffLines, splitLines} from 'shared/diff';
 import {SelfUpdate} from 'shared/immutableExt';
-import {unwrap} from 'shared/utils';
+import {nullthrows} from 'shared/utils';
 
 /** Operation code. */
 enum Op {
@@ -378,7 +378,7 @@ class Code implements ValueObject {
       if (aLinesMutable) {
         aLines[a1] = {...aLines[a1], pc: jlInst == null ? code.size : code.size + 1};
       }
-      const a1Inst = unwrap(code.get(a1Pc));
+      const a1Inst = nullthrows(code.get(a1Pc));
       if (jlInst === undefined) {
         // [3]
         code = code.push(a1Inst);
@@ -551,7 +551,7 @@ class Code implements ValueObject {
         delStack.pop();
         onStackPop?.(delStack);
       }
-      const code = unwrap(this.get(pc));
+      const code = nullthrows(this.get(pc));
       switch (code.op) {
         case Op.LINE:
           onLine?.(code);
@@ -615,7 +615,10 @@ class Code implements ValueObject {
 }
 
 // Export for testing purpose.
-export const executeCache: LRUWithStats = new LRU(100);
+export const executeCache: LRUWithStats = new LRU(1000);
+const calculateDepCache: LRUWithStats = new LRU(1000);
+const flattenCache: LRUWithStats = new LRU(1000);
+const recordTextCache: LRUWithStats = new LRU(1000);
 
 type LineLogProps = {
   /** Core state: instructions. The array index type is `Pc`. */
@@ -811,8 +814,9 @@ class LineLog extends SelfUpdate<LineLogRecord> {
    *      is skipped altogher with the outer block. See also section 0.4
    *      and 0.5 in D3628440.
    */
-  @cached({cacheSize: 1000})
-  calculateDepMap(): Readonly<Map<Rev, Set<Rev>>> {
+  public calculateDepMap = cachedMethod(this.calculateDepMapImpl, {cache: calculateDepCache});
+
+  private calculateDepMapImpl(): Readonly<Map<Rev, Set<Rev>>> {
     // With the insertion and deletion stacks (see explanation in
     // visitWithInsDelStacks), when we see a new insertion block, or deletion
     // block, we add two dependencies:
@@ -881,8 +885,9 @@ class LineLog extends SelfUpdate<LineLogRecord> {
    * Interpret the bytecodes with the given revision range.
    * Used by `checkOut`.
    */
-  @cached({cache: executeCache, cacheSize: 1000})
-  execute(
+  public execute = cachedMethod(this.executeImpl, {cache: executeCache});
+
+  private executeImpl(
     startRev: Rev,
     endRev: Rev = startRev,
     present?: {[pc: number]: boolean},
@@ -893,7 +898,7 @@ class LineLog extends SelfUpdate<LineLogRecord> {
     let patience = this.code.getSize() * 2;
     const deleted = present == null ? () => false : (pc: Pc) => !present[pc];
     while (patience > 0) {
-      const code = unwrap(this.code.get(pc));
+      const code = nullthrows(this.code.get(pc));
       switch (code.op) {
         case Op.END:
           lines.push({data: '', rev: 0, pc, deleted: deleted(pc)});
@@ -940,8 +945,9 @@ class LineLog extends SelfUpdate<LineLogRecord> {
    * similar to `absorb -e FILE` to edit all versions of a file in
    * a single view.
    */
-  @cached({cacheSize: 1000})
-  public flatten(): List<FlattenLine> {
+  public flatten = cachedMethod(this.flattenImpl, {cache: flattenCache});
+
+  private flattenImpl(): List<FlattenLine> {
     const result: FlattenLine[] = [];
 
     // See the comments in calculateDepMap for what the stacks mean.
@@ -1031,8 +1037,9 @@ class LineLog extends SelfUpdate<LineLogRecord> {
    * @param rev Revision to to edit (in-place). If not set, append a new revision.
    * @returns A new `LineLog` with the change.
    */
-  @cached({cacheSize: 1000})
-  public recordText(text: string, rev: Rev | null = null): LineLog {
+  public recordText = cachedMethod(this.recordTextImpl, {cache: recordTextCache});
+
+  private recordTextImpl(text: string, rev: Rev | null = null): LineLog {
     // rev to edit from, and rev to match 'text'.
     const [aRev, bRev] = rev != null ? [rev, rev] : [this.maxRev, this.maxRev + 1];
     const b = text;

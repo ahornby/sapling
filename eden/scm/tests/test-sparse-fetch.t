@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This software may be used and distributed according to the terms of the
@@ -43,7 +45,6 @@ Python utilities:
 
 # Use some production settings. They avoid expensive paths.
 
-  $ setconfig experimental.copytrace=off
   $ enable sparse treemanifest rebase copytrace
 
   $ newrepo
@@ -141,4 +142,3 @@ Python utilities:
 
   >>> sorted(set(collectprefetch("hg status")) - {"x", "x/x"})
   []
-

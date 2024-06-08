@@ -8,9 +8,8 @@
 import type {DagCommitInfo} from './dag/dag';
 import type {Hash} from './types';
 
-import {globalRecoil} from './AccessGlobalRecoil';
 import {CleanupButton, isStackEligibleForCleanup} from './Cleanup';
-import {FlexRow} from './ComponentUtils';
+import {Row} from './ComponentUtils';
 import {shouldShowSubmitStackConfirmation, useShowConfirmSubmitStack} from './ConfirmSubmitStack';
 import {HighlightCommitsWhileHovering} from './HighlightedCommits';
 import {OperationDisabledButton} from './OperationDisabledButton';
@@ -20,14 +19,15 @@ import {codeReviewProvider, allDiffSummaries} from './codeReview/CodeReviewInfo'
 import {SyncStatus, syncStatusAtom} from './codeReview/syncStatus';
 import {T, t} from './i18n';
 import {IconStack} from './icons/IconStack';
+import {useRunOperation} from './operationsState';
 import {dagWithPreviews} from './previews';
-import {useRunOperation, latestUncommittedChangesData} from './serverAPIState';
+import {latestUncommittedChangesData} from './serverAPIState';
 import {useConfirmUnsavedEditsBeforeSplit} from './stackEdit/ui/ConfirmUnsavedEditsBeforeSplit';
 import {StackEditIcon} from './stackEdit/ui/StackEditIcon';
 import {editingStackIntentionHashes, loadingStackState} from './stackEdit/ui/stackEditState';
 import {succeedableRevset} from './types';
 import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
-import {useRecoilValue, useRecoilState} from 'recoil';
+import {useAtom, useAtomValue} from 'jotai';
 import {type ContextMenuItem, useContextMenu} from 'shared/ContextMenu';
 import {Icon} from 'shared/Icon';
 
@@ -38,14 +38,14 @@ import './StackActions.css';
  * like submitting, hiding, editing the stack.
  */
 export function StackActions({hash}: {hash: Hash}): React.ReactElement | null {
-  const reviewProvider = useRecoilValue(codeReviewProvider);
-  const diffMap = useRecoilValue(allDiffSummaries);
-  const stackHashes = useRecoilValue(editingStackIntentionHashes)[1];
-  const loadingState = useRecoilValue(loadingStackState);
-  const suggestedRebase = useRecoilValue(showSuggestedRebaseForStack(hash));
-  const dag = useRecoilValue(dagWithPreviews);
+  const reviewProvider = useAtomValue(codeReviewProvider);
+  const diffMap = useAtomValue(allDiffSummaries);
+  const stackHashes = useAtomValue(editingStackIntentionHashes)[1];
+  const loadingState = useAtomValue(loadingStackState);
+  const suggestedRebase = useAtomValue(showSuggestedRebaseForStack(hash));
+  const dag = useAtomValue(dagWithPreviews);
   const runOperation = useRunOperation();
-  const syncStatusMap = useRecoilValue(syncStatusAtom);
+  const syncStatusMap = useAtomValue(syncStatusAtom);
 
   // buttons at the bottom of the stack
   const actions = [];
@@ -87,9 +87,7 @@ export function StackActions({hash}: {hash: Hash}): React.ReactElement | null {
       c => syncStatusMap?.get(c.hash) === SyncStatus.LocalIsNewer,
     );
 
-    const willShowConfirmationModal = shouldShowSubmitStackConfirmation(
-      globalRecoil().getSnapshot(),
-    );
+    const willShowConfirmationModal = shouldShowSubmitStackConfirmation();
 
     // any existing diffs -> show resubmit stack,
     if (
@@ -157,10 +155,10 @@ export function StackActions({hash}: {hash: Hash}): React.ReactElement | null {
         moreActions.push({
           label: (
             <HighlightCommitsWhileHovering key="submit-entire-stack" toHighlight={submittableStack}>
-              <FlexRow>
+              <Row>
                 <Icon icon="cloud-upload" slot="start" />
                 <T>Submit entire stack</T>
-              </FlexRow>
+              </Row>
             </HighlightCommitsWhileHovering>
           ),
           onClick: async () => {
@@ -252,33 +250,34 @@ export function StackActions({hash}: {hash: Hash}): React.ReactElement | null {
 }
 
 function StackEditButton({info}: {info: DagCommitInfo}): React.ReactElement | null {
-  const uncommitted = useRecoilValue(latestUncommittedChangesData);
-  const dag = useRecoilValue(dagWithPreviews);
-  const [[, stackHashes], setStackIntentionHashes] = useRecoilState(editingStackIntentionHashes);
-  const loadingState = useRecoilValue(loadingStackState);
+  const uncommitted = useAtomValue(latestUncommittedChangesData);
+  const dag = useAtomValue(dagWithPreviews);
+  const [[, stackHashes], setStackIntentionHashes] = useAtom(editingStackIntentionHashes);
+  const loadingState = useAtomValue(loadingStackState);
+  const confirmUnsavedEditsBeforeSplit = useConfirmUnsavedEditsBeforeSplit();
 
-  const set = dag.descendants(info.hash);
+  const set = dag.nonObsolete(dag.descendants(info.hash));
+  if (set.size <= 1) {
+    return null;
+  }
+
   const stackCommits = dag.getBatch(set.toArray());
   const isEditing = stackHashes.size > 0 && set.toSeq().some(h => stackHashes.has(h));
 
   const isPreview = info.previewType != null;
   const isLoading = isEditing && loadingState.state === 'loading';
   const isError = isEditing && loadingState.state === 'hasError';
-  const isLinear = dag.merge(set).size === 0 && dag.heads(set).size === 1;
-  const isDirty = stackCommits.some(c => c.isHead) && uncommitted.files.length > 0;
+  const isLinear =
+    dag.merge(set).size === 0 && dag.heads(set).size === 1 && dag.roots(set).size === 1;
+  const isDirty = stackCommits.some(c => c.isDot) && uncommitted.files.length > 0;
   const hasPublic = stackCommits.some(c => c.phase === 'public');
-  const obsoleted = stackCommits.filter(c => c.successorInfo != null);
-  const hasObsoleted = obsoleted.length > 0;
-  const disabled =
-    isDirty || hasObsoleted || !isLinear || isLoading || isError || isPreview || hasPublic;
+  const disabled = isDirty || !isLinear || isLoading || isError || isPreview || hasPublic;
   const title = isError
     ? t(`Failed to load stack: ${loadingState.error}`)
     : isLoading
     ? loadingState.exportedStack === undefined
       ? t('Reading stack content')
       : t('Analyzing stack content')
-    : hasObsoleted
-    ? t('Cannot edit stack with commits that have newer versions')
     : isDirty
     ? t(
         'Cannot edit stack when there are uncommitted changes.\nCommit or amend your changes first.',
@@ -293,13 +292,12 @@ function StackEditButton({info}: {info: DagCommitInfo}): React.ReactElement | nu
   const highlight = disabled ? [] : stackCommits;
   const tooltipDelay = disabled && !isLoading ? undefined : DOCUMENTATION_DELAY;
   const icon = isLoading ? <Icon icon="loading" slot="start" /> : <StackEditIcon slot="start" />;
-  const confirmUnsavedEditsBeforeSplit = useConfirmUnsavedEditsBeforeSplit();
 
   return (
     <HighlightCommitsWhileHovering key="submit-stack" toHighlight={highlight}>
       <Tooltip title={title} delayMs={tooltipDelay} placement="bottom">
         <VSCodeButton
-          className={`edit-stack-button ${disabled && 'disabled'}`}
+          className={`edit-stack-button${disabled ? ' disabled' : ''}`}
           disabled={disabled}
           appearance="icon"
           onClick={async () => {

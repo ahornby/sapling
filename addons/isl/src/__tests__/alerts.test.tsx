@@ -14,10 +14,7 @@ import {
   simulateMessageFromServer,
   simulateRepoConnected,
 } from '../testUtils';
-import {render, screen, fireEvent} from '@testing-library/react';
-import {act} from 'react-dom/test-utils';
-
-jest.mock('../MessageBus');
+import {render, screen, fireEvent, act} from '@testing-library/react';
 
 describe('cwd', () => {
   beforeEach(() => {
@@ -34,7 +31,7 @@ describe('cwd', () => {
         value: [
           COMMIT('1', 'some public base', '0', {phase: 'public'}),
           COMMIT('a', 'My Commit', '1'),
-          COMMIT('b', 'Another Commit', 'a', {isHead: true}),
+          COMMIT('b', 'Another Commit', 'a', {isDot: true}),
         ],
       });
     });
@@ -64,6 +61,65 @@ describe('cwd', () => {
     expect(screen.getByText('Test Alert')).toBeInTheDocument();
     expect(screen.getByText('This is a test')).toBeInTheDocument();
     expect(screen.getByText('SEV 4')).toBeInTheDocument();
+  });
+
+  describe('version matching', () => {
+    const simulateApplicationInfo = (version: string) => {
+      act(() => {
+        simulateMessageFromServer({
+          type: 'applicationInfo',
+          info: {
+            version,
+            logFilePath: '',
+            platformName: 'vscode',
+          },
+        });
+      });
+    };
+
+    const simulateAlert = (regex: string | undefined) => {
+      act(() => {
+        simulateMessageFromServer({
+          type: 'fetchedActiveAlerts',
+          alerts: [
+            {
+              key: 'version_test',
+              title: 'Test Alert',
+              description: 'This is a test',
+              severity: 'SEV 4',
+              url: 'https://sapling-scm.com',
+              ['show-in-isl']: true,
+              ['isl-version-regex']: regex,
+            },
+          ],
+        });
+      });
+    };
+
+    it('shows alerts matching current version', () => {
+      simulateApplicationInfo('0.1.38000');
+      simulateAlert('^0.1.38.*$');
+      expect(screen.getByText('Test Alert')).toBeInTheDocument();
+    });
+
+    it('hides alerts not matching current version', () => {
+      simulateApplicationInfo('0.1.36000');
+      simulateAlert('^0.1.38.*$');
+      expect(screen.queryByText('Test Alert')).not.toBeInTheDocument();
+    });
+
+    it('shows alerts missing regex', () => {
+      simulateApplicationInfo('0.1.36000');
+      simulateAlert(undefined);
+      expect(screen.getByText('Test Alert')).toBeInTheDocument();
+    });
+
+    it('hides alerts when regex given, while app info is loading', () => {
+      simulateAlert('^0.1.38.*$');
+      expect(screen.queryByText('Test Alert')).not.toBeInTheDocument();
+      simulateApplicationInfo('0.1.38');
+      expect(screen.getByText('Test Alert')).toBeInTheDocument();
+    });
   });
 
   it('dismiss alerts', () => {

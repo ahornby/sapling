@@ -12,6 +12,7 @@ import type {TrackEventName} from 'isl-server/src/analytics/eventNames';
 import type {TrackDataWithEventName} from 'isl-server/src/analytics/types';
 import type {GitHubDiffSummary} from 'isl-server/src/github/githubCodeReviewProvider';
 import type {Comparison} from 'shared/Comparison';
+import type {ParsedDiff} from 'shared/patch/parse';
 import type {AllUndefined, Json} from 'shared/typeUtils';
 import type {Hash} from 'shared/types/common';
 import type {ExportStack, ImportedStack, ImportStack} from 'shared/types/stack';
@@ -24,7 +25,6 @@ export type PlatformName =
   | 'androidStudio'
   | 'androidStudioRemote'
   | 'vscode'
-  | 'standalone'
   | 'webview'
   | 'chromelike_app';
 
@@ -64,6 +64,41 @@ export type DiffId = string;
  */
 export type DiffSummary = GitHubDiffSummary | InternalTypes['PhabricatorDiffSummary'];
 
+export type DiffCommentReaction = {
+  name: string;
+  reaction:
+    | 'ANGER'
+    | 'HAHA'
+    | 'LIKE'
+    | 'LOVE'
+    | 'WOW'
+    | 'SORRY'
+    | 'SAD'
+    | 'CONFUSED'
+    | 'EYES'
+    | 'HEART'
+    | 'HOORAY'
+    | 'LAUGH'
+    | 'ROCKET'
+    | 'THUMBS_DOWN'
+    | 'THUMBS_UP';
+};
+
+export type DiffComment = {
+  author: string;
+  authorAvatarUri?: string;
+  html: string;
+  created: Date;
+  /** If it's an inline comment, this is the file path with the comment */
+  filename?: string;
+  /** If it's an inline comment, this is the line it was added */
+  line?: number;
+  reactions: Array<DiffCommentReaction>;
+  /** Suggestion for how to change the code, as a patch */
+  suggestedChange?: ParsedDiff;
+  replies: Array<DiffComment>;
+};
+
 /**
  * Summary of CI test results for a Diff.
  * 'pass' if ALL signals succeed and not still running.
@@ -94,6 +129,17 @@ export type RepositoryError =
       type: 'unknownError';
       error: Error;
     };
+
+export type CwdInfo = {
+  /** Full cwd path, like /Users/username/repoRoot/some/subfolder */
+  cwd: AbsolutePath;
+  /** Full real path to the repository root, like /Users/username/repoRoot
+   * Undefined for cwds that are not valid repositories */
+  repoRoot?: AbsolutePath;
+  /** Label for a cwd, which is <repoBasename>/<cwd>, like 'sapling/addons'.
+   * Intended for display. Undefined for cwds that are not valid repositories */
+  repoRelativeCwdLabel?: string;
+};
 
 export type RepoInfo = RepositoryError | ValidatedRepoInfo;
 
@@ -148,6 +194,31 @@ export type StableCommitMetadata = {
   description: string;
 };
 
+export type StableCommitFetchConfig = {
+  template: string;
+  parse: (data: string) => Array<StableCommitMetadata>;
+};
+
+export type StableLocationData = {
+  /** Stables found automatically from recent builds */
+  stables: Array<Result<StableInfo>>;
+  /** Stables that enabled automatically for certain users */
+  special: Array<Result<StableInfo>>;
+  /** Stables entered in the UI. Map of provided name to a Result. null means the stable is loading. */
+  manual: Record<string, Result<StableInfo> | null>;
+  /** Whether this repo supports entering custom stables via input. */
+  repoSupportsCustomStables: boolean;
+};
+export type StableInfo = {
+  hash: string;
+  name: string;
+  /** If present, this is informational text, like the reason it's been added */
+  byline?: string;
+  /** If present, this is extra details that might be shown in a tooltip */
+  info?: string;
+  date: Date;
+};
+
 export type CommitInfo = {
   title: string;
   hash: Hash;
@@ -159,7 +230,11 @@ export type CommitInfo = {
    */
   parents: ReadonlyArray<Hash>;
   phase: CommitPhaseType;
-  isHead: boolean;
+  /**
+   * Whether this commit is the "." (working directory parent).
+   * It is the parent of "wdir()" or the "You are here" virtual commit.
+   */
+  isDot: boolean;
   author: string;
   date: Date;
   description: string;
@@ -182,6 +257,7 @@ export type CommitInfo = {
   totalFileCount: number;
   /** @see {@link DiffId} */
   diffId?: DiffId;
+  isFollower?: boolean;
   stableCommitMetadata?: ReadonlyArray<StableCommitMetadata>;
 };
 export type SuccessorInfo = {
@@ -198,6 +274,10 @@ export type ChangedFile = {
    * If this file is renamed from another, this is the path of the original file, and another change of type 'R' will exist.
    * */
   copy?: RepoRelativePath;
+};
+export type FilesSample = {
+  filesSample: Array<ChangedFile>;
+  totalFileCount: number;
 };
 
 export type SucceedableRevset = {type: 'succeedable-revset'; revset: Revset};
@@ -333,6 +413,7 @@ export type Alert = {
   url: string;
   severity: AlertSeverity;
   ['show-in-isl']: boolean;
+  ['isl-version-regex']?: string;
 };
 
 /**
@@ -345,13 +426,20 @@ export enum GeneratedStatus {
   Generated = 2,
 }
 
+export enum ConflictType {
+  BothChanged = 'both_changed',
+  DeletedInDest = 'dest_deleted',
+  DeletedInSource = 'source_deleted',
+}
+
 type ConflictInfo = {
   command: string;
   toContinue: string;
   toAbort: string;
-  files: Array<ChangedFile>;
+  files: Array<ChangedFile & {conflictType: ConflictType}>;
   fetchStartTimestamp: number;
   fetchCompletedTimestamp: number;
+  hashes?: {local?: string; other?: string};
 };
 export type MergeConflicts =
   | ({state: 'loading'} & AllUndefined<ConflictInfo>)
@@ -381,7 +469,9 @@ export type OperationProgress =
   // progress information for a specific commit, shown inline. Null hash means to apply the messasge to all hashes. Null message means to clear the message.
   | {id: string; kind: 'inlineProgress'; hash?: string; message?: string}
   | {id: string; kind: 'exit'; exitCode: number; timestamp: number}
-  | {id: string; kind: 'error'; error: string};
+  | {id: string; kind: 'error'; error: string}
+  // used by requestMissedOperationProgress, client thinks this operation is running but server no longer knows about it.
+  | {id: string; kind: 'forgot'};
 
 export type ProgressStep = {
   message: string;
@@ -413,11 +503,19 @@ export type OneIndexedLineNumber = Exclude<number, 0>;
  */
 export type PlatformSpecificClientToServerMessages =
   | {type: 'platform/openFile'; path: RepoRelativePath; options?: {line?: OneIndexedLineNumber}}
+  | {
+      type: 'platform/openFiles';
+      paths: Array<RepoRelativePath>;
+      options?: {line?: OneIndexedLineNumber};
+    }
   | {type: 'platform/openContainingFolder'; path: RepoRelativePath}
   | {type: 'platform/openDiff'; path: RepoRelativePath; comparison: Comparison}
   | {type: 'platform/openExternal'; url: string}
   | {type: 'platform/confirm'; message: string; details?: string | undefined}
   | {type: 'platform/subscribeToAvailableCwds'}
+  | {type: 'platform/subscribeToUnsavedFiles'}
+  | {type: 'platform/saveAllUnsavedFiles'}
+  | {type: 'platform/setPersistedState'; data?: string}
   | {
       type: 'platform/setVSCodeConfig';
       config: string;
@@ -425,7 +523,6 @@ export type PlatformSpecificClientToServerMessages =
       scope: 'workspace' | 'global';
     }
   | {type: 'platform/executeVSCodeCommand'; command: string; args: Array<Json>}
-  | {type: 'platform/gotUiState'; state: string}
   | {type: 'platform/subscribeToVSCodeConfig'; config: string};
 
 /**
@@ -433,15 +530,16 @@ export type PlatformSpecificClientToServerMessages =
  * usually in response to a platform-specific ClientToServer message
  */
 export type PlatformSpecificServerToClientMessages =
-  | {type: 'platform/getUiState'}
   | {
       type: 'platform/confirmResult';
       result: boolean;
     }
   | {
       type: 'platform/availableCwds';
-      options: Array<AbsolutePath>;
+      options: Array<CwdInfo>;
     }
+  | {type: 'platform/unsavedFiles'; unsaved: Array<{path: RepoRelativePath; uri: string}>}
+  | {type: 'platform/savedAllUnsavedFiles'; success: boolean}
   | {
       type: 'platform/vscodeConfigChanged';
       config: string;
@@ -457,7 +555,10 @@ export type PageVisibility = 'focused' | 'visible' | 'hidden';
 export type FileABugFields = {title: string; description: string; repro: string};
 export type FileABugProgress =
   | {status: 'starting'}
-  | {status: 'inProgress'; message: string}
+  | {
+      status: 'inProgress';
+      currentSteps: Record<string, 'blocked' | 'loading' | 'finished'>;
+    }
   | {status: 'success'; taskNumber: string; taskLink: string}
   | {status: 'error'; error: Error};
 export type FileABugProgressMessage = {type: 'fileBugReportProgress'} & FileABugProgress;
@@ -488,31 +589,73 @@ export const allConfigNames = [
   'isl.download-commit-rebase-type',
   'isl.experimental-features',
   'isl.hold-off-refresh-ms',
-  'extensions.commitcloud',
-  // which graph renderer to use (0: tree; 1: dag; 2: show both).
-  'isl.experimental-graph-renderer',
+  'isl.use-sl-graphql',
+  'github.preferred_submit_command',
+  'isl.open-file-cmd',
+  'isl.generated-files-regex',
+  'ui.username',
+  'ui.merge',
+  'fbcodereview.code-browser-url',
 ] as const;
 
-/** sl configs written by ISL */
+/** sl configs read by ISL */
 export type ConfigName = (typeof allConfigNames)[number];
+
+/**
+ * Not all configs should be set-able from the UI, for security.
+ * Only configs which could not possibly allow code execution should be allowed.
+ * This also includes values allowed to be passed in the args for Operations.
+ * Most ISL configs are OK.
+ */
+export const settableConfigNames = [
+  'isl.submitAsDraft',
+  'isl.changedFilesDisplayType',
+  'isl.hasShownGettingStarted',
+  'isl.pull-button-choice',
+  'isl.show-stack-submit-confirmation',
+  'isl.show-diff-number',
+  'isl.render-compact',
+  'isl.download-commit-should-goto',
+  'isl.download-commit-rebase-type',
+  'isl.experimental-features',
+  'isl.hold-off-refresh-ms',
+  'isl.use-sl-graphql',
+  'isl.experimental-graph-renderer',
+  'isl.generated-files-regex',
+  'github.preferred_submit_command',
+  'ui.allowemptycommit',
+  'ui.merge',
+  'amend.autorestack',
+] as const;
+
+/** sl configs written to by ISL */
+export type SettableConfigName = (typeof settableConfigNames)[number];
 
 /** local storage keys written by ISL */
 export type LocalStorageName =
   | 'isl.drawer-state'
+  | 'isl.bookmarks'
   | 'isl.ui-zoom'
   | 'isl.has-shown-getting-started'
   | 'isl.amend-autorestack'
   | 'isl.dismissed-alerts'
-  | 'isl-color-theme';
+  | 'isl.debug-react-tools'
+  | 'isl.debug-redux-tools'
+  | 'isl.condense-obsolete-stacks'
+  | 'isl.split-suggestion-enabled'
+  | 'isl.comparison-display-mode'
+  | 'isl.expand-generated-files'
+  | 'isl-color-theme'
+  | 'isl.auto-resolve-before-continue';
 
 export type ClientToServerMessage =
   | {type: 'heartbeat'; id: string}
   | {type: 'refresh'}
   | {type: 'getConfig'; name: ConfigName}
-  | {type: 'setConfig'; name: ConfigName; value: string}
+  | {type: 'setConfig'; name: SettableConfigName; value: string}
   | {type: 'changeCwd'; cwd: string}
   | {type: 'track'; data: TrackDataWithEventName}
-  | {type: 'fileBugReport'; data: FileABugFields; uiState?: Json}
+  | {type: 'fileBugReport'; data: FileABugFields; uiState?: Json; collectRage: boolean}
   | {type: 'runOperation'; operation: RunnableOperation}
   | {type: 'abortRunningOperation'; operationId: string}
   | {type: 'fetchActiveAlerts'}
@@ -520,19 +663,25 @@ export type ClientToServerMessage =
   | {type: 'fetchCommitMessageTemplate'}
   | {type: 'fetchShelvedChanges'}
   | {type: 'fetchLatestCommit'; revset: string}
-  | {type: 'fetchAllCommitChangedFiles'; hash: Hash}
+  | {type: 'fetchCommitChangedFiles'; hash: Hash; limit: number}
   | {type: 'renderMarkup'; markup: string; id: number}
   | {type: 'typeahead'; kind: TypeaheadKind; query: string; id: string}
   | {type: 'requestRepoInfo'}
   | {type: 'requestApplicationInfo'}
+  | {type: 'requestMissedOperationProgress'; operationId: string}
   | {type: 'fetchAvatars'; authors: Array<string>}
   | {type: 'fetchCommitCloudState'}
   | {type: 'fetchDiffSummaries'; diffIds?: Array<DiffId>}
+  | {type: 'fetchDiffComments'; diffId: DiffId}
   | {type: 'fetchLandInfo'; topOfStack: DiffId}
+  | {type: 'fetchAndSetStables'; additionalStables: Array<string>}
+  | {type: 'fetchStableLocationAutocompleteOptions'}
   | {type: 'confirmLand'; landConfirmationInfo: LandConfirmationInfo}
   | {type: 'getSuggestedReviewers'; context: {paths: Array<string>}; key: string}
+  | {type: 'getConfiguredMergeTool'}
   | {type: 'updateRemoteDiffMessage'; diffId: DiffId; title: string; description: string}
   | {type: 'pageVisibility'; state: PageVisibility}
+  | {type: 'getRepoUrlAtHash'; revset: Revset; path?: string}
   | {type: 'requestComparison'; comparison: Comparison}
   | {
       type: 'requestComparisonContextLines';
@@ -556,8 +705,16 @@ export type ClientToServerMessage =
       title: string;
       comparison: Comparison;
     }
+  | {type: 'gotUiState'; state: string}
   | CodeReviewProviderSpecificClientToServerMessages
-  | PlatformSpecificClientToServerMessages;
+  | PlatformSpecificClientToServerMessages
+  | {type: 'fetchSignificantLinesOfCode'; hash: Hash; excludedFiles: string[]}
+  | {
+      type: 'fetchPendingSignificantLinesOfCode';
+      requestId: number;
+      hash: Hash;
+      includedFiles: string[];
+    };
 
 export type SubscriptionResultsData = {
   uncommittedChanges: FetchedUncommittedChanges;
@@ -589,22 +746,31 @@ export type ServerToClientMessage =
   | {type: 'fetchedCommitMessageTemplate'; template: string}
   | {type: 'fetchedShelvedChanges'; shelvedChanges: Result<Array<ShelvedChange>>}
   | {type: 'fetchedLatestCommit'; info: Result<CommitInfo>; revset: string}
-  | {type: 'fetchedAllCommitChangedFiles'; hash: Hash; result: Result<Array<ChangedFile>>}
+  | {
+      type: 'fetchedCommitChangedFiles';
+      hash: Hash;
+      result: Result<FilesSample>;
+    }
   | {type: 'typeaheadResult'; id: string; result: Array<TypeaheadResult>}
   | {type: 'applicationInfo'; info: ApplicationInfo}
   | {type: 'repoInfo'; info: RepoInfo; cwd?: string}
   | {type: 'repoError'; error: RepositoryError | undefined}
-  | {type: 'fetchedAvatars'; avatars: Map<string, string>}
+  | {type: 'fetchedAvatars'; avatars: Map<string, string>; authors: Array<string>}
   | {type: 'fetchedDiffSummaries'; summaries: Result<Map<DiffId, DiffSummary>>}
+  | {type: 'fetchedDiffComments'; diffId: DiffId; comments: Result<Array<DiffComment>>}
   | {type: 'fetchedLandInfo'; topOfStack: DiffId; landInfo: Result<LandInfo>}
   | {type: 'confirmedLand'; result: Result<undefined>}
   | {type: 'fetchedCommitCloudState'; state: Result<CommitCloudSyncState>}
+  | {type: 'fetchedStables'; stables: StableLocationData}
+  | {type: 'fetchedStableLocationAutocompleteOptions'; result: Result<Array<TypeaheadResult>>}
   | {type: 'renderedMarkup'; html: string; id: number}
   | {type: 'gotSuggestedReviewers'; reviewers: Array<string>; key: string}
+  | {type: 'gotConfiguredMergeTool'; tool: string | undefined}
   | {type: 'updatedRemoteDiffMessage'; diffId: DiffId; error?: string}
   | {type: 'uploadFileResult'; id: string; result: Result<string>}
+  | {type: 'gotRepoUrlAtHash'; url: Result<string>}
   | {type: 'comparison'; comparison: Comparison; data: ComparisonData}
-  | {type: 'comparisonContextLines'; path: RepoRelativePath; lines: Array<string>}
+  | {type: 'comparisonContextLines'; path: RepoRelativePath; lines: Result<Array<string>>}
   | {type: 'beganLoadingMoreCommits'}
   | {type: 'commitsShownRange'; rangeInDays: number | undefined}
   | {type: 'additionalCommitAvailability'; moreAvailable: boolean}
@@ -623,8 +789,16 @@ export type ServerToClientMessage =
       message: Result<string>;
       id: string;
     }
+  | {type: 'getUiState'}
   | OperationProgressEvent
-  | PlatformSpecificServerToClientMessages;
+  | PlatformSpecificServerToClientMessages
+  | {type: 'fetchedSignificantLinesOfCode'; hash: Hash; linesOfCode: Result<number>}
+  | {
+      type: 'fetchedPendingSignificantLinesOfCode';
+      requestId: number;
+      hash: Hash;
+      linesOfCode: Result<number>;
+    };
 
 export type Disposable = {
   dispose(): void;
@@ -633,3 +807,9 @@ export type Disposable = {
 export type ComparisonData = {
   diff: Result<string>;
 };
+
+export type MessageBusStatus =
+  | {type: 'initializing'}
+  | {type: 'open'}
+  | {type: 'reconnecting'}
+  | {type: 'error'; error?: string};

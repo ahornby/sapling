@@ -111,8 +111,8 @@ pub fn run(ctx: ReqCtx<StatusOpts>, repo: &mut Repo, wc: &mut WorkingCopy) -> Re
         fallback!("one or more unsupported options in Rust status");
     }
 
-    if repo.storage_format().is_git() {
-        tracing::debug!(target: "status_info", status_detail="git");
+    if repo.storage_format().is_git() && repo.path().join(".gitmodules").exists() {
+        tracing::debug!(target: "status_info", status_detail="gitmodules");
         fallback!("git format unsupported (submodules)");
     }
 
@@ -198,7 +198,7 @@ pub fn run(ctx: ReqCtx<StatusOpts>, repo: &mut Repo, wc: &mut WorkingCopy) -> Re
 
     tracing::debug!(target: "status_info", status_mode="rust");
 
-    let status = wc.status(matcher.clone(), ignored, repo.config(), &ctx.logger())?;
+    let status = wc.status(&ctx.core, matcher.clone(), ignored)?;
 
     // This should be passed the "full" matcher including
     // ignores, sparse, etc., but in practice probably doesn't

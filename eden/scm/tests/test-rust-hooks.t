@@ -1,9 +1,10 @@
-#debugruntest-compatible
+
+#require no-eden
+
 
 Note that Rust hook execution escapes the debugruntest execution environment.
 For now that is desirable since I also want to test the platform specific Rust spawn logic.
 
-  $ configure modernclient
 
   $ hg debugtestcommand
 
@@ -69,7 +70,6 @@ Wait for background hook to touch file.
 
 Reset our hook config:
   $ rm $HGRCPATH
-  $ configure modernclient
 
 Test fail hooks:
   $ setconfig 'hooks.pre-debugtestcommand=echo PRE'

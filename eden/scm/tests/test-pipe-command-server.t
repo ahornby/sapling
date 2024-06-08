@@ -1,5 +1,4 @@
-#require no-windows
-  $ configure modernclient
+#require no-windows no-eden
 
   $ cat > make-request.py <<'EOF'
   > import sys, struct

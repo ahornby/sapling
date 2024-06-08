@@ -12,15 +12,15 @@
 #include <folly/portability/GTest.h>
 #include <folly/test/TestUtils.h>
 
+#include "eden/common/telemetry/NullStructuredLogger.h"
+#include "eden/common/testharness/TempFile.h"
 #include "eden/fs/config/EdenConfig.h"
 #include "eden/fs/inodes/EdenMount.h"
 #include "eden/fs/inodes/InodeNumber.h"
 #include "eden/fs/inodes/TreeInode.h"
 #include "eden/fs/inodes/overlay/gen-cpp2/overlay_types.h"
 #include "eden/fs/telemetry/EdenStats.h"
-#include "eden/fs/telemetry/NullStructuredLogger.h"
 #include "eden/fs/testharness/FakeTreeBuilder.h"
-#include "eden/fs/testharness/TempFile.h"
 #include "eden/fs/testharness/TestMount.h"
 
 namespace facebook::eden {

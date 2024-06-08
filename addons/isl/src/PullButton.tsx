@@ -7,17 +7,17 @@
 
 import type {Operation} from './operations/Operation';
 
+import {fetchStableLocations} from './BookmarksData';
 import {Internal} from './Internal';
 import {DOCUMENTATION_DELAY, Tooltip} from './Tooltip';
-import {VSCodeButtonDropdown} from './VSCodeButtonDropdown';
+import {ButtonDropdown} from './components/ButtonDropdown';
 import {t, T} from './i18n';
 import {configBackedAtom} from './jotaiUtils';
 import {PullOperation} from './operations/PullOperation';
+import {useRunOperation} from './operationsState';
 import {uncommittedChangesWithPreviews, useMostRecentPendingOperation} from './previews';
-import {useRunOperation} from './serverAPIState';
 import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
-import {useAtom} from 'jotai';
-import {useRecoilValue} from 'recoil';
+import {useAtom, useAtomValue} from 'jotai';
 import {Icon} from 'shared/Icon';
 
 import './PullButton.css';
@@ -54,7 +54,7 @@ export function PullButton() {
   const currentChoice =
     pullButtonOptions.find(option => option.id === dropdownChoiceKey) ?? pullButtonOptions[0];
 
-  const trackedChanges = useRecoilValue(uncommittedChangesWithPreviews).filter(
+  const trackedChanges = useAtomValue(uncommittedChangesWithPreviews).filter(
     change => change.status !== '?',
   );
   const hasUncommittedChnages = trackedChanges.length > 0;
@@ -77,11 +77,13 @@ export function PullButton() {
     <Tooltip placement="bottom" delayMs={DOCUMENTATION_DELAY} title={tooltip}>
       <div className="pull-info">
         {pullButtonOptions.length > 1 ? (
-          <VSCodeButtonDropdown
-            appearance="secondary"
+          <ButtonDropdown
             buttonDisabled={!!isRunningPull || disabledFromUncommittedChanges}
             options={pullButtonOptions}
-            onClick={() => runOperation(currentChoice.getOperation())}
+            onClick={() => {
+              runOperation(currentChoice.getOperation());
+              fetchStableLocations();
+            }}
             onChangeSelected={choice => setDropdownChoiceKey(choice.id)}
             selected={currentChoice}
             icon={<Icon slot="start" icon={isRunningPull ? 'loading' : 'repo'} />}
@@ -92,6 +94,7 @@ export function PullButton() {
             disabled={!!isRunningPull}
             onClick={() => {
               runOperation(new PullOperation());
+              fetchStableLocations();
             }}>
             <Icon slot="start" icon={isRunningPull ? 'loading' : 'cloud-download'} />
             <T>Pull</T>

@@ -16,8 +16,14 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use checkout::BookmarkAction;
+use checkout::CheckoutMode;
+use checkout::ReportMode;
 use configmodel::config::ConfigExt;
+use context::CoreContext;
 use cpython::*;
+use cpython_ext::convert::ImplInto;
+use cpython_ext::convert::Serde;
 use cpython_ext::error::ResultPyErrExt;
 use cpython_ext::ExtractInner;
 use cpython_ext::PyNone;
@@ -26,7 +32,7 @@ use parking_lot::RwLock;
 use pyconfigloader::config;
 use pydag::commits::commits as PyCommits;
 use pyeagerepo::EagerRepoStore as PyEagerRepoStore;
-use pyedenapi::PyClient as PyEdenApi;
+use pyedenapi::PyClient as PySaplingRemoteApi;
 use pymetalog::metalog as PyMetaLog;
 use pyrevisionstore::filescmstore as PyFileScmStore;
 use pyrevisionstore::pyremotestore as PyRemoteStore;
@@ -35,6 +41,7 @@ use pyworkingcopy::workingcopy as PyWorkingCopy;
 use revisionstore::ContentStoreBuilder;
 use rsrepo::repo::Repo;
 use rsworkingcopy::workingcopy::WorkingCopy;
+use types::HgId;
 
 pub fn init_module(py: Python, package: &str) -> PyResult<PyModule> {
     let name = [package, "repo"].join(".");
@@ -81,7 +88,7 @@ py_class!(pub class repo |py| {
     }
 
     def metalog(&self) -> PyResult<PyMetaLog> {
-        let mut repo_ref = self.inner(py).write();
+        let repo_ref = self.inner(py).write();
         let path = String::from(repo_ref.metalog_path().to_string_lossy());
         let log_ref = repo_ref.metalog().map_pyerr(py)?;
         PyMetaLog::create_instance(py, log_ref, path)
@@ -113,16 +120,16 @@ py_class!(pub class repo |py| {
         Ok(PyNone)
     }
 
-    def edenapi(&self) -> PyResult<PyEdenApi> {
+    def edenapi(&self) -> PyResult<PySaplingRemoteApi> {
         let repo_ref = self.inner(py).read();
         let edenapi_ref = repo_ref.eden_api().map_pyerr(py)?;
-        PyEdenApi::create_instance(py, edenapi_ref)
+        PySaplingRemoteApi::create_instance(py, edenapi_ref)
     }
 
-    def nullableedenapi(&self) -> PyResult<Option<PyEdenApi>> {
+    def nullableedenapi(&self) -> PyResult<Option<PySaplingRemoteApi>> {
         let repo_ref = self.inner(py).read();
         match repo_ref.optional_eden_api().map_pyerr(py)? {
-            Some(api) => Ok(Some(PyEdenApi::create_instance(py, api)?)),
+            Some(api) => Ok(Some(PySaplingRemoteApi::create_instance(py, api)?)),
             None => Ok(None),
         }
     }
@@ -233,6 +240,30 @@ py_class!(pub class repo |py| {
         let repo = self.inner(py).write();
         let _ = repo.file_store().map_pyerr(py)?;
         PyEagerRepoStore::create_instance(py, repo.eager_store().unwrap())
+    }
+
+    def goto(
+        &self,
+        ctx: ImplInto<CoreContext>,
+        target: Serde<HgId>,
+        bookmark: Serde<BookmarkAction>,
+        mode: Serde<CheckoutMode>,
+        report_mode: Serde<ReportMode>,
+    ) -> PyResult<(usize, usize, usize, usize)> {
+        let repo = self.inner(py).read();
+        let wc = repo.working_copy().map_pyerr(py)?;
+        checkout::checkout(
+            &ctx.0,
+            &repo,
+            &wc.lock().map_pyerr(py)?,
+            target.0,
+            bookmark.0,
+            mode.0,
+            report_mode.0,
+        ).map(|opt_stats| {
+            let (updated, removed) = opt_stats.unwrap_or_default();
+            (updated, 0, removed, 0)
+        }).map_pyerr(py)
     }
 });
 

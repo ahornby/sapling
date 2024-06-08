@@ -1,7 +1,6 @@
-#debugruntest-compatible
   $ setconfig experimental.allowfilepeer=True
 
-#require symlink
+#require symlink no-eden
 
 #testcases legacyupdater rustupdater
 

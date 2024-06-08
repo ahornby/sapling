@@ -20,7 +20,6 @@ use mercurial_types::HgChangesetIdPrefix;
 use mercurial_types::HgChangesetIdsResolvedFromPrefix;
 use mononoke_types::ChangesetId;
 use mononoke_types::RepositoryId;
-use rand::Rng;
 use rendezvous::ConfigurableRendezVousController;
 use rendezvous::RendezVous;
 use rendezvous::RendezVousOptions;
@@ -220,10 +219,9 @@ mononoke_queries! {
 
     read SelectMappingByBonsai(
         repo_id: RepositoryId,
-        tok: i32,
         >list bcs_id: ChangesetId
-    ) -> (HgChangesetId, ChangesetId, i32) {
-        "SELECT hg_cs_id, bcs_id, {tok}
+    ) -> (HgChangesetId, ChangesetId) {
+        "SELECT hg_cs_id, bcs_id
          FROM bonsai_hg_mapping
          WHERE repo_id = {repo_id}
            AND bcs_id IN {bcs_id}"
@@ -231,10 +229,9 @@ mononoke_queries! {
 
     read SelectMappingByHg(
         repo_id: RepositoryId,
-        tok: i32,
         >list hg_cs_id: HgChangesetId
-    ) -> (HgChangesetId, ChangesetId, i32) {
-        "SELECT hg_cs_id, bcs_id, {tok}
+    ) -> (HgChangesetId, ChangesetId) {
+        "SELECT hg_cs_id, bcs_id
          FROM bonsai_hg_mapping
          WHERE repo_id = {repo_id}
            AND hg_cs_id IN {hg_cs_id}"
@@ -305,43 +302,27 @@ impl SqlBonsaiHgMapping {
     ) -> Result<(), Error> {
         let BonsaiHgMappingEntry { hg_cs_id, bcs_id } = entry.clone();
 
-        let tok: i32 = rand::thread_rng().gen();
+        let cri = ctx.client_request_info();
         let hg_ids = &[hg_cs_id];
-        let by_hg = SelectMappingByHg::query(
+        let by_hg = SelectMappingByHg::maybe_traced_query(
             &self.read_master_connection.conn,
+            cri,
             &self.repo_id,
-            &tok,
             hg_ids,
         );
         let bcs_ids = &[bcs_id];
 
-        let by_bcs = if let Some(cri) = ctx.metadata().client_request_info() {
-            SelectMappingByBonsai::traced_query(
-                &self.read_master_connection.conn,
-                cri,
-                &self.repo_id,
-                &tok,
-                bcs_ids,
-            )
-            .boxed()
-        } else {
-            SelectMappingByBonsai::query(
-                &self.read_master_connection.conn,
-                &self.repo_id,
-                &tok,
-                bcs_ids,
-            )
-            .boxed()
-        };
+        let by_bcs = SelectMappingByBonsai::maybe_traced_query(
+            &self.read_master_connection.conn,
+            cri,
+            &self.repo_id,
+            bcs_ids,
+        )
+        .boxed();
 
         let (by_hg_rows, by_bcs_rows) = future::try_join(by_hg, by_bcs).await?;
 
-        match by_hg_rows
-            .into_iter()
-            .chain(by_bcs_rows.into_iter())
-            .map(|(hg_cs_id, bcs_id, _)| (hg_cs_id, bcs_id))
-            .next()
-        {
+        match by_hg_rows.into_iter().chain(by_bcs_rows.into_iter()).next() {
             Some(entry) if entry == (hg_cs_id, bcs_id) => Ok(()),
             Some((hg_cs_id, bcs_id)) => Err(ErrorKind::ConflictingEntries(
                 BonsaiHgMappingEntry { hg_cs_id, bcs_id },
@@ -365,17 +346,19 @@ impl BonsaiHgMapping for SqlBonsaiHgMapping {
             .increment_counter(PerfCounterType::SqlWrites);
 
         let BonsaiHgMappingEntry { hg_cs_id, bcs_id } = entry.clone();
-
+        let cri = ctx.client_request_info();
         if self.overwrite {
-            let result = ReplaceMapping::query(
+            let result = ReplaceMapping::maybe_traced_query(
                 &self.write_connection,
+                cri,
                 &[(&self.repo_id, &hg_cs_id, &bcs_id)],
             )
             .await?;
             Ok(result.affected_rows() >= 1)
         } else {
-            let result = InsertMapping::query(
+            let result = InsertMapping::maybe_traced_query(
                 &self.write_connection,
+                cri,
                 &[(&self.repo_id, &hg_cs_id, &bcs_id)],
             )
             .await?;
@@ -398,7 +381,7 @@ impl BonsaiHgMapping for SqlBonsaiHgMapping {
             .increment_counter(PerfCounterType::SqlReadsReplica);
         let (mut mappings, left_to_fetch) = select_mapping(
             ctx.fb,
-            ctx.metadata().client_request_info().cloned(),
+            ctx.client_request_info().cloned(),
             &self.read_connection,
             self.repo_id,
             ids,
@@ -414,7 +397,7 @@ impl BonsaiHgMapping for SqlBonsaiHgMapping {
             .increment_counter(PerfCounterType::SqlReadsMaster);
         let (mut master_mappings, _) = select_mapping(
             ctx.fb,
-            ctx.metadata().client_request_info().cloned(),
+            ctx.client_request_info().cloned(),
             &self.read_master_connection,
             self.repo_id,
             left_to_fetch,
@@ -437,10 +420,12 @@ impl BonsaiHgMapping for SqlBonsaiHgMapping {
         if low > high {
             return Ok(Vec::new());
         }
+        let cri = ctx.client_request_info();
         ctx.perf_counters()
             .increment_counter(PerfCounterType::SqlReadsReplica);
-        let rows = SelectHgChangesetsByRange::query(
+        let rows = SelectHgChangesetsByRange::maybe_traced_query(
             &self.read_connection.conn,
+            cri,
             &self.repo_id,
             &low.as_bytes(),
             &high.as_bytes(),
@@ -451,8 +436,9 @@ impl BonsaiHgMapping for SqlBonsaiHgMapping {
         if fetched.is_empty() {
             ctx.perf_counters()
                 .increment_counter(PerfCounterType::SqlReadsMaster);
-            let rows = SelectHgChangesetsByRange::query(
+            let rows = SelectHgChangesetsByRange::maybe_traced_query(
                 &self.read_master_connection.conn,
+                cri,
                 &self.repo_id,
                 &low.as_bytes(),
                 &high.as_bytes(),
@@ -476,8 +462,6 @@ async fn select_mapping(
         return Ok((vec![], cs_ids));
     }
 
-    let tok: i32 = rand::thread_rng().gen();
-
     let (found, missing): (Vec<_>, _) = match cs_ids {
         BonsaiOrHgChangesetIds::Bonsai(bcs_ids) => {
             let ret = connection
@@ -487,23 +471,17 @@ async fn select_mapping(
                     move |bcs_ids| async move {
                         let bcs_ids = bcs_ids.into_iter().collect::<Vec<_>>();
 
-                        let res = if let Some(cri) = cri {
-                            SelectMappingByBonsai::traced_query(
-                                &conn,
-                                &cri,
-                                &repo_id,
-                                &tok,
-                                &bcs_ids[..],
-                            )
-                            .await?
-                        } else {
-                            SelectMappingByBonsai::query(&conn, &repo_id, &tok, &bcs_ids[..])
-                                .await?
-                        };
+                        let res = SelectMappingByBonsai::maybe_traced_query(
+                            &conn,
+                            cri.as_ref(),
+                            &repo_id,
+                            &bcs_ids[..],
+                        )
+                        .await?;
 
                         Ok(res
                             .into_iter()
-                            .map(|(hg_cs_id, bcs_id, _)| (bcs_id, hg_cs_id))
+                            .map(|(hg_cs_id, bcs_id)| (bcs_id, hg_cs_id))
                             .collect())
                     }
                 })
@@ -530,13 +508,15 @@ async fn select_mapping(
                     let conn = connection.conn.clone();
                     move |hg_cs_ids| async move {
                         let hg_cs_ids = hg_cs_ids.into_iter().collect::<Vec<_>>();
-                        Ok(
-                            SelectMappingByHg::query(&conn, &repo_id, &tok, &hg_cs_ids[..])
-                                .await?
-                                .into_iter()
-                                .map(|(hg_cs_id, bcs_id, _)| (hg_cs_id, bcs_id))
-                                .collect(),
+                        Ok(SelectMappingByHg::maybe_traced_query(
+                            &conn,
+                            cri.as_ref(),
+                            &repo_id,
+                            &hg_cs_ids[..],
                         )
+                        .await?
+                        .into_iter()
+                        .collect())
                     }
                 })
                 .await?;

@@ -19,6 +19,7 @@ use changeset_fetcher::ChangesetFetcher;
 use changeset_fetcher::SimpleChangesetFetcher;
 use changesets::Changesets;
 use changesets::ChangesetsRef;
+use commit_cloud::CommitCloud;
 use commit_graph::CommitGraph;
 use context::CoreContext;
 use ephemeral_blobstore::Bubble;
@@ -118,6 +119,9 @@ pub struct BlobRepoInner {
 
     #[facet]
     pub repo_bookmark_attrs: RepoBookmarkAttrs,
+
+    #[facet]
+    pub commit_cloud: CommitCloud,
 }
 
 #[facet::container]
@@ -148,6 +152,7 @@ pub struct BlobRepo {
         dyn RepoPermissionChecker,
         dyn RepoLock,
         RepoBookmarkAttrs,
+        CommitCloud
     )]
     inner: Arc<BlobRepoInner>,
 }
@@ -201,7 +206,7 @@ impl AsBlobRepo for BlobRepo {
     }
 }
 
-/// This function uploads bonsai changests object to blobstore in parallel, and then does
+/// This function uploads bonsai changesets object to blobstore in parallel, and then does
 /// sequential writes to changesets table. Parents of the changesets should already by saved
 /// in the repository.
 pub async fn save_bonsai_changesets(

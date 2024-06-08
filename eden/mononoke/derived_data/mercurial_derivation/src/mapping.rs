@@ -6,14 +6,18 @@
  */
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use anyhow::anyhow;
 use anyhow::bail;
 use anyhow::Context;
-use anyhow::Error;
 use anyhow::Result;
 use async_trait::async_trait;
+use blobstore::BlobstoreBytes;
+use blobstore::BlobstoreGetData;
+use blobstore::StoreLoadable;
 use bonsai_hg_mapping::BonsaiHgMappingEntry;
+use bytes::Bytes;
 use context::CoreContext;
 use derived_data::batch::split_bonsais_in_linear_stacks;
 use derived_data::batch::FileConflicts;
@@ -25,6 +29,7 @@ use derived_data_manager::BonsaiDerivable;
 use derived_data_manager::DerivableType;
 use derived_data_manager::DerivationContext;
 use futures::future::try_join_all;
+use mercurial_types::HgAugmentedManifestId;
 use mercurial_types::HgChangesetId;
 use mononoke_types::BonsaiChangeset;
 use mononoke_types::ChangesetId;
@@ -36,7 +41,7 @@ define_stats! {
     new_parallel: timeseries(Rate, Sum),
 }
 
-use derived_data_service_if::types as thrift;
+use derived_data_service_if as thrift;
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct MappedHgChangesetId(HgChangesetId);
@@ -61,13 +66,14 @@ impl BonsaiDerivable for MappedHgChangesetId {
     const VARIANT: DerivableType = DerivableType::HgChangesets;
 
     type Dependencies = dependencies![];
+    type PredecessorDependencies = dependencies![];
 
     async fn derive_single(
         ctx: &CoreContext,
         derivation_ctx: &DerivationContext,
         bonsai: BonsaiChangeset,
         parents: Vec<Self>,
-    ) -> Result<Self, Error> {
+    ) -> Result<Self> {
         if bonsai.is_snapshot() {
             bail!("Can't derive Hg changeset for snapshot")
         }
@@ -86,7 +92,6 @@ impl BonsaiDerivable for MappedHgChangesetId {
         ctx: &CoreContext,
         derivation_ctx: &DerivationContext,
         bonsais: Vec<BonsaiChangeset>,
-        _gap_size: Option<usize>,
     ) -> Result<HashMap<ChangesetId, Self>> {
         if bonsais.is_empty() {
             return Ok(HashMap::new());
@@ -242,16 +247,165 @@ fn get_hg_changeset_derivation_options(
 
 impl_bonsai_derived_via_manager!(MappedHgChangesetId);
 
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct RootHgAugmentedManifestId(HgAugmentedManifestId);
+
+impl RootHgAugmentedManifestId {
+    pub fn hg_augmented_manifest_id(&self) -> HgAugmentedManifestId {
+        self.0
+    }
+}
+
+impl TryFrom<BlobstoreBytes> for RootHgAugmentedManifestId {
+    type Error = anyhow::Error;
+
+    fn try_from(blob: BlobstoreBytes) -> Result<Self> {
+        HgAugmentedManifestId::from_bytes(&blob.into_bytes()).map(Self)
+    }
+}
+
+impl TryFrom<BlobstoreGetData> for RootHgAugmentedManifestId {
+    type Error = anyhow::Error;
+
+    fn try_from(blob_get_data: BlobstoreGetData) -> Result<Self> {
+        blob_get_data.into_bytes().try_into()
+    }
+}
+
+impl From<RootHgAugmentedManifestId> for BlobstoreBytes {
+    fn from(root_hg_augmented_manifest_id: RootHgAugmentedManifestId) -> Self {
+        BlobstoreBytes::from_bytes(Bytes::copy_from_slice(
+            root_hg_augmented_manifest_id.0.as_bytes(),
+        ))
+    }
+}
+
+pub fn format_key(derivation_ctx: &DerivationContext, cs_id: ChangesetId) -> String {
+    let root_prefix = "derived_root_hgaugmentedmanifest.";
+    let key_prefix = derivation_ctx.mapping_key_prefix::<RootHgAugmentedManifestId>();
+    format!("{}{}{}", root_prefix, key_prefix, cs_id)
+}
+
+#[async_trait]
+impl BonsaiDerivable for RootHgAugmentedManifestId {
+    const VARIANT: DerivableType = DerivableType::HgAugmentedManifests;
+
+    type Dependencies = dependencies![MappedHgChangesetId];
+    type PredecessorDependencies = dependencies![MappedHgChangesetId];
+
+    async fn derive_single(
+        ctx: &CoreContext,
+        derivation_ctx: &DerivationContext,
+        bonsai: BonsaiChangeset,
+        parents: Vec<Self>,
+    ) -> Result<Self> {
+        let hg_changeset_id = derivation_ctx
+            .fetch_dependency::<MappedHgChangesetId>(ctx, bonsai.get_changeset_id())
+            .await?
+            .hg_changeset_id();
+        let hg_manifest_id = hg_changeset_id
+            .load(ctx, derivation_ctx.blobstore())
+            .await?
+            .manifestid();
+        let parents = parents
+            .into_iter()
+            .map(|parent| parent.hg_augmented_manifest_id())
+            .collect();
+        let root = crate::derive_hg_augmented_manifest::derive_from_hg_manifest_and_parents(
+            ctx,
+            derivation_ctx.blobstore(),
+            hg_manifest_id,
+            parents,
+        )
+        .await?;
+        Ok(Self(root))
+    }
+
+    async fn derive_from_predecessor(
+        ctx: &CoreContext,
+        derivation_ctx: &DerivationContext,
+        bonsai: BonsaiChangeset,
+    ) -> Result<Self> {
+        let hg_changeset_id = derivation_ctx
+            .fetch_dependency::<MappedHgChangesetId>(ctx, bonsai.get_changeset_id())
+            .await?
+            .hg_changeset_id();
+        let hg_manifest_id = hg_changeset_id
+            .load(ctx, derivation_ctx.blobstore())
+            .await?
+            .manifestid();
+        let root = crate::derive_hg_augmented_manifest::derive_from_full_hg_manifest(
+            ctx.clone(),
+            Arc::clone(derivation_ctx.blobstore()),
+            hg_manifest_id,
+        )
+        .await?;
+        Ok(Self(root))
+    }
+
+    async fn store_mapping(
+        self,
+        ctx: &CoreContext,
+        derivation_ctx: &DerivationContext,
+        changeset_id: ChangesetId,
+    ) -> Result<()> {
+        let key = format_key(derivation_ctx, changeset_id);
+        derivation_ctx
+            .blobstore()
+            .put(ctx, key, self.into())
+            .await?;
+        Ok(())
+    }
+
+    async fn fetch(
+        ctx: &CoreContext,
+        derivation_ctx: &DerivationContext,
+        changeset_id: ChangesetId,
+    ) -> Result<Option<Self>> {
+        let key = format_key(derivation_ctx, changeset_id);
+        Ok(derivation_ctx
+            .blobstore()
+            .get(ctx, &key)
+            .await?
+            .map(TryInto::try_into)
+            .transpose()?)
+    }
+
+    fn from_thrift(data: thrift::DerivedData) -> Result<Self> {
+        if let thrift::DerivedData::hg_augmented_manifest(
+            thrift::DerivedDataHgAugmentedManifest::root_hg_augmented_manifest_id(id),
+        ) = data
+        {
+            HgAugmentedManifestId::from_thrift(id).map(Self)
+        } else {
+            Err(anyhow!(
+                "Can't convert {} from provided thrift::DerivedData",
+                Self::NAME.to_string(),
+            ))
+        }
+    }
+
+    fn into_thrift(data: Self) -> Result<thrift::DerivedData> {
+        Ok(thrift::DerivedData::hg_augmented_manifest(
+            thrift::DerivedDataHgAugmentedManifest::root_hg_augmented_manifest_id(
+                data.0.into_thrift(),
+            ),
+        ))
+    }
+}
+
+impl_bonsai_derived_via_manager!(RootHgAugmentedManifestId);
+
 #[cfg(test)]
 mod test {
     use bonsai_hg_mapping::BonsaiHgMapping;
     use bookmarks::BookmarkKey;
     use bookmarks::Bookmarks;
     use borrowed::borrowed;
-    use changeset_fetcher::ChangesetFetcher;
     use changesets::Changesets;
     use cloned::cloned;
-    use derived_data_manager::BatchDeriveOptions;
+    use commit_graph::CommitGraph;
+    use commit_graph::CommitGraphRef;
     use fbinit::FacebookInit;
     use filestore::FilestoreConfig;
     use fixtures::BranchEven;
@@ -265,16 +419,12 @@ mod test {
     use fixtures::TestRepoFixture;
     use fixtures::UnsharedMergeEven;
     use fixtures::UnsharedMergeUneven;
-    use futures::compat::Stream01CompatExt;
     use futures::Future;
-    use futures::Stream;
-    use futures::TryFutureExt;
     use futures::TryStreamExt;
     use repo_blobstore::RepoBlobstore;
     use repo_derived_data::RepoDerivedData;
     use repo_derived_data::RepoDerivedDataRef;
     use repo_identity::RepoIdentity;
-    use revset::AncestorsNodeStream;
     use tests_utils::CreateCommitContext;
 
     use super::*;
@@ -294,36 +444,39 @@ mod test {
         #[facet]
         filestore_config: FilestoreConfig,
         #[facet]
-        changeset_fetcher: dyn ChangesetFetcher,
+        commit_graph: CommitGraph,
         #[facet]
         changesets: dyn Changesets,
         #[facet]
         repo_identity: RepoIdentity,
     }
 
-    fn all_commits_descendants_to_ancestors(
+    async fn all_commits_descendants_to_ancestors(
         ctx: CoreContext,
         repo: TestRepo,
-    ) -> impl Stream<Item = Result<(ChangesetId, HgChangesetId), Error>> {
+    ) -> Result<Vec<(ChangesetId, HgChangesetId)>> {
         let master_book = BookmarkKey::new("master").unwrap();
-        repo.bookmarks
+        let bcs_id = repo
+            .bookmarks
             .get(ctx.clone(), &master_book)
-            .map_ok(move |maybe_bcs_id| {
-                let bcs_id = maybe_bcs_id.unwrap();
-                AncestorsNodeStream::new(ctx.clone(), &repo.changeset_fetcher, bcs_id.clone())
-                    .compat()
-                    .and_then(move |new_bcs_id| {
-                        cloned!(ctx, repo);
-                        async move {
-                            let hg_cs_id = repo.derive_hg_changeset(&ctx, new_bcs_id).await?;
-                            Result::<_, Error>::Ok((new_bcs_id, hg_cs_id))
-                        }
-                    })
+            .await?
+            .ok_or_else(|| anyhow!("Missing master bookmark"))?;
+
+        repo.commit_graph()
+            .ancestors_difference_stream(&ctx, vec![bcs_id], vec![])
+            .await?
+            .and_then(move |new_bcs_id| {
+                cloned!(ctx, repo);
+                async move {
+                    let hg_cs_id = repo.derive_hg_changeset(&ctx, new_bcs_id).await?;
+                    Result::<_>::Ok((new_bcs_id, hg_cs_id))
+                }
             })
-            .try_flatten_stream()
+            .try_collect()
+            .await
     }
 
-    async fn verify_repo<F, Fut>(fb: FacebookInit, repo_func: F) -> Result<(), Error>
+    async fn verify_repo<F, Fut>(fb: FacebookInit, repo_func: F) -> Result<()>
     where
         F: Fn() -> Fut,
         Fut: Future<Output = TestRepo>,
@@ -333,13 +486,11 @@ mod test {
         println!("Processing {}", repo.repo_identity.name());
         borrowed!(ctx, repo);
 
-        let commits_desc_to_anc = all_commits_descendants_to_ancestors(ctx.clone(), repo.clone())
-            .try_collect::<Vec<_>>()
-            .await?;
+        let commits_desc_to_anc =
+            all_commits_descendants_to_ancestors(ctx.clone(), repo.clone()).await?;
 
         // Recreate repo from scratch and derive everything again
         let repo = repo_func().await;
-        let options = BatchDeriveOptions::Parallel { gap_size: None };
         let csids = commits_desc_to_anc
             .clone()
             .into_iter()
@@ -349,7 +500,7 @@ mod test {
         let manager = repo.repo_derived_data().manager();
 
         manager
-            .derive_exactly_batch::<MappedHgChangesetId>(ctx, csids.clone(), options, None)
+            .derive_exactly_batch::<MappedHgChangesetId>(ctx, csids.clone(), None)
             .await?;
         let batch_derived = manager
             .fetch_derived_batch::<MappedHgChangesetId>(ctx, csids, None)
@@ -364,7 +515,7 @@ mod test {
     }
 
     #[fbinit::test]
-    async fn test_batch_derive(fb: FacebookInit) -> Result<(), Error> {
+    async fn test_batch_derive(fb: FacebookInit) -> Result<()> {
         verify_repo(fb, || Linear::get_custom_test_repo::<TestRepo>(fb)).await?;
         verify_repo(fb, || BranchEven::get_custom_test_repo::<TestRepo>(fb)).await?;
         verify_repo(fb, || BranchUneven::get_custom_test_repo::<TestRepo>(fb)).await?;

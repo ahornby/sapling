@@ -9,41 +9,41 @@ import type {RepositoryError} from './types';
 import type {ReactNode} from 'react';
 import type {Writable} from 'shared/typeUtils';
 
-import {AccessGlobalRecoil} from './AccessGlobalRecoil';
 import {CommandHistoryAndProgress} from './CommandHistoryAndProgress';
 import {CommitInfoSidebar} from './CommitInfoView/CommitInfoView';
 import {CommitTreeList} from './CommitTreeList';
 import {ComparisonViewModal} from './ComparisonView/ComparisonViewModal';
-import {CwdSelections} from './CwdSelector';
+import {CwdSelections, availableCwds} from './CwdSelector';
 import {Drawers} from './Drawers';
 import {EmptyState} from './EmptyState';
 import {ErrorBoundary, ErrorNotice} from './ErrorNotice';
 import {ISLCommandContext, useCommand} from './ISLShortcuts';
 import {Internal} from './Internal';
-import {TooltipRootContainer} from './Tooltip';
+import {SuspenseBoundary} from './SuspenseBoundary';
 import {TopBar} from './TopBar';
 import {TopLevelAlerts} from './TopLevelAlert';
 import {TopLevelErrors} from './TopLevelErrors';
 import {TopLevelToast} from './TopLevelToast';
+import {ViewportOverlayRoot} from './ViewportOverlay';
 import {tracker} from './analytics';
+import {enableReactTools, enableReduxTools} from './atoms/debugToolAtoms';
+import {Button} from './components/Button';
 import {islDrawerState} from './drawerState';
 import {GettingStartedModal} from './gettingStarted/GettingStartedModal';
 import {I18nSupport, t, T} from './i18n';
 import {setJotaiStore} from './jotaiUtils';
 import platform from './platform';
-import {getEntangledAtomsInitializedState} from './recoilUtils';
 import {DEFAULT_RESET_CSS} from './resetStyle';
 import {useMainContentWidth, zoomUISettingAtom} from './responsive';
-import {applicationinfo, repositoryInfo} from './serverAPIState';
+import {repositoryInfo} from './serverAPIState';
 import {themeState} from './theme';
 import {light} from './tokens.stylex';
 import {ModalContainer} from './useModal';
-import {isTest} from './utils';
+import {usePromise} from './usePromise';
+import {isDev, isTest} from './utils';
 import * as stylex from '@stylexjs/stylex';
-import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
-import {Provider, useAtom, useAtomValue, useSetAtom, useStore} from 'jotai';
-import React from 'react';
-import {RecoilRoot, useRecoilValue} from 'recoil';
+import {Provider, atom, useAtomValue, useSetAtom, useStore} from 'jotai';
+import React, {useMemo} from 'react';
 import {ContextMenus} from 'shared/ContextMenu';
 import {Icon} from 'shared/Icon';
 import {useThrottledEffect} from 'shared/hooks';
@@ -55,24 +55,21 @@ export default function App() {
     <React.StrictMode>
       <ResetStyle />
       <I18nSupport>
-        <RecoilRoot initializeState={getEntangledAtomsInitializedState}>
-          <AccessGlobalRecoil />
-          <MaybeWithJotaiRoot>
-            <ISLRoot>
-              <ISLCommandContext>
-                <ErrorBoundary>
-                  <ISLDrawers />
-                  <TooltipRootContainer />
-                  <GettingStartedModal />
-                  <ComparisonViewModal />
-                  <ModalContainer />
-                  <ContextMenus />
-                  <TopLevelToast />
-                </ErrorBoundary>
-              </ISLCommandContext>
-            </ISLRoot>
-          </MaybeWithJotaiRoot>
-        </RecoilRoot>
+        <MaybeWithJotaiRoot>
+          <ISLRoot>
+            <ISLCommandContext>
+              <ErrorBoundary>
+                <NullStateOrDrawers />
+                <ViewportOverlayRoot />
+                <GettingStartedModal />
+                <ComparisonViewModal />
+                <ModalContainer />
+                <ContextMenus />
+                <TopLevelToast />
+              </ErrorBoundary>
+            </ISLCommandContext>
+          </ISLRoot>
+        </MaybeWithJotaiRoot>
       </I18nSupport>
     </React.StrictMode>
   );
@@ -88,10 +85,39 @@ function MaybeWithJotaiRoot({children}: {children: JSX.Element}) {
         {children}
       </Provider>
     );
+  } else if (isDev) {
+    return <MaybeJotaiDebugTools>{children}</MaybeJotaiDebugTools>;
   } else {
-    // Such scoped Provider or store complexity is not needed outside tests.
+    // Such scoped Provider or store complexity is not needed outside tests or dev.
     return children;
   }
+}
+
+const jotaiDevtools = import('./third-party/jotai-devtools/utils');
+
+function MaybeJotaiDebugTools({children}: {children: JSX.Element}) {
+  const enabledRedux = useAtomValue(enableReduxTools);
+  const enabledReact = useAtomValue(enableReactTools);
+  return enabledRedux || enabledReact ? (
+    <SuspenseBoundary>
+      {enabledRedux ? <AtomsDevtools>{children}</AtomsDevtools> : children}
+      {enabledReact && <DebugAtoms />}
+    </SuspenseBoundary>
+  ) : (
+    children
+  );
+}
+
+function AtomsDevtools({children}: {children: JSX.Element}) {
+  const {useAtomsDevtools} = usePromise(jotaiDevtools);
+  useAtomsDevtools('jotai');
+  return children;
+}
+
+function DebugAtoms() {
+  const {useAtomsDebugValue} = usePromise(jotaiDevtools);
+  useAtomsDebugValue();
+  return null;
 }
 
 function AccessJotaiRoot() {
@@ -128,6 +154,14 @@ function handleDragAndDrop(e: React.DragEvent<HTMLDivElement>) {
   }
 }
 
+function NullStateOrDrawers() {
+  const repoInfo = useAtomValue(repositoryInfo);
+  if (repoInfo != null && repoInfo.type !== 'success') {
+    return <ISLNullState repoError={repoInfo} />;
+  }
+  return <ISLDrawers />;
+}
+
 function ISLDrawers() {
   const setDrawerState = useSetAtom(islDrawerState);
   useCommand('ToggleSidebar', () => {
@@ -154,26 +188,19 @@ function ISLDrawers() {
 }
 
 function MainContent() {
-  const repoInfo = useRecoilValue(repositoryInfo);
-  useAtom(applicationinfo); // ensure this info is always fetched
-
   const ref = useMainContentWidth();
-
   return (
     <div className="main-content-area" ref={ref}>
       <TopBar />
       <TopLevelErrors />
       <TopLevelAlerts />
-      {repoInfo != null && repoInfo.type !== 'success' ? (
-        <ISLNullState repoError={repoInfo} />
-      ) : (
-        <CommitTreeList />
-      )}
+      <CommitTreeList />
     </div>
   );
 }
 
 function ISLNullState({repoError}: {repoError: RepositoryError}) {
+  const emptyCwds = useAtomValue(useMemo(() => atom(get => get(availableCwds).length === 0), []));
   useThrottledEffect(
     () => {
       if (repoError != null) {
@@ -199,49 +226,72 @@ function ISLNullState({repoError}: {repoError: RepositoryError}) {
   let content;
   if (repoError != null) {
     if (repoError.type === 'cwdNotARepository') {
-      content = (
-        <>
-          <EmptyState>
-            <div>
-              <T>Not a valid repository</T>
-            </div>
-            <p>
-              <T replace={{$cwd: <code>{repoError.cwd}</code>}}>
-                $cwd is not a valid Sapling repository. Clone or init a repository to use ISL.
-              </T>
-            </p>
-          </EmptyState>
-          <CwdSelections dismiss={() => null} />
-        </>
-      );
+      if (platform.platformName === 'vscode' && emptyCwds) {
+        content = (
+          <>
+            <EmptyState>
+              <div>
+                <T>No folder opened</T>
+              </div>
+              <p>
+                <T>Open a folder to get started.</T>
+              </p>
+            </EmptyState>
+          </>
+        );
+      } else {
+        content = (
+          <>
+            <EmptyState>
+              <div>
+                <T>Not a valid repository</T>
+              </div>
+              <p>
+                <T replace={{$cwd: <code>{repoError.cwd}</code>}}>
+                  $cwd is not a valid Sapling repository. Clone or init a repository to use ISL.
+                </T>
+              </p>
+            </EmptyState>
+            <CwdSelections dismiss={() => null} />
+          </>
+        );
+      }
     } else if (repoError.type === 'cwdDoesNotExist') {
       content = (
-        <ErrorNotice
-          title={
-            <T replace={{$cwd: repoError.cwd}}>
-              cwd $cwd does not exist. Make sure the folder exists.
-            </T>
-          }
-          error={
-            new Error(
-              t('$cwd not found', {
-                replace: {$cwd: repoError.cwd},
-              }),
-            )
-          }
-          buttons={[
-            <VSCodeButton
-              key="help-button"
-              appearance="secondary"
-              onClick={e => {
-                platform.openExternalLink('https://sapling-scm.com/docs/introduction/installation');
-                e.preventDefault();
-                e.stopPropagation();
-              }}>
-              <T>See installation docs</T>
-            </VSCodeButton>,
-          ]}
-        />
+        <>
+          {Internal.InternalInstallationDocs ? (
+            <Internal.InternalInstallationDocs repoError={repoError} />
+          ) : (
+            <ErrorNotice
+              title={
+                <T replace={{$cwd: repoError.cwd}}>
+                  cwd $cwd does not exist. Make sure the folder exists.
+                </T>
+              }
+              error={
+                new Error(
+                  t('$cwd not found', {
+                    replace: {$cwd: repoError.cwd},
+                  }),
+                )
+              }
+              buttons={[
+                <Button
+                  key="help-button"
+                  onClick={e => {
+                    platform.openExternalLink(
+                      'https://sapling-scm.com/docs/introduction/installation',
+                    );
+                    e.preventDefault();
+                    e.stopPropagation();
+                  }}>
+                  <T>See installation docs</T>
+                </Button>,
+              ]}
+            />
+          )}
+          <CwdSelections dismiss={() => null} />
+        </>
       );
     } else if (repoError.type === 'invalidCommand') {
       if (Internal.InvalidSlCommand) {
@@ -256,9 +306,8 @@ function ISLNullState({repoError}: {repoError: RepositoryError}) {
             }
             details={<T replace={{$path: repoError.path ?? '(no path found)'}}>PATH: $path'</T>}
             buttons={[
-              <VSCodeButton
+              <Button
                 key="help-button"
-                appearance="secondary"
                 onClick={e => {
                   platform.openExternalLink(
                     'https://sapling-scm.com/docs/introduction/installation',
@@ -267,7 +316,7 @@ function ISLNullState({repoError}: {repoError: RepositoryError}) {
                   e.stopPropagation();
                 }}>
                 <T>See installation docs</T>
-              </VSCodeButton>,
+              </Button>,
             ]}
           />
         );

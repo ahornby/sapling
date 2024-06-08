@@ -16,18 +16,20 @@ import {
   parseCommitMessageFields,
 } from './CommitInfoView/CommitMessageFields';
 import {Tooltip} from './Tooltip';
+import {Button} from './components/Button';
 import {T, t} from './i18n';
+import {readAtom, writeAtom} from './jotaiUtils';
 import {
   FOLD_COMMIT_PREVIEW_HASH_PREFIX,
   FoldOperation,
   getFoldRangeCommitHash,
 } from './operations/FoldOperation';
+import {operationBeingPreviewed, useRunPreviewedOperation} from './operationsState';
 import {type Dag, dagWithPreviews} from './previews';
 import {selectedCommits} from './selection';
-import {operationBeingPreviewed, useRunPreviewedOperation} from './serverAPIState';
 import {firstOfIterable} from './utils';
-import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
-import {type Snapshot, selector, useRecoilCallback, useRecoilValue} from 'recoil';
+import {atom, useAtomValue} from 'jotai';
+import {useCallback} from 'react';
 import {Icon} from 'shared/Icon';
 
 /**
@@ -35,17 +37,14 @@ import {Icon} from 'shared/Icon';
  * This selector gives the range of commits that can be folded, if any,
  * so a button may be shown to do the fold.
  */
-export const foldableSelection = selector<Array<CommitInfo> | undefined>({
-  key: 'foldableSelection',
-  get: ({get}) => {
-    const selection = get(selectedCommits);
-    if (selection.size < 2) {
-      return undefined;
-    }
-    const dag = get(dagWithPreviews);
-    const foldable = getFoldableRange(selection, dag);
-    return foldable;
-  },
+export const foldableSelection = atom(get => {
+  const selection = get(selectedCommits);
+  if (selection.size < 2) {
+    return undefined;
+  }
+  const dag = get(dagWithPreviews);
+  const foldable = getFoldableRange(selection, dag);
+  return foldable;
 });
 
 /**
@@ -74,12 +73,12 @@ export function getFoldableRange(selection: Set<Hash>, dag: Dag): Array<CommitIn
 }
 
 export function FoldButton({commit}: {commit?: CommitInfo}) {
-  const foldable = useRecoilValue(foldableSelection);
-  const onClick = useRecoilCallback(({set, snapshot}) => () => {
+  const foldable = useAtomValue(foldableSelection);
+  const onClick = useCallback(() => {
     if (foldable == null) {
       return;
     }
-    const schema = snapshot.getLoadable(commitMessageFieldsSchema).valueMaybe();
+    const schema = readAtom(commitMessageFieldsSchema);
     if (schema == null) {
       return;
     }
@@ -88,18 +87,18 @@ export function FoldButton({commit}: {commit?: CommitInfo}) {
       foldable.map(commit => parseCommitMessageFields(schema, commit.title, commit.description)),
     );
     const message = commitMessageFieldsToString(schema, messageFields);
-    set(operationBeingPreviewed, new FoldOperation(foldable, message));
-    set(selectedCommits, new Set([getFoldRangeCommitHash(foldable, /* isPreview */ true)]));
-  });
+    writeAtom(operationBeingPreviewed, new FoldOperation(foldable, message));
+    writeAtom(selectedCommits, new Set([getFoldRangeCommitHash(foldable, /* isPreview */ true)]));
+  }, [foldable]);
   if (foldable == null || (commit != null && foldable?.[0]?.hash !== commit.hash)) {
     return null;
   }
   return (
     <Tooltip title={t('Combine selected commits into one commit')}>
-      <VSCodeButton appearance="secondary" onClick={onClick}>
+      <Button onClick={onClick}>
         <Icon icon="fold" slot="start" />
         <T replace={{$count: foldable.length}}>Combine $count commits</T>
-      </VSCodeButton>
+      </Button>
     </Tooltip>
   );
 }
@@ -108,26 +107,21 @@ export function FoldButton({commit}: {commit?: CommitInfo}) {
  * Make a new copy of the FoldOperation with the latest edited message for the combined preview.
  * This allows running the fold operation to use the newly typed message.
  */
-export function updateFoldedMessageWithEditedMessage(
-  snapshot: Snapshot,
-): FoldOperation | undefined {
-  const beingPreviewed = snapshot.getLoadable(operationBeingPreviewed).valueMaybe();
+export function updateFoldedMessageWithEditedMessage(): FoldOperation | undefined {
+  const beingPreviewed = readAtom(operationBeingPreviewed);
   if (beingPreviewed != null && beingPreviewed instanceof FoldOperation) {
     const range = beingPreviewed.getFoldRange();
     const combinedHash = getFoldRangeCommitHash(range, /* isPreview */ true);
     const [existingTitle, existingMessage] = beingPreviewed.getFoldedMessage();
-    const editedMessage = snapshot.getLoadable(editedCommitMessages(combinedHash)).valueMaybe();
+    const editedMessage = readAtom(editedCommitMessages(combinedHash));
 
-    const schema = snapshot.getLoadable(commitMessageFieldsSchema).valueMaybe();
+    const schema = readAtom(commitMessageFieldsSchema);
     if (schema == null) {
       return undefined;
     }
 
     const old = parseCommitMessageFields(schema, existingTitle, existingMessage);
-    const message =
-      editedMessage == null || editedMessage.type === 'optimistic'
-        ? old
-        : applyEditedFields(old, editedMessage.fields);
+    const message = editedMessage == null ? old : applyEditedFields(old, editedMessage);
 
     const newMessage = commitMessageFieldsToString(schema, message);
 
@@ -137,19 +131,19 @@ export function updateFoldedMessageWithEditedMessage(
 
 export function useRunFoldPreview(): [cancel: () => unknown, run: () => unknown] {
   const handlePreviewedOperation = useRunPreviewedOperation();
-  const run = useRecoilCallback(({snapshot, set}) => () => {
-    const foldOperation = updateFoldedMessageWithEditedMessage(snapshot);
+  const run = useCallback(() => {
+    const foldOperation = updateFoldedMessageWithEditedMessage();
     if (foldOperation == null) {
       return;
     }
     handlePreviewedOperation(/* isCancel */ false, foldOperation);
     // select the optimistic commit instead of the preview commit
-    set(selectedCommits, last =>
+    writeAtom(selectedCommits, last =>
       last.size === 1 && firstOfIterable(last.values())?.startsWith(FOLD_COMMIT_PREVIEW_HASH_PREFIX)
         ? new Set([getFoldRangeCommitHash(foldOperation.getFoldRange(), /* isPreview */ false)])
         : last,
     );
-  });
+  }, [handlePreviewedOperation]);
   return [
     () => {
       handlePreviewedOperation(/* isCancel */ true);

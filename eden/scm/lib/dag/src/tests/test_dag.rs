@@ -5,6 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -87,7 +88,7 @@ impl TestDag {
             iter.try_collect::<Vec<_>>().await.unwrap()
         };
         let heads =
-            VertexListWithOptions::from(non_master_heads).with_highest_group(Group::NON_MASTER);
+            VertexListWithOptions::from(non_master_heads).with_desired_group(Group::NON_MASTER);
         client
             .dag
             .add_heads_and_flush(&server.dag.dag_snapshot().unwrap(), &heads)
@@ -177,7 +178,7 @@ impl TestDag {
             .collect::<Vec<_>>();
         let need_flush = !master_heads.is_empty();
         if need_flush {
-            let heads = VertexListWithOptions::from(master_heads).with_highest_group(Group::MASTER);
+            let heads = VertexListWithOptions::from(master_heads).with_desired_group(Group::MASTER);
             self.dag.flush(&heads).await.unwrap();
         }
         if validate {
@@ -186,13 +187,31 @@ impl TestDag {
         assert_eq!(self.dag.check_segments().await.unwrap(), [] as [String; 0]);
     }
 
+    /// Add one vertex to the non-master group. `parents` is split by whitespaces.
+    pub async fn add_one_vertex(&mut self, name: &str, parents: &str) {
+        let name = Vertex::copy_from(name.as_bytes());
+        let parents: Vec<Vertex> = parents
+            .split_whitespace()
+            .map(|s| Vertex::copy_from(s.as_bytes()))
+            .collect();
+        let heads =
+            VertexListWithOptions::from(&[name.clone()][..]).with_desired_group(Group::NON_MASTER);
+        self.dag
+            .add_heads(
+                &std::iter::once((name, parents)).collect::<HashMap<Vertex, Vec<Vertex>>>(),
+                &heads,
+            )
+            .await
+            .unwrap();
+    }
+
     /// Flush space-separated master heads.
     pub async fn flush(&mut self, master_heads: &str) {
         let heads: Vec<Vertex> = master_heads
             .split_whitespace()
             .map(|v| Vertex::copy_from(v.as_bytes()))
             .collect();
-        let heads = VertexListWithOptions::from(heads).with_highest_group(Group::MASTER);
+        let heads = VertexListWithOptions::from(heads).with_desired_group(Group::MASTER);
         self.dag.flush(&heads).await.unwrap();
     }
 
@@ -489,5 +508,5 @@ impl From<Set> for VertexListWithOptions {
 fn to_head_opts(set: Set) -> VertexListWithOptions {
     use crate::nameset::SyncNameSetQuery;
     let heads_vec = set.iter().unwrap().collect::<Result<Vec<_>>>().unwrap();
-    VertexListWithOptions::from(heads_vec).with_highest_group(Group::MASTER)
+    VertexListWithOptions::from(heads_vec).with_desired_group(Group::MASTER)
 }

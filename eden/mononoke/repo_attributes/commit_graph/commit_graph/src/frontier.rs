@@ -5,17 +5,26 @@
  * GNU General Public License version 2.
  */
 
+use std::collections::HashMap;
+
 use anyhow::anyhow;
 use anyhow::Result;
 use borrowed::borrowed;
 use commit_graph_types::edges::ChangesetNode;
 use commit_graph_types::frontier::ChangesetFrontier;
+use commit_graph_types::frontier::ChangesetFrontierWithinDistance;
 use commit_graph_types::storage::Prefetch;
+use commit_graph_types::storage::PrefetchEdge;
+use commit_graph_types::storage::PrefetchTarget;
 use context::CoreContext;
 use futures::future;
+use futures::stream;
 use futures::Future;
+use futures::StreamExt;
+use futures::TryStreamExt;
 use mononoke_types::ChangesetId;
 use mononoke_types::Generation;
+use mononoke_types::FIRST_GENERATION;
 
 use crate::CommitGraph;
 
@@ -58,6 +67,45 @@ impl CommitGraph {
             .collect::<Result<_>>()
     }
 
+    /// Obtain a frontier of changesets from a list of changeset ids. This frontier
+    /// enforces that at any point all changesets inside of it will be reachable
+    /// from the original list of changesets by traversing no more than `distance`
+    /// edges.
+    pub(crate) async fn frontier_within_distance(
+        &self,
+        ctx: &CoreContext,
+        cs_ids: Vec<ChangesetId>,
+        distance: u64,
+    ) -> Result<ChangesetFrontierWithinDistance> {
+        let all_edges = self
+            .storage
+            .fetch_many_edges(
+                ctx,
+                &cs_ids,
+                Prefetch::Hint(PrefetchTarget {
+                    edge: PrefetchEdge::FirstParent,
+                    generation: FIRST_GENERATION,
+                    steps: distance + 1,
+                }),
+            )
+            .await?;
+
+        cs_ids
+            .into_iter()
+            .map(|cs_id| {
+                Ok((
+                    cs_id,
+                    all_edges
+                        .get(&cs_id)
+                        .ok_or_else(|| anyhow!("Missing changeset in commit graph: {}", cs_id))?
+                        .node
+                        .generation,
+                    distance,
+                ))
+            })
+            .collect::<Result<_>>()
+    }
+
     /// Pops the highest generation changesets of a frontier, returning any that
     /// satisify a property and lowering the rest of them to either their immediate
     /// parents or their lowest skip tree edge that doesn't satisfy the property.
@@ -85,19 +133,33 @@ impl CommitGraph {
                     .fetch_many_edges(ctx, &cs_ids, prefetch)
                     .await?;
 
+                let property_map = stream::iter(frontier_edges.clone())
+                    .map(|(cs_id, edges)| {
+                        borrowed!(property);
+                        async move { anyhow::Ok((cs_id, property(edges.node).await?)) }
+                    })
+                    .buffered(100)
+                    .try_collect::<HashMap<_, _>>()
+                    .await?;
+
                 let mut property_frontier: Vec<_> = Default::default();
 
-                for (_, edges) in frontier_edges {
-                    if property(edges.node).await? {
+                for (cs_id, edges) in frontier_edges {
+                    if *property_map.get(&cs_id).ok_or_else(|| {
+                        anyhow!(
+                            "Missing changeset id {} from property_map (in ancestors_frontier)",
+                            cs_id
+                        )
+                    })? {
                         property_frontier.push(edges.node.cs_id);
                     } else {
-                        match edges
+                        let lowest_ancestor = edges
                             .lowest_skip_tree_edge_with(|node| {
                                 borrowed!(property);
                                 async move { Ok(!property(node).await?) }
                             })
-                            .await?
-                        {
+                            .await?;
+                        match lowest_ancestor {
                             Some(ancestor) => {
                                 frontier
                                     .entry(ancestor.generation)

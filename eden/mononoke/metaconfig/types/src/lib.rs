@@ -22,15 +22,18 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::anyhow;
+use anyhow::Context;
 use anyhow::Error;
 use anyhow::Result;
 use ascii::AsciiString;
 use bookmarks_types::BookmarkKey;
 use derive_more::From;
 use derive_more::Into;
+use mononoke_types::hash::GitSha1;
 use mononoke_types::path::MPath;
 use mononoke_types::BonsaiChangeset;
 use mononoke_types::ChangesetId;
+use mononoke_types::DerivableType;
 use mononoke_types::NonRootMPath;
 use mononoke_types::PrefixTrie;
 use mononoke_types::RepositoryId;
@@ -129,6 +132,11 @@ pub struct CommonConfig {
     pub redaction_config: RedactionConfig,
     /// Service identity for interal Mononoke services.
     pub internal_identity: Identity,
+    /// Upper bound in bytes for the RSS memory that can be utilized by Mononoke GRit
+    /// server for serving packfile stream
+    pub git_memory_upper_bound: Option<u64>,
+    /// Scuba table to dump edenapi requests to (for replay).
+    pub edenapi_dumper_scuba_table: Option<String>,
 }
 
 /// Configuration for logging of censored blobstore accesses
@@ -230,6 +238,12 @@ pub struct RepoConfig {
     pub deep_sharding_config: Option<ShardingModeConfig>,
     /// Local directory to write files to instead of uploading to everstore
     pub everstore_local_path: Option<String>,
+    /// The concurrency setting to be used during git protocol for this repo
+    pub git_concurrency: Option<GitConcurrencyParams>,
+    /// Configuration for the repo metadata logger
+    pub metadata_logger_config: MetadataLoggerConfig,
+    /// Configuration for connecting to Zelos
+    pub zelos_config: Option<ZelosConfig>,
 }
 
 /// Config determining if the repo is deep sharded in the context of a service.
@@ -243,7 +257,7 @@ pub struct ShardingModeConfig {
 #[derive(Eq, Clone, Debug, PartialEq, Hash)]
 pub enum ShardedService {
     /// Eden / Mononoke Service
-    EdenApi,
+    SaplingRemoteApi,
     /// Source Control Service
     SourceControlService,
     /// Derived Data Service
@@ -270,6 +284,10 @@ pub enum ShardedService {
     AliasVerify,
     /// Draft Commit Deletion,
     DraftCommitDeletion,
+    /// Mononoke Git Server
+    MononokeGitServer,
+    /// Repo Metadata Logger,
+    RepoMetadataLogger,
 }
 
 /// Indicates types of commit hashes used in a repo context.
@@ -307,7 +325,7 @@ pub struct DerivedDataConfig {
     /// Name of scuba table where all derivation will be logged to
     pub scuba_table: Option<String>,
 
-    /// Name of of configuration for enabled derived data types.
+    /// Name of configuration for enabled derived data types.
     pub enabled_config_name: String,
 
     /// All available configs for derived data types
@@ -316,25 +334,34 @@ pub struct DerivedDataConfig {
 
 impl DerivedDataConfig {
     /// Returns whether the named derived data type is enabled.
-    pub fn is_enabled(&self, name: &str) -> bool {
+    pub fn is_enabled(&self, derivable_type: DerivableType) -> bool {
         if let Some(config) = self.available_configs.get(&self.enabled_config_name) {
-            config.types.contains(name)
+            config.types.contains(&derivable_type)
         } else {
             false
         }
     }
 
     /// Return whether the named derived data type is enabled in named config
-    pub fn is_enabled_for_config_name(&self, name: &str, config_name: &str) -> bool {
+    pub fn is_enabled_for_config_name(
+        &self,
+        derivable_type: DerivableType,
+        config_name: &str,
+    ) -> bool {
         if let Some(config) = self.available_configs.get(config_name) {
-            config.types.contains(name)
+            config.types.contains(&derivable_type)
         } else {
             false
         }
     }
 
+    /// Returns active DerivedDataTypesConfig
+    pub fn get_active_config(&self) -> Option<&DerivedDataTypesConfig> {
+        self.available_configs.get(&self.enabled_config_name)
+    }
+
     /// Returns mutable ref to active DerivedDataTypesConfig
-    pub fn get_active_config(&mut self) -> Option<&mut DerivedDataTypesConfig> {
+    pub fn get_active_config_mut(&mut self) -> Option<&mut DerivedDataTypesConfig> {
         self.available_configs.get_mut(&self.enabled_config_name)
     }
 
@@ -348,7 +375,7 @@ impl DerivedDataConfig {
 #[derive(Eq, Clone, Default, Debug, PartialEq)]
 pub struct DerivedDataTypesConfig {
     /// The configured types.
-    pub types: HashSet<String>,
+    pub types: HashSet<DerivableType>,
 
     /// Key prefixes for mappings.  These are used to generate unique
     /// mapping keys when rederiving existing derived data types.
@@ -358,7 +385,7 @@ pub struct DerivedDataTypesConfig {
     ///
     /// The prefix is applied to the commit hash part of the key, i.e.
     /// `derived_root_fsnode.HASH` becomes `derived_root_fsnode.PREFIXHASH`.
-    pub mapping_key_prefixes: HashMap<String, String>,
+    pub mapping_key_prefixes: HashMap<DerivableType, String>,
 
     /// What unode version should be used.
     pub unode_version: UnodeVersion,
@@ -373,6 +400,9 @@ pub struct DerivedDataTypesConfig {
 
     /// What blame version should be used.
     pub blame_version: BlameVersion,
+
+    /// What `GitDeltaManifest` version should be used.
+    pub git_delta_manifest_version: GitDeltaManifestVersion,
 }
 
 /// What type of unode derived data to generate
@@ -389,6 +419,14 @@ pub enum BlameVersion {
     /// Blame v2
     #[default]
     V2,
+}
+
+/// What `GitDeltaManifest` version should be used.
+#[derive(Eq, Clone, Copy, Debug, Default, PartialEq)]
+pub enum GitDeltaManifestVersion {
+    /// GitDeltaManifest v1
+    #[default]
+    V1,
 }
 
 impl RepoConfig {
@@ -596,6 +634,17 @@ pub struct HookConfig {
     pub int_lists: HashMap<String, Vec<i32>>,
     /// Map of config to it's value. Values here are lists of 64bit integers
     pub int_64_lists: HashMap<String, Vec<i64>>,
+}
+
+impl HookConfig {
+    /// Parse hook config options into a deserializable struct.
+    pub fn parse_options<'a, T: serde::Deserialize<'a>>(&'a self) -> Result<T> {
+        let options = self
+            .options
+            .as_ref()
+            .ok_or_else(|| anyhow!("Missing hook options"))?;
+        serde_json::from_str(options).context("Invalid hook config")
+    }
 }
 
 /// Configuration for a hook
@@ -921,10 +970,6 @@ pub enum BlobConfig {
     },
     /// Store in an AWS S3 bucket
     AwsS3 {
-        /// AWS Account ID
-        aws_account_id: String,
-        /// AWS Role
-        aws_role: String,
         /// Bucket to connect to
         bucket: String,
         /// AWS Region
@@ -997,8 +1042,6 @@ pub struct OssRemoteDatabaseConfig {
     pub port: i16,
     /// Name of the database
     pub database: String,
-    /// Keychain group where user and password are stored
-    pub secret_group: String,
     /// Name of the user secret
     pub user_secret: String,
     /// Name of the password secret
@@ -1068,6 +1111,8 @@ pub struct RemoteMetadataDatabaseConfig {
     pub bonsai_blob_mapping: Option<ShardableRemoteDatabaseConfig>,
     /// Database for deletion log
     pub deletion_log: Option<RemoteDatabaseConfig>,
+    /// Database for commit cloud info
+    pub commit_cloud: Option<RemoteDatabaseConfig>,
 }
 
 /// Configuration for the Metadata database when it is remote.
@@ -1224,13 +1269,62 @@ pub enum DefaultSmallToLargeCommitSyncPathAction {
 /// the changesets before being synced.
 /// Since this is used in the small repo config, defininig a struct to set the
 /// default to true, to avoid accidentally syncing git submodules to large repos.
-#[derive(Debug, Clone, Eq, PartialEq, Default)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
 pub enum GitSubmodulesChangesAction {
     /// Sync all changes made to git submodules without alterations.
     Keep,
     /// Strip any changes made to git submodules from the synced bonsai.
     #[default]
     Strip,
+    /// Expand any submodule file change into multiple file changes that
+    /// achieve the same working copy. i.e. Copy the contents of the submodule
+    /// repo into the synced version of the source repo in the target repo.
+    /// This requires the `submodule_dependencies` field to be properly set
+    /// in the small repo's sync config.
+    Expand,
+}
+
+/// Default prefix for git submodule metadata files
+pub const DEFAULT_GIT_SUBMODULE_METADATA_FILE_PREFIX: &str = "x-repo-submodule";
+
+/// Stores all the information related to git submodules in a small repo,
+/// e.g. how to handle them and what other repos the small repo might depend on
+/// to expand submodule file changes.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct SmallRepoGitSubmoduleConfig {
+    /// Whether any changes made to git submodules should be stripped from
+    /// the changesets before being synced.
+    pub git_submodules_action: GitSubmodulesChangesAction,
+    /// Map from submodule path in the small repo to the ID of the submodule's
+    /// repository in Mononoke.
+    /// These repos have to be loaded with the small repo before syncing starts,
+    /// as file changes from the submodule dependencies might need to be copied.
+    pub submodule_dependencies: HashMap<NonRootMPath, RepositoryId>,
+    /// Each submodule expansion in the large repo will have a metadata file
+    /// named "<PREFIX><SUBMODULE_PATH>", e.g. ".x-repo-submodule-voip".
+    /// This file will store the git commit that the expansion corresponds to.
+    pub submodule_metadata_file_prefix: String,
+
+    /// List git commit hashes that are known dangling submodule pointers in the
+    /// repo's history, i.e. don't actually exist in the submodule repo it's
+    /// supposed to point to.
+    /// This can happen after non-fast-forward pushes or accidentally pushing
+    /// commits with local submodule pointers.
+    ///
+    /// The expansion of these commits will contain a single text file informing
+    /// that the expansion belongs to a dangling submodule pointer.
+    pub dangling_submodule_pointers: Vec<GitSha1>,
+}
+
+impl Default for SmallRepoGitSubmoduleConfig {
+    fn default() -> Self {
+        Self {
+            git_submodules_action: GitSubmodulesChangesAction::default(),
+            submodule_dependencies: HashMap::new(),
+            submodule_metadata_file_prefix: DEFAULT_GIT_SUBMODULE_METADATA_FILE_PREFIX.to_string(),
+            dangling_submodule_pointers: Vec::new(),
+        }
+    }
 }
 
 /// Commit sync configuration for a small repo
@@ -1243,9 +1337,8 @@ pub struct SmallRepoCommitSyncConfig {
     pub default_action: DefaultSmallToLargeCommitSyncPathAction,
     /// A map of prefix replacements when syncing
     pub map: HashMap<NonRootMPath, NonRootMPath>,
-    /// Whether any changes made to git submodules should be stripped from
-    /// the changesets before being synced.
-    pub git_submodules_action: GitSubmodulesChangesAction,
+    /// All information related to git submodules
+    pub submodule_config: SmallRepoGitSubmoduleConfig,
 }
 
 /// Commit sync direction
@@ -1804,4 +1897,49 @@ pub struct CommitGraphConfig {
     pub scuba_table: Option<String>,
     /// Blobstore key for a preloaded commit graph
     pub preloaded_commit_graph_blobstore_key: Option<String>,
+}
+
+/// Configuration for the repo metadata logger
+#[derive(Debug, Default, Clone, Eq, PartialEq)]
+pub struct MetadataLoggerConfig {
+    /// Bookmarks to log repo metadata for
+    pub bookmarks: Vec<BookmarkKey>,
+    /// The interval time in secs for which the repo metadata logger sleeps between
+    /// successive iterations of its incremental mode execution
+    pub sleep_interval_secs: u64,
+}
+
+/// Configuration for connecting to Zelos
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum ZelosConfig {
+    /// Connect to a local Zelos server
+    Local {
+        /// Local Zelos server port
+        port: u16,
+    },
+    /// Connect to a remote Zelos server
+    Remote {
+        /// Remote Zelos server tier name
+        tier: String,
+    },
+}
+
+/// Information on a loaded config
+#[derive(Debug, Default, Clone, Eq, PartialEq)]
+pub struct ConfigInfo {
+    /// A hash of the raw config content
+    pub content_hash: String,
+    /// The time when the config was last updated
+    pub last_updated_at: u64,
+}
+
+/// The concurrency setting to be used during git protocol
+#[derive(Debug, Default, Clone, Eq, PartialEq)]
+pub struct GitConcurrencyParams {
+    /// The concurrency value for tree and blob fetches
+    pub trees_and_blobs: usize,
+    /// The concurrency value for commit fetches
+    pub commits: usize,
+    /// The concurrency value for tag fetches
+    pub tags: usize,
 }

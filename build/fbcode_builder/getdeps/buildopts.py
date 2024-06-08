@@ -3,6 +3,8 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+# pyre-unsafe
+
 import errno
 import glob
 import ntpath
@@ -338,14 +340,17 @@ class BuildOptions(object):
     ) -> bool:  # noqa: C901
         bindir = os.path.join(d, "bin")
         found = False
+        has_pkgconfig = False
         pkgconfig = os.path.join(d, "lib", "pkgconfig")
         if os.path.exists(pkgconfig):
             found = True
+            has_pkgconfig = True
             add_path_entry(env, "PKG_CONFIG_PATH", pkgconfig, append=append)
 
         pkgconfig = os.path.join(d, "lib64", "pkgconfig")
         if os.path.exists(pkgconfig):
             found = True
+            has_pkgconfig = True
             add_path_entry(env, "PKG_CONFIG_PATH", pkgconfig, append=append)
 
         add_path_entry(env, "CMAKE_PREFIX_PATH", d, append=append)
@@ -367,6 +372,20 @@ class BuildOptions(object):
                 add_flag(env, "CPPFLAGS", f"-I{ncursesincludedir}", append=append)
             elif "/bz2-" in d:
                 add_flag(env, "CPPFLAGS", f"-I{includedir}", append=append)
+            # For non-pkgconfig projects Cabal has no way to find the includes or
+            # libraries, so we provide a set of extra Cabal flags in the env
+            if not has_pkgconfig:
+                add_flag(
+                    env,
+                    "GETDEPS_CABAL_FLAGS",
+                    f"--extra-include-dirs={includedir}",
+                    append=append,
+                )
+
+            # The thrift compiler's built-in includes are installed directly to the include dir
+            includethriftdir = os.path.join(d, "include", "thrift")
+            if os.path.exists(includethriftdir):
+                add_path_entry(env, "THRIFT_INCLUDE_PATH", includedir, append=append)
 
         # Map from FB python manifests to PYTHONPATH
         pydir = os.path.join(d, "lib", "fb-py-libs")
@@ -400,6 +419,13 @@ class BuildOptions(object):
                         add_flag(env, "LDFLAGS", f"-L{libdir}", append=append)
                     if add_library_path:
                         add_path_entry(env, "LIBRARY_PATH", libdir, append=append)
+                    if not has_pkgconfig:
+                        add_flag(
+                            env,
+                            "GETDEPS_CABAL_FLAGS",
+                            f"--extra-lib-dirs={libdir}",
+                            append=append,
+                        )
 
         # Allow resolving binaries (eg: cmake, ninja) and dlls
         # built by earlier steps

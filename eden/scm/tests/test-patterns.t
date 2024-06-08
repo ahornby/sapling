@@ -1,5 +1,4 @@
-#require no-windows
-#debugruntest-compatible
+#require no-windows no-eden
 
   $ eagerepo
 Explore the semi-mysterious matchmod.match API

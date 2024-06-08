@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 
 This is needed to avoid treemanifestserver extension "leaking" into client repos.
 #inprocess-hg-incompatible
@@ -42,7 +44,7 @@ Add drafts:
   > master   desc(B)
   > EOS
 
-Prepare another test case backed by a server repo that speaks EdenAPI
+Prepare another test case backed by a server repo that speaks SaplingRemoteAPI
 
   $ newremoterepo
   $ setconfig paths.default=test:e

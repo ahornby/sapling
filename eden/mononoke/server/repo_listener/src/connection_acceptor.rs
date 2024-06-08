@@ -22,7 +22,7 @@ use anyhow::Result;
 use bytes::Bytes;
 use cached_config::ConfigStore;
 use connection_security_checker::ConnectionSecurityChecker;
-use edenapi_service::EdenApi;
+use edenapi_service::SaplingRemoteApi;
 use failure_ext::SlogKVError;
 use fbinit::FacebookInit;
 use futures::channel::mpsc;
@@ -45,6 +45,7 @@ use metaconfig_types::CommonConfig;
 use metadata::Metadata;
 use mononoke_api::Mononoke;
 use mononoke_app::fb303::ReadyFlagService;
+use mononoke_configs::MononokeConfigs;
 use openssl::ssl::Ssl;
 use openssl::ssl::SslAcceptor;
 use permission_checker::AclProvider;
@@ -110,6 +111,7 @@ pub async fn wait_for_connections_closed(logger: &Logger) {
 
 pub async fn connection_acceptor(
     fb: FacebookInit,
+    configs: Arc<MononokeConfigs>,
     common_config: CommonConfig,
     sockname: String,
     service: ReadyFlagService,
@@ -119,7 +121,7 @@ pub async fn connection_acceptor(
     terminate_process: oneshot::Receiver<()>,
     rate_limiter: Option<RateLimitEnvironment>,
     scribe: Scribe,
-    edenapi: EdenApi,
+    edenapi: SaplingRemoteApi,
     will_exit: Arc<AtomicBool>,
     config_store: &ConfigStore,
     cslb_config: Option<String>,
@@ -175,6 +177,7 @@ pub async fn connection_acceptor(
         config_store: config_store.clone(),
         qps,
         wireproto_scuba,
+        configs,
         common_config,
         readonly,
     });
@@ -208,13 +211,14 @@ pub struct Acceptor {
     pub rate_limiter: Option<RateLimitEnvironment>,
     pub scribe: Scribe,
     pub logger: Logger,
-    pub edenapi: EdenApi,
+    pub edenapi: SaplingRemoteApi,
     pub enable_http_control_api: bool,
     pub server_hostname: String,
     pub will_exit: Arc<AtomicBool>,
     pub config_store: ConfigStore,
     pub qps: Option<Arc<Qps>>,
     pub wireproto_scuba: MononokeScubaSampleBuilder,
+    pub configs: Arc<MononokeConfigs>,
     pub common_config: CommonConfig,
     pub readonly: bool,
 }
@@ -354,6 +358,7 @@ where
         conn.pending.acceptor.fb,
         reponame,
         Arc::clone(&conn.pending.acceptor.mononoke),
+        conn.pending.acceptor.configs.clone(),
         &conn.pending.acceptor.security_checker,
         stdio,
         conn.pending.acceptor.rate_limiter.clone(),
@@ -523,8 +528,6 @@ impl ChannelConn {
     }
 }
 
-// TODO(stash): T33775046 we had to chunk responses because hgcli
-// can't cope with big chunks
 fn split_bytes_in_chunk<E>(blob: Bytes, chunksize: usize) -> impl Stream<Item = Result<Bytes, E>> {
     stream::try_unfold(blob, move |mut remain| async move {
         let len = remain.len();

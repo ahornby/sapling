@@ -127,10 +127,6 @@ class httppasswordmgrdbproxy:
         return tuple(v for v in self._get_mgr().find_user_password(realm, uri))
 
 
-def _catchterm(*args):
-    raise error.SignalInterrupt
-
-
 # unique object used to detect no default value has been provided when
 # retrieving configuration value.
 _unset: object = uiconfig._unset
@@ -153,7 +149,7 @@ class deprecationlevel(IntEnum):
 
 
 class ui:
-    def __init__(self, src=None, rcfg=None):
+    def __init__(self, src=None, rctx=None):
         """Create a fresh new ui object if no src given
 
         Use uimod.ui.load() to create a ui which knows global and user configs.
@@ -218,7 +214,7 @@ class ui:
 
             self.identity = src.identity
         else:
-            self._uiconfig = uiconfig.uiconfig(rcfg=rcfg)
+            self._uiconfig = uiconfig.uiconfig(rctx=rctx)
 
             io = util.get_main_io()
             self.fout = util.refcell(io.output())
@@ -617,10 +613,11 @@ class ui:
         self._bufferstates.append((error, subproc, labeled))
         self._bufferapplylabels = labeled
 
-    def popbuffer(self) -> str:
+    def popbuffer(self, errors="strict") -> str:
         """pop the last buffer and return the buffered output
 
-        Throws if any element of the buffer is not str.
+        Content written by `ui.writebytes` gets utf-8 decoded based on the
+        `errors` handler. See `str.decode` for valid values of `errors`.
         """
         self._bufferstates.pop()
         if self._bufferstates:
@@ -629,14 +626,14 @@ class ui:
             self._bufferapplylabels = None
 
         buf = self._buffers.pop()
-        if any(not isinstance(s, str) for s in buf):
-            raise error.ProgrammingError("popbuffer cannot be used on bytes buffer")
-        return "".join(buf)
+        return "".join(
+            (b if isinstance(b, str) else b.decode(errors=errors)) for b in buf
+        )
 
     def popbufferbytes(self) -> bytes:
         """pop the last buffer and return the buffered output
 
-        Throws if any element of the buffer is not bytes.
+        Content written by `ui.write` gets utf-8 encoded.
         """
         self._bufferstates.pop()
         if self._bufferstates:
@@ -645,9 +642,7 @@ class ui:
             self._bufferapplylabels = None
 
         buf = self._buffers.pop()
-        if any(not isinstance(s, bytes) for s in buf):
-            raise error.ProgrammingError("popbufferbytes cannot be used on str buffer")
-        return b"".join(buf)
+        return b"".join((b if isinstance(b, bytes) else b.encode()) for b in buf)
 
     def popbufferlist(self) -> "List[Union[str, bytes]]":
         """pop the last buffer and return the buffered output as a list
@@ -811,6 +806,7 @@ class ui:
           command: The full, non-aliased name of the command. That is, "log"
                    not "history, "summary" not "summ", etc.
         """
+
         if self._disablepager or self.pageractive:
             # how pager should do is already determined
             return
@@ -851,8 +847,11 @@ class ui:
 
         wasformatted = self.formatted
         wasterminaloutput = self.terminaloutput()
-        if hasattr(signal, "SIGPIPE"):
-            util.signal(signal.SIGPIPE, _catchterm)
+
+        if self.configbool("experimental", "rust-custom-pager", True):
+            self._runrustpager(pagercmd)
+            return
+
         if pagercmd == "internal:streampager":
             self._runinternalstreampager()
         elif self._runpager(pagercmd, pagerenv):
@@ -873,6 +872,27 @@ class ui:
             # given, don't try again when the command runs, to avoid a duplicate
             # warning about a missing pager command.
             self.disablepager()
+
+    def _runrustpager(self, pagercmd):
+        """Delegate both streampager and custom pagers to rust"""
+        self.debug("starting rust pager command: %r\n" % pagercmd)
+
+        origencoding = encoding.outputencoding
+
+        self.flush()
+        util.get_main_io().start_pager(self._rcfg)
+
+        # The Rust streampager wants utf-8 unconditionally.
+        if pagercmd == "internal:streampager":
+            encoding.outputencoding = "utf-8"
+
+        @self.atexit
+        def waitpager():
+            util.get_main_io().wait_pager()
+            encoding.outputencoding = origencoding
+
+        self.pageractive = True
+        return True
 
     def _runinternalstreampager(self):
         """Start the builtin streampager"""
@@ -898,6 +918,7 @@ class ui:
         This is separate in part so that extensions (like chg) can
         override how a pager is invoked.
         """
+
         if command == "cat":
             # Save ourselves some work.
             return False
@@ -1327,7 +1348,7 @@ class ui:
         if action == "diff":
             suffix = ".diff"
         elif action:
-            suffix = ".%s.hg.txt" % action
+            suffix = ".%s.%s.txt" % (action, self.identity.cliname())
         else:
             suffix = extra["suffix"]
 
@@ -1338,7 +1359,9 @@ class ui:
             rdir = os.path.join(rdir, "edit-tmp")
             util.makedirs(rdir)
         (fd, name) = tempfile.mkstemp(
-            prefix="hg-" + extra["prefix"] + "-", suffix=suffix, dir=rdir
+            prefix=self.identity.cliname() + "-" + extra["prefix"] + "-",
+            suffix=suffix,
+            dir=rdir,
         )
         try:
             f = util.fdopen(fd, r"wb")
@@ -1789,6 +1812,9 @@ class ui:
     @property
     def _rcfg(self):
         return self._uiconfig._rcfg
+
+    def rustcontext(self) -> bindings.context.context:
+        return self._uiconfig._rctx.withconfig(self._rcfg)
 
     @property
     def quiet(self):

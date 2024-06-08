@@ -5,7 +5,6 @@
  * GNU General Public License version 2.
  */
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
@@ -58,11 +57,7 @@ impl Hooks {
             return Ok(());
         }
 
-        let full_args = full_args
-            .iter()
-            .map(|a| shell_escape::escape(Cow::Borrowed(a.as_str())))
-            .collect::<Vec<_>>()
-            .join(" ");
+        let full_args = util::sys::shell_escape(full_args);
         let hook_args = HashMap::from([("args".to_string(), full_args)]);
         for hooks in &self.pre {
             hooks.run_shell_hooks(repo_root, true, &hook_args)?;
@@ -83,11 +78,7 @@ impl Hooks {
             return Ok(());
         }
 
-        let full_args = full_args
-            .iter()
-            .map(|a| shell_escape::escape(Cow::Borrowed(a.as_str())))
-            .collect::<Vec<_>>()
-            .join(" ");
+        let full_args = util::sys::shell_escape(full_args);
         let hook_args = HashMap::from([
             ("args".to_string(), full_args),
             ("result".to_string(), format!("{result}")),
@@ -106,11 +97,7 @@ impl Hooks {
             return Ok(());
         }
 
-        let full_args = full_args
-            .iter()
-            .map(|a| shell_escape::escape(Cow::Borrowed(a.as_str())))
-            .collect::<Vec<_>>()
-            .join(" ");
+        let full_args = util::sys::shell_escape(full_args);
         let hook_args = HashMap::from([("args".to_string(), full_args)]);
         for hooks in &self.fail {
             hooks.run_shell_hooks(repo_root, false, &hook_args)?;

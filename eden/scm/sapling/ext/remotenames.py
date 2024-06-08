@@ -59,6 +59,7 @@ from sapling.bookmarks import (
     selectivepullbookmarknames,
     splitremotename,
 )
+from sapling.ext.commitcloud import util as ccutil
 from sapling.i18n import _
 from sapling.node import bin, hex, short
 
@@ -371,10 +372,6 @@ def updatecmd(orig, ui, repo, node=None, rev=None, **kwargs):
 def _tracking(ui):
     # omg default true
     return ui.configbool("remotenames", "tracking")
-
-
-def _branchesenabled(ui):
-    return False
 
 
 def exrebasecmd(orig, ui, repo, *pats, **opts):
@@ -716,7 +713,10 @@ def expullcmd(orig, ui, repo, source="default", **opts):
     if not opts.get("rebase"):
         return orig(ui, repo, source, **opts)
 
-    rebasemodule = extensions.find("rebase")
+    try:
+        rebasemodule = extensions.find("rebase")
+    except KeyError:
+        rebasemodule = None
 
     if not rebasemodule:
         return orig(ui, repo, source, **opts)
@@ -892,7 +892,45 @@ def expushcmd(orig, ui, repo, dest=None, **opts):
         or (opts.get("force") and forcecompat),
     }
 
+    revs = opts.get("rev")
+
+    paths = dict((path, url) for path, url in ui.configitems("paths"))
+    # XXX T58629567: The following line triggers an infinite loop in pyre, let's disable it for now.
+    if not typing.TYPE_CHECKING:
+        revrenames = dict((v, k) for k, v in pycompat.iteritems(_getrenames(ui)))
+
+    origdest = dest
+    defaultpush = ui.paths.get("default-push") or ui.paths.get("default")
+    if defaultpush:
+        defaultpush = defaultpush.loc
+    if (
+        (not dest or dest == defaultpush)
+        and not opargs["to"]
+        and not opargs["delete"]
+        and not revs
+        and _tracking(ui)
+    ):
+        current = repo._activebookmark
+        tracking = _readtracking(repo)
+        ui.debug("tracking on %s %s\n" % (current, tracking))
+        if current and current in tracking:
+            track = tracking[current]
+            path, book = splitremotename(track)
+            # un-rename a path, if needed
+            path = revrenames.get(path, path)
+            if book and path in paths:
+                dest = path
+                opargs["to"] = book
+
     edenapi = pushmod.get_edenapi_for_dest(repo, dest)
+
+    if extensions.isenabled(ui, "commitcloud"):
+        bookname = opargs["to"] or opargs["delete"]
+        scratchmatcher = ccutil.scratchbranchmatcher(ui)
+        # infinitepush "scratch" branches don't work over the regular
+        # wire protocol, so require edenapi for them.
+        if bookname is not None and scratchmatcher.match(bookname):
+            edenapi = repo.edenapi
 
     if opargs["delete"]:
         flag = None
@@ -908,38 +946,9 @@ def expushcmd(orig, ui, repo, dest=None, **opts):
         opts["rev"] = ["null"]
         if edenapi:
             return pushmod.delete_remote_bookmark(
-                repo, edenapi, opargs["delete"], opts.get("pushvars")
+                repo, edenapi, opargs["delete"], opts.get("force"), opts.get("pushvars")
             )
         return orig(ui, repo, dest, opargs=opargs, **opts)
-
-    revs = opts.get("rev")
-
-    paths = dict((path, url) for path, url in ui.configitems("paths"))
-    # XXX T58629567: The following line triggers an infinite loop in pyre, let's disable it for now.
-    if not typing.TYPE_CHECKING:
-        revrenames = dict((v, k) for k, v in pycompat.iteritems(_getrenames(ui)))
-
-    origdest = dest
-    defaultpush = ui.paths.get("default-push") or ui.paths.get("default")
-    if defaultpush:
-        defaultpush = defaultpush.loc
-    if (
-        (not dest or dest == defaultpush)
-        and not opargs["to"]
-        and not revs
-        and _tracking(ui)
-    ):
-        current = repo._activebookmark
-        tracking = _readtracking(repo)
-        ui.debug("tracking on %s %s\n" % (current, tracking))
-        if current and current in tracking:
-            track = tracking[current]
-            path, book = splitremotename(track)
-            # un-rename a path, if needed
-            path = revrenames.get(path, path)
-            if book and path in paths:
-                dest = path
-                opargs["to"] = book
 
     # un-rename passed path
     dest = revrenames.get(dest, dest)
@@ -1039,6 +1048,7 @@ def expushcmd(orig, ui, repo, dest=None, **opts):
                 remote_bookmark=opargs["to"],
                 force=force,
                 opargs=opargs,
+                edenapi=edenapi,
             )
         except error.UnsupportedEdenApiPush as e:
             ui.status_err(_("fallback reason: %s\n") % e)

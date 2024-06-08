@@ -8,6 +8,7 @@
 #![feature(trait_alias)]
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::anyhow;
@@ -20,7 +21,6 @@ use blobsync::copy_content;
 use bonsai_hg_mapping::BonsaiHgMappingRef;
 use bookmarks::BookmarksRef;
 use borrowed::borrowed;
-use changeset_fetcher::ChangesetFetcherArc;
 use changesets::ChangesetsRef;
 use commit_graph::CommitGraphRef;
 use context::CoreContext;
@@ -31,7 +31,7 @@ use futures::stream;
 use futures::StreamExt;
 use futures::TryStreamExt;
 use manifest::get_implicit_deletes;
-use megarepo_configs::types::SourceMappingRules;
+use megarepo_configs::SourceMappingRules;
 use mononoke_types::path::MPath;
 use mononoke_types::BonsaiChangeset;
 use mononoke_types::BonsaiChangesetMut;
@@ -95,7 +95,6 @@ pub struct FileChangeFilter<'a> {
 pub trait Repo = RepoIdentityRef
     + RepoBlobstoreArc
     + ChangesetsRef
-    + ChangesetFetcherArc
     + BookmarksRef
     + BonsaiHgMappingRef
     + RepoDerivedDataRef
@@ -220,11 +219,11 @@ fn minimize_file_change_set<I: IntoIterator<Item = (NonRootMPath, FileChange)>>(
     let (adds, removes): (Vec<_>, Vec<_>) = file_changes
         .into_iter()
         .partition(|(_, fc)| fc.is_changed());
-    let adds: HashMap<NonRootMPath, FileChange> = adds.into_iter().collect();
+    let mut adds: SortedVectorMap<NonRootMPath, FileChange> = adds.into_iter().collect();
 
     let prefix_path_was_added = |removed_path: NonRootMPath| {
         removed_path
-            .into_parent_dir_iter()
+            .into_non_root_ancestors()
             .any(|parent_dir| adds.contains_key(&parent_dir))
     };
 
@@ -232,7 +231,7 @@ fn minimize_file_change_set<I: IntoIterator<Item = (NonRootMPath, FileChange)>>(
         .into_iter()
         .filter(|(ref mpath, _)| !prefix_path_was_added(mpath.clone()));
     let mut result: SortedVectorMap<_, _> = filtered_removes.collect();
-    result.extend(adds);
+    result.append(&mut adds);
     result
 }
 
@@ -571,7 +570,7 @@ pub fn rewrite_commit_with_implicit_deletes<'a>(
 
                     // If the source path doesn't remap, drop this copy info.
 
-                    // TODO(stash): a path can be remapped to multiple other paths,
+                    // FIXME: a path can be remapped to multiple other paths,
                     // but for copy_from path we pick only the first one. Instead of
                     // picking only the first one, it's a better to have a dedicated
                     // field in a thrift struct which says which path should be picked
@@ -739,8 +738,9 @@ pub async fn upload_commits<'a>(
     rewritten_list: Vec<BonsaiChangeset>,
     source_repo: &'a (impl RepoBlobstoreRef + ChangesetsRef),
     target_repo: &'a (impl RepoBlobstoreRef + ChangesetsRef + FilestoreConfigRef),
+    submodule_content_ids: Vec<(Arc<impl RepoBlobstoreRef>, HashSet<ContentId>)>,
 ) -> Result<(), Error> {
-    let mut files_to_sync = vec![];
+    let mut files_to_sync = HashSet::new();
     for rewritten in &rewritten_list {
         let rewritten_mut = rewritten.clone().into_mut();
         let new_files_to_sync =
@@ -754,6 +754,43 @@ pub async fn upload_commits<'a>(
                 });
         files_to_sync.extend(new_files_to_sync);
     }
+
+    // Remove the content ids from submodules from the ones that will be
+    // copied from source repo
+    //
+    // Used to dedupe duplicate content ids between submodules.
+    let mut already_processed: HashSet<ContentId> = HashSet::new();
+
+    let submodule_content_ids = submodule_content_ids
+        .into_iter()
+        .map(|(repo, content_ids)| {
+            // Keep only ids that haven't been seen in other submodules yet
+            let deduped_sm_content_ids = content_ids
+                .difference(&already_processed)
+                .cloned()
+                .collect::<HashSet<_>>();
+
+            deduped_sm_content_ids.iter().for_each(|content_id| {
+                // Remove it from the set of ids that are actually from
+                // the source repo
+                files_to_sync.remove(content_id);
+                // Add it to the list of content ids that were processed
+                already_processed.insert(*content_id);
+            });
+
+            (repo, deduped_sm_content_ids)
+        });
+
+    // Copy submodule changes
+    stream::iter(submodule_content_ids)
+        .map(|(sm_repo, content_ids)| async move {
+            copy_file_contents(ctx, sm_repo.as_ref(), target_repo, content_ids, |_| {}).await
+        })
+        .buffer_unordered(10)
+        .try_collect()
+        .await?;
+
+    // Then copy from source repo
     copy_file_contents(ctx, source_repo, target_repo, files_to_sync, |_| {}).await?;
     save_bonsai_changesets(rewritten_list.clone(), ctx.clone(), target_repo).await?;
     Ok(())
@@ -763,7 +800,10 @@ pub async fn copy_file_contents<'a>(
     ctx: &'a CoreContext,
     source_repo: &'a impl RepoBlobstoreRef,
     target_repo: &'a (impl RepoBlobstoreRef + FilestoreConfigRef),
-    content_ids: impl IntoIterator<Item = ContentId>,
+    // Contents are uploaded concurrently, so they have to deduped to prevent
+    // race conditions that bypass the `filestore::exists` check and lead to
+    // `File exists (os error 17)` errors.
+    content_ids: HashSet<ContentId>,
     progress_reporter: impl Fn(usize),
 ) -> Result<(), Error> {
     let source_blobstore = source_repo.repo_blobstore();

@@ -5,6 +5,8 @@
  * GNU General Public License version 2.
  */
 
+#![feature(async_closure)]
+
 mod mem_writes_changesets;
 use std::collections::HashMap;
 use std::path::Path;
@@ -33,12 +35,12 @@ use futures::future;
 use import_tools::create_changeset_for_annotated_tag;
 use import_tools::import_tree_as_single_bonsai_changeset;
 use import_tools::upload_git_tag;
+use import_tools::BackfillDerivation;
 use import_tools::GitimportPreferences;
 use import_tools::GitimportTarget;
 use linked_hash_map::LinkedHashMap;
 use mercurial_derivation::get_manifest_from_bonsai;
 use mercurial_derivation::DeriveHgChangeset;
-use mononoke_api::BookmarkCategory;
 use mononoke_api::BookmarkFreshness;
 use mononoke_api::BookmarkKey;
 use mononoke_app::args::RepoArgs;
@@ -47,11 +49,14 @@ use mononoke_app::fb303::Fb303AppExtension;
 use mononoke_app::MononokeApp;
 use mononoke_app::MononokeAppBuilder;
 use mononoke_types::ChangesetId;
+use mononoke_types::DerivableType;
 use repo_authorization::AuthorizationContext;
 use repo_blobstore::RepoBlobstoreArc;
 use repo_blobstore::RepoBlobstoreRef;
+use repo_derived_data::RepoDerivedDataRef;
 use repo_identity::RepoIdentityRef;
 use slog::info;
+use slog::warn;
 
 use crate::mem_writes_changesets::MemWritesChangesets;
 
@@ -116,9 +121,9 @@ struct GitimportArgs {
     /// Use at your own risk!
     #[clap(long)]
     generate_bookmarks: bool,
-    /// If set, will record the HEAD symref in Mononoke for the given repo
+    /// If set, will skip recording the HEAD symref in Mononoke for the given repo
     #[clap(long)]
-    record_head_symref: bool,
+    skip_head_symref: bool,
     /// When set, the gitimport tool would bypass the read-only check while creating and moving bookmarks.
     #[clap(long)]
     bypass_readonly: bool,
@@ -145,6 +150,11 @@ struct GitimportArgs {
     /// Only use if you are sure that's what you want.
     #[clap(long)]
     discard_submodules: bool,
+    /// Don't backfill derived data during this import.
+    /// This is dangerous if used in conjunction with generate_bookmarks as public
+    /// commits which are not derived may create high load for the derived data service
+    #[clap(long)]
+    bypass_derived_data_backfilling: bool,
 }
 
 #[derive(Subcommand)]
@@ -183,20 +193,6 @@ async fn async_main(app: MononokeApp) -> Result<(), Error> {
         ClientInfo::default_with_entry_point(ClientEntryPoint::GitImport),
     );
     let args: GitimportArgs = app.args()?;
-    let mut prefs = GitimportPreferences {
-        concurrency: args.concurrency,
-        submodules: !args.discard_submodules,
-        ..Default::default()
-    };
-    // if we are readonly, then we'll set up some overrides to still be able to do meaningful
-    // things below.
-    let dry_run = app.readonly_storage().0;
-    prefs.dry_run = dry_run;
-
-    if let Some(path) = args.git_command_path {
-        prefs.git_command_path = PathBuf::from(path);
-    }
-
     let path = Path::new(&args.git_repository_path);
 
     let reupload = if args.reupload_commits {
@@ -213,6 +209,7 @@ async fn async_main(app: MononokeApp) -> Result<(), Error> {
         repo.repo_identity().id(),
     );
 
+    let dry_run = app.readonly_storage().0;
     let repo = if dry_run {
         repo.dangerous_override(|blobstore| -> Arc<dyn Blobstore> {
             Arc::new(MemWritesBlobstore::new(blobstore))
@@ -227,6 +224,46 @@ async fn async_main(app: MononokeApp) -> Result<(), Error> {
     } else {
         repo
     };
+
+    let backfill_derivation = if args.bypass_derived_data_backfilling {
+        if args.generate_bookmarks {
+            warn!(
+                logger,
+                "Warning: gitimport was called bypassing derived data backfilling while generating bookmarks.\nIt is your responsibility to ensure that all derived data types are backfilled before this repository is expose to prod to avoid the risk of overloading the derived data service."
+            );
+        }
+        BackfillDerivation::No
+    } else if args.discard_submodules {
+        let configured_types = &repo.repo_derived_data().active_config().types;
+        BackfillDerivation::OnlySpecificTypes(
+            configured_types
+                .iter()
+                .filter(|ty| match ty {
+                    // If we discard submodules, we can't derive the git data types since they are inconsistent
+                    DerivableType::GitCommits
+                    | DerivableType::GitDeltaManifests
+                    | DerivableType::GitTrees => false,
+                    _ => true,
+                })
+                .cloned()
+                .collect(),
+        )
+    } else {
+        BackfillDerivation::AllConfiguredTypes
+    };
+    let mut prefs = GitimportPreferences {
+        concurrency: args.concurrency,
+        submodules: !args.discard_submodules,
+        backfill_derivation,
+        ..Default::default()
+    };
+    // if we are readonly, then we'll set up some overrides to still be able to do meaningful
+    // things below.
+    prefs.dry_run = dry_run;
+
+    if let Some(path) = args.git_command_path {
+        prefs.git_command_path = PathBuf::from(path);
+    }
 
     let uploader = import_direct::DirectUploader::new(repo.clone(), reupload);
 
@@ -264,7 +301,7 @@ async fn async_main(app: MononokeApp) -> Result<(), Error> {
             .await
             .context("derive_hg failed")?;
     }
-    if args.record_head_symref {
+    if !args.skip_head_symref {
         let symref_entry = import_tools::read_symref(HEAD_SYMREF, path, &prefs)
             .await
             .context("read_symrefs failed")?;
@@ -333,21 +370,19 @@ async fn async_main(app: MononokeApp) -> Result<(), Error> {
                     // Skip the HEAD revision: it shouldn't be imported as a bookmark in mononoke
                     continue;
                 }
-                if let Some(tag_id) = maybe_tag_id {
-                    // The ref getting imported is a tag, so store the raw git Tag object.
-                    upload_git_tag(&ctx, &uploader, path, &prefs, tag_id).await?;
-                    // Create the changeset corresponding to the commit pointed to by the tag.
-                    create_changeset_for_annotated_tag(
-                        &ctx, &uploader, path, &prefs, tag_id, changeset,
-                    )
-                    .await?;
-                }
-                // Set the appropriate category for branch and tag bookmarks
-                let bookmark_key = if maybe_tag_id.is_some() {
-                    BookmarkKey::with_name_and_category(name.parse()?, BookmarkCategory::Tag)
-                } else {
-                    BookmarkKey::new(&name)?
+                let upload_if_tag = async {
+                    if let Some(tag_id) = maybe_tag_id {
+                        // The ref getting imported is a tag, so store the raw git Tag object.
+                        upload_git_tag(&ctx, &uploader, path, &prefs, tag_id).await?;
+                        // Create the changeset corresponding to the commit pointed to by the tag.
+                        create_changeset_for_annotated_tag(
+                            &ctx, &uploader, path, &prefs, tag_id, changeset,
+                        )
+                        .await?;
+                    }
+                    Ok::<_, Error>(())
                 };
+                let bookmark_key = BookmarkKey::new(&name)?;
 
                 let pushvars = if args.bypass_readonly {
                     Some(HashMap::from_iter([(
@@ -366,6 +401,7 @@ async fn async_main(app: MononokeApp) -> Result<(), Error> {
                     // The bookmark already exists. Instead of creating it, we need to move it.
                     Some(old_changeset) => {
                         if old_changeset != final_changeset {
+                            upload_if_tag.await?;
                             let allow_non_fast_forward = true;
                             repo_context
                                 .move_bookmark(
@@ -374,6 +410,7 @@ async fn async_main(app: MononokeApp) -> Result<(), Error> {
                                     Some(old_changeset),
                                     allow_non_fast_forward,
                                     pushvars.as_ref(),
+                                    Some(gitimport_result.len()),
                                 )
                                 .await
                                 .with_context(|| format!("failed to move bookmark {name} from {old_changeset:?} to {final_changeset:?}"))?;
@@ -390,8 +427,14 @@ async fn async_main(app: MononokeApp) -> Result<(), Error> {
                     }
                     // The bookmark doesn't yet exist. Create it.
                     None => {
+                        upload_if_tag.await?;
                         repo_context
-                            .create_bookmark(&bookmark_key, final_changeset, pushvars.as_ref())
+                            .create_bookmark(
+                                &bookmark_key,
+                                final_changeset,
+                                pushvars.as_ref(),
+                                Some(gitimport_result.len()),
+                            )
                             .await
                             .with_context(|| {
                                 format!("failed to create bookmark {name} during gitimport")

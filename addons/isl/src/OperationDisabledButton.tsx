@@ -6,11 +6,13 @@
  */
 
 import type {Operation} from './operations/Operation';
+import type {PrimitiveAtom} from 'jotai';
 
+import {atomFamilyWeak} from './jotaiUtils';
+import {useRunOperation} from './operationsState';
 import {useMostRecentPendingOperation} from './previews';
-import {useRunOperation} from './serverAPIState';
 import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
-import {atomFamily, useRecoilState} from 'recoil';
+import {atom, useAtom} from 'jotai';
 import {Icon} from 'shared/Icon';
 import {isPromise} from 'shared/utils';
 
@@ -45,14 +47,14 @@ export function OperationDisabledButton({
     | Array<Operation>
     | undefined
     | Promise<Operation | Array<Operation> | undefined>;
-  children: React.ReactNode;
+  children?: React.ReactNode;
   disabled?: boolean;
   icon?: React.ReactNode;
   className?: string;
 }) {
   const actuallyRunOperation = useRunOperation();
   const pendingOperation = useMostRecentPendingOperation();
-  const [triggeredOperationId, setTriggeredOperationId] = useRecoilState(
+  const [triggeredOperationId, setTriggeredOperationId] = useAtom(
     operationButtonDisableState(contextKey),
   );
   const isRunningThisOperation =
@@ -85,7 +87,7 @@ export function OperationDisabledButton({
   );
 }
 
-const operationButtonDisableState = atomFamily<Array<string>, string | undefined>({
-  key: 'operationButtonDisableState',
-  default: undefined,
-});
+const operationButtonDisableState = atomFamilyWeak<
+  string,
+  PrimitiveAtom<Array<string> | undefined>
+>((_param: string | undefined) => atom<Array<string> | undefined>(undefined));

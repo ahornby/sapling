@@ -5,6 +5,7 @@
  * GNU General Public License version 2.
  */
 
+#![feature(iter_array_chunks)]
 #![feature(trait_upcasting)]
 
 use std::collections::HashSet;
@@ -46,6 +47,7 @@ macro_rules! impl_commit_graph_tests {
             test_skip_tree,
             test_p1_linear_tree,
             test_ancestors_difference,
+            test_ancestors_difference_segment_slices,
             test_find_by_prefix,
             test_add_recursive,
             test_add_recursive_many_changesets,
@@ -53,7 +55,9 @@ macro_rules! impl_commit_graph_tests {
             test_range_stream,
             test_common_base,
             test_slice_ancestors,
+            test_segmented_slice_ancestors,
             test_children,
+            test_descendants,
             test_ancestors_difference_segments_1,
             test_ancestors_difference_segments_2,
             test_ancestors_difference_segments_3,
@@ -61,6 +65,7 @@ macro_rules! impl_commit_graph_tests {
             test_changeset_ids_to_locations,
             test_process_topologically,
             test_minimize_frontier,
+            test_ancestors_within_distance,
         );
     };
 }
@@ -97,6 +102,17 @@ pub async fn test_storage_store_and_fetch(
     assert!(graph.exists(&ctx, name_cs_id("A")).await?);
 
     assert!(!graph.exists(&ctx, name_cs_id("nonexistent")).await?);
+    assert_eq!(
+        graph
+            .known_changesets(
+                &ctx,
+                vec![name_cs_id("A"), name_cs_id("B"), name_cs_id("nonexistent")]
+            )
+            .await?
+            .into_iter()
+            .collect::<HashSet<_>>(),
+        hashset! {name_cs_id("A"), name_cs_id("B")}
+    );
     assert_eq!(
         graph
             .changeset_generation(&ctx, name_cs_id("G"))
@@ -403,6 +419,65 @@ pub async fn test_p1_linear_tree(
     assert_p1_linear_lowest_common_ancestor(&graph, &ctx, "D", "C", Some("C")).await?;
     assert_p1_linear_lowest_common_ancestor(&graph, &ctx, "N", "K", None).await?;
     assert_p1_linear_lowest_common_ancestor(&graph, &ctx, "A", "I", Some("A")).await?;
+
+    Ok(())
+}
+
+pub async fn test_ancestors_difference_segment_slices(
+    ctx: CoreContext,
+    storage: Arc<dyn CommitGraphStorageTest>,
+) -> Result<()> {
+    let graph = from_dag(
+        &ctx,
+        r"
+         A-B-C-D-G-H---J-K
+            \   /   \ /
+             E-F     I
+
+         L-M-N-O-P-Q-R-S-T-U
+         ",
+        storage.clone(),
+    )
+    .await?;
+    storage.flush();
+
+    assert_ancestors_difference_segment_slices(
+        &graph,
+        &ctx,
+        &["K"],
+        &[],
+        3,
+        &[
+            &["A", "B", "C"],
+            &["D"],
+            &["E", "F"],
+            &["G", "H", "I"],
+            &["J", "K"],
+        ],
+    )
+    .await?;
+
+    assert_ancestors_difference_segment_slices(
+        &graph,
+        &ctx,
+        &["K", "U"],
+        &[],
+        3,
+        &[
+            &["L", "M", "N"],
+            &["O", "P", "Q"],
+            &["R", "S", "T"],
+            &["U"],
+            &["A", "B"],
+            &["C", "D"],
+            &["E"],
+            &["F"],
+            &["G", "H"],
+            &["I"],
+            &["J", "K"],
+        ],
+    )
+    .await?;
 
     Ok(())
 }
@@ -992,6 +1067,93 @@ pub async fn test_slice_ancestors(
     Ok(())
 }
 
+pub async fn test_segmented_slice_ancestors(
+    ctx: CoreContext,
+    storage: Arc<dyn CommitGraphStorageTest>,
+) -> Result<()> {
+    let graph = from_dag(
+        &ctx,
+        r"
+         A-B-C-D-G-H---J-K
+            \   /   \ /
+             E-F     I
+
+         L-M-N-O-P-Q-R-S-T-U-V
+         ",
+        storage.clone(),
+    )
+    .await?;
+    storage.flush();
+
+    assert_segmented_slice_ancestors(
+        &graph,
+        &ctx,
+        vec!["H"],
+        vec![],
+        2,
+        vec![
+            vec![("B", "A")],
+            vec![("D", "C")],
+            vec![("F", "E")],
+            vec![("H", "G")],
+        ],
+        vec!["B", "D", "F"],
+    )
+    .await?;
+
+    assert_segmented_slice_ancestors(
+        &graph,
+        &ctx,
+        vec!["Q"],
+        vec![],
+        1,
+        vec![
+            vec![("L", "L")],
+            vec![("M", "M")],
+            vec![("N", "N")],
+            vec![("O", "O")],
+            vec![("P", "P")],
+            vec![("Q", "Q")],
+        ],
+        vec!["L", "M", "N", "O", "P"],
+    )
+    .await?;
+
+    assert_segmented_slice_ancestors(
+        &graph,
+        &ctx,
+        vec!["K", "V"],
+        vec![],
+        5,
+        vec![
+            vec![("P", "L")],
+            vec![("U", "Q")],
+            vec![("V", "V"), ("D", "A")],
+            vec![("F", "E"), ("I", "G")],
+            vec![("K", "J")],
+        ],
+        vec!["B", "D", "H", "I", "P", "U"],
+    )
+    .await?;
+
+    assert_segmented_slice_ancestors(
+        &graph,
+        &ctx,
+        vec!["K", "V"],
+        vec!["D", "N"],
+        5,
+        vec![
+            vec![("S", "O")],
+            vec![("V", "T"), ("F", "E")],
+            vec![("I", "G"), ("K", "J")],
+        ],
+        vec!["F", "S"],
+    )
+    .await?;
+
+    Ok(())
+}
+
 pub async fn test_children(
     ctx: CoreContext,
     storage: Arc<dyn CommitGraphStorageTest>,
@@ -1024,6 +1186,73 @@ pub async fn test_children(
     assert_children(&graph, &ctx, "L", vec!["M", "N"]).await?;
     assert_children(&graph, &ctx, "M", vec![]).await?;
     assert_children(&graph, &ctx, "N", vec![]).await?;
+
+    Ok(())
+}
+
+pub async fn test_descendants(
+    ctx: CoreContext,
+    storage: Arc<dyn CommitGraphStorageTest>,
+) -> Result<()> {
+    let graph = from_dag(
+        &ctx,
+        r"
+        A-B-C-D-E-L------N
+           \       \    /
+            F-G-H   M  /
+             \     /  /
+              I-J-K--/
+        ",
+        storage.clone(),
+    )
+    .await?;
+    storage.flush();
+
+    assert_descendants(
+        &graph,
+        &ctx,
+        vec!["A"],
+        vec![
+            "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N",
+        ],
+    )
+    .await?;
+    assert_descendants(
+        &graph,
+        &ctx,
+        vec!["B"],
+        vec![
+            "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N",
+        ],
+    )
+    .await?;
+    assert_descendants(&graph, &ctx, vec!["C"], vec!["C", "D", "E", "L", "M", "N"]).await?;
+    assert_descendants(&graph, &ctx, vec!["D"], vec!["D", "E", "L", "M", "N"]).await?;
+    assert_descendants(&graph, &ctx, vec!["E"], vec!["E", "L", "M", "N"]).await?;
+    assert_descendants(
+        &graph,
+        &ctx,
+        vec!["F"],
+        vec!["F", "G", "H", "I", "J", "K", "M", "N"],
+    )
+    .await?;
+    assert_descendants(&graph, &ctx, vec!["G"], vec!["G", "H"]).await?;
+    assert_descendants(&graph, &ctx, vec!["H"], vec!["H"]).await?;
+    assert_descendants(&graph, &ctx, vec!["I"], vec!["I", "J", "K", "M", "N"]).await?;
+    assert_descendants(&graph, &ctx, vec!["J"], vec!["J", "K", "M", "N"]).await?;
+    assert_descendants(&graph, &ctx, vec!["K"], vec!["K", "M", "N"]).await?;
+    assert_descendants(&graph, &ctx, vec!["L"], vec!["L", "M", "N"]).await?;
+    assert_descendants(&graph, &ctx, vec!["M"], vec!["M"]).await?;
+    assert_descendants(&graph, &ctx, vec!["N"], vec!["N"]).await?;
+
+    assert_descendants(
+        &graph,
+        &ctx,
+        vec!["C", "G", "H"],
+        vec!["C", "D", "E", "G", "H", "L", "M", "N"],
+    )
+    .await?;
+    assert_descendants(&graph, &ctx, vec![], vec![]).await?;
 
     Ok(())
 }
@@ -1287,6 +1516,155 @@ pub async fn test_minimize_frontier(
         vec!["H", "M", "N"],
     )
     .await?;
+
+    Ok(())
+}
+
+pub async fn test_ancestors_within_distance(
+    ctx: CoreContext,
+    storage: Arc<dyn CommitGraphStorageTest>,
+) -> Result<()> {
+    let graph = from_dag(
+        &ctx,
+        r"
+        A-B-C-D-E-L------N
+           \       \    /
+            F-G-H   M  /
+             \     /  /
+              I-J-K--/
+        ",
+        storage.clone(),
+    )
+    .await?;
+    storage.flush();
+
+    assert_ancestors_within_distance(&ctx, &graph, vec!["N"], 0, vec![("N", 0)]).await?;
+    assert_ancestors_within_distance(
+        &ctx,
+        &graph,
+        vec!["N"],
+        1,
+        vec![("N", 0), ("L", 1), ("K", 1)],
+    )
+    .await?;
+    assert_ancestors_within_distance(
+        &ctx,
+        &graph,
+        vec!["N"],
+        2,
+        vec![("N", 0), ("L", 1), ("K", 1), ("E", 2), ("J", 2)],
+    )
+    .await?;
+    assert_ancestors_within_distance(
+        &ctx,
+        &graph,
+        vec!["N"],
+        3,
+        vec![
+            ("N", 0),
+            ("L", 1),
+            ("K", 1),
+            ("E", 2),
+            ("J", 2),
+            ("I", 3),
+            ("D", 3),
+        ],
+    )
+    .await?;
+    assert_ancestors_within_distance(
+        &ctx,
+        &graph,
+        vec!["N"],
+        4,
+        vec![
+            ("N", 0),
+            ("L", 1),
+            ("K", 1),
+            ("E", 2),
+            ("J", 2),
+            ("I", 3),
+            ("D", 3),
+            ("F", 4),
+            ("C", 4),
+        ],
+    )
+    .await?;
+    assert_ancestors_within_distance(
+        &ctx,
+        &graph,
+        vec!["N"],
+        5,
+        vec![
+            ("N", 0),
+            ("L", 1),
+            ("K", 1),
+            ("E", 2),
+            ("J", 2),
+            ("I", 3),
+            ("D", 3),
+            ("F", 4),
+            ("C", 4),
+            ("B", 5),
+        ],
+    )
+    .await?;
+    assert_ancestors_within_distance(
+        &ctx,
+        &graph,
+        vec!["N"],
+        6,
+        vec![
+            ("N", 0),
+            ("L", 1),
+            ("K", 1),
+            ("E", 2),
+            ("J", 2),
+            ("I", 3),
+            ("D", 3),
+            ("F", 4),
+            ("C", 4),
+            ("B", 5),
+            ("A", 6),
+        ],
+    )
+    .await?;
+    assert_ancestors_within_distance(
+        &ctx,
+        &graph,
+        vec!["N"],
+        100,
+        vec![
+            ("N", 0),
+            ("L", 1),
+            ("K", 1),
+            ("E", 2),
+            ("J", 2),
+            ("I", 3),
+            ("D", 3),
+            ("F", 4),
+            ("C", 4),
+            ("B", 5),
+            ("A", 6),
+        ],
+    )
+    .await?;
+    assert_ancestors_within_distance(
+        &ctx,
+        &graph,
+        vec!["N", "M", "H"],
+        0,
+        vec![("N", 0), ("M", 0), ("H", 0)],
+    )
+    .await?;
+    assert_ancestors_within_distance(
+        &ctx,
+        &graph,
+        vec!["N", "M", "H"],
+        1,
+        vec![("N", 0), ("M", 0), ("H", 0), ("L", 1), ("K", 1), ("G", 1)],
+    )
+    .await?;
+    assert_ancestors_within_distance(&ctx, &graph, vec![], 100, vec![]).await?;
 
     Ok(())
 }

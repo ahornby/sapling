@@ -1,5 +1,4 @@
-#debugruntest-compatible
-#require git
+#require git no-eden
 
   $ eagerepo
   $ . $TESTDIR/git.sh

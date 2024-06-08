@@ -37,7 +37,13 @@ export function TokensList({
             }>
             {token}
             {onClickX == null ? null : (
-              <VSCodeButton appearance="icon" onClick={() => onClickX?.(token)}>
+              <VSCodeButton
+                appearance="icon"
+                data-testid="token-x"
+                onClick={e => {
+                  onClickX?.(token);
+                  e.stopPropagation();
+                }}>
                 <Icon icon="x" />
               </VSCodeButton>
             )}
@@ -55,7 +61,10 @@ function deduplicate<T>(values: Array<T>) {
 export function extractTokens(raw: string): [Array<string>, string] {
   const tokens = raw.split(',');
   const remaining = tokens.length === 0 ? raw : tokens.pop();
-  return [deduplicate(tokens.map(token => token.trim())), remaining ?? ''];
+  return [
+    deduplicate(tokens.map(token => token.trim())).filter(token => token !== ''),
+    remaining ?? '',
+  ];
 }
 
 /** Combine tokens back into a string to be stored in the commit message */

@@ -21,9 +21,11 @@ use anyhow::bail;
 use anyhow::format_err;
 use anyhow::Context;
 use anyhow::Error;
+use borrowed::borrowed;
 use bytes::Bytes;
 use cloned::cloned;
 use context::CoreContext;
+use futures::stream;
 use futures::try_join;
 use futures::Stream;
 use futures::StreamExt;
@@ -46,9 +48,9 @@ use tokio::process::Command;
 use tokio::task;
 
 pub use crate::git_reader::GitRepoReader;
-pub use crate::gitimport_objects::convert_time_to_datetime;
 pub use crate::gitimport_objects::oid_to_sha1;
 use crate::gitimport_objects::read_raw_object;
+pub use crate::gitimport_objects::BackfillDerivation;
 pub use crate::gitimport_objects::CommitMetadata;
 pub use crate::gitimport_objects::ExtractedCommit;
 pub use crate::gitimport_objects::GitLeaf;
@@ -273,36 +275,50 @@ pub async fn gitimport_acc<Uploader: GitUploader>(
 
     let reader = GitRepoReader::new(&prefs.git_command_path, path).await?;
     let roots = target.get_roots();
-    // TODO - remove this
-    let nb_commits_to_import = target.get_nb_commits(&prefs.git_command_path, path).await?;
+    let all_commits = target.list_commits(&prefs.git_command_path, path).await?;
+    let nb_commits_to_import = all_commits.len();
     if 0 == nb_commits_to_import {
         info!(ctx.logger(), "Nothing to import for repo {}.", repo_name);
         return Ok(GitimportAccumulator::new());
     }
 
     let acc = RwLock::new(GitimportAccumulator::new());
+    let backfill_derivation = prefs.backfill_derivation.clone();
 
-    // Kick off a stream that consumes the walk and prepared commits. Then, produce the Bonsais.
-    target
-        .list_commits(&prefs.git_command_path, path)
+    // How many commits to query from bonsai git mapping per SQL query.
+    const SQL_CONCURRENCY: usize = 10_000;
+    let mappings: Vec<(ObjectId, ChangesetId)> = stream::iter(&all_commits)
+        // Ignore any error. This is an optional optimization
+        .filter_map(|res| async { res.as_ref().ok() })
+        .chunks(SQL_CONCURRENCY)
+        .map(|v| v.into_iter().cloned().collect::<Vec<_>>())
+        .map(|oids| {
+            borrowed!(uploader);
+            async move { uploader.preload_uploaded_commits(ctx, &oids).await }
+        })
+        .buffered(prefs.concurrency)
+        .try_collect::<Vec<_>>()
         .await?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    acc.write().expect("lock poisoned").inner.extend(mappings);
+    let n_existing_commits = acc.read().expect("lock poisoned").len();
+    if n_existing_commits > 0 {
+        info!(
+            ctx.logger(),
+            "GitRepo:{} {} of {} commit(s) already exist",
+            repo_name,
+            n_existing_commits,
+            nb_commits_to_import,
+        );
+    }
+    // Kick off a stream that consumes the walk and prepared commits. Then, produce the Bonsais.
+    stream::iter(all_commits)
         .try_filter_map({
-            let acc = &acc;
-            let uploader = &uploader;
-            let repo_name = &repo_name;
+            borrowed!(acc);
             move |oid| async move {
-                if let Some(bcs_id) = uploader.check_commit_uploaded(ctx, &oid).await? {
-                    acc.write().expect("lock poisoned").insert(oid, bcs_id);
-                    let git_sha1 = oid_to_sha1(&oid)?;
-                    info!(
-                        ctx.logger(),
-                        "GitRepo:{} commit {} of {} - Oid:{} => Bid:{} (already exists)",
-                        repo_name,
-                        acc.read().expect("lock poisoned").len(),
-                        nb_commits_to_import,
-                        git_sha1.to_brief(),
-                        bcs_id.to_brief()
-                    );
+                if let Some(_bcs_id) = acc.read().expect("lock poisoned").get(&oid) {
                     Ok(None)
                 } else {
                     Ok(Some(oid))
@@ -329,9 +345,8 @@ pub async fn gitimport_acc<Uploader: GitUploader>(
         .try_buffered(prefs.concurrency)
         .and_then(|(extracted_commit, file_changes)| {
             let acc = &acc;
-            let uploader = &uploader;
             let repo_name = &repo_name;
-            let reader = &reader;
+            cloned!(uploader, reader, ctx);
             async move {
                 let oid = extracted_commit.metadata.oid;
                 let bonsai_parents = extracted_commit
@@ -356,40 +371,44 @@ pub async fn gitimport_acc<Uploader: GitUploader>(
                 // Before generating the corresponding changeset at Mononoke end, upload the raw git commit
                 // and the git tree pointed to by the git commit.
                 extracted_commit
-                    .changed_trees(ctx, reader)
+                    .changed_trees(&ctx, &reader)
                     .map_ok(|entry| {
-                        cloned!(oid);
+                        cloned!(oid, uploader, reader, ctx);
                         async move {
-                            let tree_for_commit =
-                                read_raw_object(reader, &entry.0).await.with_context(|| {
-                                    format_err!(
-                                        "Failed to fetch git tree {} for commit {}",
-                                        entry.0,
-                                        oid
-                                    )
-                                })?;
-                            let tree_bytes = tree_for_commit.clone();
-                            // Upload packfile base item for given tree object and the raw Git tree
-                            let packfile_item_upload = async {
-                                uploader
-                                .upload_packfile_base_item(ctx, entry.0, tree_for_commit)
-                                .await
-                                .with_context(|| {
-                                    format_err!(
-                                        "Failed to upload packfile item for git tree {} for commit {}",
-                                        entry.0,
-                                        oid
-                                    )
-                                })
-                            };
-                            let git_tree_upload = async {
-                                uploader.upload_object(ctx, entry.0, tree_bytes).await
-                                .with_context(|| {
-                                    format_err!("Failed to upload raw git tree {} for commit {}", entry.0, oid)
-                                })
-                            };
-                            try_join!(packfile_item_upload, git_tree_upload)?;
-                            anyhow::Ok(())
+                            tokio::spawn(async move {
+                                let tree_for_commit =
+                                    read_raw_object(&reader, &entry.0).await.with_context(|| {
+                                        format_err!(
+                                            "Failed to fetch git tree {} for commit {}",
+                                            entry.0,
+                                            oid
+                                        )
+                                    })?;
+                                let tree_bytes = tree_for_commit.clone();
+                                // Upload packfile base item for given tree object and the raw Git tree
+                                let packfile_item_upload = async {
+                                    uploader
+                                        .upload_packfile_base_item(&ctx, entry.0, tree_for_commit)
+                                        .await
+                                        .with_context(|| {
+                                            format_err!(
+                                                "Failed to upload packfile item for git tree {} for commit {}",
+                                                entry.0,
+                                                oid
+                                            )
+                                        })
+                                };
+                                let git_tree_upload = async {
+                                    uploader
+                                        .upload_object(&ctx, entry.0, tree_bytes).await
+                                        .with_context(|| {
+                                            format_err!("Failed to upload raw git tree {} for commit {}", entry.0, oid)
+                                        })
+                                };
+                                try_join!(packfile_item_upload, git_tree_upload)?;
+                                anyhow::Ok(())
+                            })
+                            .await?
                         }
                     })
                     .try_buffer_unordered(100)
@@ -399,7 +418,7 @@ pub async fn gitimport_acc<Uploader: GitUploader>(
                 let packfile_item_upload = async {
                     uploader
                         .upload_packfile_base_item(
-                            ctx,
+                            &ctx,
                             oid,
                             extracted_commit.original_commit.clone(),
                         )
@@ -410,7 +429,7 @@ pub async fn gitimport_acc<Uploader: GitUploader>(
                 };
                 let git_commit_upload = async {
                     uploader
-                        .upload_object(ctx, oid, extracted_commit.original_commit.clone())
+                        .upload_object(&ctx, oid, extracted_commit.original_commit.clone())
                         .await
                         .with_context(|| format_err!("Failed to upload raw git commit {}", oid))
                 };
@@ -418,7 +437,7 @@ pub async fn gitimport_acc<Uploader: GitUploader>(
                 // Upload Git commit
                 let (int_cs, bcs_id) = uploader
                     .generate_changeset_for_commit(
-                        ctx,
+                        &ctx,
                         bonsai_parents,
                         extracted_commit.metadata,
                         file_changes,
@@ -445,8 +464,8 @@ pub async fn gitimport_acc<Uploader: GitUploader>(
         // Go from Vec<Result<X,Y>> -> Result<Vec<X>,Y>
         .map(|v| v.into_iter().collect::<Result<Vec<_>, Error>>())
         .try_for_each(|v| async {
-            cloned!(ctx, uploader);
-            task::spawn(async move { uploader.finalize_batch(&ctx, dry_run, v).await }).await?
+            cloned!(backfill_derivation, ctx, uploader);
+            task::spawn(async move { uploader.finalize_batch(&ctx, dry_run, backfill_derivation, v).await }).await?
         })
         .await?;
 
@@ -660,7 +679,12 @@ pub async fn import_tree_as_single_bonsai_changeset(
         )
         .and_then(|(cs, id)| {
             uploader
-                .finalize_batch(ctx, prefs.dry_run, vec![(cs, sha1)])
+                .finalize_batch(
+                    ctx,
+                    prefs.dry_run,
+                    prefs.backfill_derivation.clone(),
+                    vec![(cs, sha1)],
+                )
                 .map_ok(move |_| id)
         })
         .await

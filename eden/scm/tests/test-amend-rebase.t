@@ -1,4 +1,6 @@
-#debugruntest-compatible
+
+#require no-eden
+
 # coding=utf-8
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 #
@@ -39,7 +41,7 @@
   rebasing 22094967a90d "r1"
   merging mf
   $ showgraph
-  o  309a29d7f33b r1
+  o  89cc0c77a33f r1
   │
   o  e5d56d7a7894 r3
   │

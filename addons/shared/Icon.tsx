@@ -13,11 +13,12 @@ export function Icon({
   size,
   slot,
   color,
+  className,
   ...other
 }: {
   slot?: 'start';
   icon: string;
-  size?: 'S' | 'M' | 'L';
+  size?: 'XS' | 'S' | 'M' | 'L';
   color?: 'blue' | 'red' | 'green' | 'yellow';
 } & React.DetailedHTMLProps<React.HTMLAttributes<HTMLDivElement>, HTMLDivElement>) {
   return (
@@ -25,7 +26,7 @@ export function Icon({
       slot={slot}
       className={`codicon codicon-${icon} icon-size-${size ?? 'S'} ${
         color == null ? '' : `icon-${color}`
-      }`}
+      } ${className ?? ''}`}
       {...other}
     />
   );

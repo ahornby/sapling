@@ -17,10 +17,8 @@ use byteorder::WriteBytesExt;
 use configmodel::convert::ByteCount;
 use configmodel::Config;
 use configmodel::ConfigExt;
-use edenapi_types::FileAuxData;
 use indexedlog::log::IndexOutput;
 use minibytes::Bytes;
-use parking_lot::RwLock;
 use types::hgid::ReadHgIdExt;
 use types::HgId;
 use vlqencoding::VLQDecode;
@@ -29,82 +27,116 @@ use vlqencoding::VLQEncode;
 use crate::indexedlogutil::Store;
 use crate::indexedlogutil::StoreOpenOptions;
 use crate::indexedlogutil::StoreType;
+use crate::scmstore::FileAuxData;
 
 /// See edenapi_types::FileAuxData and mononoke_types::ContentMetadataV2
 pub(crate) type Entry = FileAuxData;
 
 /// Serialize the Entry to Bytes.
 ///
-/// The serialization format is as follows:
+/// The serialization format (v2) is as follows:
 /// - HgId <20 bytes>
 /// - Version <1 byte> (for compatibility)
-/// - content_id <32 bytes>
-/// - content sha1 <20 bytes>
-/// - content sha256 <32 bytes>
 /// - total_size <u64 VLQ, 1-9 bytes>
-/// - presence byte for seeded blake3 <1 byte>
-/// - content seeded blake3 <32 OR 0 bytes>
+/// - content sha1 <20 bytes>
+/// - content blake3 <32 bytes>
+///
+/// Note: (v1) was the same but containing also sha256 hash
+///       (v0) also contained content_id hash and blake3 hash was optional,
+///       also, size field was close to the end, just before the blake3
 pub(crate) fn serialize(this: &FileAuxData, hgid: HgId) -> Result<Bytes> {
+    // Write an original format for the migration period.
+    // version 0
     let mut buf = Vec::new();
     buf.write_all(hgid.as_ref())?;
     buf.write_u8(0)?; // write version
-    buf.write_all(this.content_id.as_ref())?;
+    buf.write_all(edenapi_types::ContentId::default().as_ref())?;
     buf.write_all(this.sha1.as_ref())?;
-    buf.write_all(this.sha256.as_ref())?;
+    buf.write_all(edenapi_types::Sha256::default().as_ref())?;
     buf.write_vlq(this.total_size)?;
-    match this.seeded_blake3 {
-        Some(seeded_blake3) => {
-            buf.write_u8(1)?; // A value of 1 indicates the blake3 hash is present
-            buf.write_all(seeded_blake3.as_ref())?;
-        }
-        None => buf.write_u8(0)?, // A value of 0 indicates the blake3 hash is absent
-    };
+    buf.write_u8(1)?; // A value of 1 indicates the blake3 hash is present
+    buf.write_all(this.blake3.as_ref())?;
     Ok(buf.into())
+
+    // TODO(liubovd): finish roll out of the new format after 05-22-2024
+    /* New format (tested)
+    let mut buf = Vec::new();
+    buf.write_all(hgid.as_ref())?;
+    buf.write_u8(2)?; // write version
+    buf.write_vlq(this.total_size)?;
+    buf.write_all(this.sha1.as_ref())?;
+    buf.write_all(this.blake3.as_ref())?;
+    Ok(buf.into())
+    */
 }
 
-fn deserialize(bytes: Bytes) -> Result<(HgId, FileAuxData)> {
+fn deserialize(bytes: Bytes) -> Result<Option<(HgId, FileAuxData)>> {
     let data: &[u8] = bytes.as_ref();
     let mut cur = Cursor::new(data);
 
     let hgid = cur.read_hgid()?;
 
     let version = cur.read_u8()?;
-    if version != 0 {
+    if version > 2 {
         bail!("unsupported auxstore entry version {}", version);
     }
 
-    let mut content_id = [0u8; 32];
-    cur.read_exact(&mut content_id)?;
+    if version == 0 {
+        let mut content_id = [0u8; 32];
+        cur.read_exact(&mut content_id)?;
 
-    let mut sha1 = [0u8; 20];
-    cur.read_exact(&mut sha1)?;
+        let mut sha1 = [0u8; 20];
+        cur.read_exact(&mut sha1)?;
 
-    let mut sha256 = [0u8; 32];
-    cur.read_exact(&mut sha256)?;
+        let mut sha256 = [0u8; 32];
+        cur.read_exact(&mut sha256)?;
 
-    let total_size: u64 = cur.read_vlq()?;
-    let remaining = cur.position() < bytes.len() as u64;
-    let seeded_blake3 = if remaining && cur.read_u8()? == 1 {
-        let mut seeded_blake3 = [0u8; 32];
-        cur.read_exact(&mut seeded_blake3)?;
-        Some(seeded_blake3.into())
+        let total_size: u64 = cur.read_vlq()?;
+        let remaining = cur.position() < bytes.len() as u64;
+        let blake3 = if remaining && cur.read_u8()? == 1 {
+            let mut blake3 = [0u8; 32];
+            cur.read_exact(&mut blake3)?;
+            blake3.into()
+        } else {
+            // invalid auxstore entry (missing blake3), possibly old entry incompatible
+            // with the current format, fallback to fetching from remote or local calculation
+            return Ok(None);
+        };
+
+        Ok(Some((
+            hgid,
+            FileAuxData {
+                total_size,
+                sha1: sha1.into(),
+                blake3,
+            },
+        )))
     } else {
-        None
-    };
+        let total_size: u64 = cur.read_vlq()?;
 
-    Ok((
-        hgid,
-        FileAuxData {
-            content_id: content_id.into(),
-            sha1: sha1.into(),
-            sha256: sha256.into(),
-            total_size,
-            seeded_blake3,
-        },
-    ))
+        let mut sha1 = [0u8; 20];
+        cur.read_exact(&mut sha1)?;
+
+        if version == 1 {
+            // deprecated from version #2
+            let mut sha256 = [0u8; 32];
+            cur.read_exact(&mut sha256)?;
+        }
+
+        let mut blake3 = [0u8; 32];
+        cur.read_exact(&mut blake3)?;
+        Ok(Some((
+            hgid,
+            FileAuxData {
+                total_size,
+                sha1: sha1.into(),
+                blake3: blake3.into(),
+            },
+        )))
+    }
 }
 
-pub struct AuxStore(RwLock<Store>);
+pub struct AuxStore(Store);
 
 impl AuxStore {
     pub fn new(path: impl AsRef<Path>, config: &dyn Config, store_type: StoreType) -> Result<Self> {
@@ -116,14 +148,14 @@ impl AuxStore {
             StoreType::Shared => open_options.shared(&path),
         }?;
 
-        Ok(AuxStore(RwLock::new(log)))
+        Ok(AuxStore(log))
     }
 
     fn open_options(config: &dyn Config) -> Result<StoreOpenOptions> {
         // If you update defaults/logic here, please update the "cache" help topic
         // calculations in help.py.
 
-        let mut open_options = StoreOpenOptions::new()
+        let mut open_options = StoreOpenOptions::new(config)
             .max_log_count(4)
             .max_bytes_per_log(250 * 1000 * 1000 / 4)
             .auto_sync_threshold(10 * 1024 * 1024)
@@ -160,32 +192,42 @@ impl AuxStore {
         let bytes = log.slice_to_bytes(slice);
         drop(log);
 
-        deserialize(bytes).map(|(_hgid, entry)| Some(entry))
+        deserialize(bytes).map(|value| value.map(|(_hgid, entry)| entry))
+    }
+
+    pub fn contains(&self, hgid: HgId) -> Result<bool> {
+        let log = self.0.read();
+        Ok(!log.lookup(0, hgid)?.is_empty()?)
     }
 
     pub fn put(&self, hgid: HgId, entry: &Entry) -> Result<()> {
         let serialized = serialize(entry, hgid)?;
-        self.0.write().append(&serialized)
+        self.0.append(&serialized)
     }
 
     pub fn flush(&self) -> Result<()> {
-        self.0.write().flush()
+        self.0.flush()
     }
 
     #[cfg(test)]
     pub(crate) fn hgids(&self) -> Result<Vec<HgId>> {
         let log = self.0.read();
-        log.iter()
+        Ok(log
+            .iter()
             .map(|slice| {
                 let bytes = log.slice_to_bytes(slice?);
-                deserialize(bytes).map(|(hgid, _entry)| hgid)
+                deserialize(bytes)
             })
-            .collect()
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .filter_map(|v| v.map(|(hgid, _entry)| hgid))
+            .collect())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::str::FromStr;
     use std::sync::Arc;
 
@@ -195,12 +237,12 @@ mod tests {
     use edenapi_types::Sha256;
     use fs_err::remove_file;
     use tempfile::TempDir;
+    use types::fetch_mode::FetchMode;
     use types::testutil::*;
 
     use super::*;
     use crate::indexedlogdatastore::IndexedLogHgIdDataStore;
     use crate::indexedlogdatastore::IndexedLogHgIdDataStoreConfig;
-    use crate::scmstore::FetchMode;
     use crate::scmstore::FileAttributes;
     use crate::scmstore::FileStore;
     use crate::testutil::*;
@@ -322,7 +364,7 @@ mod tests {
 
         // Set up local-only FileStore
         let mut store = FileStore::empty();
-        store.aux_local = Some(aux);
+        store.aux_cache = Some(aux);
 
         // Attempt fetch.
         let fetched = store
@@ -351,6 +393,7 @@ mod tests {
             max_bytes: None,
         };
         let content = Arc::new(IndexedLogHgIdDataStore::new(
+            &BTreeMap::<&str, &str>::new(),
             &tmp,
             ExtStoredPolicy::Ignore,
             &config,
@@ -366,21 +409,15 @@ mod tests {
         // Set up local-only FileStore
         let mut store = FileStore::empty();
         store.indexedlog_local = Some(content);
-        store.aux_local = Some(aux.clone());
+        store.aux_cache = Some(aux.clone());
+        store.compute_aux_data = true;
 
         let expected = Entry {
             total_size: 4,
-            content_id: ContentId::from_str(
-                "aa6ab85da77ca480b7624172fe44aa9906b6c3f00f06ff23c3e5f60bfd0c414e",
-            )?,
             sha1: Sha1::from_str("7110eda4d09e062aa5e4a390b0a572ac0d2c0220")?,
-            sha256: Sha256::from_str(
-                "03ac674216f3e15c761ee1a5e255f067953623c8b388b4459e13f978d7c846f4",
-            )?,
-            seeded_blake3: Some(Blake3::from_str(
+            blake3: Blake3::from_str(
                 "2078b4229b5353de0268efc7f64b68f3c99fb8829e9c052117b4e1e090b2603a",
-            )?),
-            ..Default::default()
+            )?,
         };
         // Attempt fetch.
         let fetched = store
@@ -400,33 +437,127 @@ mod tests {
     }
 
     #[test]
-    /// Test that we can deserialize non-BLAKE3 entries stored in cache.
+    /// Test that we can deserialize old non-BLAKE3 entries stored in cache as "missing" rather than fail.
     fn test_deserialize_non_blake3_entry() -> Result<()> {
-        let k = key("a", "def6f29d7b61f9cb70b2f14f79cd5c43c38e21b2");
-        let entry = Entry {
-            total_size: 4,
-            content_id: ContentId::from_str(
-                "aa6ab85da77ca480b7624172fe44aa9906b6c3f00f06ff23c3e5f60bfd0c414e",
-            )?,
-            sha1: Sha1::from_str("7110eda4d09e062aa5e4a390b0a572ac0d2c0220")?,
-            sha256: Sha256::from_str(
-                "03ac674216f3e15c761ee1a5e255f067953623c8b388b4459e13f978d7c846f4",
-            )?,
-            seeded_blake3: Some(Blake3::from_str(
-                "2078b4229b5353de0268efc7f64b68f3c99fb8829e9c052117b4e1e090b2603a",
-            )?),
-        };
-
         let mut buf = Vec::new();
-        buf.write_all(k.hgid.as_ref())?;
+        buf.write_all(
+            key("a", "def6f29d7b61f9cb70b2f14f79cd5c43c38e21b2")
+                .hgid
+                .as_ref(),
+        )?;
         buf.write_u8(0)?; // write version
-        buf.write_all(entry.content_id.as_ref())?;
-        buf.write_all(entry.sha1.as_ref())?;
-        buf.write_all(entry.sha256.as_ref())?;
-        buf.write_vlq(entry.total_size)?;
+        buf.write_all(
+            ContentId::from_str(
+                "aa6ab85da77ca480b7624172fe44aa9906b6c3f00f06ff23c3e5f60bfd0c414e",
+            )?
+            .as_ref(),
+        )?;
+        buf.write_all(Sha1::from_str("7110eda4d09e062aa5e4a390b0a572ac0d2c0220")?.as_ref())?;
+        buf.write_all(
+            Sha256::from_str("03ac674216f3e15c761ee1a5e255f067953623c8b388b4459e13f978d7c846f4")?
+                .as_ref(),
+        )?;
+        buf.write_vlq(4)?;
 
         // Validate that we can deserialize the entry even when the Blake3 hash has not been written to it.
-        deserialize(buf.into()).expect("Failed to deserialize non-Blake3 entry");
+        assert_eq!(
+            deserialize(buf.into()).expect("Failed to deserialize non-Blake3 entry"),
+            None
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    /// Test that we can deserialize old entries stored in the cache (older format with version 0)
+    fn test_deserialize_old_format_entry_v0() -> Result<()> {
+        let mut buf = Vec::new();
+        buf.write_all(
+            key("a", "def6f29d7b61f9cb70b2f14f79cd5c43c38e21b2")
+                .hgid
+                .as_ref(),
+        )?;
+        buf.write_u8(0)?; // write version
+        buf.write_all(
+            ContentId::from_str(
+                "aa6ab85da77ca480b7624172fe44aa9906b6c3f00f06ff23c3e5f60bfd0c414e",
+            )?
+            .as_ref(),
+        )?;
+        buf.write_all(Sha1::from_str("7110eda4d09e062aa5e4a390b0a572ac0d2c0220")?.as_ref())?;
+        buf.write_all(
+            Sha256::from_str("03ac674216f3e15c761ee1a5e255f067953623c8b388b4459e13f978d7c846f4")?
+                .as_ref(),
+        )?;
+        buf.write_vlq(4)?;
+        buf.write_u8(1)?; // A value of 1 indicates the blake3 hash is present
+        buf.write_all(
+            Blake3::from_str("2078b4229b5353de0268efc7f64b68f3c99fb8829e9c052117b4e1e090b2603a")?
+                .as_ref(),
+        )?;
+
+        assert!(
+            deserialize(buf.into())
+                .expect("Failed to deserialize old format entry")
+                .is_some(),
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    /// Test that we can deserialize old entries stored in the cache (older format with version 1)
+    fn test_deserialize_old_format_entry_v1() -> Result<()> {
+        let mut buf = Vec::new();
+        buf.write_all(
+            key("a", "def6f29d7b61f9cb70b2f14f79cd5c43c38e21b2")
+                .hgid
+                .as_ref(),
+        )?;
+        buf.write_u8(1)?; // write version
+        buf.write_vlq(4)?;
+        buf.write_all(Sha1::from_str("7110eda4d09e062aa5e4a390b0a572ac0d2c0220")?.as_ref())?;
+        buf.write_all(
+            Sha256::from_str("03ac674216f3e15c761ee1a5e255f067953623c8b388b4459e13f978d7c846f4")?
+                .as_ref(),
+        )?;
+        buf.write_all(
+            Blake3::from_str("2078b4229b5353de0268efc7f64b68f3c99fb8829e9c052117b4e1e090b2603a")?
+                .as_ref(),
+        )?;
+
+        assert!(
+            deserialize(buf.into())
+                .expect("Failed to deserialize old format entry")
+                .is_some(),
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    /// Test that we can deserialize correctly the v2 format
+    fn test_deserialize_old_entry_v2() -> Result<()> {
+        let mut buf = Vec::new();
+        buf.write_all(
+            key("a", "def6f29d7b61f9cb70b2f14f79cd5c43c38e21b2")
+                .hgid
+                .as_ref(),
+        )?;
+        buf.write_u8(2)?; // write version
+        buf.write_vlq(4)?;
+        buf.write_all(Sha1::from_str("7110eda4d09e062aa5e4a390b0a572ac0d2c0220")?.as_ref())?;
+        buf.write_all(
+            Blake3::from_str("2078b4229b5353de0268efc7f64b68f3c99fb8829e9c052117b4e1e090b2603a")?
+                .as_ref(),
+        )?;
+
+        assert!(
+            deserialize(buf.into())
+                .expect("Failed to deserialize old format entry")
+                .is_some(),
+        );
+
         Ok(())
     }
 }

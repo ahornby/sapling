@@ -10,19 +10,22 @@ import type {ValidatedRepoInfo} from './types';
 import type {ReactNode} from 'react';
 
 import {Delayed} from './Delayed';
+import {Subtle} from './Subtle';
 import {Tooltip} from './Tooltip';
 import {codeReviewProvider} from './codeReview/CodeReviewInfo';
 import {T, t} from './i18n';
 import {
+  EXIT_CODE_FORGET,
   operationList,
   queuedOperations,
-  repositoryInfo,
   useAbortRunningOperation,
-} from './serverAPIState';
+} from './operationsState';
+import {repositoryInfo} from './serverAPIState';
+import {processTerminalLines} from './terminalOutput';
 import {CommandRunner} from './types';
 import {short} from './utils';
 import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
-import {useRecoilValue} from 'recoil';
+import {useAtomValue} from 'jotai';
 import {Icon} from 'shared/Icon';
 import './CommandHistoryAndProgress.css';
 import {notEmpty, truncate} from 'shared/utils';
@@ -36,7 +39,7 @@ function OperationDescription(props: {
   const {info, operation, className} = props;
   const desc = operation.getDescriptionForDisplay();
 
-  const reviewProvider = useRecoilValue(codeReviewProvider);
+  const reviewProvider = useAtomValue(codeReviewProvider);
 
   if (desc?.description) {
     return <span className={className}>{desc.description}</span>;
@@ -87,11 +90,11 @@ function OperationDescription(props: {
 }
 
 export function CommandHistoryAndProgress() {
-  const list = useRecoilValue(operationList);
-  const queued = useRecoilValue(queuedOperations);
+  const list = useAtomValue(operationList);
+  const queued = useAtomValue(queuedOperations);
   const abortRunningOperation = useAbortRunningOperation();
 
-  const info = useRecoilValue(repositoryInfo);
+  const info = useAtomValue(repositoryInfo);
   if (info?.type !== 'success') {
     return null;
   }
@@ -143,11 +146,21 @@ export function CommandHistoryAndProgress() {
     // Exited (tested above) by abort.
     label = <T replace={{$command: command}}>Aborted $command</T>;
     icon = <Icon icon="stop-circle" aria-label={t('Command aborted')} />;
+  } else if (progress.exitCode === EXIT_CODE_FORGET) {
+    label = <span>{command}</span>;
+    icon = (
+      <Icon
+        icon="question"
+        aria-label={t('Command ran during disconnection. Exit status is lost.')}
+      />
+    );
   } else {
     label = <span>{command}</span>;
     icon = <Icon icon="error" aria-label={t('Command exited unsuccessfully')} />;
     showLastLineOfOutput = true;
   }
+
+  const processedLines = processTerminalLines(progress.commandOutput ?? []);
 
   return (
     <div className="progress-container" data-testid="progress-container">
@@ -163,7 +176,17 @@ export function CommandHistoryAndProgress() {
                 <br />
                 <b>Command output:</b>
                 <br />
-                <pre>{progress.commandOutput?.join('') || 'No output'}</pre>
+                {processedLines.length === 0 ? (
+                  <Subtle>
+                    <T>No output</T>
+                  </Subtle>
+                ) : (
+                  <pre>
+                    {processedLines.map((line, i) => (
+                      <div key={i}>{line}</div>
+                    ))}
+                  </pre>
+                )}
               </>
             )}
           </div>
@@ -193,9 +216,7 @@ export function CommandHistoryAndProgress() {
                   {progress.currentProgress.message}
                 </ProgressLine>
               ) : (
-                progress.commandOutput
-                  ?.slice(-1)
-                  .map((line, i) => <ProgressLine key={i}>{line}</ProgressLine>)
+                processedLines.length > 0 && <ProgressLine>{processedLines.at(-1)}</ProgressLine>
               )}
             </div>
           </div>

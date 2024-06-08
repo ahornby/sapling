@@ -4,6 +4,8 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
+# pyre-unsafe
+
 import abc
 import configparser
 import itertools
@@ -120,6 +122,7 @@ class EdenHgTestCase(testcase.EdenTestCase, metaclass=abc.ABCMeta):
             init_configs = ["experimental.windows-symlinks=True"]
         else:
             init_configs = []
+        init_configs.append("format.use-segmented-changelog=true")
         hgrc = self.get_hgrc()
         repo = self.create_hg_repo("main", hgrc=hgrc, init_configs=init_configs)
         self.populate_backing_repo(repo)
@@ -177,8 +180,9 @@ class EdenHgTestCase(testcase.EdenTestCase, metaclass=abc.ABCMeta):
     def hg_clone_additional_repo(
         self,
         *clone_args: str,
+        backing_repo: hgrepo.HgRepository,
         client_name: str = "repository",
-    ) -> Tuple[hgrepo.HgRepository, Optional[hgrepo.HgRepository]]:
+    ) -> hgrepo.HgRepository:
         """Creates another Hg Repository using `hg clone`. This excercises a
         different code path than setup_eden_test(). This function returns two
         HgRepository objects. The first corresponds to the new Eden mount. The
@@ -186,9 +190,8 @@ class EdenHgTestCase(testcase.EdenTestCase, metaclass=abc.ABCMeta):
         num_repos = len(self.adtl_repos)
         eager = str(Path(self.repos_dir) / f"eager_{num_repos}")
         mount = str(Path(self.mounts_dir) / f"{client_name}")
-        backing = str(Path(self.repos_dir) / f"{client_name}_{num_repos}")
 
-        # TODO: We rely on `hg clone` to create the eager and backing repos for
+        # TODO: We rely on `hg clone` to create the eager repo for
         # us. We could theoretically provide our own to test more cases.
         cmd, env = FindExe.get_edenfsctl_env()
         self.repo.hg(
@@ -199,7 +202,7 @@ class EdenHgTestCase(testcase.EdenTestCase, metaclass=abc.ABCMeta):
             "--config",
             "clone.use-rust=true",
             "--eden-backing-repo",
-            f"{backing}",
+            f"{backing_repo.path}",
             "--config",
             f"edenfs.command={cmd}",
             "--config",
@@ -210,7 +213,12 @@ class EdenHgTestCase(testcase.EdenTestCase, metaclass=abc.ABCMeta):
         )
 
         # The use-eden-sparse config means that a FilteredFS repo was cloned
-        is_filtered = clone_args.count("clone.use-eden-sparse=true") > 0
+        is_filtered = False
+        for a in clone_args:
+            if a.startswith("clone.use-eden-sparse=") or a.startswith(
+                "clone.eden-sparse-filter"
+            ):
+                is_filtered = True
 
         # Create the HgRepository objects for the new mount and backing repo
         mount = hgrepo.HgRepository(
@@ -218,14 +226,9 @@ class EdenHgTestCase(testcase.EdenTestCase, metaclass=abc.ABCMeta):
             system_hgrc=self.system_hgrc,
             filtered=is_filtered,
         )
-        backing = hgrepo.HgRepository(
-            backing,
-            system_hgrc=self.system_hgrc,
-            temp_mgr=self.temp_mgr,
-            filtered=is_filtered,
-        )
-        self.adtl_repos.append((mount, backing))
-        return mount, backing
+
+        self.adtl_repos.append((mount, backing_repo))
+        return mount
 
     def create_editor_that_writes_commit_messages(self, messages: List[str]) -> str:
         """
@@ -554,9 +557,7 @@ def _replicate_hg_test(
 
     # Mix in FilteredHg tests if the build supports it.
     scm_variants: MixinList = [("", [])]
-    # Temporarily disable FilteredHg mixins to test whether they are causing
-    # other tests to hang
-    if eden.config.HAVE_FILTEREDHG and False:
+    if eden.config.HAVE_FILTEREDHG:
         scm_variants.append(("FilteredHg", [FilteredTestMixin]))
 
     overlay_variants: MixinList = [("", [])]

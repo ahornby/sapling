@@ -21,21 +21,24 @@ use configmodel::ConfigExt;
 use eagerepo::EagerRepo;
 use eagerepo::EagerRepoStore;
 use edenapi::Builder;
-use edenapi::EdenApi;
-use edenapi::EdenApiError;
-use fs_err as fs;
+use edenapi::SaplingRemoteApi;
+use edenapi::SaplingRemoteApiError;
 use manifest_tree::ReadTreeManifest;
 use metalog::MetaLog;
-use once_cell::sync::Lazy;
 use once_cell::sync::OnceCell;
 use parking_lot::RwLock;
+use repo_minimal_info::constants::SUPPORTED_DEFAULT_REQUIREMENTS;
+use repo_minimal_info::constants::SUPPORTED_STORE_REQUIREMENTS;
+pub use repo_minimal_info::read_sharedpath;
+use repo_minimal_info::RepoMinimalInfo;
+use repo_minimal_info::Requirements;
 use repolock::RepoLocker;
 use revisionstore::scmstore;
 use revisionstore::scmstore::FileStoreBuilder;
 use revisionstore::scmstore::TreeStoreBuilder;
 use revisionstore::trait_impls::ArcFileStore;
-use revisionstore::EdenApiFileStore;
-use revisionstore::EdenApiTreeStore;
+use revisionstore::SaplingRemoteApiFileStore;
+use revisionstore::SaplingRemoteApiTreeStore;
 use revsets::errors::RevsetLookupError;
 use revsets::utils as revset_utils;
 use storemodel::FileStore;
@@ -49,11 +52,8 @@ use util::path::absolute;
 #[cfg(feature = "wdir")]
 use workingcopy::workingcopy::WorkingCopy;
 
-use crate::constants::SUPPORTED_DEFAULT_REQUIREMENTS;
-use crate::constants::SUPPORTED_STORE_REQUIREMENTS;
 use crate::errors;
 use crate::init;
-use crate::requirements::Requirements;
 use crate::trees::TreeManifestResolver;
 
 pub struct Repo {
@@ -68,8 +68,8 @@ pub struct Repo {
     pub requirements: Requirements,
     pub store_requirements: Requirements,
     repo_name: Option<String>,
-    metalog: Option<Arc<RwLock<MetaLog>>>,
-    eden_api: OnceCell<Arc<dyn EdenApi>>,
+    metalog: OnceCell<Arc<RwLock<MetaLog>>>,
+    eden_api: OnceCell<Arc<dyn SaplingRemoteApi>>,
     dag_commits: OnceCell<Arc<RwLock<Box<dyn DagCommits + Send + 'static>>>>,
     file_store: OnceCell<Arc<dyn FileStore>>,
     file_scm_store: OnceCell<Arc<scmstore::FileStore>>,
@@ -88,7 +88,7 @@ impl Repo {
     ) -> Result<Repo> {
         let root_path = absolute(root_path)?;
         init::init_hg_repo(&root_path, config, repo_config_contents)?;
-        let mut repo = Self::load(&root_path, pinned_config)?;
+        let repo = Self::load(&root_path, pinned_config)?;
         repo.metalog()?.write().init_tracked()?;
         Ok(repo)
     }
@@ -100,7 +100,7 @@ impl Repo {
     where
         P: Into<PathBuf>,
     {
-        Self::build(path, pinned_config, None)
+        Self::build(path.into(), pinned_config, None)
     }
 
     /// Loads the repo at given path, eschewing any config loading in
@@ -111,16 +111,23 @@ impl Repo {
     where
         P: Into<PathBuf>,
     {
-        Self::build(path, &[], Some(config))
+        Self::build(path.into(), &[], Some(config))
     }
 
-    fn build<P>(path: P, pinned_config: &[PinnedConfig], config: Option<ConfigSet>) -> Result<Self>
-    where
-        P: Into<PathBuf>,
-    {
-        let path = path.into();
-        assert!(path.is_absolute());
+    fn build(
+        path: PathBuf,
+        pinned_config: &[PinnedConfig],
+        config: Option<ConfigSet>,
+    ) -> Result<Self> {
+        let info = RepoMinimalInfo::from_repo_root(path)?;
+        Self::build_with_info(info, pinned_config, config)
+    }
 
+    fn build_with_info(
+        info: RepoMinimalInfo,
+        pinned_config: &[PinnedConfig],
+        config: Option<ConfigSet>,
+    ) -> Result<Self> {
         constructors::init();
 
         assert!(
@@ -128,26 +135,22 @@ impl Repo {
             "Don't pass a config and CLI overrides to Repo::build"
         );
 
-        let ident = match identity::sniff_dir(&path)? {
-            Some(ident) => ident,
-            None => {
-                return Err(errors::RepoNotFound(path.to_string_lossy().to_string()).into());
-            }
-        };
-
         let config = match config {
             Some(config) => config,
-            None => configloader::hg::load(Some(&path), pinned_config)?,
+            None => configloader::hg::load(Some(&info), pinned_config)?,
         };
 
-        let dot_hg_path = path.join(ident.dot_dir());
-
-        let (shared_path, shared_ident) = match read_sharedpath(&dot_hg_path)? {
-            Some((path, ident)) => (path, ident),
-            None => (path.clone(), ident.clone()),
-        };
-        let shared_dot_hg_path = shared_path.join(shared_ident.dot_dir());
-        let store_path = shared_dot_hg_path.join("store");
+        let RepoMinimalInfo {
+            path,
+            ident,
+            shared_path,
+            shared_ident,
+            store_path,
+            dot_hg_path,
+            shared_dot_hg_path,
+            requirements,
+            store_requirements,
+        } = info;
 
         let repo_name = configloader::hg::read_repo_name_from_disk(&shared_dot_hg_path)
             .ok()
@@ -156,15 +159,6 @@ impl Repo {
                     .get("remotefilelog", "reponame")
                     .map(|v| v.to_string())
             });
-
-        let requirements = Requirements::open(
-            &dot_hg_path.join("requires"),
-            Lazy::force(&SUPPORTED_DEFAULT_REQUIREMENTS),
-        )?;
-        let store_requirements = Requirements::open(
-            &store_path.join("requires"),
-            Lazy::force(&SUPPORTED_STORE_REQUIREMENTS),
-        )?;
 
         let locker = Arc::new(RepoLocker::new(&config, store_path.clone())?);
 
@@ -180,7 +174,7 @@ impl Repo {
             requirements,
             store_requirements,
             repo_name,
-            metalog: None,
+            metalog: Default::default(),
             eden_api: Default::default(),
             dag_commits: Default::default(),
             file_store: Default::default(),
@@ -199,11 +193,11 @@ impl Repo {
     pub fn reload_requires(&mut self) -> Result<()> {
         self.requirements = Requirements::open(
             &self.dot_hg_path.join("requires"),
-            Lazy::force(&SUPPORTED_DEFAULT_REQUIREMENTS),
+            &SUPPORTED_DEFAULT_REQUIREMENTS,
         )?;
         self.store_requirements = Requirements::open(
             &self.store_path.join("requires"),
-            Lazy::force(&SUPPORTED_STORE_REQUIREMENTS),
+            &SUPPORTED_STORE_REQUIREMENTS,
         )?;
         Ok(())
     }
@@ -262,19 +256,14 @@ impl Repo {
         self.dot_hg_path.join(self.ident.config_repo_file())
     }
 
-    pub fn metalog(&mut self) -> Result<Arc<RwLock<MetaLog>>> {
-        match &self.metalog {
-            Some(metalog) => Ok(metalog.clone()),
-            None => {
-                let ml = Arc::new(RwLock::new(self.load_metalog()?));
-                self.metalog = Some(ml.clone());
-                Ok(ml)
-            }
-        }
+    pub fn metalog(&self) -> Result<Arc<RwLock<MetaLog>>> {
+        self.metalog
+            .get_or_try_init(|| Ok(Arc::new(RwLock::new(self.load_metalog()?))))
+            .cloned()
     }
 
     pub fn invalidate_metalog(&self) -> Result<()> {
-        if let Some(ml) = &self.metalog {
+        if let Some(ml) = self.metalog.get() {
             *ml.write() = self.load_metalog()?;
         }
         Ok(())
@@ -289,37 +278,39 @@ impl Repo {
         self.store_path.join("metalog")
     }
 
-    /// Constructs the EdenAPI client. Errors out if the EdenAPI should not be
+    /// Constructs the SaplingRemoteAPI client. Errors out if the SaplingRemoteAPI should not be
     /// constructed.
     ///
-    /// Use `optional_eden_api` if `EdenAPI` is optional.
-    pub fn eden_api(&self) -> Result<Arc<dyn EdenApi>, EdenApiError> {
+    /// Use `optional_eden_api` if `SaplingRemoteAPI` is optional.
+    pub fn eden_api(&self) -> Result<Arc<dyn SaplingRemoteApi>, SaplingRemoteApiError> {
         match self.optional_eden_api()? {
             Some(v) => Ok(v),
-            None => Err(EdenApiError::Other(anyhow!(
-                "EdenAPI is requested but not available for this repo"
+            None => Err(SaplingRemoteApiError::Other(anyhow!(
+                "SaplingRemoteAPI is requested but not available for this repo"
             ))),
         }
     }
 
     /// Private API used by `optional_eden_api` that bypasses checks about whether
-    /// EdenAPI should be used or not.
-    fn force_construct_eden_api(&self) -> Result<Arc<dyn EdenApi>, EdenApiError> {
-        let eden_api =
-            self.eden_api
-                .get_or_try_init(|| -> Result<Arc<dyn EdenApi>, EdenApiError> {
-                    tracing::trace!(target: "repo::eden_api", "creating edenapi");
-                    let eden_api = Builder::from_config(&self.config)?.build()?;
-                    tracing::info!(url=eden_api.url(), path=?self.path, "EdenApi built");
-                    Ok(eden_api)
-                })?;
+    /// SaplingRemoteAPI should be used or not.
+    fn force_construct_eden_api(&self) -> Result<Arc<dyn SaplingRemoteApi>, SaplingRemoteApiError> {
+        let eden_api = self.eden_api.get_or_try_init(
+            || -> Result<Arc<dyn SaplingRemoteApi>, SaplingRemoteApiError> {
+                tracing::trace!(target: "repo::eden_api", "creating edenapi");
+                let eden_api = Builder::from_config(&self.config)?.build()?;
+                tracing::info!(url=eden_api.url(), path=?self.path, "SaplingRemoteApi built");
+                Ok(eden_api)
+            },
+        )?;
         Ok(eden_api.clone())
     }
 
-    /// Constructs EdenAPI client if it should be constructed.
+    /// Constructs SaplingRemoteAPI client if it should be constructed.
     ///
-    /// Returns `None` if EdenAPI should not be used.
-    pub fn optional_eden_api(&self) -> Result<Option<Arc<dyn EdenApi>>, EdenApiError> {
+    /// Returns `None` if SaplingRemoteAPI should not be used.
+    pub fn optional_eden_api(
+        &self,
+    ) -> Result<Option<Arc<dyn SaplingRemoteApi>>, SaplingRemoteApiError> {
         if self.store_requirements.contains("git") {
             tracing::trace!(target: "repo::eden_api", "disabled because of git");
             return Ok(None);
@@ -338,15 +329,12 @@ impl Repo {
                 return Ok(None);
             }
             Some(path) => {
-                // EagerRepo URLs (test:, eager: file path).
-                if path.starts_with("test:")
-                    || path.starts_with("eager:")
-                    || (!path.contains("://") && EagerRepo::url_to_dir(&path).is_some())
-                {
+                // EagerRepo URLs (test:, eager: file path, dummyssh).
+                if EagerRepo::url_to_dir(&path).is_some() {
                     tracing::trace!(target: "repo::eden_api", "using EagerRepo at {}", &path);
                     return Ok(Some(self.force_construct_eden_api()?));
                 }
-                // Legacy tests are incompatible with EdenAPI.
+                // Legacy tests are incompatible with SaplingRemoteAPI.
                 // They use None or file or ssh scheme with dummyssh.
                 if path.starts_with("file:") {
                     tracing::trace!(target: "repo::eden_api", "disabled because paths.default is not set");
@@ -359,9 +347,9 @@ impl Repo {
                         }
                     }
                 }
-                // Explicitly set EdenAPI URLs.
+                // Explicitly set SaplingRemoteAPI URLs.
                 // Ideally we can make paths.default derive the edenapi URLs. But "push" is not on
-                // EdenAPI yet. So we have to wait.
+                // SaplingRemoteAPI yet. So we have to wait.
                 if self.config.get_nonempty("edenapi", "url").is_none()
                     || self
                         .config
@@ -404,21 +392,21 @@ impl Repo {
         Ok(())
     }
 
-    pub fn remote_bookmarks(&mut self) -> Result<BTreeMap<String, HgId>> {
+    pub fn remote_bookmarks(&self) -> Result<BTreeMap<String, HgId>> {
         match self.metalog()?.read().get("remotenames")? {
             Some(rn) => Ok(refencode::decode_remotenames(&rn)?),
             None => Err(errors::RemotenamesMetalogKeyError.into()),
         }
     }
 
-    pub fn set_remote_bookmarks(&mut self, names: &BTreeMap<String, HgId>) -> Result<()> {
+    pub fn set_remote_bookmarks(&self, names: &BTreeMap<String, HgId>) -> Result<()> {
         self.metalog()?
             .write()
             .set("remotenames", &refencode::encode_remotenames(names))?;
         Ok(())
     }
 
-    pub fn local_bookmarks(&mut self) -> Result<BTreeMap<String, HgId>> {
+    pub fn local_bookmarks(&self) -> Result<BTreeMap<String, HgId>> {
         match self.metalog()?.read().get("bookmarks")? {
             Some(rn) => Ok(refencode::decode_bookmarks(&rn)?),
             None => Err(errors::RemotenamesMetalogKeyError.into()),
@@ -468,15 +456,10 @@ impl Repo {
 
         if let Some(eden_api) = eden_api {
             tracing::trace!(target: "repo::file_store", "enabling edenapi");
-            file_builder = file_builder.edenapi(EdenApiFileStore::new(eden_api));
+            file_builder = file_builder.edenapi(SaplingRemoteApiFileStore::new(eden_api));
         } else {
             tracing::trace!(target: "repo::file_store", "disabling edenapi");
             file_builder = file_builder.override_edenapi(false);
-        }
-
-        tracing::trace!(target: "repo::file_store", "configuring aux data");
-        if self.config.get_or_default("scmstore", "auxindexedlog")? {
-            file_builder = file_builder.store_aux_data();
         }
 
         tracing::trace!(target: "repo::file_store", "building file store");
@@ -514,11 +497,24 @@ impl Repo {
 
         if let Some(eden_api) = eden_api {
             tracing::trace!(target: "repo::tree_store", "enabling edenapi");
-            tree_builder = tree_builder.edenapi(EdenApiTreeStore::new(eden_api));
+            tree_builder = tree_builder.edenapi(SaplingRemoteApiTreeStore::new(eden_api));
         } else {
             tracing::trace!(target: "repo::tree_store", "disabling edenapi");
             tree_builder = tree_builder.override_edenapi(false);
         }
+
+        // Trigger construction of file store.
+        let _ = self.file_store();
+
+        // The presence of the file store on the tree store causes the tree store to
+        // request tree metadata (and write it back to file store aux cache).
+        if let Some(file_store) = self.file_scm_store() {
+            tracing::trace!(target: "repo::tree_store", "configuring filestore for aux fetching");
+            tree_builder = tree_builder.filestore(file_store);
+        } else {
+            tracing::trace!(target: "repo::tree_store", "no filestore for aux fetching");
+        }
+
         let ts = Arc::new(tree_builder.build()?);
         let _ = self.tree_scm_store.set(ts.clone());
         let _ = self.tree_store.set(ts.clone());
@@ -549,14 +545,16 @@ impl Repo {
         treestate: Option<&TreeState>,
         change_id: &str,
     ) -> Result<HgId> {
-        let id_map = self.dag_commits()?.read().id_map_snapshot()?;
+        let dag = self.dag_commits()?;
+        let dag = dag.read();
         let metalog = self.metalog()?;
         let metalog = metalog.read();
         let edenapi = self.optional_eden_api()?;
         revset_utils::resolve_single(
             &self.config,
             change_id,
-            &id_map,
+            &dag.id_map_snapshot()?,
+            &dag.dag_snapshot()?,
             &metalog,
             treestate,
             edenapi.as_deref(),
@@ -634,33 +632,6 @@ impl Repo {
             }
         }
     }
-}
-
-pub fn read_sharedpath(dot_path: &Path) -> Result<Option<(PathBuf, identity::Identity)>> {
-    let sharedpath = fs::read_to_string(dot_path.join("sharedpath"))
-        .ok()
-        .map(PathBuf::from)
-        .and_then(|p| Some(PathBuf::from(p.parent()?)));
-
-    if let Some(mut possible_path) = sharedpath {
-        // sharedpath can be relative to our dot dir.
-        possible_path = dot_path.join(possible_path);
-
-        if !possible_path.is_dir() {
-            return Err(
-                errors::InvalidSharedPath(possible_path.to_string_lossy().to_string()).into(),
-            );
-        }
-
-        return match identity::sniff_dir(&possible_path)? {
-            Some(ident) => Ok(Some((possible_path, ident))),
-            None => {
-                Err(errors::InvalidSharedPath(possible_path.to_string_lossy().to_string()).into())
-            }
-        };
-    }
-
-    Ok(None)
 }
 
 impl std::fmt::Debug for Repo {

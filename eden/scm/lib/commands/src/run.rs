@@ -37,6 +37,7 @@ use commandserver::ipc::Server;
 use configloader::config::ConfigSet;
 use configmodel::Config;
 use configmodel::ConfigExt;
+use configmodel::Text;
 use fail::FailScenario;
 use parking_lot::Mutex;
 use progress_model::Registry;
@@ -70,7 +71,7 @@ pub fn run_command(args: Vec<String>, io: &IO) -> i32 {
     if let Some(arg1) = args.get(1).map(|s| s.as_ref()) {
         match arg1 {
             "start-pfc-server" => {
-                let config: Arc<dyn Config> = Arc::new(ConfigSet::new());
+                let config: Arc<dyn Config> = Arc::new(ConfigSet::new().named("pfc-server"));
                 return HgPython::new(&args).run_hg(args, io, &config, false);
             }
             "start-commandserver" => {
@@ -254,6 +255,8 @@ fn dispatch_command(
             if failed_fallback {
                 197
             } else if should_fallback {
+                tracing::debug!(?err, "falling back to python");
+
                 fell_back = true;
                 // Change the current dir back to the original so it is not surprising to the Python
                 // code.
@@ -273,7 +276,10 @@ fn dispatch_command(
                     }
                 }
 
-                let mut interp = HgPython::new(dispatcher.args());
+                // Init interpreter with unmodifed args. This is so `sys.argv` in Python
+                // reflects what the user actually typed (we muck with the args in Rust
+                // dispatch).
+                let mut interp = HgPython::new(dispatcher.orig_args());
                 if dispatcher.global_opts().trace {
                     // Error is not fatal.
                     let _ = interp.setup_tracing("*".into());
@@ -329,6 +335,7 @@ fn dispatch_command(
     }
 
     let _ = log_perftrace(io, config, start_time);
+    let _ = print_metrics(io, config);
 
     exit_code
 }
@@ -484,7 +491,7 @@ fn spawn_progress_thread(
         disable_rendering = true;
     }
 
-    if global_opts.quiet || global_opts.debug || hgplain::is_plain(Some("progress")) {
+    if global_opts.quiet || hgplain::is_plain(Some("progress")) {
         disable_rendering = true;
     }
 
@@ -596,14 +603,14 @@ fn maybe_write_trace(
 
 pub(crate) fn write_trace(io: &IO, path: &str, data: &TracingData) -> Result<()> {
     enum Format {
-        ASCII,
+        Ascii,
         TraceEventJSON,
         TraceEventGzip,
         SpansJSON,
     }
 
     let format = if path.ends_with(".txt") {
-        Format::ASCII
+        Format::Ascii
     } else if path.ends_with("spans.json") {
         Format::SpansJSON
     } else if path.ends_with(".json") {
@@ -611,7 +618,7 @@ pub(crate) fn write_trace(io: &IO, path: &str, data: &TracingData) -> Result<()>
     } else if path.ends_with(".gz") {
         Format::TraceEventGzip
     } else {
-        Format::ASCII
+        Format::Ascii
     };
 
     let mut out: Box<dyn Write> = if path == "-" || path.is_empty() {
@@ -621,7 +628,7 @@ pub(crate) fn write_trace(io: &IO, path: &str, data: &TracingData) -> Result<()>
     };
 
     match format {
-        Format::ASCII => {
+        Format::Ascii => {
             let mut ascii_opts = tracing_collector::model::AsciiOptions::default();
             ascii_opts.min_duration_parent_percentage_to_show = 10;
             ascii_opts.min_duration_micros_to_hide = 100000;
@@ -748,7 +755,8 @@ fn log_end(
         target: "command_info",
         exit_code=exit_code,
         max_rss=max_rss,
-        total_blocked_ms=util::math::truncate_int(total_blocked_ms, 3),
+        total_blocked_ms=total_blocked_ms,
+        is_plain=hgplain::is_plain(None),
     );
 
     blackbox::log(&blackbox::event::Event::Finish {
@@ -864,6 +872,26 @@ fn log_perftrace(io: &IO, config: &dyn Config, start_time: StartTime) -> Result<
     Ok(())
 }
 
+fn print_metrics(io: &IO, config: &dyn Config) -> Result<()> {
+    let prefixes: Vec<Text> = config.must_get::<Vec<Text>>("devel", "print-metrics")?;
+    if prefixes.is_empty() {
+        return Ok(());
+    }
+
+    let metrics = hg_metrics::summarize();
+    let mut keys = metrics.keys().collect::<Vec<_>>();
+    keys.sort();
+    for key in keys {
+        for prefix in prefixes.iter() {
+            if key.starts_with(prefix.as_ref()) {
+                writeln!(io.error(), "{key}: {}", metrics.get(key).unwrap())?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 // TODO: Replace this with the 'exitcode' crate once it's available.
 mod exitcode {
     pub const IOERR: i32 = 74;
@@ -894,13 +922,13 @@ fn setup_atexit(start_time: StartTime) {
     atexit::AtExit::new(Box::new(move || {
         let duration_ms = start_time.elapsed().as_millis() as u64;
 
-        // Truncate duration to top three significant decimal digits of
-        // precision to reduce cardinality for logging storage.
-        tracing::debug!(target: "measuredtimes", command_duration=util::math::truncate_int(duration_ms, 3));
+        tracing::debug!(target: "measuredtimes", command_duration=duration_ms);
 
         // Make extra sure our metrics are written out.
         sampling::flush();
-    })).named("flush sampling".into()).queued();
+    }))
+    .named("flush sampling".into())
+    .queued();
 }
 
 fn setup_ctrlc() {
@@ -924,6 +952,11 @@ fn setup_ctrlc() {
         // Exit pager to restore terminal states (ex. quit raw mode)
         if let Ok(io) = clidispatch::io::IO::main() {
             let _ = io.quit_pager();
+
+            // Attempt to reset terminal back to a good state. In particular, this fixes
+            // the terminal if a Python `input()` call (with readline) is interrupted by
+            // ctrl-c.
+            let _ = io.reset_term();
         }
 
         // Run atexit handlers.

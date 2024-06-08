@@ -20,7 +20,7 @@ use derived_data_manager::dependencies;
 use derived_data_manager::BonsaiDerivable;
 use derived_data_manager::DerivableType;
 use derived_data_manager::DerivationContext;
-use derived_data_service_if::types as thrift;
+use derived_data_service_if as thrift;
 use futures::future::ready;
 use futures::stream::FuturesUnordered;
 use futures::stream::TryStreamExt;
@@ -46,9 +46,10 @@ fn format_key(derivation_ctx: &DerivationContext, changeset_id: ChangesetId) -> 
 
 #[async_trait]
 impl BonsaiDerivable for TreeHandle {
-    const VARIANT: DerivableType = DerivableType::GitTree;
+    const VARIANT: DerivableType = DerivableType::GitTrees;
 
     type Dependencies = dependencies![];
+    type PredecessorDependencies = dependencies![];
 
     async fn derive_single(
         ctx: &CoreContext,

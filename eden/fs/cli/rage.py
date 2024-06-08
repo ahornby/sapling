@@ -4,6 +4,8 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
+# pyre-strict
+
 import csv
 import getpass
 import io
@@ -33,7 +35,12 @@ from . import (
 from .config import EdenInstance
 
 try:
-    from .facebook.rage import find_fb_cdb, get_host_dashboard_url, setup_fb_env
+    from .facebook.rage import (
+        find_fb_cdb,
+        get_host_dashboard_url,
+        get_quickstack_cmd,
+        setup_fb_env,
+    )
 
 except ImportError:
 
@@ -46,6 +53,11 @@ except ImportError:
     def get_host_dashboard_url(
         normalized_hostname: str, period_end: datetime
     ) -> Optional[str]:
+        return None
+
+    def get_quickstack_cmd(
+        instance: EdenInstance,
+    ) -> Optional[List[str]]:
         return None
 
 
@@ -72,6 +84,11 @@ except ImportError:
     ) -> None:
         print("_report_edenfs_bug() is unimplemented.", file=sys.stderr)
         return None
+
+
+THRIFT_COUNTER_REGEX = (
+    r"thrift\.(EdenService|BaseService)\..*(time|num_samples|num_calls).*"
+)
 
 
 def section_title(message: str, out: IO[bytes]) -> None:
@@ -105,6 +122,32 @@ def get_watchman_log_path() -> Optional[Path]:
 
     if os.path.isfile(watchman_log):
         return Path(watchman_log)
+    return None
+
+
+def get_upgrade_log_path() -> Optional[Path]:
+    if sys.platform == "win32":
+        return None
+
+    for upgrade_log in [
+        "/var/facebook/logs/edenfs_upgrade.log",
+        "/Users/Shared/edenfs_upgrade.log",
+    ]:
+        if os.path.isfile(upgrade_log):
+            return Path(upgrade_log)
+    return None
+
+
+def get_config_log_path() -> Optional[Path]:
+    if sys.platform == "win32":
+        return None
+
+    for config_log in [
+        "/var/facebook/logs/edenfs_config.log",
+        "/Users/Shared/edenfs_config.log",
+    ]:
+        if os.path.isfile(config_log):
+            return Path(config_log)
     return None
 
 
@@ -173,6 +216,45 @@ def print_diagnostic_info(
             out,
             dry_run,
         )
+
+    upgrade_log_path = get_upgrade_log_path()
+
+    if upgrade_log_path:
+        section_title("EdenFS Upgrade logs:", out)
+        out.write(b"Logs from: %s\n" % str(upgrade_log_path).encode())
+        paste_output(
+            lambda sink: print_log_file(
+                upgrade_log_path,
+                sink,
+                whole_file=False,
+            ),
+            processor,
+            out,
+            dry_run,
+        )
+    elif sys.platform != "win32":
+        section_title("EdenFS Upgrade logs:", out)
+        out.write(b"Log file does not exist\n")
+
+    config_log_path = get_config_log_path()
+
+    if config_log_path:
+        section_title("EdenFS Config logs:", out)
+        out.write(b"Logs from: %s\n" % str(config_log_path).encode())
+        paste_output(
+            lambda sink: print_log_file(
+                config_log_path,
+                sink,
+                whole_file=False,
+            ),
+            processor,
+            out,
+            dry_run,
+        )
+    elif sys.platform != "win32":
+        section_title("EdenFS Config logs:", out)
+        out.write(b"Log file does not exist\n")
+
     print_tail_of_log_file(instance.get_log_path(), out)
     print_running_eden_process(out)
     print_crashed_edenfs_logs(processor, out, dry_run)
@@ -217,6 +299,12 @@ def print_diagnostic_info(
             out.write(stats_stream.getvalue().encode())
 
     print_counters(instance, "EdenFS", top_mod.COUNTER_REGEX, out)
+    print_counters(
+        instance,
+        "Thrift",
+        THRIFT_COUNTER_REGEX,
+        out,
+    )
 
     if health_status.is_healthy() and not dry_run and processor:
         print_recent_events(processor, out, dry_run)
@@ -236,13 +324,24 @@ def print_diagnostic_info(
 
     print_system_load(out)
 
+    quickstack_cmd = get_quickstack_cmd(instance)
+
+    if quickstack_cmd:
+        section_title("Quickstack:", out)
+        paste_output(
+            lambda sink: run_cmd(quickstack_cmd, sink, out),
+            processor,
+            out,
+            dry_run,
+        )
+
     print_ulimits(out)
 
 
 def report_edenfs_bug(instance: EdenInstance, reporter: str) -> None:
-    rage_lambda: Callable[
-        [EdenInstance, IO[bytes]], None
-    ] = lambda inst, sink: print_diagnostic_info(inst, sink, False)
+    rage_lambda: Callable[[EdenInstance, IO[bytes]], None] = (
+        lambda inst, sink: print_diagnostic_info(inst, sink, False)
+    )
     _report_edenfs_bug(rage_lambda, instance, reporter)
 
 
@@ -536,8 +635,17 @@ def print_system_load(out: IO[bytes]) -> None:
         out.write(f"Error printing system load: {e}\n".encode())
 
 
-def run_edenfsctl_cmd(cmd: List[str], sink: IO[bytes]) -> None:
-    subprocess.run(cmd, check=True, stderr=subprocess.STDOUT, stdout=sink)
+def run_cmd(
+    cmd: List[str], sink: IO[bytes], out: IO[bytes], timeout: float = 10
+) -> None:
+    try:
+        subprocess.run(
+            cmd, check=True, stderr=subprocess.STDOUT, stdout=sink, timeout=timeout
+        )
+    except subprocess.TimeoutExpired:
+        out.write(
+            f"Command {' '.join(cmd)} timed out after {timeout} seconds\n".encode()
+        )
 
 
 def print_eden_config(
@@ -547,7 +655,7 @@ def print_eden_config(
     fsconfig_cmd = ["edenfsctl", "fsconfig", "--all"]
 
     result = paste_output(
-        lambda sink: run_edenfsctl_cmd(fsconfig_cmd, sink),
+        lambda sink: run_cmd(fsconfig_cmd, sink, out),
         processor,
         out,
         dry_run,
@@ -608,26 +716,33 @@ def print_crashed_edenfs_logs(processor: str, out: IO[bytes], dry_run: bool) -> 
     section_title("EdenFS crashes and dumps:", out)
     num_uploads = 0
     for crashes_path in crashes_paths:
-        if not crashes_path.exists():
-            continue
+        try:
+            if not crashes_path.exists():
+                continue
 
-        # Only upload crashes from the past week.
-        date_threshold = datetime.now() - timedelta(weeks=1)
-        for crash in crashes_path.iterdir():
-            if crash.name.startswith("edenfs"):
-                crash_time = datetime.fromtimestamp(crash.stat().st_mtime)
-                human_crash_time = crash_time.strftime("%b %d %H:%M:%S")
-                out.write(f"{str(crash.name)} from {human_crash_time}: ".encode())
-                if crash_time > date_threshold and num_uploads <= 2:
-                    num_uploads += 1
-                    paste_output(
-                        lambda sink: print_log_file(crash, sink, whole_file=True),
-                        processor,
-                        out,
-                        dry_run,
-                    )
-                else:
-                    out.write(" not uploaded due to age or max num dumps\n".encode())
+            # Only upload crashes from the past week.
+            date_threshold = datetime.now() - timedelta(weeks=1)
+            for crash in crashes_path.iterdir():
+                if crash.name.startswith("edenfs"):
+                    crash_time = datetime.fromtimestamp(crash.stat().st_mtime)
+                    human_crash_time = crash_time.strftime("%b %d %H:%M:%S")
+                    out.write(f"{str(crash.name)} from {human_crash_time}: ".encode())
+                    if crash_time > date_threshold and num_uploads <= 2:
+                        num_uploads += 1
+                        paste_output(
+                            lambda sink, crash=crash: print_log_file(
+                                crash, sink, whole_file=True
+                            ),
+                            processor,
+                            out,
+                            dry_run,
+                        )
+                    else:
+                        out.write(
+                            " not uploaded due to age or max num dumps\n".encode()
+                        )
+        except Exception as e:
+            out.write(f"Error accessing crash file at {crashes_path}: {e}\n".encode())
 
     out.write("\n".encode())
 
@@ -651,7 +766,7 @@ def trace_running_edenfs(
 
 def print_recent_events(processor: str, out: IO[bytes], dry_run: bool) -> None:
     section_title("EdenFS recent events", out)
-    for opt in ["thrift", "hg", "inode"]:
+    for opt in ["thrift", "sl", "inode"]:
         trace_cmd = [
             "edenfsctl",
             "trace",
@@ -662,7 +777,7 @@ def print_recent_events(processor: str, out: IO[bytes], dry_run: bool) -> None:
         try:
             out.write(f"{opt}: ".encode())
             paste_output(
-                lambda sink: run_edenfsctl_cmd(trace_cmd, sink),
+                lambda sink, trace_cmd=trace_cmd: run_cmd(trace_cmd, sink, out),
                 processor,
                 out,
                 dry_run,

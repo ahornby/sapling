@@ -191,6 +191,23 @@ pub trait DagAlgorithm: Send + Sync {
         default_impl::reachable_roots(self, roots, heads).await
     }
 
+    /// Suggest the next place to test during a bisect.
+    ///
+    /// - `(roots, heads)` are either `(good, bad)` or `(bad, good)`.
+    /// - `skip` should be non-lazy.
+    ///
+    /// Return `(vertex_to_bisect_next, untested_set, roots(high::))`.
+    ///
+    /// If `vertex_to_bisect_next` is `None`, the bisect is completed. At this
+    /// time, `roots(heads::)` is the "first good/bad" set. `untested_set`
+    /// is usually empty, or a subset of `skip`.
+    async fn suggest_bisect(
+        &self,
+        roots: NameSet,
+        heads: NameSet,
+        skip: NameSet,
+    ) -> Result<(Option<VertexName>, NameSet, NameSet)>;
+
     /// Vertexes buffered in memory, not yet written to disk.
     async fn dirty(&self) -> Result<NameSet>;
 
@@ -228,14 +245,18 @@ pub trait Parents: Send + Sync {
 
     /// A hint of a sub-graph for inserting `heads`.
     ///
-    /// This is used to reduce remote fetches in a lazy graph.
-    /// The roots will be checked first, if a root is unknown locally then
-    /// all its descendants will be considered unknown locally.
+    /// This is used to reduce remote fetches in a lazy graph. The function
+    /// should ideally return a subset of pending vertexes that are confirmed to
+    /// not overlap in the existing (potentially lazy) graph.
+    ///
+    /// The pending roots will be checked first, if a root is unknown locally
+    /// then all its descendants will be considered unknown locally.
     ///
     /// The returned graph is only used to optimize network fetches in
     /// `assign_head`. It is not used to be actually inserted to the graph. So
     /// returning an empty or "incorrect" graph does not hurt correctness. But
-    /// might hurt performance.
+    /// might hurt performance. Returning a set that contains vertexes that do
+    /// overlap in the existing graph is incorrect.
     async fn hint_subdag_for_insertion(&self, _heads: &[VertexName]) -> Result<MemNameDag>;
 }
 
@@ -295,8 +316,19 @@ impl Parents for std::collections::HashMap<VertexName, Vec<VertexName>> {
 /// Add vertexes recursively to the DAG.
 #[async_trait::async_trait]
 pub trait DagAddHeads {
-    /// Add vertexes and their ancestors to the DAG. This does not persistent
-    /// changes to disk.
+    /// Add non-lazy vertexes and their ancestors in memory.
+    ///
+    /// Does not persist changes to disk. Use `add_heads_and_flush` to persist.
+    /// Use `import_pull_data` to add lazy segments to the DAG.
+    ///
+    /// `heads` must use non-MASTER (NON_MASTER, VIRTUAL) groups as
+    /// `desired_group`. `heads` are imported in the given order.
+    ///
+    /// | Method              | Allowed groups      | Persist | Lazy |
+    /// |---------------------|---------------------|---------|------|
+    /// | add_heads           | NON_MASTER, VIRTUAL | No      | No   |
+    /// | add_heads_and_flush | MASTER              | Yes     | No   |
+    /// | import_pull_data    | MASTER              | Yes     | Yes  |
     async fn add_heads(
         &mut self,
         parents: &dyn Parents,
@@ -307,11 +339,10 @@ pub trait DagAddHeads {
 /// Remove vertexes and their descendants from the DAG.
 #[async_trait::async_trait]
 pub trait DagStrip {
-    /// Remove the given `set` and their descendants.
+    /// Remove the given `set` and their descendants on disk.
     ///
-    /// This will reload the DAG from its source (ex. filesystem) and writes
-    /// changes back with a lock so there are no other processes adding
-    /// new descendants of the stripped set.
+    /// Reload and persist changes to disk (with lock) immediately.
+    /// Errors out if pending changes in NON_MASTER were added by `add_heads`.
     ///
     /// After strip, the `self` graph might contain new vertexes because of
     /// the reload.
@@ -322,6 +353,10 @@ pub trait DagStrip {
 #[async_trait::async_trait]
 pub trait DagImportCloneData {
     /// Updates the DAG using a `CloneData` object.
+    ///
+    /// This predates `import_pull_data`. New logic should use the general
+    /// purpose `import_pull_data` instead. Clone is just a special case of
+    /// pull.
     async fn import_clone_data(&mut self, clone_data: CloneData<VertexName>) -> Result<()>;
 }
 
@@ -329,9 +364,23 @@ pub trait DagImportCloneData {
 /// Ids in the passed CloneData might not match ids in existing DAG.
 #[async_trait::async_trait]
 pub trait DagImportPullData {
-    /// Updates the DAG using a `CloneData` object.
+    /// Imports lazy segments ("name" partially known, "shape" known) on disk.
     ///
-    /// Only import the given `heads`.
+    /// Reload and persist changes to disk (with lock) immediately.
+    /// Errors out if pending changes in NON_MASTER were added by `add_heads`.
+    /// Errors out if `clone_data` overlaps with the existing graph.
+    ///
+    /// `heads` must use MASTER as `desired_group`. `heads` are imported
+    /// in the given order (useful to distinguish between primary and secondary
+    /// branches, and specify their gaps in the id ranges, to reduce
+    /// fragmentation).
+    ///
+    /// `heads` with `reserve_size > 0` must be passed in even if they
+    /// already exist and are not being added, for the id reservation to work
+    /// correctly.
+    ///
+    /// If `clone_data` includes parts not covered by `heads` and their
+    /// ancestors, those parts will be ignored.
     async fn import_pull_data(
         &mut self,
         clone_data: CloneData<VertexName>,
@@ -357,13 +406,35 @@ pub trait DagExportPullData {
 pub trait DagPersistent {
     /// Write in-memory DAG to disk. This might also pick up changes to
     /// the DAG by other processes.
+    ///
+    /// Calling `add_heads` followed by `flush` is like calling
+    /// `add_heads_and_flush` with the `master_heads` passed to `flush` concated
+    /// with `heads` from `add_heads`. `add_heads` followed by `flush` is more
+    /// flexible but less performant than `add_heads_and_flush`.
     async fn flush(&mut self, master_heads: &VertexListWithOptions) -> Result<()>;
 
     /// Write in-memory IdMap that caches Id <-> Vertex translation from
     /// remote service to disk.
     async fn flush_cached_idmap(&self) -> Result<()>;
 
-    /// A faster path for add_heads, followed by flush.
+    /// Add non-lazy vertexes, their ancestors, and vertexes added previously by
+    /// `add_heads` on disk.
+    ///
+    /// Reload and persist changes to disk (with lock) immediately.
+    /// Does not error out if pending changes were added by `add_heads`.
+    ///
+    /// `heads` should not use `VIRTUAL` as `desired_group`. `heads` are
+    /// imported in the given order, followed by `heads` previously added
+    /// by `add_heads`.
+    ///
+    /// `heads` with `reserve_size > 0` must be passed in even if they
+    /// already exist and are not being added, for the id reservation to work
+    /// correctly.
+    ///
+    /// `add_heads_and_flush` is faster than `add_heads`. But `add_heads` can
+    /// be useful for the VIRTUAL group, and when the final group is not yet
+    /// decided (ex. the MASTER group is decided by remotenames info but
+    /// remotenames is not yet known at `add_heads` time).
     async fn add_heads_and_flush(
         &mut self,
         parent_names_func: &dyn Parents,
@@ -386,7 +457,7 @@ pub trait DagPersistent {
             .try_collect::<Vec<_>>()
             .await?;
         let heads = VertexListWithOptions::from(master_heads)
-            .with_highest_group(Group::MASTER)
+            .with_desired_group(Group::MASTER)
             .chain(non_master_heads);
         self.add_heads_and_flush(&dag.dag_snapshot()?, &heads).await
     }
@@ -464,7 +535,7 @@ pub trait IdConvert: PrefixLookup + Sync {
     async fn contains_vertex_name_locally(&self, name: &[VertexName]) -> Result<Vec<bool>>;
 
     async fn vertex_id_optional(&self, name: &VertexName) -> Result<Option<Id>> {
-        self.vertex_id_with_max_group(name, Group::NON_MASTER).await
+        self.vertex_id_with_max_group(name, Group::MAX).await
     }
 
     /// Convert [`Id`]s to [`VertexName`]s in batch.

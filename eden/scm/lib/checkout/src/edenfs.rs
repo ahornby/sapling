@@ -19,13 +19,17 @@ use anyhow::Result;
 use configmodel::Config;
 use configmodel::ConfigExt;
 use context::CoreContext;
-use edenfs_client::CheckoutConflict;
 use manifest::Manifest;
 use pathmatcher::AlwaysMatcher;
 use repo::repo::Repo;
 use spawn_ext::CommandExt;
+use status::Status;
+use status::StatusBuilder;
 use termlogger::TermLogger;
 use treestate::filestate::StateFlags;
+use types::workingcopy_client::CheckoutConflict;
+use types::workingcopy_client::CheckoutMode;
+use types::workingcopy_client::ConflictType;
 use types::HgId;
 use types::RepoPath;
 use workingcopy::util::walk_treestate;
@@ -39,34 +43,75 @@ use crate::check_conflicts;
 use crate::errors::EdenConflictError;
 use crate::ActionMap;
 use crate::Checkout;
-use crate::CheckoutMode;
 use crate::CheckoutPlan;
 
 fn actionmap_from_eden_conflicts(
     config: &dyn Config,
+    wc: &WorkingCopy,
     source_manifest: &impl Manifest,
     target_manifest: &impl Manifest,
-    conflicts: Vec<edenfs_client::CheckoutConflict>,
-) -> Result<ActionMap> {
+    conflicts: Vec<CheckoutConflict>,
+) -> Result<(ActionMap, Status)> {
+    let mut modified = Vec::new();
+    let mut removed = Vec::new();
+    let mut added = Vec::new();
+    let mut unknown = Vec::new();
+    let treestate_binding = wc.treestate();
+    let mut treestate = treestate_binding.lock();
+
     let mut map = HashMap::new();
     for conflict in conflicts {
         let action = match conflict.conflict_type {
-            edenfs_client::ConflictType::Error => {
+            ConflictType::Error => {
                 abort_on_eden_conflict_error(config, vec![conflict.clone()])?;
                 None
             }
-            edenfs_client::ConflictType::UntrackedAdded
-            | edenfs_client::ConflictType::RemovedModified => {
+            ConflictType::UntrackedAdded | ConflictType::RemovedModified => {
                 let conflict_path = conflict.path.as_repo_path();
+                if conflict.conflict_type == ConflictType::UntrackedAdded {
+                    let file_state = treestate
+                        .normalized_get(conflict_path.as_str().as_bytes())?
+                        .map_or(StateFlags::empty(), |f| f.state);
+                    if file_state.intersects(StateFlags::EXIST_NEXT) {
+                        // This means that the file was added, since it's
+                        // visible in the treestate but EdenFS sees it as
+                        // untracked
+                        added.push(conflict_path.to_owned());
+                    } else if !wc
+                        .ignore_matcher
+                        .match_relative(conflict_path.to_path().as_path(), false)
+                    {
+                        // If the treestate doesn't see the file, it means that
+                        // the file is either ignored or untracked. There are
+                        // some particular edge cases when we want to treat
+                        // unknown files as special during checkout
+                        unknown.push(conflict_path.to_owned());
+                    }
+                } else if let Some(file_state) =
+                    treestate.normalized_get(conflict_path.as_str().as_bytes())?
+                {
+                    if file_state
+                        .state
+                        .intersects(StateFlags::EXIST_P1 | StateFlags::EXIST_P2)
+                    {
+                        // Seems like this code path never gets hit, but let's handle it anyways
+                        removed.push(conflict_path.to_owned());
+                    }
+                }
                 let meta = target_manifest.get_file(conflict_path)?.context(format!(
                     "file metadata for {} not found at destination commit",
                     conflict_path
                 ))?;
                 Some(Action::Update(UpdateAction::new(None, meta)))
             }
-            edenfs_client::ConflictType::ModifiedRemoved => Some(Action::Remove),
-            edenfs_client::ConflictType::ModifiedModified => {
+            ConflictType::ModifiedRemoved => {
                 let conflict_path = conflict.path.as_repo_path();
+                modified.push(conflict_path.to_owned());
+                Some(Action::Remove)
+            }
+            ConflictType::ModifiedModified => {
+                let conflict_path = conflict.path.as_repo_path();
+                modified.push(conflict_path.to_owned());
                 let old_meta = source_manifest.get_file(conflict_path)?.context(format!(
                     "file metadata for {} not found at source commit",
                     conflict_path
@@ -77,42 +122,46 @@ fn actionmap_from_eden_conflicts(
                 ))?;
                 changed_metadata_to_action(old_meta, new_meta)
             }
-            edenfs_client::ConflictType::MissingRemoved
-            | edenfs_client::ConflictType::DirectoryNotEmpty => None,
+            ConflictType::MissingRemoved | ConflictType::DirectoryNotEmpty => None,
         };
         if let Some(action) = action {
             map.insert(conflict.path, action);
         }
     }
-    Ok(ActionMap { map })
+
+    // This will generate something mostly equivalent to what one gets
+    // with the status command
+    let mut status_builder = StatusBuilder::new();
+    status_builder = status_builder.modified(modified);
+    status_builder = status_builder.removed(removed);
+    status_builder = status_builder.added(added);
+    status_builder = status_builder.unknown(unknown);
+
+    Ok((ActionMap { map }, status_builder.build()))
 }
 
 pub fn edenfs_checkout(
     ctx: &CoreContext,
-    repo: &mut Repo,
+    repo: &Repo,
     wc: &LockedWorkingCopy,
     target_commit: HgId,
-    checkout_mode: CheckoutMode,
+    revert_conflicts: bool,
 ) -> anyhow::Result<()> {
     // TODO (sggutier): try to unify these steps with the non-edenfs version of checkout
     let target_commit_tree_hash = repo.tree_resolver()?.get_root_id(&target_commit)?;
 
     // Perform the actual checkout depending on the mode
-    match checkout_mode {
-        CheckoutMode::Force => {
-            edenfs_force_checkout(repo, wc, target_commit, target_commit_tree_hash)?
-        }
-        CheckoutMode::NoConflict => edenfs_noconflict_checkout(
-            &ctx.logger,
-            repo,
-            wc,
-            target_commit,
-            target_commit_tree_hash,
-        )?,
-        CheckoutMode::Merge => bail!("native merge checkout not yet supported for EdenFS"),
-    };
+    if revert_conflicts {
+        edenfs_force_checkout(repo, wc, target_commit, target_commit_tree_hash)?
+    } else {
+        edenfs_noconflict_checkout(ctx, repo, wc, target_commit, target_commit_tree_hash)?
+    }
 
     // Update the treestate and parents with the new changes
+    if fail::eval("checkout-pre-set-parents", |_| ()).is_some() {
+        bail!("Error set by checkout-pre-set-parents FAILPOINTS");
+    }
+
     wc.set_parents(vec![target_commit], Some(target_commit_tree_hash))?;
     wc.treestate().lock().flush()?;
     // Clear the update state
@@ -128,18 +177,18 @@ fn create_edenfs_plan(
     config: &dyn Config,
     source_manifest: &impl Manifest,
     target_manifest: &impl Manifest,
-    conflicts: Vec<edenfs_client::CheckoutConflict>,
-) -> Result<CheckoutPlan> {
+    conflicts: Vec<CheckoutConflict>,
+) -> Result<(CheckoutPlan, Status)> {
     let vfs = wc.vfs();
-    let actionmap =
-        actionmap_from_eden_conflicts(config, source_manifest, target_manifest, conflicts)?;
+    let (actionmap, status) =
+        actionmap_from_eden_conflicts(config, wc, source_manifest, target_manifest, conflicts)?;
     let checkout = Checkout::from_config(vfs.clone(), &config)?;
-    Ok(checkout.plan_action_map(actionmap))
+    Ok((checkout.plan_action_map(actionmap), status))
 }
 
 fn edenfs_noconflict_checkout(
-    lgr: &TermLogger,
-    repo: &mut Repo,
+    ctx: &CoreContext,
+    repo: &Repo,
     wc: &LockedWorkingCopy,
     target_commit: HgId,
     target_commit_tree_hash: HgId,
@@ -150,16 +199,14 @@ fn edenfs_noconflict_checkout(
     let target_mf = tree_resolver.get(&target_commit)?;
 
     // Do a dry run to check if there will be any conflicts before modifying any actual files
-    let conflicts = wc.eden_client()?.checkout(
+    let conflicts = wc.working_copy_client()?.checkout(
         target_commit,
         target_commit_tree_hash,
-        edenfs_client::CheckoutMode::DryRun,
+        CheckoutMode::DryRun,
     )?;
-    let plan = create_edenfs_plan(wc, repo.config(), &source_mf, &target_mf, conflicts)?;
+    let (plan, status) = create_edenfs_plan(wc, repo.config(), &source_mf, &target_mf, conflicts)?;
 
-    let status = wc.status(Arc::new(AlwaysMatcher::new()), false, repo.config(), lgr)?;
-
-    check_conflicts(lgr, repo, wc, &plan, &target_mf, &status)?;
+    check_conflicts(repo, wc, &plan, &target_mf, &status)?;
 
     // Signal that an update is being performed
     let updatestate_path = wc.dot_hg_path().join("updatestate");
@@ -168,33 +215,34 @@ fn edenfs_noconflict_checkout(
     })?;
 
     // Do the actual checkout
-    let actual_conflicts = wc.eden_client()?.checkout(
+    let actual_conflicts = wc.working_copy_client()?.checkout(
         target_commit,
         target_commit_tree_hash,
-        edenfs_client::CheckoutMode::Normal,
+        CheckoutMode::Normal,
     )?;
     abort_on_eden_conflict_error(repo.config(), actual_conflicts)?;
 
     // Execute the plan, applying changes to conflicting-ish files
     let apply_result = plan.apply_store(repo.file_store()?.as_ref())?;
     for (path, err) in apply_result.remove_failed {
-        lgr.warn(format!("update failed to remove {}: {:#}!\n", path, err));
+        ctx.logger
+            .warn(format!("update failed to remove {}: {:#}!\n", path, err));
     }
 
     Ok(())
 }
 
 fn edenfs_force_checkout(
-    repo: &mut Repo,
+    repo: &Repo,
     wc: &LockedWorkingCopy,
     target_commit: HgId,
     target_commit_tree_hash: HgId,
 ) -> anyhow::Result<()> {
     // Try to run checkout on EdenFS on force mode, then check for network errors
-    let conflicts = wc.eden_client()?.checkout(
+    let conflicts = wc.working_copy_client()?.checkout(
         target_commit,
         target_commit_tree_hash,
-        edenfs_client::CheckoutMode::Force,
+        CheckoutMode::Force,
     )?;
     abort_on_eden_conflict_error(repo.config(), conflicts)?;
 
@@ -210,13 +258,12 @@ fn clear_edenfs_dirstate(wc: &LockedWorkingCopy) -> anyhow::Result<()> {
     let tbind = wc.treestate();
     let mut treestate = tbind.lock();
     let matcher = Arc::new(AlwaysMatcher::new());
-    let mask = StateFlags::EXIST_P1 | StateFlags::EXIST_P2 | StateFlags::EXIST_NEXT;
     let mut tracked = Vec::new();
     walk_treestate(
         &mut treestate,
         matcher,
         StateFlags::empty(),
-        mask,
+        StateFlags::TRACKED,
         StateFlags::empty(),
         |path, _state| {
             tracked.push(path);
@@ -270,10 +317,19 @@ fn is_edenfs_redirect_okay(wc: &WorkingCopy) -> anyhow::Result<Option<bool>> {
     let vfs = wc.vfs();
     let mut redirections = HashMap::new();
 
+    let client = wc.working_copy_client()?;
+    let client = match client
+        .as_any()
+        .downcast_ref::<edenfs_client::EdenFsClient>()
+    {
+        Some(v) => v,
+        None => anyhow::bail!("bug: edenfs_redirect called on non-eden working copy"),
+    };
+
     // Check edenfs-client/src/redirect.rs for the config paths and file format.
     let client_paths = vec![
         wc.vfs().root().join(".eden-redirections"),
-        wc.eden_client()?.client_path().join("config.toml"),
+        client.client_path().join("config.toml"),
     ];
 
     for path in client_paths {
@@ -335,7 +391,7 @@ pub fn abort_on_eden_conflict_error(
         return Ok(());
     }
     for conflict in conflicts {
-        if edenfs_client::ConflictType::Error == conflict.conflict_type {
+        if ConflictType::Error == conflict.conflict_type {
             hg_metrics::increment_counter("abort_on_eden_conflict_error", 1);
             return Err(EdenConflictError {
                 path: conflict.path.into_string(),

@@ -16,10 +16,12 @@ use anyhow::bail;
 use anyhow::format_err;
 use anyhow::Context;
 use anyhow::Error;
+use anyhow::Result;
 use async_trait::async_trait;
 use blobstore::LoadableError;
 use bytes::Bytes;
 use context::CoreContext;
+use derived_data_manager::DerivableType;
 use encoding_rs::Encoding;
 use futures::stream::Stream;
 use futures::stream::StreamExt;
@@ -51,7 +53,6 @@ use tokio::io::AsyncWriteExt;
 use tokio::io::BufReader;
 use tokio::process::Child;
 use tokio::process::Command;
-use tokio_stream::wrappers::LinesStream;
 
 use crate::git_reader::GitRepoReader;
 use crate::gitlfs::GitImportLfs;
@@ -177,6 +178,7 @@ pub struct GitimportPreferences {
     pub submodules: bool,
     pub lfs: GitImportLfs,
     pub git_command_path: PathBuf,
+    pub backfill_derivation: BackfillDerivation,
 }
 
 impl Default for GitimportPreferences {
@@ -188,6 +190,7 @@ impl Default for GitimportPreferences {
             submodules: true,
             lfs: GitImportLfs::default(),
             git_command_path: PathBuf::from("/usr/bin/git.real"),
+            backfill_derivation: BackfillDerivation::No,
         }
     }
 }
@@ -236,36 +239,13 @@ impl GitimportTarget {
         }
     }
 
-    /// Returns the number of commits to import
-    pub async fn get_nb_commits(
-        &self,
-        git_command_path: &Path,
-        repo_path: &Path,
-    ) -> Result<usize, Error> {
-        let mut rev_list = self
-            .build_rev_list(git_command_path, repo_path)
-            .arg("--count")
-            .spawn()?;
-
-        self.write_filter_list(&mut rev_list).await?;
-
-        // stdout is a single line that parses as number of commits
-        let stdout = BufReader::new(rev_list.stdout.take().context("stdout not set up")?);
-        let mut lines = stdout.lines();
-        if let Some(line) = lines.next_line().await? {
-            Ok(line.parse()?)
-        } else {
-            bail!("No lines returned by git rev-list");
-        }
-    }
-
-    /// Returns a stream of commit hashes to import, ordered so that all
+    /// Returns a Vec of commit hashes to import, ordered so that all
     /// of a commit's parents are listed first
     pub(crate) async fn list_commits(
         &self,
         git_command_path: &Path,
         repo_path: &Path,
-    ) -> Result<impl Stream<Item = Result<ObjectId, Error>>, Error> {
+    ) -> Result<Vec<Result<ObjectId, Error>>, Error> {
         let mut rev_list = self
             .build_rev_list(git_command_path, repo_path)
             .arg("--topo-order")
@@ -275,15 +255,17 @@ impl GitimportTarget {
         self.write_filter_list(&mut rev_list).await?;
 
         let stdout = BufReader::new(rev_list.stdout.take().context("stdout not set up")?);
-        let lines_stream = LinesStream::new(stdout.lines());
+        let mut lines = stdout.lines();
 
-        Ok(lines_stream.err_into().and_then(|line| async move {
-            // rev-list with --boundary option returns boundary commits prefixed with `-`
-            // here we remove that prefix to get uniformed list of commits
-            line.replace('-', "")
-                .parse()
-                .context("Reading from git rev-list")
-        }))
+        let mut vec = Vec::new();
+        while let Some(line) = lines.next_line().await? {
+            vec.push(
+                line.replace('-', "")
+                    .parse()
+                    .context("Reading from git rev-list"),
+            );
+        }
+        Ok(vec)
     }
 
     async fn write_filter_list(&self, rev_list: &mut Child) -> Result<(), Error> {
@@ -345,7 +327,7 @@ impl TagMetadata {
 
         let author_date = tagger
             .take()
-            .map(|tagger| convert_time_to_datetime(&tagger.time))
+            .map(|tagger| DateTime::from_gix(tagger.time))
             .transpose()?;
         let author = tagger
             .take()
@@ -495,8 +477,8 @@ impl ExtractedCommit {
             trees
         };
 
-        let author_date = convert_time_to_datetime(&author.time)?;
-        let committer_date = convert_time_to_datetime(&committer.time)?;
+        let author_date = DateTime::from_gix(author.time)?;
+        let committer_date = DateTime::from_gix(committer.time)?;
         let author = format_signature(author.to_ref());
         let committer = format_signature(committer.to_ref());
         let message = decode_message(&message, &encoding, ctx.logger())?;
@@ -616,8 +598,25 @@ impl ExtractedCommit {
     }
 }
 
-pub fn convert_time_to_datetime(time: &gix_date::Time) -> Result<DateTime, Error> {
-    DateTime::from_timestamp(time.seconds, -time.offset)
+#[derive(Clone, Debug)]
+pub enum BackfillDerivation {
+    AllConfiguredTypes,
+    OnlySpecificTypes(Vec<DerivableType>),
+    No,
+}
+
+impl BackfillDerivation {
+    pub fn types(&self, configured_types: &HashSet<DerivableType>) -> Vec<DerivableType> {
+        match self {
+            BackfillDerivation::AllConfiguredTypes => configured_types.iter().cloned().collect(),
+            BackfillDerivation::OnlySpecificTypes(derived_data_types) => derived_data_types
+                .iter()
+                .filter(|ty| configured_types.contains(ty))
+                .cloned()
+                .collect(),
+            BackfillDerivation::No => Vec::new(),
+        }
+    }
 }
 
 #[async_trait]
@@ -630,6 +629,15 @@ pub trait GitUploader: Clone + Send + Sync + 'static {
 
     /// Returns a change representing a deletion
     fn deleted() -> Self::Change;
+
+    /// Preload a number of commits, allowing us to batch the
+    /// lookups in the bonsai_git_mapping table, largely reducing
+    /// the I/O load
+    async fn preload_uploaded_commits(
+        &self,
+        ctx: &CoreContext,
+        oids: &[gix_hash::ObjectId],
+    ) -> Result<Vec<(gix_hash::ObjectId, ChangesetId)>, Error>;
 
     /// Looks to see if we can elide importing a commit
     /// If you can give us the ChangesetId for a given git object,
@@ -701,6 +709,7 @@ pub trait GitUploader: Clone + Send + Sync + 'static {
         &self,
         ctx: &CoreContext,
         dry_run: bool,
+        backfill_derivation: BackfillDerivation,
         changesets: Vec<(Self::IntermediateChangeset, hash::GitSha1)>,
     ) -> Result<(), Error>;
 }

@@ -1294,10 +1294,13 @@ def updateone(repo, fctxfunc, wctx, f, flags, backup=False, backgroundclose=Fals
         # They are handled separately.
         return 0
     wctx[f].clearunknown()
-    data = fctx.data()
-    wctx[f].write(data, flags, backgroundclose=backgroundclose)
+    wctx[f].write(fctx, flags, backgroundclose=backgroundclose)
 
-    return len(data)
+    if fctx.flags() == "m":
+        # size() doesn't seem to work for submodules
+        return len(fctx.data())
+    else:
+        return fctx.size()
 
 
 def batchget(repo, mctx, wctx, actions):
@@ -1348,9 +1351,11 @@ def applyupdates(repo, actions, wctx, mctx, overwrite, labels=None, ancestors=No
         node=wctx.p1().node(),
         other=mctx.node(),
         # Ancestor can include the working copy, so we use this helper:
-        ancestors=[scmutil.contextnodesupportingwdir(c) for c in ancestors]
-        if ancestors
-        else None,
+        ancestors=(
+            [scmutil.contextnodesupportingwdir(c) for c in ancestors]
+            if ancestors
+            else None
+        ),
         labels=labels,
     )
 
@@ -1465,7 +1470,7 @@ def applyupdates(repo, actions, wctx, mctx, overwrite, labels=None, ancestors=No
             if wctx[f0].lexists():
                 repo.ui.note(_("moving %s to %s\n") % (f0, f))
                 wctx[f].audit()
-                wctx[f].write(wctx.filectx(f0).data(), wctx.filectx(f0).flags())
+                wctx[f].write(wctx.filectx(f0), wctx.filectx(f0).flags())
                 wctx[f0].remove()
             z += 1
             prog.value = (z, f)
@@ -1542,7 +1547,7 @@ def applyupdates(repo, actions, wctx, mctx, overwrite, labels=None, ancestors=No
             f0, flags = args
             repo.ui.note(_("moving %s to %s\n") % (f0, f))
             wctx[f].audit()
-            wctx[f].write(wctx.filectx(f0).data(), flags)
+            wctx[f].write(wctx.filectx(f0), flags)
             wctx[f0].remove()
             updated += 1
 
@@ -1553,7 +1558,7 @@ def applyupdates(repo, actions, wctx, mctx, overwrite, labels=None, ancestors=No
             prog.value = (z, f)
             f0, flags = args
             repo.ui.note(_("getting %s to %s\n") % (f0, f))
-            wctx[f].write(mctx.filectx(f0).data(), flags)
+            wctx[f].write(mctx.filectx(f0), flags)
             updated += 1
 
         # exec
@@ -1851,36 +1856,11 @@ def _logupdatedistance(ui, repo, node):
         # doesn't play nicely with revsets later because it resolve to the tip
         # commit.
         node = repo[node].node()
-        revdistance = abs(repo["."].rev() - repo[node].rev())
-        if revdistance == 0:
-            distance = 0
-        elif revdistance >= 100000:
-            # Calculating real distance is too slow.
-            # Use an approximate.
-            distance = ((revdistance + 500) / 1000) * 1000
-        else:
-            distance = len(repo.revs("(%n %% .) + (. %% %n)", node, node))
+        distance = len(repo.revs("(%n %% .) + (. %% %n)", node, node))
         repo.ui.log("update_size", update_distance=distance)
     except Exception:
         # error may happen like: RepoLookupError: unknown revision '-1'
         pass
-
-
-def querywatchmanrecrawls(repo):
-    try:
-        path = repo.root
-        x, x, x, p = util.popen4("watchman debug-status")
-        stdout, stderr = p.communicate()
-        data = json.loads(stdout)
-        for root in data["roots"]:
-            if root["path"] == path:
-                count = root["recrawl_info"]["count"]
-                if root["recrawl_info"]["should-recrawl"] is True:
-                    count += 1
-                return count
-        return 0
-    except Exception:
-        return 0
 
 
 def _prefetchlazychildren(repo, node):
@@ -1906,7 +1886,8 @@ def _prefetchlazychildren(repo, node):
                 )
             else:
                 tracing.debug(
-                    "children of %s: %s" % (hex(node), [hex(n) for n in childrennodes]),
+                    "children of %s: [%s]"
+                    % (hex(node), ", ".join(map(hex, childrennodes))),
                     target="checkout::prefetch",
                 )
         else:
@@ -1937,10 +1918,13 @@ def goto(
         # a value for updatecheck. We may want to allow updatecheck='abort' to
         # better suppport some of these callers.
         if updatecheck is None:
-            updatecheck = "linear"
-        assert updatecheck in ("none", "linear", "noconflict")
+            updatecheck = "none"
+        assert updatecheck in ("none", "noconflict")
 
-    if edenfs.requirement in repo.requirements:
+    if (
+        edenfs.requirement in repo.requirements
+        or git.DOTGIT_REQUIREMENT in repo.requirements
+    ):
         from . import eden_update
 
         return eden_update.update(
@@ -1997,7 +1981,6 @@ def goto(
                     p2,
                     force,
                     wc,
-                    querywatchmanrecrawls(repo),
                 )
                 if git.isgitformat(repo):
                     git.submodulecheckout(p2, force=force)
@@ -2098,8 +2081,6 @@ def _update(
     Return the same tuple as applyupdates().
     """
 
-    # This function used to find the default destination if node was None, but
-    # that's now in destutil.py.
     assert node is not None
 
     # Positive indication we aren't using eden fastpath for eden integration tests.
@@ -2107,8 +2088,6 @@ def _update(
         repo.ui.debug("falling back to non-eden update code path: merge\n")
 
     with repo.wlock():
-        prerecrawls = querywatchmanrecrawls(repo)
-
         if wc is None:
             wc = repo[None]
         pl = wc.parents()
@@ -2160,28 +2139,6 @@ def _update(
                 repo.hook("preupdate", throw=True, parent1=xp2, parent2="")
                 repo.hook("update", parent1=xp2, parent2="", error=0)
                 return 0, 0, 0, 0
-
-            if updatecheck == "linear" and pas not in ([p1], [p2]):  # nonlinear
-                dirty = wc.dirty(missing=True)
-                if dirty:
-                    # Branching is a bit strange to ensure we do the minimal
-                    # amount of call to mutation.foreground_contains.
-                    if mutation.enabled(repo):
-                        in_foreground = mutation.foreground_contains(
-                            repo, [p1.node()], repo[node].node()
-                        )
-                    else:
-                        in_foreground = False
-                    # note: the <node> variable contains a random identifier
-                    if in_foreground:
-                        pass  # allow updating to successors
-                    else:
-                        msg = _("uncommitted changes")
-                        hint = _("commit or goto --clean to discard changes")
-                        raise error.UpdateAbort(msg, hint=hint)
-                else:
-                    # Allow jumping branches if clean and specific rev given
-                    pass
 
         if overwrite:
             pas = [wc]
@@ -2332,8 +2289,6 @@ def _update(
 
     # Log the number of files updated.
     repo.ui.log("update_size", update_filecount=sum(stats))
-    postrecrawls = querywatchmanrecrawls(repo)
-    repo.ui.log("watchman-recrawls", watchman_recrawls=postrecrawls - prerecrawls)
 
     return stats
 
@@ -2392,7 +2347,7 @@ def makenativecheckoutplan(repo, p1, p2, updateprogresspath=None):
 
 
 @util.timefunction("donativecheckout", 0, "ui")
-def donativecheckout(repo, p1, p2, force, wc, prerecrawls):
+def donativecheckout(repo, p1, p2, force, wc):
     repo.ui.debug("Using native checkout\n")
     repo.ui.log(
         "nativecheckout",
@@ -2453,7 +2408,7 @@ def donativecheckout(repo, p1, p2, force, wc, prerecrawls):
     failed_removes = plan.apply(
         repo.fileslog.filestore,
     )
-    for (path, err) in failed_removes:
+    for path, err in failed_removes:
         repo.ui.warn(_("update failed to remove %s: %s!\n") % (path, err))
     repo.ui.debug("Apply done\n")
     stats = plan.stats()
@@ -2488,8 +2443,6 @@ def donativecheckout(repo, p1, p2, force, wc, prerecrawls):
                 repo._persistprofileconfigs()
 
     repo.hook("update", parent1=xp1, parent2=xp2, error=stats[3])
-    postrecrawls = querywatchmanrecrawls(repo)
-    repo.ui.log("watchman-recrawls", watchman_recrawls=postrecrawls - prerecrawls)
     return stats
 
 

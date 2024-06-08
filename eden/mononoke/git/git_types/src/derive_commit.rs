@@ -20,7 +20,7 @@ use derived_data_manager::dependencies;
 use derived_data_manager::BonsaiDerivable;
 use derived_data_manager::DerivableType;
 use derived_data_manager::DerivationContext;
-use derived_data_service_if::types as thrift;
+use derived_data_service_if as thrift;
 use filestore::hash_bytes;
 use filestore::Sha1IncrementalHasher;
 use gix_actor::Signature;
@@ -36,7 +36,7 @@ use crate::TreeHandle;
 
 fn get_signature(id_str: &str, time: &DateTime) -> Result<Signature> {
     let (name, email) = get_name_and_email(id_str)?;
-    let signature_time = gix_date::Time::new(time.timestamp_secs(), time.tz_offset_secs());
+    let signature_time = time.into_gix();
     Ok(Signature {
         name: name.into(),
         email: email.into(),
@@ -45,7 +45,7 @@ fn get_signature(id_str: &str, time: &DateTime) -> Result<Signature> {
 }
 
 fn get_name_and_email<'a>(input: &'a str) -> Result<(&'a str, &'a str)> {
-    let regex = regex::Regex::new(r"((?<name>.*)<(?<email>.*)>)|(?<name_without_email>.*)")
+    let regex = regex::Regex::new(r"((?<name>.*?)\s?<(?<email>.*)>)|(?<name_without_email>.*)")
         .context("Invalid regex for parsing name and email")?;
     let captures = regex
         .captures(input)
@@ -61,9 +61,10 @@ fn get_name_and_email<'a>(input: &'a str) -> Result<(&'a str, &'a str)> {
 
 #[async_trait]
 impl BonsaiDerivable for MappedGitCommitId {
-    const VARIANT: DerivableType = DerivableType::GitCommit;
+    const VARIANT: DerivableType = DerivableType::GitCommits;
 
     type Dependencies = dependencies![TreeHandle];
+    type PredecessorDependencies = dependencies![];
 
     /// Derives a Git commit for a given Bonsai changeset. The mapping is recorded in bonsai_git_mapping and as a result
     /// imported Mononoke commits from Git repos will by default be marked as having their Git commits derived. This method
@@ -78,7 +79,7 @@ impl BonsaiDerivable for MappedGitCommitId {
             bail!("Can't derive MappedGitCommitId for snapshot")
         }
         let tree_handle = derivation_ctx
-            .derive_dependency::<TreeHandle>(ctx, bonsai.get_changeset_id())
+            .fetch_dependency::<TreeHandle>(ctx, bonsai.get_changeset_id())
             .await?;
         let commit_tree_id = gix_hash::oid::try_from_bytes(tree_handle.oid().as_ref())
             .with_context(|| {
@@ -202,6 +203,7 @@ mod test {
     use fbinit::FacebookInit;
     use fixtures::TestRepoFixture;
     use futures_util::stream::TryStreamExt;
+    use maplit::hashmap;
     use mononoke_types::hash::GitSha1;
     use repo_blobstore::RepoBlobstoreArc;
     use repo_derived_data::RepoDerivedDataRef;
@@ -343,4 +345,25 @@ mod test {
     impl_test!(unshared_merge_even, UnsharedMergeEven);
     impl_test!(unshared_merge_uneven, UnsharedMergeUneven);
     impl_test!(many_diamonds, ManyDiamonds);
+
+    #[fbinit::test]
+    fn test_get_name_and_email() {
+        let test_cases = hashmap! {
+             "John Doe <john.doe@gmail.com>" => ("John Doe", "john.doe@gmail.com"),
+             "John Doe<john.doe@gmail.com>" => ("John Doe", "john.doe@gmail.com"),
+             "John Doe\t<john.doe@gmail.com>" => ("John Doe", "john.doe@gmail.com"),
+             "  John Doe  <john.doe@gmail.com>" => ("  John Doe ", "john.doe@gmail.com"),
+             "John Doe" => ("John Doe", ""),
+             "<john.doe@gmail.com>" => ("", "john.doe@gmail.com"),
+        };
+
+        for (input, expected) in test_cases {
+            let actual = get_name_and_email(input).expect("We are only testing valid inputs");
+
+            assert_eq!(
+                expected, actual,
+                "Failed to get name and email for input: {input}"
+            );
+        }
+    }
 }

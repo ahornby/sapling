@@ -9,6 +9,7 @@
 
 #![allow(non_camel_case_types)]
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -16,7 +17,6 @@ use std::sync::Arc;
 use anyhow::format_err;
 use anyhow::Error;
 use configmodel::Config;
-use configmodel::ConfigExt;
 use cpython::*;
 use cpython_ext::ExtractInner;
 use cpython_ext::ExtractInnerRef;
@@ -28,7 +28,6 @@ use cpython_ext::ResultPyErrExt;
 use parking_lot::RwLock;
 use pyconfigloader::config;
 use revisionstore::repack;
-use revisionstore::scmstore::FetchMode;
 use revisionstore::scmstore::FileAttributes;
 use revisionstore::scmstore::FileStore;
 use revisionstore::scmstore::FileStoreBuilder;
@@ -41,8 +40,6 @@ use revisionstore::DataPack;
 use revisionstore::DataPackStore;
 use revisionstore::DataPackVersion;
 use revisionstore::Delta;
-use revisionstore::EdenApiFileStore;
-use revisionstore::EdenApiTreeStore;
 use revisionstore::ExtStoredPolicy;
 use revisionstore::HgIdDataStore;
 use revisionstore::HgIdHistoryStore;
@@ -66,9 +63,12 @@ use revisionstore::RemoteDataStore;
 use revisionstore::RemoteHistoryStore;
 use revisionstore::RepackKind;
 use revisionstore::RepackLocation;
+use revisionstore::SaplingRemoteApiFileStore;
+use revisionstore::SaplingRemoteApiTreeStore;
 use revisionstore::StoreKey;
 use revisionstore::StoreResult;
 use revisionstore::StoreType;
+use types::fetch_mode::FetchMode;
 use types::Key;
 use types::NodeInfo;
 
@@ -386,7 +386,13 @@ py_class!(class indexedlogdatastore |py| {
         let config = IndexedLogHgIdDataStoreConfig { max_log_count: None, max_bytes_per_log: None, max_bytes: None };
         indexedlogdatastore::create_instance(
             py,
-            Box::new(IndexedLogHgIdDataStore::new(path.as_path(), ExtStoredPolicy::Ignore, &config, StoreType::Local).map_pyerr(py)?),
+            Box::new(IndexedLogHgIdDataStore::new(
+                &BTreeMap::<&str, &str>::new(),
+                path.as_path(),
+                ExtStoredPolicy::Ignore,
+                &config,
+                StoreType::Local,
+            ).map_pyerr(py)?),
         )
     }
 
@@ -471,6 +477,7 @@ fn make_mutabledeltastore(
             max_bytes: None,
         };
         Arc::new(IndexedLogHgIdDataStore::new(
+            &BTreeMap::<&str, &str>::new(),
             indexedlogpath.as_path(),
             ExtStoredPolicy::Ignore,
             &config,
@@ -840,46 +847,46 @@ impl ExtractInnerRef for pyremotestore {
     }
 }
 
-// Python wrapper around an EdenAPI-backed remote store for files.
+// Python wrapper around an SaplingRemoteAPI-backed remote store for files.
 //
-// This type exists for the sole purpose of allowing an `EdenApiFileStore`
+// This type exists for the sole purpose of allowing an `SaplingRemoteApiFileStore`
 // to be passed from Rust to Python and back into Rust. It cannot be created
 // by Python code and does not expose any functionality to Python.
 py_class!(pub class edenapifilestore |py| {
-    data remote: Arc<EdenApiFileStore>;
+    data remote: Arc<SaplingRemoteApiFileStore>;
 });
 
 impl edenapifilestore {
-    pub fn new(py: Python, remote: Arc<EdenApiFileStore>) -> PyResult<Self> {
+    pub fn new(py: Python, remote: Arc<SaplingRemoteApiFileStore>) -> PyResult<Self> {
         edenapifilestore::create_instance(py, remote)
     }
 }
 
 impl ExtractInnerRef for edenapifilestore {
-    type Inner = Arc<EdenApiFileStore>;
+    type Inner = Arc<SaplingRemoteApiFileStore>;
 
     fn extract_inner_ref<'a>(&'a self, py: Python<'a>) -> &'a Self::Inner {
         self.remote(py)
     }
 }
 
-// Python wrapper around an EdenAPI-backed remote store for trees.
+// Python wrapper around an SaplingRemoteAPI-backed remote store for trees.
 //
-// This type exists for the sole purpose of allowing an `EdenApiTreeStore`
+// This type exists for the sole purpose of allowing an `SaplingRemoteApiTreeStore`
 // to be passed from Rust to Python and back into Rust. It cannot be created
 // by Python code and does not expose any functionality to Python.
 py_class!(pub class edenapitreestore |py| {
-    data remote: Arc<EdenApiTreeStore>;
+    data remote: Arc<SaplingRemoteApiTreeStore>;
 });
 
 impl edenapitreestore {
-    pub fn new(py: Python, remote: Arc<EdenApiTreeStore>) -> PyResult<Self> {
+    pub fn new(py: Python, remote: Arc<SaplingRemoteApiTreeStore>) -> PyResult<Self> {
         edenapitreestore::create_instance(py, remote)
     }
 }
 
 impl ExtractInnerRef for edenapitreestore {
-    type Inner = Arc<EdenApiTreeStore>;
+    type Inner = Arc<SaplingRemoteApiTreeStore>;
 
     fn extract_inner_ref<'a>(&'a self, py: Python<'a>) -> &'a Self::Inner {
         self.remote(py)
@@ -1084,15 +1091,11 @@ fn make_filescmstore<'a>(
     path: Option<&'a Path>,
     config: &'a dyn Config,
     remote: Arc<PyHgIdRemoteStore>,
-    edenapi_filestore: Option<Arc<EdenApiFileStore>>,
+    edenapi_filestore: Option<Arc<SaplingRemoteApiFileStore>>,
     suffix: Option<String>,
 ) -> Result<(Arc<FileStore>, Arc<ContentStore>)> {
     let mut builder = ContentStoreBuilder::new(&config);
     let mut filestore_builder = FileStoreBuilder::new(&config);
-
-    if config.get_or_default::<bool>("scmstore", "auxindexedlog")? {
-        filestore_builder = filestore_builder.store_aux_data();
-    }
 
     builder = if let Some(path) = path {
         filestore_builder = filestore_builder.local_path(path);
@@ -1173,7 +1176,7 @@ py_class!(pub class filescmstore |py| {
         contentstore::create_instance(py, self.contentstore(py).clone())
     }
 
-    def fetch_contentsha256(&self, keys: PyList) -> PyResult<PyList> {
+    def fetch_content_blake3(&self, keys: PyList) -> PyResult<PyList> {
         let keys = keys
             .iter(py)
             .map(|tuple| from_tuple_to_key(py, &tuple))
@@ -1193,13 +1196,13 @@ py_class!(pub class filescmstore |py| {
         }
         for (key, storefile) in found.into_iter() {
             let key_tuple = from_key_to_tuple(py, &key).into_object();
-            let content_sha256 = storefile.aux_data().map_pyerr(py)?.sha256;
-            let content_sha256 = PyBytes::new(py, content_sha256.as_ref());
+            let content_blake3 = storefile.aux_data().map_pyerr(py)?.blake3;
+            let content_blake3 = PyBytes::new(py, content_blake3.as_ref());
             let result_tuple = PyTuple::new(
                 py,
                 &[
                     key_tuple,
-                    content_sha256.into_object(),
+                    content_blake3.into_object(),
                 ],
             );
             results.append(py, result_tuple.into_object());
@@ -1244,7 +1247,14 @@ py_class!(pub class filescmstore |py| {
 
     def prefetch(&self, keys: PyList) -> PyResult<PyObject> {
         let store = self.store(py);
-        store.prefetch_py(py, keys)
+
+        let keys = keys
+            .iter(py)
+            .map(|tuple| from_tuple_to_key(py, &tuple))
+            .collect::<PyResult<Vec<Key>>>()?;
+        py.allow_threads(|| FileStore::prefetch(store, keys)).map_pyerr(py)?;
+
+        Ok(Python::None(py))
     }
 
     def markforrefresh(&self) -> PyResult<PyNone> {
@@ -1302,7 +1312,7 @@ fn make_treescmstore<'a>(
     path: Option<&'a Path>,
     config: &'a dyn Config,
     remote: Arc<PyHgIdRemoteStore>,
-    edenapi_treestore: Option<Arc<EdenApiTreeStore>>,
+    edenapi_treestore: Option<Arc<SaplingRemoteApiTreeStore>>,
     filestore: Option<Arc<FileStore>>,
     suffix: Option<String>,
 ) -> Result<(Arc<TreeStore>, Arc<ContentStore>)> {
@@ -1321,7 +1331,7 @@ fn make_treescmstore<'a>(
         treestore_builder = treestore_builder.suffix(suffix);
     }
 
-    // Extract EdenApiAdapter for scmstore construction later on
+    // Extract SaplingRemoteApiAdapter for scmstore construction later on
     builder = if let Some(edenapi) = edenapi_treestore {
         treestore_builder = treestore_builder.edenapi(edenapi.clone());
         builder.remotestore(edenapi)

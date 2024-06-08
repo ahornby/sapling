@@ -25,9 +25,11 @@ use commit_graph_types::storage::PrefetchEdge;
 use commit_graph_types::storage::PrefetchTarget;
 use context::CoreContext;
 use futures::stream;
+use futures::stream::BoxStream;
 use futures::StreamExt;
 use futures::TryStreamExt;
 use futures_stats::TimedTryFutureExt;
+use itertools::sorted;
 use itertools::Itertools;
 use mononoke_types::ChangesetId;
 use mononoke_types::Generation;
@@ -494,6 +496,40 @@ impl CommitGraph {
         Ok((segments, locations))
     }
 
+    /// Returns a stream of expanded changeset segments representing all ancestors of heads,
+    /// excluding all ancestors of commons.
+    /// Each slice is contained within a segment (it represents a linear set of changesets)
+    /// Each segment slice is no longer than `slice_size`
+    /// The ordering of the output is topological, both for the stream and the Vec
+    pub async fn ancestors_difference_segment_slices(
+        &self,
+        ctx: &CoreContext,
+        heads: Vec<ChangesetId>,
+        common: Vec<ChangesetId>,
+        slice_size: u64,
+    ) -> Result<BoxStream<'static, Result<Vec<ChangesetId>>>> {
+        cloned!(self as graph, ctx);
+        let (segmented_slices, _boundary_changesets) = graph
+            .segmented_slice_ancestors(&ctx, heads, common, slice_size)
+            .await?;
+        Ok(stream::iter(
+            segmented_slices
+                .into_iter()
+                .flat_map(|segmented_slice| segmented_slice.segments),
+        )
+        .then(move |segment| {
+            cloned!(graph, ctx);
+            async move {
+                Ok(graph
+                    .range_stream(&ctx, segment.base, segment.head)
+                    .await?
+                    .collect::<Vec<_>>()
+                    .await)
+            }
+        })
+        .boxed())
+    }
+
     /// Returns a list of segments representing all ancestors of heads, excluding
     /// all ancestors of common.
     pub async fn ancestors_difference_segments(
@@ -608,6 +644,59 @@ impl CommitGraph {
         segment_generation_handle.await??;
 
         Ok(all_segments)
+    }
+
+    /// Sort segments returned by `ancestors_difference_segments` in dfs order.
+    pub fn dfs_order_segments(
+        _ctx: &CoreContext,
+        segments: Vec<ChangesetSegment>,
+    ) -> Vec<ChangesetSegment> {
+        let mut segment_children: BTreeMap<ChangesetId, Vec<(u64, ChangesetId)>> =
+            Default::default();
+        let mut segment_parents_count: BTreeMap<ChangesetId, usize> = Default::default();
+        let mut stack = vec![];
+
+        for segment in segments.iter() {
+            for parent in segment.parents.iter() {
+                // Segment parent has a location only if it belongs to another segment.
+                if let Some(location) = parent.location {
+                    *segment_parents_count.entry(segment.head).or_default() += 1;
+                    segment_children
+                        .entry(location.head)
+                        .or_default()
+                        .push((segment.length, segment.head));
+                }
+            }
+
+            // All segment parents don't belong to any of the other segments.
+            if *segment_parents_count.get(&segment.head).unwrap_or(&0) == 0 {
+                stack.push(segment.head);
+            }
+        }
+        // Sort to guarantee determinism.
+        stack.sort();
+
+        let mut segments = segments
+            .into_iter()
+            .map(|segment| (segment.head, segment))
+            .collect::<HashMap<_, _>>();
+
+        let mut sorted_segments = vec![];
+        while let Some(segment_head) = stack.pop() {
+            if let Some(children) = segment_children.remove(&segment_head) {
+                // Iterate over children segments in reverse order of their length,
+                // so that shortest segments end up on top of the stack.
+                for (_length, child) in sorted(children).rev() {
+                    let count = segment_parents_count.entry(child).or_default();
+                    *count -= 1;
+                    if *count == 0 {
+                        stack.push(child);
+                    }
+                }
+            }
+            sorted_segments.push(segments.remove(&segment_head).unwrap());
+        }
+        sorted_segments
     }
 
     /// Returns all changesets in a segment in reverse topological order, verifying

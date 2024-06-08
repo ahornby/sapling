@@ -11,6 +11,7 @@ use std::fmt;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::sync::Arc;
+use std::time::Duration;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
@@ -48,25 +49,25 @@ use bookmarks::BookmarksRef;
 pub use bookmarks::Freshness as BookmarkFreshness;
 use bookmarks::Freshness;
 use bookmarks_cache::BookmarksCache;
+use bulk_derivation::BulkDerivation;
 use bytes::Bytes;
 use cacheblob::InProcessLease;
 use cacheblob::LeaseOps;
-use changeset_fetcher::ChangesetFetcher;
-use changeset_fetcher::ChangesetFetcherArc;
-use changeset_fetcher::ChangesetFetcherRef;
 use changeset_info::ChangesetInfo;
 use changesets::Changesets;
 use changesets::ChangesetsArc;
 use changesets::ChangesetsRef;
+use commit_cloud::CommitCloud;
 use commit_graph::CommitGraph;
 use commit_graph::CommitGraphRef;
 use context::CoreContext;
-use cross_repo_sync::types::Target;
+use cross_repo_sync::get_small_and_large_repos;
 use cross_repo_sync::CandidateSelectionHint;
 use cross_repo_sync::CommitSyncContext;
 use cross_repo_sync::CommitSyncRepos;
 use cross_repo_sync::CommitSyncer;
-use derived_data_manager::manager::derive::BatchDeriveOptions;
+use cross_repo_sync::SubmoduleDeps;
+use cross_repo_sync::Target;
 use derived_data_manager::BonsaiDerivable;
 use derived_data_manager::DerivableType;
 use ephemeral_blobstore::ArcRepoEphemeralStore;
@@ -83,8 +84,6 @@ use filestore::FetchKey;
 use filestore::FilestoreConfig;
 use filestore::FilestoreConfigRef;
 pub use filestore::StoreRequest;
-use fsnodes::RootFsnodeId;
-use futures::compat::Stream01CompatExt;
 use futures::stream;
 use futures::stream::Stream;
 use futures::stream::StreamExt;
@@ -100,6 +99,7 @@ use live_commit_sync_config::LiveCommitSyncConfig;
 use mercurial_derivation::MappedHgChangesetId;
 use mercurial_mutation::HgMutationStore;
 use mercurial_types::Globalrev;
+use mercurial_types::NonRootMPath;
 use metaconfig_types::HookManagerParams;
 use metaconfig_types::InfinitepushNamespace;
 use metaconfig_types::InfinitepushParams;
@@ -144,15 +144,14 @@ use repo_permission_checker::RepoPermissionChecker;
 use repo_sparse_profiles::ArcRepoSparseProfiles;
 use repo_sparse_profiles::RepoSparseProfiles;
 use repo_sparse_profiles::RepoSparseProfilesArc;
-use revset::AncestorsNodeStream;
 use segmented_changelog::CloneData;
 use segmented_changelog::DisabledSegmentedChangelog;
 use segmented_changelog::Location;
 use segmented_changelog::SegmentedChangelog;
 use segmented_changelog::SegmentedChangelogRef;
-use skeleton_manifest::RootSkeletonManifestId;
 use slog::debug;
 use slog::error;
+use slog::warn;
 use sql_construct::SqlConstruct;
 use sql_ext::facebook::MysqlOptions;
 use stats::prelude::*;
@@ -221,7 +220,6 @@ pub struct Repo {
         dyn BonsaiHgMapping,
         dyn BookmarkUpdateLog,
         dyn Bookmarks,
-        dyn ChangesetFetcher,
         dyn Changesets,
         dyn Phases,
         dyn PushrebaseMutationMapping,
@@ -240,6 +238,7 @@ pub struct Repo {
         CommitGraph,
         dyn GitSymbolicRefs,
         dyn Filenodes,
+        CommitCloud
     )]
     pub inner: InnerRepo,
 
@@ -271,6 +270,7 @@ pub struct RepoContext {
     authz: Arc<AuthorizationContext>,
     repo: Arc<Repo>,
     push_redirector: Option<Arc<PushRedirector<Repo>>>,
+    repos: Arc<MononokeRepos<Repo>>,
 }
 
 impl fmt::Debug for RepoContext {
@@ -285,6 +285,7 @@ pub struct RepoContextBuilder {
     repo: Arc<Repo>,
     push_redirector: Option<Arc<PushRedirector<Repo>>>,
     bubble_id: Option<BubbleId>,
+    repos: Arc<MononokeRepos<Repo>>,
 }
 
 async fn maybe_push_redirector(
@@ -326,17 +327,19 @@ impl RepoContextBuilder {
     pub(crate) async fn new(
         ctx: CoreContext,
         repo: Arc<Repo>,
-        repos: &MononokeRepos<Repo>,
+        repos: Arc<MononokeRepos<Repo>>,
     ) -> Result<Self, MononokeError> {
-        let push_redirector = maybe_push_redirector(&ctx, &repo, repos)
+        let push_redirector = maybe_push_redirector(&ctx, &repo, repos.as_ref())
             .await?
             .map(Arc::new);
+
         Ok(RepoContextBuilder {
             ctx,
             authz: None,
             repo,
             push_redirector,
             bubble_id: None,
+            repos,
         })
     }
 
@@ -357,6 +360,7 @@ impl RepoContextBuilder {
     pub async fn build(self) -> Result<RepoContext, MononokeError> {
         let authz = Arc::new(
             self.authz
+                .clone()
                 .unwrap_or_else(|| AuthorizationContext::new(&self.ctx)),
         );
         RepoContext::new(
@@ -365,6 +369,7 @@ impl RepoContextBuilder {
             self.repo,
             self.bubble_id,
             self.push_redirector,
+            self.repos,
         )
         .await
     }
@@ -390,11 +395,21 @@ pub async fn open_synced_commit_mapping(
 }
 
 /// Defines behavuiour of xrepo_commit_lookup when there's no mapping for queries commit just yet.
+#[derive(PartialEq, Eq, Copy, Clone, Debug)]
 pub enum XRepoLookupSyncBehaviour {
     // Initiates sync and returns the sync result
     SyncIfAbsent,
     // Returns None
     NeverSync,
+}
+
+/// Defines behavuiour of xrepo_commit_lookup when there's no exact mapping but only working copy equivalence
+#[derive(PartialEq, Eq, Copy, Clone, Debug)]
+pub enum XRepoLookupExactBehaviour {
+    // Returns result only when there's exact mapping
+    OnlyExactMapping,
+    // Returns result also when there's working copy equivalent match
+    WorkingCopyEquivalence,
 }
 
 impl Repo {
@@ -707,12 +722,10 @@ impl Repo {
         // This is a generation number beyond which we don't need to traverse
         let min_gen_num = self.fetch_gen_num(ctx, &ancestor).await?;
 
-        let mut ancestors = AncestorsNodeStream::new(
-            ctx.clone(),
-            &self.blob_repo().changeset_fetcher_arc(),
-            descendant,
-        )
-        .compat();
+        let mut ancestors = self
+            .commit_graph()
+            .ancestors_difference_stream(ctx, vec![descendant], vec![])
+            .await?;
 
         let mut traversed = 0;
         while let Some(cs_id) = ancestors.next().await {
@@ -722,11 +735,7 @@ impl Repo {
             }
 
             let cs_id = cs_id?;
-            let parents = self
-                .blob_repo()
-                .changeset_fetcher()
-                .get_parents(ctx, cs_id)
-                .await?;
+            let parents = self.commit_graph().changeset_parents(ctx, cs_id).await?;
 
             if parents.contains(&ancestor) {
                 return Ok(Some(cs_id));
@@ -746,10 +755,7 @@ impl Repo {
         ctx: &CoreContext,
         cs_id: &ChangesetId,
     ) -> Result<Generation, Error> {
-        self.blob_repo()
-            .changeset_fetcher()
-            .get_generation_number(ctx, *cs_id)
-            .await
+        self.commit_graph().changeset_generation(ctx, *cs_id).await
     }
 }
 
@@ -774,6 +780,7 @@ impl RepoContext {
         repo: Arc<Repo>,
         bubble_id: Option<BubbleId>,
         push_redirector: Option<Arc<PushRedirector<Repo>>>,
+        repos: Arc<MononokeRepos<Repo>>,
     ) -> Result<Self, MononokeError> {
         let ctx = ctx.with_mutated_scuba(|mut scuba| {
             scuba.add("permissions_model", format!("{:?}", authz));
@@ -799,12 +806,13 @@ impl RepoContext {
             authz,
             repo,
             push_redirector,
+            repos,
         })
     }
 
     pub async fn new_test(ctx: CoreContext, repo: Arc<Repo>) -> Result<Self, MononokeError> {
         let authz = Arc::new(AuthorizationContext::new_bypass_access_control());
-        RepoContext::new(ctx, authz, repo, None, None).await
+        RepoContext::new(ctx, authz, repo, None, None, Arc::new(MononokeRepos::new())).await
     }
 
     /// The context for this query.
@@ -902,21 +910,21 @@ impl RepoContext {
         self.blob_repo()
             .repo_derived_data()
             .config()
-            .is_enabled(ChangesetInfo::NAME)
+            .is_enabled(ChangesetInfo::VARIANT)
     }
 
     pub fn derive_gitcommit_enabled(&self) -> bool {
         self.blob_repo()
             .repo_derived_data()
             .config()
-            .is_enabled(MappedGitCommitId::NAME)
+            .is_enabled(MappedGitCommitId::VARIANT)
     }
 
     pub fn derive_hgchangesets_enabled(&self) -> bool {
         self.blob_repo()
             .repo_derived_data()
             .config()
-            .is_enabled(MappedHgChangesetId::NAME)
+            .is_enabled(MappedHgChangesetId::VARIANT)
     }
 
     /// Load bubble from id
@@ -964,6 +972,10 @@ impl RepoContext {
             .await?
             .exists(&self.ctx, changeset_id)
             .await?)
+    }
+
+    pub fn commit_graph(&self) -> &CommitGraph {
+        self.repo.commit_graph()
     }
 
     /// Look up a changeset specifier to find the canonical bonsai changeset
@@ -1102,7 +1114,6 @@ impl RepoContext {
         let repo = self.clone();
 
         Ok(self
-            .repo()
             .commit_graph()
             .ancestors_difference_stream(&self.ctx, includes, excludes)
             .await?
@@ -1543,21 +1554,21 @@ impl RepoContext {
 
         use CandidateSelectionHintArgs::*;
         match args {
-            OnlyOrAncestorOfBookmark(bookmark) => {
+            AncestorOfBookmark(bookmark) => {
                 let repo = other_repo_context.target_repo();
-                Ok(CandidateSelectionHint::OnlyOrAncestorOfBookmark(
+                Ok(CandidateSelectionHint::AncestorOfBookmark(
                     Target(bookmark),
                     repo,
                 ))
             }
-            OnlyOrDescendantOfBookmark(bookmark) => {
+            DescendantOfBookmark(bookmark) => {
                 let repo = other_repo_context.target_repo();
-                Ok(CandidateSelectionHint::OnlyOrDescendantOfBookmark(
+                Ok(CandidateSelectionHint::DescendantOfBookmark(
                     Target(bookmark),
                     repo,
                 ))
             }
-            OnlyOrAncestorOfCommit(specifier) => {
+            AncestorOfCommit(specifier) => {
                 let repo = other_repo_context.target_repo();
                 let cs_id = other_repo_context
                     .resolve_specifier(specifier)
@@ -1568,12 +1579,12 @@ impl RepoContext {
                             specifier
                         ))
                     })?;
-                Ok(CandidateSelectionHint::OnlyOrAncestorOfCommit(
+                Ok(CandidateSelectionHint::AncestorOfCommit(
                     Target(cs_id),
                     repo,
                 ))
             }
-            OnlyOrDescendantOfCommit(specifier) => {
+            DescendantOfCommit(specifier) => {
                 let repo = other_repo_context.target_repo();
                 let cs_id = other_repo_context
                     .resolve_specifier(specifier)
@@ -1584,7 +1595,7 @@ impl RepoContext {
                             specifier
                         ))
                     })?;
-                Ok(CandidateSelectionHint::OnlyOrDescendantOfCommit(
+                Ok(CandidateSelectionHint::DescendantOfCommit(
                     Target(cs_id),
                     repo,
                 ))
@@ -1606,12 +1617,17 @@ impl RepoContext {
 
     /// Get the equivalent changeset from another repo - it may sync it if needed (depending on
     /// `sync_behaviour` arg).
-    pub async fn xrepo_commit_lookup(
-        &self,
-        other: &Self,
+    ///
+    /// Setting exact to true will return result only if there's exact match for the requested
+    /// commit - rather than commit with equivalent working copy (which happens in case the source
+    /// commit rewrites to nothing in target repo).
+    pub async fn xrepo_commit_lookup<'a, 'b>(
+        &'a self,
+        other: &'a Self,
         specifier: impl Into<ChangesetSpecifier>,
         maybe_candidate_selection_hint_args: Option<CandidateSelectionHintArgs>,
         sync_behaviour: XRepoLookupSyncBehaviour,
+        exact: XRepoLookupExactBehaviour,
     ) -> Result<Option<ChangesetContext>, MononokeError> {
         let common_config = self
             .live_commit_sync_config()
@@ -1627,8 +1643,17 @@ impl RepoContext {
             .build_candidate_selection_hint(maybe_candidate_selection_hint_args, other)
             .await?;
 
-        let commit_sync_repos =
-            CommitSyncRepos::new(self.repo().clone(), other.repo().clone(), &common_config)?;
+        let (_small_repo, _large_repo) =
+            get_small_and_large_repos(self.repo.as_ref(), other.repo.as_ref(), &common_config)?;
+
+        let submodule_deps = self.get_final_submodule_deps(other).await?;
+
+        let commit_sync_repos = CommitSyncRepos::new(
+            self.repo().clone(),
+            other.repo().clone(),
+            submodule_deps,
+            &common_config,
+        )?;
 
         let specifier = specifier.into();
         let changeset = self.resolve_specifier(specifier).await?.ok_or_else(|| {
@@ -1643,34 +1668,155 @@ impl RepoContext {
             self.repo.x_repo_sync_lease().clone(),
         );
 
-        let maybe_cs_id = match sync_behaviour {
-            XRepoLookupSyncBehaviour::NeverSync => {
-                // We are not using the candidate_selection_hint here as  it's also not used by the
-                // sync_commit to resolve the result to return. (It's used when remapping parents).
-                use cross_repo_sync::CommitSyncOutcome::*;
-                commit_syncer
-                    .get_commit_sync_outcome(&self.ctx, changeset)
-                    .await?
-                    .and_then(|outcome| match outcome {
-                        NotSyncCandidate(_) => None,
-                        RewrittenAs(cs_id, _) | EquivalentWorkingCopyAncestor(cs_id, _) => {
-                            Some(cs_id)
-                        }
-                    })
-            }
-            XRepoLookupSyncBehaviour::SyncIfAbsent => {
-                commit_syncer
-                    .sync_commit(
-                        &self.ctx,
-                        changeset,
-                        candidate_selection_hint,
-                        CommitSyncContext::ScsXrepoLookup,
-                        false,
-                    )
-                    .await?
-            }
-        };
+        if sync_behaviour == XRepoLookupSyncBehaviour::SyncIfAbsent {
+            let _ = commit_syncer
+                .sync_commit(
+                    &self.ctx,
+                    changeset,
+                    candidate_selection_hint,
+                    CommitSyncContext::ScsXrepoLookup,
+                    false,
+                )
+                .await?;
+        }
+        use cross_repo_sync::CommitSyncOutcome::*;
+        let maybe_cs_id = commit_syncer
+            .get_commit_sync_outcome(&self.ctx, changeset)
+            .await?
+            .and_then(|outcome| match outcome {
+                NotSyncCandidate(_) => None,
+                EquivalentWorkingCopyAncestor(_cs_id, _)
+                    if exact == XRepoLookupExactBehaviour::OnlyExactMapping =>
+                {
+                    None
+                }
+                EquivalentWorkingCopyAncestor(cs_id, _) | RewrittenAs(cs_id, _) => Some(cs_id),
+            });
         Ok(maybe_cs_id.map(|cs_id| ChangesetContext::new(other.clone(), cs_id)))
+    }
+
+    /// Syncing commits from/to repos that have git submodule actions set to
+    /// expand requires loading the repo of the submodules it dependsnon.
+    ///
+    /// This will read the commit sync config and will load the repos of all the
+    /// submodules that the given repo ever depended on.
+    ///
+    /// TODO(T184633369): stop getting all dependencies from history and
+    /// use only the most recent on. Maybe read the most recent commits and use
+    /// their versions?
+    async fn get_all_possible_repo_submodule_deps(
+        &self,
+    ) -> Result<SubmoduleDeps<Repo>, MononokeError> {
+        let ctx = &self.ctx;
+        let repo = self.repo.as_ref();
+        let live_commit_sync_config = repo.live_commit_sync_config();
+
+        let source_repo_id = repo.repo_identity().id();
+
+        let source_repo_sync_configs = live_commit_sync_config
+            .get_all_commit_sync_config_versions(source_repo_id)
+            .await?;
+
+        let repo_deps_ids = source_repo_sync_configs
+            .into_values()
+            .filter_map(|mut cfg| {
+                cfg.small_repos
+                    .remove(&source_repo_id)
+                    .map(|small_repo_cfg| small_repo_cfg.submodule_config.submodule_dependencies)
+            })
+            .flatten()
+            .collect::<HashMap<_, _>>();
+
+        let submodule_deps_to_load = repo_deps_ids.len();
+
+        if submodule_deps_to_load == 0 {
+            // For repos without any submodule dependencies, we shouldn't expect any
+            // submodule expansion to be called, so return that submodule deps
+            // are not needed instead of returning an empty hash map.
+            return Ok(SubmoduleDeps::NotNeeded);
+        };
+
+        let repo_deps: HashMap<NonRootMPath, Arc<Repo>> = repo_deps_ids
+            .into_iter()
+            .filter_map(|(submodule_path, sm_repo_id)| {
+                let mb_sm_repo = self.repos.get_by_id(sm_repo_id.id());
+                match mb_sm_repo {
+                    Some(sm_repo) => Some((submodule_path, sm_repo)),
+                    None => {
+                        // We don't want to fail the entire request if a submodule
+                        // is not found **here**, because not all operations
+                        // that run this code path might actually need the submodule
+                        // deps and repos could be missing due to repo sharding.
+                        // But let's at least log a warning if this happen.
+                        warn!(
+                            ctx.logger(),
+                            "Failed to load submodule dependency at path {} with id {}",
+                            submodule_path.clone(),
+                            sm_repo_id.id()
+                        );
+
+                        ctx.scuba().clone().log_with_msg(
+                            "Failed to load submodule dependency in RepoContextBuilder",
+                            format!(
+                                "Submodule path: {}. Submodule repo id: {}",
+                                submodule_path.clone(),
+                                sm_repo_id.id()
+                            ),
+                        );
+                        None
+                    }
+                }
+            })
+            .collect();
+
+        if repo_deps.len() < submodule_deps_to_load {
+            warn!(
+                ctx.logger(),
+                "Submodule dependencies failed to load. {} were loaded instead of the required {}",
+                repo_deps.len(),
+                submodule_deps_to_load
+            );
+
+            ctx.scuba().clone().log_with_msg(
+                "Submodule dependencies failed to load",
+                format!(
+                    "{} were loaded instead of the required {}",
+                    repo_deps.len(),
+                    submodule_deps_to_load
+                ),
+            );
+            return Ok(SubmoduleDeps::NotAvailable);
+        }
+
+        Ok(SubmoduleDeps::ForSync(repo_deps))
+    }
+
+    /// Only the small repo should have submodule dependencies in the commit sync
+    /// config, but when `xrepo_commit_lookup`, we don't know if the small repo
+    /// is the source (forward sync) or target (backsync).
+    /// So just get the submodule dependencies from both repos
+    async fn get_final_submodule_deps<'a>(
+        &'a self,
+        target_repo_ctx: &'a Self,
+    ) -> Result<SubmoduleDeps<Repo>, MononokeError> {
+        let source_submodule_deps = self.get_all_possible_repo_submodule_deps().await?;
+        let target_submodule_deps = target_repo_ctx
+            .get_all_possible_repo_submodule_deps()
+            .await?;
+
+        match (
+            source_submodule_deps.dep_map(),
+            target_submodule_deps.dep_map(),
+        ) {
+            (Some(dep_map), None) => Ok(SubmoduleDeps::ForSync(dep_map.clone())),
+            (None, Some(dep_map)) => Ok(SubmoduleDeps::ForSync(dep_map.clone())),
+            (Some(source_deps_map), Some(target_deps_map)) => {
+                let mut deps_map = source_deps_map.clone();
+                deps_map.extend(target_deps_map.clone());
+                Ok(SubmoduleDeps::ForSync(deps_map))
+            }
+            (None, None) => Ok(SubmoduleDeps::NotAvailable),
+        }
     }
 
     /// Start a write to the repo.
@@ -1729,8 +1875,7 @@ impl RepoContext {
 
         let ancestors = match use_commit_graph {
             true => {
-                self.repo()
-                    .commit_graph()
+                self.commit_graph()
                     .locations_to_changeset_ids(
                         self.ctx(),
                         location.descendant,
@@ -1769,7 +1914,6 @@ impl RepoContext {
 
         match use_commit_graph {
             true => Ok(self
-                .repo()
                 .commit_graph()
                 .changeset_ids_to_locations(self.ctx(), master_heads, cs_ids)
                 .await
@@ -1834,46 +1978,40 @@ impl RepoContext {
         Ok(pull_data)
     }
 
-    pub async fn prepare_derived_data(
+    pub async fn derive_bulk(
         &self,
-        derivable_type: DerivableType,
+        ctx: &CoreContext,
         csids: Vec<ChangesetId>,
-    ) -> Result<(), MononokeError> {
-        // Simple initial implementation: does not support types with
-        // dependencies, and only supports a single type at a time.
-        match derivable_type {
-            DerivableType::Fsnodes => {
-                self.repo
-                    .repo_derived_data()
-                    .manager()
-                    .derive_exactly_batch::<RootFsnodeId>(
-                        self.ctx(),
-                        csids,
-                        BatchDeriveOptions::Parallel { gap_size: None },
-                        None,
-                    )
-                    .await?;
-            }
-            DerivableType::SkeletonManifests => {
-                self.repo
-                    .repo_derived_data()
-                    .manager()
-                    .derive_exactly_batch::<RootSkeletonManifestId>(
-                        self.ctx(),
-                        csids,
-                        BatchDeriveOptions::Parallel { gap_size: None },
-                        None,
-                    )
-                    .await?;
-            }
-            _ => {
-                return Err(MononokeError::InvalidRequest(format!(
-                    "Unsupported derived data type for preparation: {}",
-                    derivable_type
-                )));
-            }
-        }
-        Ok(())
+        derivable_types: &[DerivableType],
+    ) -> Result<Duration, MononokeError> {
+        // We don't need to expose rederivation to users of the repo api
+        // That's a lower level concept that clients like the derived data backfiller
+        // can get straight from the derived data manager
+        let rederivation = None;
+        Ok(self
+            .repo
+            .repo_derived_data()
+            .manager()
+            .derive_bulk(ctx, csids, rederivation, derivable_types)
+            .await?)
+    }
+
+    pub async fn is_derived(
+        &self,
+        ctx: &CoreContext,
+        csid: ChangesetId,
+        derivable_type: DerivableType,
+    ) -> Result<bool, MononokeError> {
+        // We don't need to expose rederivation to users of the repo api
+        // That's a lower level concept that clients like the derived data backfiller
+        // can get straight from the derived data manager
+        let rederivation = None;
+        Ok(self
+            .repo
+            .repo_derived_data()
+            .manager()
+            .is_derived(ctx, csid, rederivation, derivable_type)
+            .await?)
     }
 }
 

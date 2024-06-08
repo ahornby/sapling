@@ -31,7 +31,6 @@ from sapling.node import hex
 from sapling.pycompat import encodeutf8
 
 from . import (
-    backup,
     backuplock,
     backupstate,
     error as ccerror,
@@ -190,30 +189,19 @@ def _sync(
         return 0, None
 
     # Connect to the commit cloud service.
-    serv = service.get(ui)
+    serv = service.get(ui, repo)
 
     origrepostate = _hashrepostate(repo)
 
     remotepath = ccutil.getremotepath(ui)
 
-    getconnection = lambda: repo.connectionpool.get(
-        remotepath, connect_opts, reason="cloudsync"
-    )
-
-    # Load the backup state under the repo lock to ensure a consistent view.
-    usehttp = ui.configbool("commitcloud", "usehttpupload")
-    with repo.lock():
-        state = backupstate.BackupState(repo, usehttp=usehttp)
+    state = backupstate.BackupState(repo)
 
     with repo.ui.timesection("commitcloud_sync_push"):
-        if usehttp:
-            uploaded, failed = upload.upload(repo, None, localbackupstate=state)
-            # Upload returns a list of all newly uploaded heads and failed nodes (not just heads).
-            # Backup returns a revset for failed. Create a revset for compatibility.
-            failed = repo.revs("%ln", failed)
-        else:
-            # Back up all local commits that are not already backed up.
-            backedup, failed = backup._backup(repo, state, remotepath, getconnection)
+        uploaded, failed = upload.upload(repo, None, localbackupstate=state)
+        # Upload returns a list of all newly uploaded heads and failed nodes (not just heads).
+        # Backup returns a revset for failed. Create a revset for compatibility.
+        failed = repo.revs("%ln", failed)
 
     # Now that commits are backed up, check that visibleheads are enabled
     # locally, and only sync if visibleheads is enabled.
@@ -439,10 +427,10 @@ def _prefetchexpensivebookmarks(repo, remotepath, remotebookmarknewnames):
         component="commitcloud",
     )
 
-    _pullheadgroups(
+    pullheadgroups(
         repo,
         remotepath,
-        _partitionheads(repo.ui, sorted(remotebookmarknewnamesprefetch.values())),
+        partitionheads(repo.ui, sorted(remotebookmarknewnamesprefetch.values())),
     )
 
     for name in remotebookmarknewnamesprefetch.keys():
@@ -574,10 +562,10 @@ def _applycloudchanges(repo, remotepath, lastsyncstate, cloudrefs, maxage, state
 
     if remotebookmarknewnames or newheads:
         # Partition the heads into groups we can pull together.
-        headgroups = _partitionheads(
+        headgroups = partitionheads(
             repo.ui, list(remotebookmarknewnames.values()) + newheads
         )
-        _pullheadgroups(repo, remotepath, headgroups)
+        pullheadgroups(repo, remotepath, headgroups)
 
     omittedbookmarks.extend(
         _mergebookmarks(
@@ -634,7 +622,7 @@ def _applycloudchanges(repo, remotepath, lastsyncstate, cloudrefs, maxage, state
     )
 
 
-def _pullheadgroups(repo, remotepath, headgroups):
+def pullheadgroups(repo, remotepath, headgroups):
     backuplock.progresspulling(
         repo, [nodemod.bin(node) for newheads in headgroups for node in newheads]
     )
@@ -655,7 +643,7 @@ def _pullheadgroups(repo, remotepath, headgroups):
             repo.connectionpool.close()
 
 
-def _partitionheads(ui, heads):
+def partitionheads(ui, heads):
     sizelimit = int(ui.config("commitcloud", "pullsizelimit"))
     it = iter(heads)
     return list(iter(lambda: tuple(itertools.islice(it, sizelimit)), ()))
@@ -787,7 +775,7 @@ def _forcesyncremotebookmarks(repo, cloudrefs, lastsyncstate, remotepath, tr):
     )
     newnames = _prefetchexpensivebookmarks(repo, remotepath, newnames)
     if newnames:
-        _pullheadgroups(repo, remotepath, _partitionheads(repo.ui, newnames.values()))
+        pullheadgroups(repo, remotepath, partitionheads(repo.ui, newnames.values()))
     omittedremotebookmarks = _updateremotebookmarks(repo, tr, updates)
 
     # We have now synced the repo to the cloud version.  Store this.

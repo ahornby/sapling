@@ -26,6 +26,7 @@ use pathmatcher::ExactMatcher;
 use pathmatcher::UnionMatcher;
 pub use sparse::Root;
 use storemodel::FileStore;
+use types::fetch_mode::FetchMode;
 use types::RepoPath;
 use types::RepoPathBuf;
 use vfs::VFS;
@@ -118,7 +119,7 @@ pub fn build_matcher(
         };
 
         let repo_path = RepoPathBuf::from_string(path.clone())?;
-        let bytes = store.get_content(&repo_path, file_id)?;
+        let bytes = store.get_content(&repo_path, file_id, FetchMode::AllowRemote)?;
         let mut bytes = bytes.into_vec();
         if let Some(extra) = overrides.get(&path) {
             bytes.append(&mut extra.to_string().into_bytes());
@@ -174,7 +175,10 @@ pub fn disk_overrides(dot_path: &Path) -> anyhow::Result<HashMap<String, String>
         CONFIG_OVERRIDE_CACHE.to_string(),
     ] {
         match util::file::open(dot_path.join(&loc), "r") {
-            Ok(f) => return Ok(serde_json::from_reader(f)?),
+            Ok(f) => match serde_json::from_reader(f) {
+                Ok(v) => return Ok(v),
+                Err(_) => continue,
+            },
             Err(err) if err.kind() != std::io::ErrorKind::NotFound => return Err(err.into()),
             _ => continue,
         }

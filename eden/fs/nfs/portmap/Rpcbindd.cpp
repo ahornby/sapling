@@ -13,10 +13,11 @@
 #include <folly/Synchronized.h>
 #include <folly/Utility.h>
 #include <folly/logging/xlog.h>
+
+#include "eden/common/utils/ImmediateFuture.h"
 #include "eden/fs/nfs/MountdRpc.h"
 #include "eden/fs/nfs/portmap/RpcbindRpc.h"
 #include "eden/fs/nfs/rpc/RpcServer.h"
-#include "eden/fs/utils/ImmediateFuture.h"
 
 namespace facebook::eden {
 
@@ -211,13 +212,17 @@ ImmediateFuture<folly::Unit> RpcbinddServerProcessor::dispatchRpc(
 Rpcbindd::Rpcbindd(
     folly::EventBase* evb,
     std::shared_ptr<folly::Executor> threadPool,
-    const std::shared_ptr<StructuredLogger>& structuredLogger)
+    const std::shared_ptr<StructuredLogger>& structuredLogger,
+    size_t maximumInFlightRequests,
+    std::chrono::nanoseconds highNfsRequestsLogInterval)
     : proc_(std::make_shared<RpcbinddServerProcessor>()),
       server_(RpcServer::create(
           proc_,
           evb,
           std::move(threadPool),
-          structuredLogger)) {}
+          structuredLogger,
+          maximumInFlightRequests,
+          highNfsRequestsLogInterval)) {}
 
 void Rpcbindd::initialize() {
   server_->initialize(folly::SocketAddress("127.0.0.1", kPortmapPortNumber));

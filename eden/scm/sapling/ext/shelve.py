@@ -533,7 +533,7 @@ def _docreatecmd(ui, repo, pats, opts) -> Optional[int]:
     # it might have been created previously and shelve just
     # reuses it
     try:
-        hg.update(repo, parent.node())
+        hg.update(repo, parent.node(), updatecheck="none")
     except Exception:
         # failed to update to the original revision, which has left us on the
         # (hidden) shelve commit.  Move directly to the original commit by
@@ -574,7 +574,7 @@ def _listshelvefileinfos(repo, shelvedir):
 def cleanupcmd(ui, repo) -> None:
     """subcommand that deletes all shelves"""
     with repo.wlock():
-        for (name, _type) in _listshelvefileinfos(repo, shelvedir):
+        for name, _type in _listshelvefileinfos(repo, shelvedir):
             suffix = name.rsplit(".", 1)[-1]
             if suffix in shelvefileextensions:
                 shelvedfile(repo, name).movetobackup()
@@ -614,7 +614,7 @@ def listshelves(repo):
             raise
         return []
     info = []
-    for (name, _type) in names:
+    for name, _type in names:
         pfx, sfx = name.rsplit(".", 1)
         if not pfx or sfx != patchextension:
             continue

@@ -4,6 +4,8 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
+# pyre-unsafe
+
 from eden.integration.lib import hgrepo
 
 from .lib.hg_extension_test_base import EdenHgTestCase, hg_test, JournalEntry
@@ -22,8 +24,6 @@ class JournalTest(EdenHgTestCase):
 
     def test_journal(self) -> None:
         self.assert_journal_empty()
-        # TODO(sggutier): Remove this once the journal is implemented for Rust commands
-        self.repo.hg("config", "--local", "checkout.use-rust=false")
 
         # Create a new commit
         self.assert_status_empty()
