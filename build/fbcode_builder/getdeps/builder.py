@@ -46,6 +46,8 @@ class BuilderBase(object):
 
         subdir = manifest.get("build", "subdir", ctx=ctx)
         if subdir:
+            if build_opts.is_windows():
+                subdir = subdir.replace("/", "\\")
             src_dir = os.path.join(src_dir, subdir)
 
         self.patchfile = manifest.get("build", "patchfile", ctx=ctx)
