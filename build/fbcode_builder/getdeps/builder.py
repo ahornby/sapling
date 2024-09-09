@@ -749,7 +749,7 @@ if __name__ == "__main__":
         # Resolve the cmake that we installed
         cmake = path_search(env, "cmake")
         if cmake is None:
-            raise Exception("Failed to find CMake")
+            raise Exception(f"Failed to find CMake in {env['PATH']}")
 
         if reconfigure:
             define_args = self._compute_cmake_define_args(env)
