@@ -77,6 +77,14 @@ class remotefilelog:
         if node is None:
             node = revlog.hash(text, p1, p2)
 
+        if (
+            self.repo.ui.configbool("experimental", "reuse-filenodes", True)
+            and node in self.nodemap
+            and self._localparentsmatch(node, p1, p2)
+        ):
+            self.repo.ui.debug("reusing remotefilelog node %s\n" % hex(node))
+            return node
+
         meta, metaoffset = filelog.parsemeta(text)
         rawtext, validatehash = self._processflags(text, flags, "write")
 
@@ -122,6 +130,19 @@ class remotefilelog:
             cachedelta,
             _metatuple=(meta, metaoffset),
         )
+
+    def _localparentsmatch(self, node, p1, p2) -> bool:
+        localinfo = self.repo.fileslog.metadatastore.getlocalnodeinfo(
+            self.filename, node
+        )
+        if localinfo is None:
+            return False
+
+        lp1, lp2, _, copyfrom = localinfo
+        if copyfrom:
+            lp1 = nullid
+
+        return (p1, p2) == (lp1, lp2)
 
     def addrawrevision(
         self,
@@ -208,9 +229,15 @@ class remotefilelog:
         # The content comparison is expensive as well, since we have to load
         # the content from the store and from disk. Let's just check the
         # node instead.
-        p1, p2, linknode, copyfrom = self.repo.fileslog.metadatastore.getnodeinfo(
-            self.filename, node
-        )
+        try:
+            p1, p2, linknode, copyfrom = self.repo.fileslog.metadatastore.getnodeinfo(
+                self.filename, node
+            )
+        except KeyError:
+            # for subtree copy, we are reusing the old filelog node but with a new filename,
+            # so the key (filename, node) is not in the metadatastore, let's just do a full
+            # comparison.
+            return self.read(node) != text
 
         if copyfrom or text.startswith(b"\1\n"):
             meta = {}
@@ -255,12 +282,6 @@ class remotefilelog:
             p1 = nullid
 
         return p1, p2
-
-    def linknode(self, node):
-        p1, p2, linknode, copyfrom = self.repo.fileslog.metadatastore.getnodeinfo(
-            self.filename, node
-        )
-        return linknode
 
     def revdiff(self, node1, node2):
         if node1 != nullid and (self.flags(node1) or self.flags(node2)):
@@ -411,7 +432,7 @@ class remotefilelog:
             return nullid
 
         revmap, parentfunc = self._buildrevgraph(a, b)
-        nodemap = dict(((v, k) for (k, v) in pycompat.iteritems(revmap)))
+        nodemap = dict(((v, k) for (k, v) in revmap.items()))
 
         ancs = ancestor.ancestors(parentfunc, revmap[a], revmap[b])
         if ancs:
@@ -426,7 +447,7 @@ class remotefilelog:
             return nullid
 
         revmap, parentfunc = self._buildrevgraph(a, b)
-        nodemap = dict(((v, k) for (k, v) in pycompat.iteritems(revmap)))
+        nodemap = dict(((v, k) for (k, v) in revmap.items()))
 
         ancs = ancestor.commonancestorsheads(parentfunc, revmap[a], revmap[b])
         return list(map(nodemap.__getitem__, ancs))
@@ -442,7 +463,7 @@ class remotefilelog:
         parentsmap = collections.defaultdict(list)
         allparents = set()
         for mapping in (amap, bmap):
-            for node, pdata in pycompat.iteritems(mapping):
+            for node, pdata in mapping.items():
                 parents = parentsmap[node]
                 p1, p2, linknode, copyfrom = pdata
                 # Don't follow renames (copyfrom).
@@ -514,40 +535,6 @@ class remotefileslog(filelog.fileslog):
 
         return self._edenapistore
 
-    def makesharedonlyruststore(self, repo):
-        """Build non-local stores.
-
-        There are handful of cases where we need to force prefetch data
-        that is present in the local store, for this specific case, let's
-        build shared-only stores.
-
-        Do not use it except in the fileserverclient.prefetch method!
-        """
-
-        sharedonlyremotestore = revisionstore.pyremotestore(
-            fileserverclient.getpackclient(repo)
-        )
-        edenapistore = self.edenapistore(repo)
-
-        mask = os.umask(0o002)
-        try:
-            sharedonlycontentstore = revisionstore.filescmstore(
-                None,
-                repo.ui._rcfg,
-                sharedonlyremotestore,
-                edenapistore,
-            )
-            sharedonlymetadatastore = revisionstore.metadatastore(
-                None,
-                repo.ui._rcfg,
-                sharedonlyremotestore,
-                edenapistore,
-            )
-        finally:
-            os.umask(mask)
-
-        return sharedonlycontentstore, sharedonlymetadatastore
-
     def makeruststore(self, repo):
         remotestore = revisionstore.pyremotestore(fileserverclient.getpackclient(repo))
 
@@ -555,9 +542,9 @@ class remotefileslog(filelog.fileslog):
 
         mask = os.umask(0o002)
         try:
-            self.filestore = repo._rsrepo.filescmstore(remotestore)
+            self.filestore = repo._rsrepo.filescmstore()
             self.metadatastore = revisionstore.metadatastore(
-                repo.svfs.vfs.base,
+                repo.svfs.base,
                 repo.ui._rcfg,
                 remotestore,
                 edenapistore,

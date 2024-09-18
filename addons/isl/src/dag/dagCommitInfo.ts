@@ -54,11 +54,13 @@ const CommitInfoExtRecord = Record<CommitInfoExtProps>({
   remoteBookmarks: [],
   successorInfo: undefined,
   closestPredecessors: undefined,
+  optimisticRevset: undefined,
   filesSample: [],
   totalFileCount: 0,
   diffId: undefined,
   isFollower: undefined,
   stableCommitMetadata: undefined,
+  maxCommonPathPrefix: '',
 
   // WithPreviewType
   previewType: undefined,
@@ -148,6 +150,10 @@ export class DagCommitInfo extends SelfUpdate<CommitInfoExtRecord> {
     return this.inner.closestPredecessors;
   }
 
+  get optimisticRevset(): string | undefined {
+    return this.inner.optimisticRevset;
+  }
+
   get filesSample(): ReadonlyArray<ChangedFile> {
     return this.inner.filesSample;
   }
@@ -182,5 +188,9 @@ export class DagCommitInfo extends SelfUpdate<CommitInfoExtRecord> {
 
   get isYouAreHere(): boolean | undefined {
     return this.inner.isYouAreHere;
+  }
+
+  get maxCommonPathPrefix(): string {
+    return this.inner.maxCommonPathPrefix;
   }
 }

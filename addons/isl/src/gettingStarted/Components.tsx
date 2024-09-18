@@ -10,16 +10,16 @@ import {T} from '../i18n';
 import platform from '../platform';
 import {themeState} from '../theme';
 import {Ribbon} from './Ribbon';
-import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
+import {Button} from 'isl-components/Button';
+import {Icon} from 'isl-components/Icon';
 import {useAtomValue} from 'jotai';
-import {Icon} from 'shared/Icon';
 
 export function DismissButton({dismiss}: {dismiss: () => void}) {
   return (
     <div className="dismiss">
-      <VSCodeButton appearance="icon" onClick={dismiss}>
+      <Button icon onClick={dismiss}>
         <Icon icon="x" />
-      </VSCodeButton>
+      </Button>
     </div>
   );
 }

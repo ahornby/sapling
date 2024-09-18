@@ -28,13 +28,28 @@ EOF
 
     cd "$TESTTMP"
     for clone in "$@"; do
-        hgclone_treemanifest ssh://user@dummy/repo "$clone"
+        hg clone -q mono:repo "$clone"
     done
     blobimport repo/.hg repo
 
     # start mononoke
     mononoke
     wait_for_mononoke
+}
+
+function empty_snapshot_repo_setup {
+    ENABLE_API_WRITES=true INFINITEPUSH_ALLOW_WRITES=true setup_common_config
+    cd "$TESTTMP"
+    cat >> "$HGRCPATH" <<EOF
+[extensions]
+snapshot =
+commitcloud =
+infinitepush =
+amend =
+EOF
+
+    hginit_treemanifest repo
+    cd repo
 }
 
 function base_commit_and_snapshot {
@@ -51,7 +66,7 @@ function base_commit_and_snapshot {
     hg addremove -q
     hg commit -m "Add base files"
     BASE_SNAPSHOT_COMMIT=$(hg log -T "{node}" -r .)
-    EDENSCM_LOG=edenapi::client=error hgedenapi cloud upload -q
+    EDENSCM_LOG=edenapi::client=error hg cloud upload -q
     # Create snapshot
     echo b > modified_file
     echo b > untracked_file
@@ -65,7 +80,7 @@ function base_commit_and_snapshot {
     hg rm deleted_file_then_untracked_modify
     echo b > deleted_file_then_untracked_modify
     ln -s symlink_target symlink_file
-    BASE_SNAPSHOT=$(HGPLAIN=1 hgedenapi snapshot create --labels testing,labels)
+    BASE_SNAPSHOT=$(HGPLAIN=1 hg snapshot create --labels testing,labels)
 }
 
 function assert_on_base_snapshot {

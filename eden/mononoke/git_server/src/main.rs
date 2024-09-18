@@ -20,15 +20,10 @@ use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Error;
 use anyhow::Result;
-use bonsai_git_mapping::BonsaiGitMapping;
-use bonsai_tag_mapping::BonsaiTagMapping;
-use bookmarks::Bookmarks;
-use bookmarks_cache::BookmarksCache;
 use clap::Parser;
 use clientinfo::ClientEntryPoint;
 use cloned::cloned;
 use cmdlib_caching::CachelibSettings;
-use commit_graph::CommitGraph;
 use connection_security_checker::ConnectionSecurityChecker;
 use environment::BookmarkCacheDerivedData;
 use environment::BookmarkCacheKind;
@@ -39,7 +34,6 @@ use futures::channel::oneshot;
 use futures::future::try_select;
 use futures::pin_mut;
 use futures::TryFutureExt;
-use git_symbolic_refs::GitSymbolicRefs;
 use gotham_ext::handler::MononokeHttpHandler;
 use gotham_ext::middleware::ConfigInfoMiddleware;
 use gotham_ext::middleware::LoadMiddleware;
@@ -54,8 +48,9 @@ use gotham_ext::middleware::TlsSessionDataMiddleware;
 use gotham_ext::serve;
 use http::HeaderValue;
 use metaconfig_parser::RepoConfigs;
-use metaconfig_types::RepoConfig;
 use metaconfig_types::ShardedService;
+use middleware::PushvarsParsingMiddleware;
+use mononoke_api::Repo;
 use mononoke_app::args::McrouterAppExtension;
 use mononoke_app::args::ReadonlyArgs;
 use mononoke_app::args::RepoFilterAppExtension;
@@ -67,10 +62,6 @@ use mononoke_app::fb303::Fb303AppExtension;
 use mononoke_app::MononokeApp;
 use mononoke_app::MononokeAppBuilder;
 use mononoke_app::MononokeReposManager;
-use repo_blobstore::RepoBlobstore;
-use repo_derived_data::RepoDerivedData;
-use repo_identity::RepoIdentity;
-use repo_permission_checker::RepoPermissionChecker;
 use slog::info;
 use tokio::net::TcpListener;
 
@@ -91,6 +82,7 @@ mod scuba;
 mod service;
 mod sharding;
 mod util;
+mod write;
 
 const SERVICE_NAME: &str = "mononoke_git_server";
 const SM_CLEANUP_TIMEOUT_SECS: u64 = 60;
@@ -99,46 +91,6 @@ const SM_CLEANUP_TIMEOUT_SECS: u64 = 60;
 // object size results in more entries and possibly higher idle memory usage.
 // More info: https://fburl.com/wiki/i78i3uzk
 const CACHE_OBJECT_SIZE: usize = 256 * 1024;
-
-#[facet::container]
-#[derive(Clone)]
-pub struct Repo {
-    #[facet]
-    repo_identity: RepoIdentity,
-
-    #[init(repo_identity.name().to_string())]
-    name: String,
-
-    #[facet]
-    repo_config: RepoConfig,
-
-    #[facet]
-    repo_blobstore: RepoBlobstore,
-
-    #[facet]
-    bookmarks: dyn Bookmarks,
-
-    #[facet]
-    bonsai_tag_mapping: dyn BonsaiTagMapping,
-
-    #[facet]
-    bonsai_git_mapping: dyn BonsaiGitMapping,
-
-    #[facet]
-    repo_derived_data: RepoDerivedData,
-
-    #[facet]
-    git_symbolic_refs: dyn GitSymbolicRefs,
-
-    #[facet]
-    commit_graph: CommitGraph,
-
-    #[facet]
-    repo_permission_checker: dyn RepoPermissionChecker,
-
-    #[facet]
-    pub warm_bookmarks_cache: dyn BookmarksCache,
-}
 
 /// Mononoke Git Server
 #[derive(Parser)]
@@ -174,6 +126,13 @@ struct GitServerArgs {
     /// Whether or not to use test-friendly logging
     #[clap(long)]
     test_friendly_logging: bool,
+    /// Lfs server url to use to fetch lfs files from
+    #[clap(long)]
+    upstream_lfs_server: Option<String>,
+    /// How many times to retry fetching LFS files from the server
+    /// before deciding that the file is missing.
+    #[clap(long, default_value_t = 5)]
+    lfs_import_max_attempts: u32,
 }
 
 #[derive(Clone)]
@@ -206,7 +165,7 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
         .with_default_scuba_dataset("mononoke_git_server")
         .with_bookmarks_cache(BookmarkCacheOptions {
             cache_kind: BookmarkCacheKind::Local,
-            derived_data: BookmarkCacheDerivedData::GitOnly,
+            derived_data: BookmarkCacheDerivedData::NoDerivation, // Derivation is already done at push time
         })
         .with_app_extension(WarmBookmarksCacheExtension {})
         .with_app_extension(McrouterAppExtension {})
@@ -226,6 +185,7 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
 
     let tls_acceptor = args
         .tls_params
+        .clone()
         .map(|tls_params| {
             secure_utils::SslConfig::new(
                 tls_params.tls_ca,
@@ -261,6 +221,7 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let server = {
         cloned!(logger, will_exit);
+        let tls_args = args.tls_params.clone();
         move |app: MononokeApp| async move {
             let repos_mgr = Arc::new(app.open_managed_repos(service_name).await?);
             let repos = GitRepos::new(repos_mgr.clone())
@@ -281,8 +242,13 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
             // We use the listen_host rather than the ip of listener.local_addr()
             // because the certs user passed will be referencing listen_host
             let bound_addr = format!("{}:{}", listen_host, listener.local_addr()?.port());
-            let git_server_context =
-                GitServerContext::new(repos, enforce_authorization, logger.clone());
+            let git_server_context = GitServerContext::new(
+                repos,
+                enforce_authorization,
+                logger.clone(),
+                args.upstream_lfs_server,
+                tls_args,
+            );
 
             let router = build_router(git_server_context);
 
@@ -298,6 +264,7 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
                     logger.clone(),
                     common.internal_identity.clone(),
                     ClientEntryPoint::MononokeGitServer,
+                    false,
                 ))
                 .add(RequestContentEncodingMiddleware {})
                 .add(RequestContextMiddleware::new(
@@ -307,6 +274,7 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
                     None,
                     args.readonly.readonly,
                 ))
+                .add(PushvarsParsingMiddleware {})
                 .add(ResponseContentTypeMiddleware {})
                 .add(PostResponseMiddleware::default())
                 .add(LoadMiddleware::new())

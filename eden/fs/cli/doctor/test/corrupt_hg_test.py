@@ -10,12 +10,13 @@
 import os
 import shutil
 import typing
+from unittest.mock import patch
 
 import eden.fs.cli.doctor as doctor
 from eden.fs.cli.config import EdenInstance
 from eden.fs.cli.doctor.test.lib.fake_eden_instance import FakeEdenInstance
 from eden.fs.cli.doctor.test.lib.fake_fs_util import FakeFsUtil
-from eden.fs.cli.doctor.test.lib.fake_kerberos_checker import FakeKerberosChecker
+from eden.fs.cli.doctor.test.lib.fake_network_checker import FakeNetworkChecker
 from eden.fs.cli.doctor.test.lib.fake_vscode_extensions_checker import (
     getFakeVSCodeExtensionsChecker,
 )
@@ -34,7 +35,9 @@ class CorruptHgTest(DoctorTestBase):
             FakeEdenInstance, self.checkout.instance
         ).default_backing_repo
 
-    def test_truncated_hg_dirstate_is_a_problem(self) -> None:
+    def test_truncated_hg_dirstate_is_a_problem(
+        self,
+    ) -> None:
         dirstate_path = self.checkout.path / ".hg" / "dirstate"
         os.truncate(dirstate_path, dirstate_path.stat().st_size - 1)
 
@@ -121,7 +124,12 @@ Repairing hg directory contents for {self.checkout.path}...<green>fixed<reset>
         store.mkdir()
         journal = store / "journal"
         journal.write_text("")
-        out = self.cure_what_ails_you(dry_run=False)
+        with patch(
+            "eden.fs.cli.doctor.check_hg.AbandonedTransactionChecker.repair",
+            wraps=lambda: os.unlink(journal),
+        ) as mock_run_hg:
+            out = self.cure_what_ails_you(dry_run=False)
+            mock_run_hg.assert_called_once()
         self.assertEqual(
             f"""\
 Checking {self.checkout.path}
@@ -163,8 +171,8 @@ Repairing hg directory contents for {self.checkout.path}...<green>fixed<reset>
             mount_table=self.instance.mount_table,
             fs_util=FakeFsUtil(),
             proc_utils=self.make_proc_utils(),
-            kerberos_checker=FakeKerberosChecker(),
             vscode_extensions_checker=getFakeVSCodeExtensionsChecker(),
+            network_checker=FakeNetworkChecker(),
             out=out,
         )
         return out

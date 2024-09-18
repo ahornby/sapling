@@ -14,7 +14,6 @@ use async_trait::async_trait;
 use blobstore::BlobstoreGetData;
 use bytes::Bytes;
 use context::CoreContext;
-use derived_data::impl_bonsai_derived_via_manager;
 use derived_data_manager::dependencies;
 use derived_data_manager::BonsaiDerivable;
 use derived_data_manager::DerivableType;
@@ -59,7 +58,7 @@ impl RootDeletedManifestIdCommon for RootDeletedManifestV2Id {
 impl TryFrom<BlobstoreBytes> for RootDeletedManifestV2Id {
     type Error = Error;
     fn try_from(blob_bytes: BlobstoreBytes) -> Result<Self> {
-        DeletedManifestV2Id::from_bytes(&blob_bytes.into_bytes()).map(RootDeletedManifestV2Id)
+        DeletedManifestV2Id::from_bytes(blob_bytes.into_bytes()).map(RootDeletedManifestV2Id)
     }
 }
 
@@ -139,8 +138,6 @@ impl BonsaiDerivable for RootDeletedManifestV2Id {
         ))
     }
 }
-
-impl_bonsai_derived_via_manager!(RootDeletedManifestV2Id);
 
 #[cfg(test)]
 crate::test_utils::impl_deleted_manifest_tests!(RootDeletedManifestV2Id);

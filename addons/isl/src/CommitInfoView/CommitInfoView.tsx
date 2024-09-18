@@ -9,7 +9,6 @@ import type {CommitInfo, DiffId} from '../types';
 import type {CommitInfoMode, EditedMessage} from './CommitInfoState';
 import type {CommitMessageFields, FieldConfig, FieldsBeingEdited} from './types';
 
-import {Banner, BannerKind} from '../Banner';
 import {ChangedFilesWithFetching} from '../ChangedFilesWithFetching';
 import serverAPI from '../ClientToServerAPI';
 import {Commit} from '../Commit';
@@ -22,10 +21,7 @@ import {Link} from '../Link';
 import {OperationDisabledButton} from '../OperationDisabledButton';
 import {SubmitSelectionButton} from '../SubmitSelectionButton';
 import {SubmitUpdateMessageInput} from '../SubmitUpdateMessageInput';
-import {Subtle} from '../Subtle';
-import {latestSuccessorUnlessExplicitlyObsolete} from '../SuccessionTracker';
 import {SuggestedRebaseButton} from '../SuggestedRebase';
-import {Tooltip} from '../Tooltip';
 import {UncommittedChanges} from '../UncommittedChanges';
 import {confirmUnsavedFiles} from '../UnsavedFiles';
 import {tracker} from '../analytics';
@@ -36,14 +32,16 @@ import {
 } from '../codeReview/CodeReviewInfo';
 import {submitAsDraft, SubmitAsDraftCheckbox} from '../codeReview/DraftCheckbox';
 import {overrideDisabledSubmitModes} from '../codeReview/github/branchPrState';
-import {Badge} from '../components/Badge';
-import {Divider} from '../components/Divider';
 import GatedComponent from '../components/GatedComponent';
-import {RadioGroup} from '../components/Radio';
 import {FoldButton, useRunFoldPreview} from '../fold';
 import {t, T} from '../i18n';
+import {IrrelevantCwdIcon} from '../icons/IrrelevantCwdIcon';
 import {readAtom, writeAtom} from '../jotaiUtils';
-import {messageSyncingEnabledState, updateRemoteMessage} from '../messageSyncing';
+import {
+  messageSyncingEnabledState,
+  messageSyncingOverrideState,
+  updateRemoteMessage,
+} from '../messageSyncing';
 import {AmendMessageOperation} from '../operations/AmendMessageOperation';
 import {getAmendOperation} from '../operations/AmendOperation';
 import {getCommitOperation} from '../operations/CommitOperation';
@@ -55,8 +53,11 @@ import {useRunOperation} from '../operationsState';
 import {useUncommittedSelection} from '../partialSelection';
 import platform from '../platform';
 import {CommitPreview, uncommittedChangesWithPreviews} from '../previews';
+import {repoRelativeCwd, useIsIrrelevantToCwd} from '../repositoryData';
 import {selectedCommits} from '../selection';
 import {commitByHash, latestHeadCommit, repositoryInfo} from '../serverAPIState';
+import {latestSuccessorUnlessExplicitlyObsolete} from '../successionUtils';
+import {showToast} from '../toast';
 import {GeneratedStatus, succeedableRevset} from '../types';
 import {useModal} from '../useModal';
 import {firstOfIterable} from '../utils';
@@ -84,14 +85,21 @@ import {DiffStats, PendingDiffStats} from './DiffStats';
 import {FillCommitMessage} from './FillCommitMessage';
 import SplitSuggestion from './SplitSuggestion';
 import {CommitTitleByline, getFieldToAutofocus, Section, SmallCapsTitle} from './utils';
-import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
 import deepEqual from 'fast-deep-equal';
+import {Badge} from 'isl-components/Badge';
+import {Banner, BannerKind, BannerTooltip} from 'isl-components/Banner';
+import {Button} from 'isl-components/Button';
+import {Divider} from 'isl-components/Divider';
+import {Column} from 'isl-components/Flex';
+import {Icon} from 'isl-components/Icon';
+import {RadioGroup} from 'isl-components/Radio';
+import {Subtle} from 'isl-components/Subtle';
+import {Tooltip} from 'isl-components/Tooltip';
 import {useAtom, useAtomValue} from 'jotai';
 import {useAtomCallback} from 'jotai/utils';
 import {useCallback, useEffect, useMemo} from 'react';
 import {ComparisonType} from 'shared/Comparison';
 import {useContextMenu} from 'shared/ContextMenu';
-import {Icon} from 'shared/Icon';
 import {usePrevious} from 'shared/hooks';
 import {firstLine, notEmpty, nullthrows} from 'shared/utils';
 
@@ -182,6 +190,9 @@ export function CommitInfoDetails({commit}: {commit: CommitInfo}) {
   const isOptimistic =
     useAtomValue(commitByHash(commit.hash)) == null && !isCommitMode && !isFoldPreview;
 
+  const cwd = useAtomValue(repoRelativeCwd);
+  const isIrrelevantToCwd = useIsIrrelevantToCwd(commit);
+
   const isPublic = commit.phase === 'public';
   const isObsoleted = commit.successorInfo != null;
   const isAmendDisabled = mode === 'amend' && (isPublic || isObsoleted);
@@ -235,6 +246,12 @@ export function CommitInfoDetails({commit}: {commit: CommitInfo}) {
     schema,
     fieldsBeingEdited,
     previousFieldsBeingEdited,
+  );
+
+  const diffSummaries = useAtomValue(allDiffSummaries);
+  const remoteTrackingBranch = provider?.getRemoteTrackingBranch(
+    diffSummaries?.value,
+    commit.diffId,
   );
 
   const isSplitSuggestionSupported = provider?.isSplitSuggestionSupported() ?? false;
@@ -305,12 +322,45 @@ export function CommitInfoDetails({commit}: {commit: CommitInfo}) {
                         latestFields={parsedFields}
                         editedCommitMessageKey={isCommitMode ? 'head' : commit.hash}
                       />
+                      {!isPublic && isIrrelevantToCwd ? (
+                        <Tooltip
+                          title={
+                            <T
+                              replace={{
+                                $prefix: <pre>{commit.maxCommonPathPrefix}</pre>,
+                                $cwd: <pre>{cwd}</pre>,
+                              }}>
+                              This commit only contains files within: $prefix These are irrelevant
+                              to your current working directory: $cwd
+                            </T>
+                          }>
+                          <Banner kind={BannerKind.default}>
+                            <IrrelevantCwdIcon />
+                            <div style={{paddingLeft: 'var(--halfpad)'}}>
+                              <T replace={{$cwd: <code>{cwd}</code>}}>
+                                All files in this commit are outside $cwd
+                              </T>
+                            </div>
+                          </Banner>
+                        </Tooltip>
+                      ) : null}
                     </>
                   ) : undefined
                 }
               />
             );
           })}
+        {remoteTrackingBranch == null ? null : (
+          <Section>
+            <SmallCapsTitle>
+              <Icon icon="source-control"></Icon>
+              <T>Remote Tracking Branch</T>
+            </SmallCapsTitle>
+            <div className="commit-info-tokenized-field">
+              <span className="token">{remoteTrackingBranch}</span>
+            </div>
+          </Section>
+        )}
         <Divider />
         {commit.isDot && !isAmendDisabled ? (
           <Section data-testid="changes-to-amend">
@@ -325,7 +375,7 @@ export function CommitInfoDetails({commit}: {commit: CommitInfo}) {
             </SmallCapsTitle>
             {uncommittedChanges.length > 0 ? (
               <GatedComponent featureFlag={Internal.featureFlags?.ShowSplitSuggestion}>
-                <PendingDiffStats commit={commit} />
+                <PendingDiffStats />
               </GatedComponent>
             ) : null}
             {uncommittedChanges.length === 0 ? (
@@ -399,8 +449,8 @@ function OpenAllFilesButton({commit}: {commit: CommitInfo}) {
           ? t('Open all non-generated files for editing')
           : t('Opens all files for editing.\nNote: All files are generated.')
       }>
-      <VSCodeButton
-        appearance="icon"
+      <Button
+        icon
         onClick={() => {
           tracker.track('OpenAllFiles');
           const statuses = getCachedGeneratedFileStatuses(
@@ -420,7 +470,7 @@ function OpenAllFilesButton({commit}: {commit: CommitInfo}) {
         ) : (
           <T>Open All Files</T>
         )}
-      </VSCodeButton>
+      </Button>
     </Tooltip>
   );
 }
@@ -446,15 +496,15 @@ function areTextFieldsUnchanged(
 
 function FoldPreviewBanner() {
   return (
-    <Banner
-      kind={BannerKind.green}
-      icon={<Icon icon="info" />}
+    <BannerTooltip
       tooltip={t(
         'This is the commit message after combining these commits with the fold command. ' +
           'You can edit this message before confirming and running fold.',
       )}>
-      <T>Previewing result of combined commits</T>
-    </Banner>
+      <Banner kind={BannerKind.green} icon={<Icon icon="info" />}>
+        <T>Previewing result of combined commits</T>
+      </Banner>
+    </BannerTooltip>
   );
 }
 
@@ -471,6 +521,7 @@ function ShowingRemoteMessageBanner({
   const schema = useAtomValue(commitMessageFieldsSchema);
   const runOperation = useRunOperation();
   const syncingEnabled = useAtomValue(messageSyncingEnabledState);
+  const syncingOverride = useAtomValue(messageSyncingOverrideState);
 
   const loadLocalMessage = useCallback(() => {
     const originalFields = parseCommitMessageFields(schema, commit.title, commit.description);
@@ -492,7 +543,7 @@ function ShowingRemoteMessageBanner({
         onClick: () => {
           runOperation(
             new AmendMessageOperation(
-              succeedableRevset(commit.hash),
+              latestSuccessorUnlessExplicitlyObsolete(commit),
               commitMessageFieldsToString(schema, latestFields),
             ),
           );
@@ -501,8 +552,37 @@ function ShowingRemoteMessageBanner({
     ];
   });
 
-  if (!syncingEnabled || !provider) {
+  if (!provider || (syncingOverride == null && !syncingEnabled)) {
     return null;
+  }
+
+  if (syncingOverride === false) {
+    return (
+      <BannerTooltip
+        tooltip={t(
+          'Message syncing with $provider has been temporarily disabled due to a failed sync.\n\n' +
+            'Your local commit message is shown instead.\n' +
+            "Changes you make won't be automatically synced.\n\n" +
+            'Make sure to manually sync your message with $provider, then reenable or restart ISL to start syncing again.',
+          {replace: {$provider: provider.label}},
+        )}>
+        <Banner
+          icon={<Icon icon="warn" />}
+          alwaysShowButtons
+          kind={BannerKind.warning}
+          buttons={
+            <Button
+              icon
+              onClick={() => {
+                writeAtom(messageSyncingOverrideState, null);
+              }}>
+              <T>Show Remote Messages Instead</T>
+            </Button>
+          }>
+          <T replace={{$provider: provider.label}}>Not syncing messages with $provider</T>
+        </Banner>
+      </BannerTooltip>
+    );
   }
 
   const originalFields = parseCommitMessageFields(schema, commit.title, commit.description);
@@ -510,28 +590,29 @@ function ShowingRemoteMessageBanner({
   if (areTextFieldsUnchanged(schema, originalFields, latestFields)) {
     return null;
   }
+
   return (
-    <>
+    <BannerTooltip
+      tooltip={t(
+        'Viewing the newer commit message from $provider. This message will be used when your code is landed. You can also load the local message instead.',
+        {replace: {$provider: provider.label}},
+      )}>
       <Banner
         icon={<Icon icon="info" />}
-        tooltip={t(
-          'Viewing the newer commit message from $provider. This message will be used when your code is landed. You can also load the local message instead.',
-          {replace: {$provider: provider.label}},
-        )}
         alwaysShowButtons
         buttons={
-          <VSCodeButton
-            appearance="icon"
+          <Button
+            icon
             data-testid="message-sync-banner-context-menu"
             onClick={e => {
               contextMenu(e);
             }}>
             <Icon icon="ellipsis" />
-          </VSCodeButton>
+          </Button>
         }>
         <T replace={{$provider: provider.label}}>Showing latest commit message from $provider</T>
       </Banner>
-    </>
+    </BannerTooltip>
   );
 }
 
@@ -540,12 +621,12 @@ function FoldPreviewActions() {
   return (
     <div className="commit-info-actions-bar" data-testid="commit-info-actions-bar">
       <div className="commit-info-actions-bar-right">
-        <VSCodeButton appearance="secondary" onClick={cancel}>
+        <Button onClick={cancel}>
           <T>Cancel</T>
-        </VSCodeButton>
-        <VSCodeButton appearance="primary" onClick={run}>
+        </Button>
+        <Button primary onClick={run}>
           <T>Run Combine</T>
-        </VSCodeButton>
+        </Button>
       </div>
     </div>
   );
@@ -613,7 +694,8 @@ function ActionsBar({
         }
       }
 
-      writeAtom(editedCommitMessages(isCommitMode ? 'head' : commit.hash), {});
+      // Delete the edited message atom (and delete from persisted storage)
+      writeAtom(editedCommitMessages(isCommitMode ? 'head' : commit.hash), undefined);
     },
     [commit.hash, isCommitMode],
   );
@@ -651,7 +733,7 @@ function ActionsBar({
   const forceEnableSubmit = useAtomValue(overrideDisabledSubmitModes);
   const submitDisabledReason = forceEnableSubmit ? undefined : provider?.submitDisabledReason?.();
 
-  const ongoingImageUploads = useAtomValue(numPendingImageUploads);
+  const ongoingImageUploads = useAtomValue(numPendingImageUploads(undefined));
   const areImageUploadsOngoing = ongoingImageUploads > 0;
 
   // Generally "Amend"/"Commit" for head commit, but if there's no changes while amending, just use "Amend message"
@@ -668,9 +750,9 @@ function ActionsBar({
       </div>
       <div className="commit-info-actions-bar-right">
         {isAnythingBeingEdited && !isCommitMode ? (
-          <VSCodeButton appearance="secondary" onClick={() => clearEditedCommitMessage()}>
+          <Button onClick={() => clearEditedCommitMessage()}>
             <T>Cancel</T>
-          </VSCodeButton>
+          </Button>
         ) : null}
 
         {showCommitOrAmend ? (
@@ -689,7 +771,6 @@ function ActionsBar({
             trigger={areImageUploadsOngoing || !anythingToCommit ? 'hover' : 'disabled'}>
             <OperationDisabledButton
               contextKey={isCommitMode ? 'commit' : 'amend'}
-              appearance="secondary"
               disabled={!anythingToCommit || editedMessage == null || areImageUploadsOngoing}
               runOperation={async () => {
                 if (!isCommitMode) {
@@ -737,7 +818,6 @@ function ActionsBar({
             }>
             <OperationDisabledButton
               contextKey={`amend-message-${commit.hash}`}
-              appearance="secondary"
               data-testid="amend-message-button"
               disabled={!isAnythingBeingEdited || editedMessage == null || areImageUploadsOngoing}
               runOperation={async () => {
@@ -790,6 +870,7 @@ function ActionsBar({
             }
             placement="top">
             <OperationDisabledButton
+              kind="primary"
               contextKey={`submit-${commit.isDot ? 'head' : commit.hash}`}
               disabled={
                 !canSubmitWithCodeReviewProvider ||
@@ -961,8 +1042,28 @@ async function tryToUpdateRemoteMessage(
       .operation('SyncDiffMessageMutation', 'SyncMessageError', {extras: {reason}}, () =>
         updateRemoteMessage(diffId, title, description),
       )
-      .catch(() => {
-        // TODO: We should notify about this in the UI
+      .catch(err => {
+        // Uh oh we failed to sync. Let's override all syncing so you can see your local changes
+        // and we don't get you stuck in a syncing loop.
+
+        writeAtom(messageSyncingOverrideState, false);
+
+        showToast(
+          <Banner kind={BannerKind.error}>
+            <Column alignStart>
+              <div>
+                <T>Failed to sync message to remote. Further syncing has been disabled.</T>
+              </div>
+              <div>
+                <T>Try manually syncing and restarting ISL.</T>
+              </div>
+              <div>{firstLine(err.message || err.toString())}</div>
+            </Column>
+          </Banner>,
+          {
+            durationMs: 20_000,
+          },
+        );
       });
   }
   return false;

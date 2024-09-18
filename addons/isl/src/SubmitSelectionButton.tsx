@@ -10,13 +10,13 @@ import type {CommitInfo} from './types';
 import {HighlightCommitsWhileHovering} from './HighlightedCommits';
 import {OperationDisabledButton} from './OperationDisabledButton';
 import {multiSubmitUpdateMessage} from './SubmitUpdateMessageInput';
-import {Tooltip} from './Tooltip';
 import {allDiffSummaries, codeReviewProvider} from './codeReview/CodeReviewInfo';
 import {submitAsDraft} from './codeReview/DraftCheckbox';
 import {t, T} from './i18n';
 import {readAtom, writeAtom} from './jotaiUtils';
 import {dagWithPreviews} from './previews';
 import {selectedCommits} from './selection';
+import {Tooltip} from 'isl-components/Tooltip';
 import {atom, useAtomValue} from 'jotai';
 
 /**
@@ -36,7 +36,7 @@ export const submittableSelection = atom(get => {
   }
 
   const dag = get(dagWithPreviews);
-  const commits = dag.getBatch(dag.sortAsc(selection));
+  const commits = dag.getBatch(dag.sortAsc(dag.present(selection)));
   const submittable =
     (diffSummaries.value != null
       ? provider?.getSubmittableDiffs(commits, diffSummaries.value)
@@ -74,7 +74,6 @@ export function SubmitSelectionButton({commit}: {commit?: CommitInfo}) {
       })}>
       <HighlightCommitsWhileHovering toHighlight={submittable}>
         <OperationDisabledButton
-          appearance="secondary"
           runOperation={() => {
             const updateMessage = readAtom(multiSubmitUpdateMessage(submittable));
             // clear update message on submit

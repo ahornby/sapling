@@ -18,8 +18,8 @@ use crate::ChangesetHook;
 use crate::CrossRepoPushSource;
 use crate::HookConfig;
 use crate::HookExecution;
-use crate::HookFileContentProvider;
 use crate::HookRejectionInfo;
+use crate::HookStateProvider;
 use crate::PushAuthoredBy;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -58,7 +58,7 @@ impl ChangesetHook for BlockCommitMessagePatternHook {
         _ctx: &'ctx CoreContext,
         _bookmark: &BookmarkKey,
         changeset: &'cs BonsaiChangeset,
-        _content_manager: &'fetcher dyn HookFileContentProvider,
+        _content_manager: &'fetcher dyn HookStateProvider,
         _cross_repo_push_source: CrossRepoPushSource,
         push_authored_by: PushAuthoredBy,
     ) -> Result<HookExecution> {
@@ -80,6 +80,7 @@ impl ChangesetHook for BlockCommitMessagePatternHook {
 #[cfg(test)]
 mod tests {
     use fbinit::FacebookInit;
+    use mononoke_macros::mononoke;
     use tests_utils::bookmark;
     use tests_utils::drawdag::changes;
     use tests_utils::drawdag::create_from_dag_with_changes;
@@ -88,7 +89,7 @@ mod tests {
     use super::*;
     use crate::testlib::test_changeset_hook;
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_blocks_pattern_when_present(fb: FacebookInit) -> Result<()> {
         let ctx = CoreContext::test_mock(fb);
         let repo: BasicTestRepo = test_repo_factory::build_empty(fb).await?;

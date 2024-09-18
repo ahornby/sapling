@@ -5,7 +5,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-import type {TypeaheadKind, TypeaheadResult} from 'isl/src/CommitInfoView/types';
+import type {TypeaheadResult} from 'isl-components/Types';
+import type {TypeaheadKind} from 'isl/src/CommitInfoView/types';
 import type {
   DiffId,
   DiffSummary,
@@ -17,6 +18,7 @@ import type {
   CodeReviewProviderSpecificClientToServerMessages,
   ClientToServerMessage,
   DiffComment,
+  ServerToClientMessage,
 } from 'isl/src/types';
 
 type DiffSummaries = Map<DiffId, DiffSummary>;
@@ -70,5 +72,6 @@ export interface CodeReviewProvider {
 
   handleClientToServerMessage?(
     message: ClientToServerMessage,
+    postMessage: (message: ServerToClientMessage) => void,
   ): message is CodeReviewProviderSpecificClientToServerMessages;
 }

@@ -21,8 +21,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+#[cfg(feature = "fb")]
 use anyhow::bail;
-use anyhow::Context;
 use anyhow::Result;
 use configmodel::Config;
 use configmodel::ConfigExt;
@@ -32,7 +32,7 @@ use hgplain;
 use identity::Identity;
 use minibytes::Text;
 use repo_minimal_info::RepoMinimalInfo;
-use url::Url;
+use repourl::repo_name_from_url;
 
 use crate::config::ConfigSet;
 use crate::config::Options;
@@ -673,84 +673,6 @@ impl ConfigSetExtInternal for ConfigSet {
     }
 }
 
-/// Using custom "schemes" from config, resolve given url.
-pub fn resolve_custom_scheme(config: &dyn Config, url: Url) -> Result<Url> {
-    if let Some(tmpl) = config.get_nonempty("schemes", url.scheme()) {
-        let non_scheme = match url.as_str().split_once(':') {
-            Some((_, after)) => after.trim_start_matches('/'),
-            None => bail!("url {url} has no scheme"),
-        };
-
-        let resolved_url = if tmpl.contains("{1}") {
-            tmpl.replace("{1}", non_scheme)
-        } else {
-            format!("{tmpl}{non_scheme}")
-        };
-
-        return Url::parse(&resolved_url)
-            .with_context(|| format!("parsing resolved custom scheme URL {resolved_url}"));
-    }
-
-    Ok(url)
-}
-
-pub fn repo_name_from_url(config: &dyn Config, s: &str) -> Option<String> {
-    // Use a base_url to support non-absolute urls.
-    let base_url = Url::parse("file:///.").unwrap();
-    let parse_opts = Url::options().base_url(Some(&base_url));
-    match parse_opts.parse(s) {
-        Ok(url) => {
-            let url = resolve_custom_scheme(config, url).ok()?;
-
-            tracing::trace!("parsed url {}: {:?}", s, url);
-            match url.scheme() {
-                "mononoke" => {
-                    // In Mononoke URLs, the repo name is always the full path
-                    // with slashes trimmed.
-                    let path = url.path().trim_matches('/');
-                    if !path.is_empty() {
-                        return Some(path.to_string());
-                    }
-                }
-                _ => {
-                    // Try to remove special prefixes to guess the repo name from that
-                    if let Some(repo_prefix) = config.get("remotefilelog", "reponame-path-prefixes")
-                    {
-                        if let Some((_, reponame)) =
-                            url.path().split_once(repo_prefix.to_string().as_str())
-                        {
-                            if !reponame.is_empty() {
-                                return Some(reponame.to_string());
-                            }
-                        }
-                    }
-                    // Try the last segment in url path.
-                    if let Some(last_segment) = url
-                        .path_segments()
-                        .and_then(|s| s.rev().find(|s| !s.is_empty()))
-                    {
-                        return Some(last_segment.to_string());
-                    }
-                    // Try path. `path_segment` can be `None` for URL like "test:reponame".
-                    let path = url.path().trim_matches('/');
-                    if !path.is_empty() {
-                        return Some(path.to_string());
-                    }
-                    // Try the hostname. ex. in "fb://fbsource", "fbsource" is a host not a path.
-                    // Also see https://www.mercurial-scm.org/repo/hg/help/schemes
-                    if let Some(host_str) = url.host_str() {
-                        return Some(host_str.to_string());
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            tracing::warn!("cannot parse url {}: {:?}", s, e);
-        }
-    }
-    None
-}
-
 #[cfg(feature = "fb")]
 fn get_config_dir(info: Option<&RepoMinimalInfo>) -> Result<PathBuf, Error> {
     Ok(match info {
@@ -794,9 +716,18 @@ pub fn calculate_internalconfig(
     canary: Option<String>,
     user_name: String,
     proxy_sock_path: Option<String>,
+    allow_remote_snapshot: bool,
 ) -> Result<ConfigSet> {
     use crate::fb::internalconfig::Generator;
-    Generator::new(mode, repo_name, config_dir, user_name, proxy_sock_path)?.execute(canary)
+    Generator::new(
+        mode,
+        repo_name,
+        config_dir,
+        user_name,
+        proxy_sock_path,
+        allow_remote_snapshot,
+    )?
+    .execute(canary)
 }
 
 #[cfg(feature = "fb")]
@@ -807,6 +738,7 @@ pub fn generate_internalconfig(
     canary: Option<String>,
     user_name: String,
     proxy_sock_path: Option<String>,
+    allow_remote_snapshot: bool,
 ) -> Result<()> {
     use std::io::Write;
 
@@ -858,8 +790,9 @@ pub fn generate_internalconfig(
         canary,
         user_name,
         proxy_sock_path,
+        allow_remote_snapshot,
     )?;
-    let config_str = format!("{}{}", header, config.to_string());
+    let config_str = format!("{}{}", header, config);
 
     // If the file exists and will be unchanged, just update the mtime.
     if hgrc_path.exists() && read_to_string(&hgrc_path).unwrap_or_default() == config_str {
@@ -957,7 +890,16 @@ fn load_dynamic(
         };
 
         // Regen inline
-        let res = generate_internalconfig(mode, info, repo_name, None, user_name, proxy_sock_path);
+        let res = generate_internalconfig(
+            mode,
+            info,
+            repo_name,
+            None,
+            user_name,
+            proxy_sock_path,
+            // Allow using baked in remote config snapshot in case remote fetch fails.
+            true,
+        );
         if let Err(e) = res {
             let is_perm_error = e
                 .chain()
@@ -1012,7 +954,6 @@ pub fn read_repo_name_from_disk(shared_dot_hg_path: &Path) -> io::Result<String>
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::io::Write;
 
     use once_cell::sync::Lazy;
@@ -1304,11 +1245,13 @@ mod tests {
 
         let dir = TempDir::with_prefix("test_load.").unwrap();
 
-        let repo_rc = dir.path().join(".hg/hgrc");
+        let repo_rc = dir.path().join(".sl/config");
         write_file(repo_rc, "[s]\na=orig\nb=orig\nc=orig");
 
         let other_rc = dir.path().join("other.rc");
         write_file(other_rc.clone(), "[s]\na=other\nb=other");
+
+        write_file(dir.path().join(".sl/requires"), "treestate\n");
 
         let repo = RepoMinimalInfo::from_repo_root(dir.path().to_path_buf()).unwrap();
 
@@ -1327,65 +1270,5 @@ mod tests {
         assert_eq!(cfg.get("s", "a"), Some("other".into()));
         assert_eq!(cfg.get("s", "b"), Some("flag".into()));
         assert_eq!(cfg.get("s", "c"), Some("orig".into()));
-    }
-
-    #[test]
-    fn test_repo_name_from_url() {
-        let config = BTreeMap::<&str, &str>::from([("schemes.fb", "mononoke://example.com/{1}")]);
-
-        let check = |url, name| {
-            assert_eq!(repo_name_from_url(&config, url).as_deref(), name);
-        };
-
-        // Ordinary schemes use the basename as the repo name
-        check("repo", Some("repo"));
-        check("../path/to/repo", Some("repo"));
-        check("file:repo", Some("repo"));
-        check("file:/path/to/repo", Some("repo"));
-        check("file://server/path/to/repo", Some("repo"));
-        check("ssh://user@host/repo", Some("repo"));
-        check("ssh://user@host/path/to/repo", Some("repo"));
-        check("file:/", None);
-
-        // This isn't correct, but is a side-effect of earlier hacks (should
-        // be `None`)
-        check("ssh://user@host:100/", Some("host"));
-
-        // Mononoke scheme uses the full path, and repo names can contain
-        // slashes.
-        check("mononoke://example.com/repo", Some("repo"));
-        check("mononoke://example.com/path/to/repo", Some("path/to/repo"));
-        check("mononoke://example.com/", None);
-
-        // FB scheme uses the full path.
-        check("fb:repo", Some("repo"));
-        check("fb:path/to/repo", Some("path/to/repo"));
-        check("fb:", None);
-
-        // FB scheme works even when there are extra slashes that shouldn't be
-        // there.
-        check("fb://repo/", Some("repo"));
-        check("fb://path/to/repo", Some("path/to/repo"));
-    }
-
-    #[test]
-    fn test_resolve_custom_scheme() {
-        let config = BTreeMap::<&str, &str>::from([
-            ("schemes.append", "appended://bar/"),
-            ("schemes.subst", "substd://bar/{1}/baz"),
-        ]);
-
-        let check = |url, resolved| {
-            assert_eq!(
-                resolve_custom_scheme(&config, Url::parse(url).unwrap())
-                    .unwrap()
-                    .as_str(),
-                resolved
-            );
-        };
-
-        check("other://foo", "other://foo");
-        check("append:one/two", "appended://bar/one/two");
-        check("subst://one/two", "substd://bar/one/two/baz");
     }
 }

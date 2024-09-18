@@ -10,8 +10,12 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Optional, Set
+
+from eden.fs.cli import mtab
+from eden.fs.cli.doctor import check_stale_mounts
 
 from eden.fs.cli.util import poll_until
 from eden.thrift.legacy import EdenClient, EdenNotRunningError
@@ -32,8 +36,8 @@ from .lib import testcase
 
 
 @testcase.eden_repo_test
-# pyre-ignore[13]: T62487924
 class MountTest(testcase.EdenRepoTest):
+    # pyre-fixme[13]: Attribute `expected_mount_entries` is never initialized.
     expected_mount_entries: Set[str]
     enable_fault_injection: bool = True
 
@@ -152,16 +156,16 @@ class MountTest(testcase.EdenRepoTest):
                 return None
 
             poll_until(mount_started, timeout=30)
+            self.wait_on_fault_hit(key_class="mount")
             self.assertEqual({self.mount: "INITIALIZING"}, self.eden.list_cmd_simple())
 
             # Most thrift calls to access the mount should be disallowed while it is
             # still initializing.
             self._assert_thrift_calls_fail_during_mount_init(client)
 
-            # Unblock mounting and wait for the mount to transition to running
             client.unblockFault(UnblockFaultArg(keyClass="mount", keyValueRegex=".*"))
-
             self._wait_for_mount_running(client)
+
             self.assertEqual({self.mount: "RUNNING"}, self.eden.list_cmd_simple())
 
             mount_proc.wait()
@@ -366,3 +370,53 @@ class MountTest(testcase.EdenRepoTest):
         with self.eden.get_thrift_client_legacy() as client:
             mount_failures = client.getCounter("startup_mount_failures")
             self.assertEqual(2, mount_failures)
+
+    def test_start_with_hanging_mounts(self) -> None:
+        """This test checks that hanging mounts are remounted upon restart.
+        It does this by checking the location of a nonexistent file in the mount.
+        If the mount is valid, a FileNotFoundError is raised. If the mount is
+        hanging, an OSError is raised.
+
+        Only for Linux since on MacOS a hanging mount will cause a system popup
+        and only FUSE since NFS fails to remount before the hanging mount is detected.
+        """
+        if sys.platform != "linux":
+            return
+
+        if self.use_nfs():
+            return
+
+        mount_table = mtab.new()
+        test_mounts = set()
+        for mount_point, mount_type in check_stale_mounts.get_all_eden_mount_points(
+            mount_table
+        ):
+            if mount_point.decode() == self.mount:
+                test_mounts.add((mount_point, mount_type))
+
+        # Check that mounts are valid
+        for errored_mount_list in check_stale_mounts.get_stale_eden_mount_points(
+            mount_table, test_mounts
+        ):
+            self.assertTrue(
+                len(errored_mount_list) == 0, f"errored mounts: {errored_mount_list}"
+            )
+
+        # Now restart EdenFS with mounting blocked
+        self.eden.kill_dirty()
+
+        # Check that mounts are hanging
+        stale_mounts = check_stale_mounts.get_stale_eden_mount_points(
+            mount_table, test_mounts
+        )
+        self.assertEqual(len(stale_mounts[0]), 1)
+        self.assertEqual(stale_mounts[0][0].decode(), self.mount)
+
+        # Check that mounts are valid upon restart
+        self.eden.start()
+        for errored_mount_list in check_stale_mounts.get_stale_eden_mount_points(
+            mount_table, test_mounts
+        ):
+            self.assertTrue(
+                len(errored_mount_list) == 0, f"errored mounts: {errored_mount_list}"
+            )

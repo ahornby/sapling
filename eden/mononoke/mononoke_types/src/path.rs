@@ -35,6 +35,7 @@ use crate::errors::MononokeTypeError;
 use crate::hash::Blake2;
 use crate::hash::Context;
 use crate::thrift;
+use crate::ThriftConvert;
 
 pub mod mpath_element;
 
@@ -235,13 +236,6 @@ impl MPath {
         self.elements.is_empty()
     }
 
-    pub fn from_thrift(mpath: thrift::path::MPath) -> Result<Self> {
-        let elements: Result<Vec<_>> = mpath.0.into_iter().map(MPathElement::from_thrift).collect();
-        let elements = elements?;
-
-        Ok(Self { elements })
-    }
-
     pub fn join<'a, Elements: IntoIterator<Item = &'a MPathElement>>(
         &self,
         another: Elements,
@@ -387,13 +381,8 @@ impl MPath {
             .map(|(first, rest)| (first, Self::from_elements(rest.iter())))
     }
 
-    pub fn into_thrift(self) -> thrift::path::MPath {
-        thrift::path::MPath(
-            self.elements
-                .into_iter()
-                .map(|elem| elem.into_thrift())
-                .collect(),
-        )
+    pub fn iter(&self) -> Iter<MPathElement> {
+        self.elements.iter()
     }
 
     pub fn get_path_hash(&self) -> MPathHash {
@@ -732,6 +721,10 @@ impl NonRootMPath {
         }
     }
 
+    pub fn iter(&self) -> Iter<MPathElement> {
+        self.0.iter()
+    }
+
     pub fn into_iter_opt(path: Option<Self>) -> ::std::vec::IntoIter<MPathElement> {
         match path {
             Some(path) => path.into_iter(),
@@ -876,6 +869,31 @@ impl NonRootMPath {
     pub fn matches_regex(&self, re: &Regex) -> bool {
         let s: String = format!("{}", self);
         re.is_match(&s)
+    }
+}
+
+impl ThriftConvert for MPath {
+    const NAME: &'static str = "MPath";
+    type Thrift = thrift::path::MPath;
+
+    fn from_thrift(thrift: Self::Thrift) -> Result<Self> {
+        let elements: Result<Vec<_>> = thrift
+            .0
+            .into_iter()
+            .map(MPathElement::from_thrift)
+            .collect();
+        let elements = elements?;
+
+        Ok(Self { elements })
+    }
+
+    fn into_thrift(self) -> Self::Thrift {
+        thrift::path::MPath(
+            self.elements
+                .into_iter()
+                .map(|elem| elem.into_thrift())
+                .collect(),
+        )
     }
 }
 
@@ -1423,19 +1441,20 @@ where
 mod test {
     use std::mem::size_of;
 
+    use mononoke_macros::mononoke;
     use quickcheck::quickcheck;
     use quickcheck::TestResult;
 
     use super::*;
 
-    #[test]
+    #[mononoke::test]
     fn test_mpath_element_size() {
         // MPathElement size is important as we have a lot of them.
         // Test so we are aware of any change.
         assert_eq!(32, size_of::<MPathElement>());
     }
 
-    #[test]
+    #[mononoke::test]
     fn get_path_hash_multiple_elem() {
         let path = MPath::new("foo/bar/baz").unwrap();
         assert_eq!(
@@ -1444,7 +1463,7 @@ mod test {
         );
     }
 
-    #[test]
+    #[mononoke::test]
     fn get_path_hash_single_elem() {
         let path = MPath::new("foo").unwrap();
         assert_eq!(
@@ -1509,14 +1528,14 @@ mod test {
         }
     }
 
-    #[test]
+    #[mononoke::test]
     fn path_make() {
         let path = MPath::new(b"1234abc");
         assert!(MPath::new(b"1234abc").is_ok());
         assert_eq!(path.unwrap().to_vec().len(), 7);
     }
 
-    #[test]
+    #[mononoke::test]
     fn repo_path_make() {
         let path = NonRootMPath::new(b"abc").unwrap();
         assert_eq!(
@@ -1526,7 +1545,7 @@ mod test {
         assert_ne!(RepoPath::dir(path).unwrap(), RepoPath::file("abc").unwrap());
     }
 
-    #[test]
+    #[mononoke::test]
     fn empty_non_root_paths() {
         fn assert_empty(path: &str) {
             NonRootMPath::new(path).expect_err(&format!(
@@ -1541,7 +1560,7 @@ mod test {
         assert_empty("////");
     }
 
-    #[test]
+    #[mononoke::test]
     fn empty_paths() {
         fn assert_empty(path: &str) {
             MPath::new(path).unwrap_or_else(|_| panic!("unexpected err - path '{}' is logically empty which should be allowed for MPath",
@@ -1554,7 +1573,7 @@ mod test {
         assert_empty("////");
     }
 
-    #[test]
+    #[mononoke::test]
     fn ancestors() {
         fn path(p: &str) -> MPath {
             MPath::new(p).unwrap()
@@ -1575,7 +1594,7 @@ mod test {
         );
     }
 
-    #[test]
+    #[mononoke::test]
     fn non_root_ancestors() {
         fn path(p: &str) -> NonRootMPath {
             NonRootMPath::new(p).unwrap()
@@ -1596,7 +1615,7 @@ mod test {
         );
     }
 
-    #[test]
+    #[mononoke::test]
     fn components() {
         let foo = MPath::new("foo").unwrap();
         let foo_bar1 = MPath::new("foo/bar1").unwrap();
@@ -1621,7 +1640,7 @@ mod test {
             .expect_err("unexpected OK - too many components");
     }
 
-    #[test]
+    #[mononoke::test]
     fn remove_prefix_component() {
         let foo = MPath::new("foo").unwrap();
         let foo_bar1 = MPath::new("foo/bar1").unwrap();
@@ -1637,19 +1656,19 @@ mod test {
         assert_eq!(foo_bar12.remove_prefix_component(&foo_bar1), two);
     }
 
-    #[test]
+    #[mononoke::test]
     fn bad_path() {
         assert!(NonRootMPath::new(b"\0").is_err());
     }
-    #[test]
+    #[mononoke::test]
     fn bad_path2() {
         assert!(NonRootMPath::new(b"abc\0").is_err());
     }
-    #[test]
+    #[mononoke::test]
     fn bad_path3() {
         assert!(NonRootMPath::new(b"ab\0cde").is_err());
     }
-    #[test]
+    #[mononoke::test]
     fn bad_path4() {
         let p = vec![97; 255];
         assert!(NonRootMPath::new(p).is_ok());
@@ -1658,7 +1677,7 @@ mod test {
         assert!(NonRootMPath::new(p).is_err());
     }
 
-    #[test]
+    #[mononoke::test]
     fn bad_path_element() {
         let p = vec![97; 255];
         assert!(MPathElement::new(p).is_ok());
@@ -1667,7 +1686,7 @@ mod test {
         assert!(MPathElement::new(p).is_err());
     }
 
-    #[test]
+    #[mononoke::test]
     fn bad_path_thrift() {
         let bad_thrift =
             thrift::path::MPath(vec![thrift::path::MPathElement(b"abc\0".to_vec().into())]);
@@ -1678,7 +1697,7 @@ mod test {
         MPath::from_thrift(bad_thrift).expect_err("unexpected OK - embedded slash");
     }
 
-    #[test]
+    #[mononoke::test]
     fn path_cmp() {
         let a = NonRootMPath::new(b"a").unwrap();
         let b = NonRootMPath::new(b"b").unwrap();
@@ -1690,7 +1709,7 @@ mod test {
         assert!(a <= b);
     }
 
-    #[test]
+    #[mononoke::test]
     fn pcf() {
         check_pcf_paths(vec![("foo", true), ("bar", true)])
             .expect("unexpected Err - no directories");
@@ -1714,7 +1733,7 @@ mod test {
         .expect_err("unexpected OK - other paths and prefixes");
     }
 
-    #[test]
+    #[mononoke::test]
     fn case_conflicts() {
         fn m(mpath: &str) -> NonRootMPath {
             NonRootMPath::new(mpath).unwrap()
@@ -1763,7 +1782,7 @@ mod test {
         check_pcf(paths.iter().map(|(path, is_changed)| (path, *is_changed)))
     }
 
-    #[test]
+    #[mononoke::test]
     fn prefix_trie() {
         let mut prefixes = PrefixTrie::new();
 
@@ -1814,7 +1833,7 @@ mod test {
         assert!(prefixes.contains_everything());
     }
 
-    #[test]
+    #[mononoke::test]
     fn has_suffix_suffix() {
         let path = |path| NonRootMPath::new(path).unwrap();
 

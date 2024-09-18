@@ -12,7 +12,7 @@ harness = false
 required-features = ["for-tests"]
 
 [dependencies]
-anyhow = "1.0.75"
+anyhow = "1.0.86"
 crossbeam = "0.8"
 factory = { version = "0.1.0", path = "../util/factory" }
 manifest = { version = "0.1.0", path = "../manifest" }
@@ -26,10 +26,11 @@ rand = { version = "0.8", features = ["small_rng"], optional = true }
 sha1 = "0.10.5"
 storemodel = { version = "0.1.0", path = "../storemodel" }
 thiserror = "1.0.49"
-tracing = { version = "0.1.40", features = ["attributes"] }
+tracing = { version = "0.1.40", features = ["attributes", "valuable"] }
 types = { version = "0.1.0", path = "../types" }
 
 [dev-dependencies]
+dev-logger = { version = "0.1.0", path = "../dev-logger" }
 manifest = { version = "0.1.0", path = "../manifest", features = ["for-tests"], default-features = false }
 minibench = { version = "0.1.0", path = "../minibench" }
 quickcheck = "1.0"

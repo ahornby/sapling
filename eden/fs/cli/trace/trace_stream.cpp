@@ -40,6 +40,8 @@ constexpr auto kTimeout = std::chrono::seconds{1};
 constexpr size_t kStartingInodeWidth = 5;
 static const auto kTreeEmoji =
     reinterpret_cast<const char*>(u8"\U0001F332"); // 🌲
+static const auto kTreeMetaEmoji =
+    reinterpret_cast<const char*>(u8"U000100B7"); // 𐂷
 static const auto kBlobEmoji =
     reinterpret_cast<const char*>(u8"\U0001F4C4"); // 📄
 static const auto kBlobMetaEmoji =
@@ -98,6 +100,7 @@ static const std::unordered_map<HgResourceType, const char*> kResourceTypes = {
     {HgResourceType::BLOB, kBlobEmoji},
     {HgResourceType::TREE, kTreeEmoji},
     {HgResourceType::BLOBMETA, kBlobMetaEmoji},
+    {HgResourceType::TREEMETA, kTreeMetaEmoji},
 };
 
 static const std::unordered_map<HgImportPriority, const char*>
@@ -193,7 +196,8 @@ std::string formatPrjfsCall(
 
 void print_hg_event(
     const HgEvent& evt,
-    std::unordered_map<uint64_t, ActiveHgRequest>& activeRequests) {
+    std::unordered_map<uint64_t, ActiveHgRequest>& activeRequests,
+    bool printQueuedEvents = false) {
   std::optional<HgEvent> queueEvent;
   std::optional<HgEvent> startEvent;
 
@@ -229,8 +233,10 @@ void print_hg_event(
     case HgEventType::UNKNOWN:
       break;
     case HgEventType::QUEUE:
-      // TODO: Might be interesting to add an option to see queuing events.
-      return;
+      if (!printQueuedEvents) {
+        return;
+      }
+      break;
     case HgEventType::START:
       if (queueEvent) {
         auto queueTime = evt.times()->monotonic_time_ns().value() -
@@ -309,18 +315,33 @@ int trace_hg(
     apache::thrift::RocketClientChannel::Ptr channel) {
   apache::thrift::Client<StreamingEdenService> client{std::move(channel)};
 
+  auto outstandingHgEventsFuture =
+      client.semifuture_debugOutstandingHgEvents(mountRoot.asString())
+          .via(evbThread.getEventBase());
   apache::thrift::ClientBufferedStream<HgEvent> traceHgStream =
       client.semifuture_traceHgEvents(mountRoot.asString())
           .via(evbThread.getEventBase())
           .get();
 
-  /**
-   * Like `eden strace`, would be nice to print the active set of requests (that
-   * are currently in progress when streaming starts) before streaming the
-   * events in trace_hg.
-   */
-  std::unordered_map<uint64_t, ActiveHgRequest> activeRequests;
+  std::move(outstandingHgEventsFuture)
+      .thenValue([](std::vector<HgEvent> outstandingEvents) {
+        if (outstandingEvents.empty()) {
+          return;
+        }
+        std::string_view header = "Outstanding Sapling events"sv;
+        fmt::print("{}\n{}\n", header, std::string(header.size(), '-'));
+        std::unordered_map<uint64_t, ActiveHgRequest> activeRequests;
+        for (const auto& event : outstandingEvents) {
+          print_hg_event(event, activeRequests, true);
+        }
+        fmt::print("\n");
+      })
+      .get();
 
+  std::string_view header = "Ongoing Sapling events"sv;
+  fmt::print("{}\n{}\n", header, std::string(header.size(), '-'));
+
+  std::unordered_map<uint64_t, ActiveHgRequest> activeRequests;
   std::move(traceHgStream).subscribeInline([&](folly::Try<HgEvent>&& event) {
     if (event.hasException()) {
       fmt::print("Error: {}\n", folly::exceptionStr(event.exception()));

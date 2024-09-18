@@ -15,6 +15,7 @@ use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Error;
 use anyhow::Result;
+use base64::Engine;
 use bookmarks::BookmarksRef;
 #[cfg(fbcode_build)]
 use clientinfo::ClientEntryPoint;
@@ -24,6 +25,7 @@ use clientinfo::ClientInfo;
 use clientinfo::CLIENT_INFO_HEADER;
 use futures::future::BoxFuture;
 use futures::future::FutureExt;
+use gotham_ext::middleware::metadata::ingress_request_identities_from_headers;
 use gotham_ext::socket_data::TlsSocketData;
 use http::HeaderMap;
 use http::HeaderValue;
@@ -34,6 +36,7 @@ use http::Uri;
 use hyper::service::Service;
 use hyper::Body;
 use metadata::Metadata;
+use mononoke_api::Repo;
 use percent_encoding::percent_decode;
 use qps::Qps;
 use session_id::generate_session_id;
@@ -333,7 +336,7 @@ where
 
         if path == "/drop_bookmarks_cache" {
             for repo in self.acceptor().mononoke.repos() {
-                repo.blob_repo().bookmarks().drop_caches();
+                repo.bookmarks().drop_caches();
             }
 
             return Ok(ok);
@@ -384,7 +387,7 @@ where
         Ok(res)
     }
 
-    fn acceptor(&self) -> &Acceptor {
+    fn acceptor(&self) -> &Acceptor<Repo> {
         &self.conn.pending.acceptor
     }
 
@@ -465,7 +468,7 @@ fn calculate_websocket_accept(headers: &HeaderMap<HeaderValue>) -> String {
     }
     sha1.update(WEBSOCKET_MAGIC_KEY.as_bytes());
     let hash: [u8; 20] = sha1.finalize().into();
-    base64::encode(hash)
+    base64::engine::general_purpose::STANDARD.encode(hash)
 }
 
 #[cfg(not(fbcode_build))]
@@ -477,6 +480,8 @@ mod h2m {
         headers: &HeaderMap<HeaderValue>,
     ) -> Result<Metadata> {
         let debug = headers.contains_key(HEADER_CLIENT_DEBUG);
+
+        let _ = conn.pending.acceptor.common_config; // Fix compiler warning in OSS build
 
         Ok(Metadata::new(
             Some(&generate_session_id().to_string()),
@@ -600,6 +605,15 @@ mod h2m {
 
         let mut identities = cats_identities.unwrap_or_default();
         identities.extend(conn.identities.iter().cloned());
+
+        if conn.mtls_disabled {
+            identities.extend(
+                ingress_request_identities_from_headers(headers)
+                    .unwrap()
+                    .iter()
+                    .cloned(),
+            );
+        }
 
         // Generic fallback
         let mut metadata = Metadata::new(

@@ -8,14 +8,14 @@
 import {CleanupAllButton} from './Cleanup';
 import {DropdownFields} from './DropdownFields';
 import {useCommandEvent} from './ISLShortcuts';
-import {Kbd} from './Kbd';
 import {SelectAllButton} from './SelectAllCommits';
 import {SuggestedRebaseButton} from './SuggestedRebase';
-import {Tooltip} from './Tooltip';
-import {Button} from './components/Button';
 import {T} from './i18n';
-import {Icon} from 'shared/Icon';
-import {KeyCode, Modifier} from 'shared/KeyboardShortcuts';
+import {Button} from 'isl-components/Button';
+import {Icon} from 'isl-components/Icon';
+import {Kbd} from 'isl-components/Kbd';
+import {KeyCode, Modifier} from 'isl-components/KeyboardShortcuts';
+import {Tooltip} from 'isl-components/Tooltip';
 
 import './BulkActionsMenu.css';
 
@@ -32,7 +32,7 @@ export function BulkActionsMenu() {
           Bulk Actions ($shortcut)
         </T>
       }
-      additionalToggles={additionalToggles}>
+      additionalToggles={additionalToggles.asEventTarget()}>
       <Button icon data-testid="bulk-actions-button">
         <Icon icon="run-all" />
       </Button>

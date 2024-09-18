@@ -93,7 +93,6 @@ from sapling.i18n import _, _n
 from sapling.node import bin, hex, nullid, short
 from sapling.pycompat import range
 
-from .. import clienttelemetry
 from ..remotefilelog import (
     cmdtable as remotefilelogcmdtable,
     resolveprefetchopts,
@@ -218,7 +217,6 @@ def uisetup(ui):
     )
     extensions.wrapfunction(debugcommands, "_debugbundle2part", _debugbundle2part)
     extensions.wrapfunction(repair, "_collectfiles", collectfiles)
-    extensions.wrapfunction(repair, "striptrees", striptrees)
     extensions.wrapfunction(repair, "_collectmanifest", _collectmanifest)
     extensions.wrapfunction(repair, "stripmanifest", stripmanifest)
     extensions.wrapfunction(bundle2, "_addpartsfromopts", _addpartsfromopts)
@@ -330,6 +328,14 @@ def stripmanifest(orig, repo, striprev, tr, files):
     orig(repo, striprev, tr, files)
 
 
+def _addtreecaps(caps):
+    caps = set(caps)
+    caps.add("gettreepack")
+    caps.add("designatednodes")
+    caps.add("treeonly")
+    return list(caps)
+
+
 def reposetup(ui, repo):
     # Update "{manifest}" again since it might be rewritten by templatekw.init.
     templatekw.defaulttempl["manifest"] = "{node}"
@@ -337,14 +343,14 @@ def reposetup(ui, repo):
     if not isinstance(repo, localrepo.localrepository):
         return
 
-    repo.svfs.treemanifestserver = False
-    clientreposetup(repo)
+    repo.name = repo.ui.config("remotefilelog", "reponame", "unknown")
+
+    def _capabilities(orig, repo, proto):
+        return _addtreecaps(orig(repo, proto))
+
+    extensions.wrapfunction(wireproto, "_capabilities", _capabilities)
 
     wraprepo(repo)
-
-
-def clientreposetup(repo):
-    repo.name = repo.ui.config("remotefilelog", "reponame", "unknown")
 
 
 def wraprepo(repo):
@@ -375,10 +381,7 @@ def wraprepo(repo):
 
         def _restrictcapabilities(self, caps):
             caps = super(treerepository, self)._restrictcapabilities(caps)
-            caps.add("designatednodes")
-            caps.add("gettreepack")
-            caps.add("treeonly")
-            return caps
+            return _addtreecaps(caps)
 
         def forcebfsprefetch(self, mfnodes):
             self._bfsprefetch(mfnodes)
@@ -393,14 +396,6 @@ def wraprepo(repo):
 
     repo.__class__ = treerepository
     repo._treefetches = 0
-
-
-def _prunesharedpacks(repo, packpath):
-    """Repack the packpath if it has too many packs in it"""
-    try:
-        numentries = len(os.listdir(packpath))
-    except OSError:
-        return
 
 
 def setuptreestores(repo, mfl):
@@ -549,7 +544,17 @@ class basetreemanifestlog:
         if node == nullid or self._isgit or self._iseager:
             return treemanifestctx(self, dir, node)
         if node in self._treemanifestcache:
-            return self._treemanifestcache[node]
+            m = self._treemanifestcache[node]
+            if m.dirty():
+                # Manifest has been modified in memory - don't share it.
+                del self._treemanifestcache[node]
+            else:
+                # Manifest is clean. Copy it so mutations aren't shared between
+                # objects accidentally. Since the manifest is clean, this should
+                # be a cheap, shallow copy.
+                if m._tree:
+                    m._tree = m._tree.copy()
+                return m
 
         store = self.datastore
 
@@ -580,12 +585,10 @@ class basetreemanifestlog:
         remotestore = revisionstore.pyremotestore(remotetreestore(self._repo))
         mask = os.umask(0o002)
         try:
-            self.treescmstore = self._repo._rsrepo.treescmstore(
-                remotestore,
-            )
+            self.treescmstore = self._repo._rsrepo.treescmstore()
             self.datastore = self.treescmstore
             self.historystore = revisionstore.metadatastore(
-                self._repo.svfs.vfs.base,
+                self._repo.svfs.base,
                 self.ui._rcfg,
                 remotestore,
                 None,
@@ -705,7 +708,7 @@ class treemanifestctx:
             raise NotImplemented("native trees don't support shallow " "readdelta yet")
         else:
             md = _buildtree(self._manifestlog)
-            for f, ((n1, fl1), (n2, fl2)) in pycompat.iteritems(parentmf.diff(mf)):
+            for f, ((n1, fl1), (n2, fl2)) in parentmf.diff(mf).items():
                 if n2:
                     md[f] = n2
                     if fl2:
@@ -714,6 +717,9 @@ class treemanifestctx:
 
     def find(self, key):
         return self.read().find(key)
+
+    def dirty(self):
+        return self._tree and self._tree.dirty()
 
 
 class memtreemanifestctx:
@@ -836,7 +842,7 @@ def debuggetroottree(ui, repo, rootnode):
 def _difftoaddremove(diff):
     added = []
     removed = []
-    for filename, (old, new) in pycompat.iteritems(diff):
+    for filename, (old, new) in diff.items():
         if new is not None and new[0] is not None:
             added.append((filename, new[0], new[1]))
         else:
@@ -1143,8 +1149,7 @@ def pull(orig, ui, repo, *pats, **opts):
         except Exception as ex:
             # Errors are not fatal.
             ui.warn(_("failed to prefetch trees after pull: %s\n") % ex)
-            ui.log(
-                "exceptions",
+            ui.log_exception(
                 exception_type=type(ex).__name__,
                 exception_msg=str(ex),
                 fatal="false",
@@ -1428,6 +1433,9 @@ class EagerHistoryStore:
     def add(self, filename, node, p1, p2, linknode, copyfrom):
         self._added[(filename, node)] = (p1, p2, linknode, copyfrom)
 
+    def getsharedmutable(self):
+        return self
+
 
 class EagerDataStore:
     def __init__(self, store):
@@ -1481,6 +1489,9 @@ class EagerDataStore:
     def prefetch(self, items):
         # EagerRepoStore is not lazy.
         pass
+
+    def getsharedmutable(self):
+        return self
 
     def __getattr__(self, name):
         return getattr(self._store, name)
@@ -1708,11 +1719,6 @@ def collectfiles(orig, repo, striprev):
             files.update(repo[x].files())
 
     return sorted(files)
-
-
-def striptrees(orig, repo, tr, striprev, files):
-    if not treeenabled(repo.ui):
-        return orig(repo, tr, striprev, files)
 
 
 def _addpartsfromopts(orig, ui, repo, bundler, source, outgoing, *args, **kwargs):

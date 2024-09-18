@@ -6,16 +6,16 @@
  */
 
 import type {Dag} from '../previews';
-import type {ExactRevset, SucceedableRevset} from '../types';
+import type {ExactRevset, OptimisticRevset, SucceedableRevset} from '../types';
 
-import {latestSuccessor} from '../SuccessionTracker';
+import {latestSuccessor} from '../successionUtils';
 import {exactRevset} from '../types';
 import {Operation} from './Operation';
 
 export class RebaseAllDraftCommitsOperation extends Operation {
   constructor(
     private timeRangeDays: number | undefined,
-    private destination: ExactRevset | SucceedableRevset,
+    private destination: SucceedableRevset | ExactRevset | OptimisticRevset,
   ) {
     super('RebaseAllDraftCommitsOperation');
   }

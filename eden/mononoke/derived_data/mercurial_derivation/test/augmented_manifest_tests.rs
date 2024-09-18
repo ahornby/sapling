@@ -8,7 +8,6 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use blobrepo::BlobRepo;
 use blobstore::Loadable;
 use cacheblob::MemWritesBlobstore;
 use context::CoreContext;
@@ -20,13 +19,16 @@ use mercurial_derivation::derive_hg_augmented_manifest;
 use mercurial_derivation::DeriveHgChangeset;
 use mercurial_types::HgAugmentedManifestId;
 use mercurial_types::HgManifestId;
+use mononoke_macros::mononoke;
 use mononoke_types::ChangesetId;
 use repo_blobstore::RepoBlobstoreRef;
 use tests_utils::drawdag::extend_from_dag_with_actions;
 
+use crate::Repo;
+
 async fn get_manifests(
     ctx: &CoreContext,
-    repo: &BlobRepo,
+    repo: &Repo,
     cs_id: ChangesetId,
     parents: Vec<HgAugmentedManifestId>,
 ) -> Result<(HgManifestId, HgAugmentedManifestId)> {
@@ -53,6 +55,7 @@ async fn get_manifests(
         repo.repo_blobstore(),
         hg_id,
         parents,
+        &Default::default(),
     )
     .await?;
     let aug = aug_id.load(ctx, repo.repo_blobstore()).await?;
@@ -65,7 +68,7 @@ async fn get_manifests(
 
 async fn compare_manifests(
     ctx: &CoreContext,
-    repo: &BlobRepo,
+    repo: &Repo,
     hg_id: HgManifestId,
     aug_id: HgAugmentedManifestId,
 ) -> Result<()> {
@@ -105,11 +108,11 @@ async fn compare_manifests(
     Ok(())
 }
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_augmented_manifest(fb: FacebookInit) -> Result<()> {
     let ctx = CoreContext::test_mock(fb);
 
-    let repo: BlobRepo = test_repo_factory::build_empty(fb).await?;
+    let repo: Repo = test_repo_factory::build_empty(fb).await?;
 
     let (commits, _dag) = extend_from_dag_with_actions(
         &ctx,

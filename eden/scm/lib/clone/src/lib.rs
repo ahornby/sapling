@@ -16,6 +16,7 @@ use anyhow::Context;
 use anyhow::Result;
 use configmodel::Config;
 use configmodel::ConfigExt;
+use configmodel::Text;
 use context::CoreContext;
 use repo::repo::Repo;
 use tracing::instrument;
@@ -68,6 +69,7 @@ pub fn init_working_copy(
     let wc = repo.working_copy()?;
 
     if let Some(target) = target {
+        let wc = wc.write();
         let wc = wc.lock()?;
 
         if let Err(err) = checkout::checkout(
@@ -78,6 +80,7 @@ pub fn init_working_copy(
             checkout::BookmarkAction::None,
             checkout::CheckoutMode::AbortIfConflicts,
             checkout::ReportMode::Minimal,
+            true,
         ) {
             if ctx.config.get_or_default("checkout", "resumable")? {
                 ctx.logger.info(format!(
@@ -110,9 +113,18 @@ fn get_eden_clone_command(config: &dyn Config) -> Result<Command> {
 
 #[tracing::instrument]
 fn run_eden_clone_command(clone_command: &mut Command) -> Result<()> {
-    let output = clone_command
-        .output()
-        .with_context(|| format!("failed to execute {:?}", clone_command))?;
+    let output = clone_command.output().with_context(|| {
+        let binary_path = PathBuf::from(clone_command.get_program());
+        // On Windows, users frequently hit clone errors caused by EdenFS not being installed.
+        if cfg!(windows) && !binary_path.exists() {
+            format!(
+                "failed to execute {:?}: edenfs binary not found at {:?}.",
+                clone_command, binary_path
+            )
+        } else {
+            format!("failed to execute {:?}", clone_command)
+        }
+    })?;
 
     if !output.status.success() {
         return Err(EdenCloneError::ExeuctionFailure(
@@ -132,7 +144,12 @@ fn run_eden_clone_command(clone_command: &mut Command) -> Result<()> {
 }
 
 #[instrument(err)]
-pub fn eden_clone(backing_repo: &Repo, working_copy: &Path, target: Option<HgId>) -> Result<()> {
+pub fn eden_clone(
+    backing_repo: &Repo,
+    working_copy: &Path,
+    target: Option<HgId>,
+    filter: Option<Text>,
+) -> Result<()> {
     let config = backing_repo.config();
 
     let mut clone_command = get_eden_clone_command(config)?;
@@ -174,26 +191,9 @@ pub fn eden_clone(backing_repo: &Repo, working_copy: &Path, target: Option<HgId>
         clone_command.arg("--allow-empty-repo");
     }
 
-    // The old config value was a bool while the new config value is a String. We need to support
-    // both values until we can deprecate the old one.
-    let eden_sparse_filter = match config.must_get::<String>("clone", "eden-sparse-filter") {
-        // A non-empty string means we should activate this filter after cloning the repo.
-        // An empty string means the repo should be cloned without activating a filter.
-        Ok(val) => Some(val),
-        Err(_) => {
-            // If the old config value is true, we should use eden sparse but not activate a filter
-            if config.get_or_default::<bool>("clone", "use-eden-sparse")? {
-                Some("".to_owned())
-            } else {
-                // Otherwise we don't want to use eden sparse or activate any filters
-                None
-            }
-        }
-    };
-
     // The current Eden installation may not yet support the --filter-path option. We will back-up
     // the clone arguments and retry without --filter-path if our first clone attempt fails.
-    let args_without_filter = match eden_sparse_filter {
+    let args_without_filter = match filter {
         Some(filter) if !filter.is_empty() => {
             clone_command.args(["--backing-store", "filteredhg"]);
             let args_without_filter = clone_command

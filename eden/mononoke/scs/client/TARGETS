@@ -1,5 +1,4 @@
 load("@fbcode_macros//build_defs:rust_binary.bzl", "rust_binary")
-load("@fbsource//tools/build_defs:glob_defs.bzl", "glob")
 
 oncall("mononoke")
 
@@ -24,6 +23,7 @@ rust_binary(
     deps = [
         "fbsource//third-party/rust:ansi_term",
         "fbsource//third-party/rust:anyhow",
+        "fbsource//third-party/rust:async-trait",
         "fbsource//third-party/rust:auto_impl",
         "fbsource//third-party/rust:bytesize",
         "fbsource//third-party/rust:chrono",

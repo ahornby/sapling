@@ -35,15 +35,18 @@ Sanity check that children metadata isn't fetched by default:
                           hgid: HgId("2aabbe46539594a3aede2a262ebfbcd3107ad10c"),
                       },
                       data: Some(
-                          b"dir\0ac934ed5f01e06c92b6c95661b2ccaf2a734509ft\nfile1\0a58629e4c3c5a5d14b5810b2e35681bb84319167\nfile2\0ecbe8b3047eb5d9bb298f516d451f64491812e07\n",
+                          b"dir\x00ac934ed5f01e06c92b6c95661b2ccaf2a734509ft\nfile1\x00a58629e4c3c5a5d14b5810b2e35681bb84319167\nfile2\x00ecbe8b3047eb5d9bb298f516d451f64491812e07\n",
                       ),
                       parents: Some(
                           None,
                       ),
                       children: None,
+                      tree_aux_data: None,
                   },
               ),
           ),
+          parents: None,
+          aux_data: None,
       },
   )
 
@@ -69,7 +72,7 @@ Fetch a tree with children metadata:
                           hgid: HgId("2aabbe46539594a3aede2a262ebfbcd3107ad10c"),
                       },
                       data: Some(
-                          b"dir\0ac934ed5f01e06c92b6c95661b2ccaf2a734509ft\nfile1\0a58629e4c3c5a5d14b5810b2e35681bb84319167\nfile2\0ecbe8b3047eb5d9bb298f516d451f64491812e07\n",
+                          b"dir\x00ac934ed5f01e06c92b6c95661b2ccaf2a734509ft\nfile1\x00a58629e4c3c5a5d14b5810b2e35681bb84319167\nfile2\x00ecbe8b3047eb5d9bb298f516d451f64491812e07\n",
                       ),
                       parents: Some(
                           None,
@@ -81,7 +84,7 @@ Fetch a tree with children metadata:
                                       TreeChildFileEntry {
                                           key: Key {
                                               path: RepoPathBuf(
-                                                  "dir/file1",
+                                                  "file1",
                                               ),
                                               hgid: HgId("a58629e4c3c5a5d14b5810b2e35681bb84319167"),
                                           },
@@ -92,6 +95,7 @@ Fetch a tree with children metadata:
                                                   content_sha1: Sha1("60b27f004e454aca81b0480209cce5081ec52390"),
                                                   content_sha256: Sha256("0000000000000000000000000000000000000000000000000000000000000000"),
                                                   content_blake3: Blake3("0a370c8c0d1deeea00890dfa7b6c52a863d45d95ab472fae5510e4aacf674fd4"),
+                                                  file_header_metadata: None,
                                               },
                                           ),
                                       },
@@ -102,7 +106,7 @@ Fetch a tree with children metadata:
                                       TreeChildFileEntry {
                                           key: Key {
                                               path: RepoPathBuf(
-                                                  "dir/file2",
+                                                  "file2",
                                               ),
                                               hgid: HgId("ecbe8b3047eb5d9bb298f516d451f64491812e07"),
                                           },
@@ -113,6 +117,7 @@ Fetch a tree with children metadata:
                                                   content_sha1: Sha1("cb99b709a1978bd205ab9dfd4c5aaa1fc91c7523"),
                                                   content_sha256: Sha256("0000000000000000000000000000000000000000000000000000000000000000"),
                                                   content_blake3: Blake3("aab0b64d0a516f16e06cd7571dece3e6cc6f57ca2462ce69872d3d7e6664e7da"),
+                                                  file_header_metadata: None,
                                               },
                                           ),
                                       },
@@ -120,9 +125,12 @@ Fetch a tree with children metadata:
                               ),
                           ],
                       ),
+                      tree_aux_data: None,
                   },
               ),
           ),
+          parents: None,
+          aux_data: None,
       },
   )
 
@@ -135,6 +143,7 @@ We should also have aux data for the files available as a side effect of tree fe
               total_size: 5,
               sha1: Sha1("60b27f004e454aca81b0480209cce5081ec52390"),
               blake3: Blake3("0a370c8c0d1deeea00890dfa7b6c52a863d45d95ab472fae5510e4aacf674fd4"),
+              file_header_metadata: None,
           },
       ),
   }
@@ -163,7 +172,7 @@ Fetch mode can also trigger tree metadata fetch:
                           hgid: HgId("2aabbe46539594a3aede2a262ebfbcd3107ad10c"),
                       },
                       data: Some(
-                          b"dir\0ac934ed5f01e06c92b6c95661b2ccaf2a734509ft\nfile1\0a58629e4c3c5a5d14b5810b2e35681bb84319167\nfile2\0ecbe8b3047eb5d9bb298f516d451f64491812e07\n",
+                          b"dir\x00ac934ed5f01e06c92b6c95661b2ccaf2a734509ft\nfile1\x00a58629e4c3c5a5d14b5810b2e35681bb84319167\nfile2\x00ecbe8b3047eb5d9bb298f516d451f64491812e07\n",
                       ),
                       parents: Some(
                           None,
@@ -175,7 +184,7 @@ Fetch mode can also trigger tree metadata fetch:
                                       TreeChildFileEntry {
                                           key: Key {
                                               path: RepoPathBuf(
-                                                  "dir/file1",
+                                                  "file1",
                                               ),
                                               hgid: HgId("a58629e4c3c5a5d14b5810b2e35681bb84319167"),
                                           },
@@ -186,6 +195,7 @@ Fetch mode can also trigger tree metadata fetch:
                                                   content_sha1: Sha1("60b27f004e454aca81b0480209cce5081ec52390"),
                                                   content_sha256: Sha256("0000000000000000000000000000000000000000000000000000000000000000"),
                                                   content_blake3: Blake3("0a370c8c0d1deeea00890dfa7b6c52a863d45d95ab472fae5510e4aacf674fd4"),
+                                                  file_header_metadata: None,
                                               },
                                           ),
                                       },
@@ -196,7 +206,7 @@ Fetch mode can also trigger tree metadata fetch:
                                       TreeChildFileEntry {
                                           key: Key {
                                               path: RepoPathBuf(
-                                                  "dir/file2",
+                                                  "file2",
                                               ),
                                               hgid: HgId("ecbe8b3047eb5d9bb298f516d451f64491812e07"),
                                           },
@@ -207,6 +217,7 @@ Fetch mode can also trigger tree metadata fetch:
                                                   content_sha1: Sha1("cb99b709a1978bd205ab9dfd4c5aaa1fc91c7523"),
                                                   content_sha256: Sha256("0000000000000000000000000000000000000000000000000000000000000000"),
                                                   content_blake3: Blake3("aab0b64d0a516f16e06cd7571dece3e6cc6f57ca2462ce69872d3d7e6664e7da"),
+                                                  file_header_metadata: None,
                                               },
                                           ),
                                       },
@@ -214,8 +225,11 @@ Fetch mode can also trigger tree metadata fetch:
                               ),
                           ],
                       ),
+                      tree_aux_data: None,
                   },
               ),
           ),
+          parents: None,
+          aux_data: None,
       },
   )

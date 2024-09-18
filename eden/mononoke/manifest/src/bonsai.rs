@@ -29,8 +29,8 @@ use mononoke_types::FileType;
 use mononoke_types::NonRootMPath;
 use tokio::task;
 
-use crate::AsyncManifest;
 use crate::Entry;
+use crate::Manifest;
 
 pub(crate) type BonsaiEntry<ManifestId, FileId> = Entry<ManifestId, (FileType, FileId)>;
 
@@ -152,8 +152,8 @@ where
     FileId: Hash + Eq,
     ManifestId: Hash + Eq + StoreLoadable<Store>,
     <ManifestId as StoreLoadable<Store>>::Value:
-        AsyncManifest<Store, TreeId = ManifestId, LeafId = Leaf> + Send + Sync,
-    Leaf: ManifestLeafId<FileId = FileId>,
+        Manifest<Store, TreeId = ManifestId, Leaf = Leaf> + Send + Sync,
+    Leaf: ManifestLeaf<FileId = FileId>,
 {
     // If there is a single parent, and it's unchanged, then we don't need to recurse.
     if parents.len() == 1 && node.as_ref() == parents.iter().next() {
@@ -260,8 +260,8 @@ where
     FileId: Hash + Eq,
     ManifestId: Hash + Eq + StoreLoadable<Store>,
     <ManifestId as StoreLoadable<Store>>::Value:
-        AsyncManifest<Store, TreeId = ManifestId, LeafId = Leaf> + Send + Sync,
-    Leaf: ManifestLeafId<FileId = FileId>,
+        Manifest<Store, TreeId = ManifestId, Leaf = Leaf> + Send + Sync,
+    Leaf: ManifestLeaf<FileId = FileId>,
 {
     let res = match node {
         Some(Entry::Tree(node)) => {
@@ -340,8 +340,8 @@ where
     ManifestId: Hash + Eq + StoreLoadable<Store> + Send + Sync + 'static,
     Store: Send + Sync + Clone + 'static,
     <ManifestId as StoreLoadable<Store>>::Value:
-        AsyncManifest<Store, TreeId = ManifestId, LeafId = Leaf> + Send + Sync,
-    Leaf: ManifestLeafId<FileId = FileId>,
+        Manifest<Store, TreeId = ManifestId, Leaf = Leaf> + Send + Sync,
+    Leaf: ManifestLeaf<FileId = FileId>,
 {
     // NOTE: `async move` blocks are used below to own CoreContext and Store for the (static)
     // lifetime of the stream we're returning here (recurse_trees and bonsai_diff_unfold don't
@@ -366,16 +366,16 @@ where
     .try_filter_map(future::ok)
 }
 
-/// Trait that generalizes the LeafId bound from `bonsai_diff` so that it can be
+/// Trait that generalizes the Leaf bound from `bonsai_diff` so that it can be
 /// called with manifests other than the ones that have the leaf `(FileType, _)`.
-pub trait ManifestLeafId: Hash + Eq {
+pub trait ManifestLeaf: Hash + Eq {
     type FileId: Hash + Eq;
 
     fn file_type(&self) -> FileType;
     fn file_id(self) -> Self::FileId;
 }
 
-impl<FId: Hash + Eq> ManifestLeafId for (FileType, FId) {
+impl<FId: Hash + Eq> ManifestLeaf for (FileType, FId) {
     type FileId = FId;
 
     fn file_type(&self) -> FileType {
@@ -387,7 +387,7 @@ impl<FId: Hash + Eq> ManifestLeafId for (FileType, FId) {
     }
 }
 
-impl ManifestLeafId for FsnodeFile {
+impl ManifestLeaf for FsnodeFile {
     type FileId = (ContentId, u64);
 
     fn file_type(&self) -> FileType {
@@ -407,6 +407,7 @@ mod test {
     use blobstore::Storable;
     use fbinit::FacebookInit;
     use memblob::Memblob;
+    use mononoke_macros::mononoke;
 
     use super::*;
     use crate::tests::test_manifest::TestLeaf;
@@ -433,7 +434,7 @@ mod test {
         }
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_unfold_file_from_files(fb: FacebookInit) -> Result<(), Error> {
         let ctx = CoreContext::test_mock(fb);
         let store: Arc<dyn Blobstore> = Arc::new(Memblob::default());
@@ -488,7 +489,7 @@ mod test {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_unfold_file_mode_change(fb: FacebookInit) -> Result<(), Error> {
         let ctx = CoreContext::test_mock(fb);
         let store: Arc<dyn Blobstore> = Arc::new(Memblob::default());
@@ -515,7 +516,7 @@ mod test {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_unfold_file_from_dirs(fb: FacebookInit) -> Result<(), Error> {
         let ctx = CoreContext::test_mock(fb);
         let store: Arc<dyn Blobstore> = Arc::new(Memblob::default());
@@ -573,7 +574,7 @@ mod test {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_unfold_dir_from_dirs(fb: FacebookInit) -> Result<(), Error> {
         let ctx = CoreContext::test_mock(fb);
         let store: Arc<dyn Blobstore> = Arc::new(Memblob::default());
@@ -638,7 +639,7 @@ mod test {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_unfold_dir_from_files(fb: FacebookInit) -> Result<(), Error> {
         let ctx = CoreContext::test_mock(fb);
         let store: Arc<dyn Blobstore> = Arc::new(Memblob::default());
@@ -663,7 +664,7 @@ mod test {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_unfold_missing_from_files(fb: FacebookInit) -> Result<(), Error> {
         let ctx = CoreContext::test_mock(fb);
         let store: Arc<dyn Blobstore> = Arc::new(Memblob::default());
@@ -683,7 +684,7 @@ mod test {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_unfold_missing_from_dirs(fb: FacebookInit) -> Result<(), Error> {
         let ctx = CoreContext::test_mock(fb);
         let store: Arc<dyn Blobstore> = Arc::new(Memblob::default());

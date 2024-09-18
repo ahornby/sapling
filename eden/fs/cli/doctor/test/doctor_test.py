@@ -7,6 +7,7 @@
 # pyre-strict
 
 import binascii
+import errno
 import os
 import stat
 import struct
@@ -15,34 +16,50 @@ import sys
 import typing
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
-from unittest.mock import call, patch
+from unittest.mock import call, MagicMock, patch
 
 import eden.fs.cli.doctor as doctor
-from eden.fs.cli.config import EdenCheckout, EdenInstance
-from eden.fs.cli.doctor import check_hg, check_watchman
+
+from eden.fs.cli.config import EdenCheckout, EdenInstance, SnapshotState
+from eden.fs.cli.doctor import (
+    check_hg,
+    check_mount,
+    check_network,
+    check_running_mount,
+    check_watchman,
+    get_doctor_link,
+    get_local_commit_recovery_link,
+)
 from eden.fs.cli.doctor.check_filesystems import (
     check_hg_status_match_hg_diff,
     check_loaded_content,
     check_materialized_are_accessible,
 )
+from eden.fs.cli.doctor.check_redirections import check_redirections
+from eden.fs.cli.doctor.facebook.internal_consts import get_netinfo_link
 from eden.fs.cli.doctor.problem import ProblemSeverity
 from eden.fs.cli.doctor.test.lib.fake_client import ResetParentsCommitsArgs
 from eden.fs.cli.doctor.test.lib.fake_eden_instance import FakeEdenInstance
 from eden.fs.cli.doctor.test.lib.fake_fs_util import FakeFsUtil
 from eden.fs.cli.doctor.test.lib.fake_hg_repo import FakeHgRepo
-from eden.fs.cli.doctor.test.lib.fake_kerberos_checker import FakeKerberosChecker
 from eden.fs.cli.doctor.test.lib.fake_mount_table import FakeMountTable
+from eden.fs.cli.doctor.test.lib.fake_network_checker import FakeNetworkChecker
 from eden.fs.cli.doctor.test.lib.fake_vscode_extensions_checker import (
     getFakeVSCodeExtensionsChecker,
     getFakeVSCodeExtensionsCheckerWithExtensions,
 )
 from eden.fs.cli.doctor.test.lib.problem_collector import ProblemCollector
 from eden.fs.cli.doctor.test.lib.testcase import DoctorTestBase
+from eden.fs.cli.doctor.util import CheckoutInfo
 from eden.fs.cli.prjfs import PRJ_FILE_STATE
+from eden.fs.cli.redirect import Redirection, RedirectionState, RedirectionType
 from eden.fs.cli.test.lib.output import TestOutput
+
 from facebook.eden.ttypes import (
     GetScmStatusResult,
+    InternalStats,
     MountInodeInfo,
+    MountState,
     ScmFileStatus,
     ScmStatus,
     SHA1Result,
@@ -97,9 +114,113 @@ class DoctorTest(DoctorTestBase):
     # pyre-fixme[4]: Attribute must be annotated.
     maxDiff = None
 
+    def format_win_path_for_regex(self, path: str) -> str:
+        # Formats the path to be compatible with regex matching on windows
+        if sys.platform == "win32":
+            return path.replace("\\", "\\\\")
+        return path
+
+    def setUpEdenMountTest(
+        self,
+        state: Optional[MountState] = None,
+    ) -> Tuple[doctor.ProblemFixer, TestOutput, EdenCheckout]:
+        instance = FakeEdenInstance(self.make_temporary_directory())
+        checkout = instance.create_test_mount("path1")
+
+        path = checkout.path
+        checkout_info = CheckoutInfo(
+            # pyre-fixme[6]: For 3rd param expected `EdenInstance` but got
+            # `FakeEdenInstance`.
+            instance,
+            path,
+            state=state,
+            backing_repo=checkout.get_backing_repo_path(),
+        )
+
+        fixer, out = self.create_fixer(dry_run=False)
+        mount_table = instance.mount_table
+
+        edenfs_path = "/path/to/eden-mount"
+        watchman_roots = {edenfs_path}
+        watchman_info = check_watchman.WatchmanCheckInfo(watchman_roots)
+
+        check_mount(
+            out,
+            fixer,
+            # pyre-fixme[6]: For 3rd param expected `EdenInstance` but got
+            # `FakeEdenInstance`.
+            instance,
+            checkout_info,
+            mount_table,
+            watchman_info,
+            [checkout_info],
+            set(),
+            set(),
+            FakeNetworkChecker(),
+            True,
+            True,
+        )
+        return fixer, out, checkout
+
+    @patch("eden.fs.cli.doctor.check_filesystems.check_inode_counts")
+    @patch("eden.fs.cli.doctor.check_filesystems.check_using_nfs_path")
+    @patch("eden.fs.cli.doctor.check_hg.check_hg")
+    @patch("eden.fs.cli.doctor.check_filesystems.check_hg_status_match_hg_diff")
+    @patch("eden.fs.cli.config.EdenCheckout.get_config")
+    def setUpEdenNetworkTest(
+        self,
+        mock_get_config: MagicMock,
+        mock_check_hg_status: MagicMock,
+        mock_check_hg: MagicMock,
+        mock_check_nfs: MagicMock,
+        mock_check_inode: MagicMock,
+    ) -> Tuple[doctor.ProblemFixer, TestOutput, EdenCheckout]:
+        instance = FakeEdenInstance(self.make_temporary_directory())
+        checkout = instance.create_test_mount("path1")
+        checkout_config = instance._checkouts_by_path[str(checkout.path)].config
+
+        mock_get_config.return_value = checkout_config
+        path = checkout.path
+        checkout_info = CheckoutInfo(
+            # pyre-fixme[6]: For 3rd param expected `EdenInstance` but got
+            # `FakeEdenInstance`.
+            instance,
+            path,
+            state=MountState.RUNNING,
+            backing_repo=checkout.get_backing_repo_path(),
+            running_state_dir=path,
+            configured_state_dir=path,
+        )
+
+        fixer, out = self.create_fixer(dry_run=False)
+        mount_table = instance.mount_table
+
+        edenfs_path = "/path/to/eden-mount"
+        watchman_roots = {edenfs_path}
+        watchman_info = check_watchman.WatchmanCheckInfo(watchman_roots)
+
+        check_mount(
+            out,
+            fixer,
+            # pyre-fixme[6]: For 3rd param expected `EdenInstance` but got
+            # `FakeEdenInstance`.
+            instance,
+            checkout_info,
+            mount_table,
+            watchman_info,
+            [],
+            set(),
+            set(),
+            check_network.NetworkChecker(),
+            False,
+            False,
+        )
+        return fixer, out, checkout
+
     @patch("eden.fs.cli.doctor.check_watchman._call_watchman")
-    # pyre-fixme[2]: Parameter must be annotated.
-    def test_end_to_end_test_with_various_scenarios(self, mock_watchman) -> None:
+    def test_end_to_end_test_with_various_scenarios(
+        self, mock_watchman: MagicMock
+    ) -> None:
         side_effects: List[Dict[str, Any]] = []
         calls = []
         instance = FakeEdenInstance(self.make_temporary_directory())
@@ -139,7 +260,6 @@ class DoctorTest(DoctorTestBase):
         side_effects.append({"watch-del": True, "root": edenfs_path2})
         calls.append(call(["watch-project", edenfs_path2]))
         side_effects.append({"watcher": "eden"})
-
         calls.append(call(["watch-project", edenfs_path3]))
         side_effects.append({"watcher": "eden"})
 
@@ -157,8 +277,8 @@ class DoctorTest(DoctorTestBase):
             mount_table=instance.mount_table,
             fs_util=FakeFsUtil(),
             proc_utils=self.make_proc_utils(),
-            kerberos_checker=FakeKerberosChecker(),
             vscode_extensions_checker=getFakeVSCodeExtensionsChecker(),
+            network_checker=FakeNetworkChecker(),
             out=out,
         )
 
@@ -217,8 +337,8 @@ Repairing hg directory contents for {edenfs_path3}...<green>fixed<reset>
             mount_table=instance.mount_table,
             fs_util=FakeFsUtil(),
             proc_utils=self.make_proc_utils(),
-            kerberos_checker=FakeKerberosChecker(),
             vscode_extensions_checker=getFakeVSCodeExtensionsChecker(),
+            network_checker=FakeNetworkChecker(),
             out=out,
         )
 
@@ -249,17 +369,23 @@ Repairing hg directory contents for {edenfs_path3}...<green>fixed<reset>
             mount_table=FakeMountTable(),
             fs_util=FakeFsUtil(),
             proc_utils=self.make_proc_utils(),
-            kerberos_checker=FakeKerberosChecker(),
             vscode_extensions_checker=getFakeVSCodeExtensionsChecker(),
+            network_checker=FakeNetworkChecker(),
             out=out,
         )
 
         self.assertEqual("EdenFS is not in use.\n", out.getvalue())
         self.assertEqual(0, exit_code)
 
+    @patch("eden.fs.cli.util.HealthStatus.is_healthy")
+    @patch("eden.fs.cli.daemon.start_edenfs_service")
     @patch("eden.fs.cli.doctor.check_watchman._call_watchman")
-    # pyre-fixme[2]: Parameter must be annotated.
-    def test_edenfs_not_running(self, mock_watchman) -> None:
+    def test_edenfs_not_running_then_started(
+        self,
+        mock_watchman: MagicMock,
+        mock_start: MagicMock,
+        mock_is_healthy: MagicMock,
+    ) -> None:
         instance = FakeEdenInstance(
             self.make_temporary_directory(), status=fb303_status.DEAD
         )
@@ -267,6 +393,10 @@ Repairing hg directory contents for {edenfs_path3}...<green>fixed<reset>
 
         out = TestOutput()
         dry_run = False
+        # We can't actually start the Eden daemon in a unit test, so we mock
+        # it instead.
+        mock_start.return_value = None
+        mock_is_healthy.return_value = True
         exit_code = doctor.cure_what_ails_you(
             # pyre-fixme[6]: For 1st param expected `EdenInstance` but got
             #  `FakeEdenInstance`.
@@ -276,7 +406,51 @@ Repairing hg directory contents for {edenfs_path3}...<green>fixed<reset>
             mount_table=FakeMountTable(),
             fs_util=FakeFsUtil(),
             proc_utils=self.make_proc_utils(),
-            kerberos_checker=FakeKerberosChecker(),
+            vscode_extensions_checker=getFakeVSCodeExtensionsChecker(),
+            network_checker=FakeNetworkChecker(),
+            out=out,
+        )
+
+        self.assertRegex(
+            out.getvalue(),
+            r"""<yellow>- Found problem:<reset>
+EdenFS is not running
+Running `eden start` to start EdenFS......<green>fixed<reset>
+
+<yellow>Successfully fixed 1 problem.<reset>
+""",
+        )
+        self.assertEqual(0, exit_code)
+
+    @patch("eden.fs.cli.util.HealthStatus.is_starting")
+    @patch("eden.fs.cli.daemon.start_edenfs_service")
+    @patch("eden.fs.cli.doctor.check_watchman._call_watchman")
+    def test_edenfs_not_running_then_still_starting(
+        self,
+        mock_watchman: MagicMock,
+        mock_start: MagicMock,
+        mock_is_starting: MagicMock,
+    ) -> None:
+        instance = FakeEdenInstance(
+            self.make_temporary_directory(), status=fb303_status.DEAD
+        )
+        instance.create_test_mount("eden-mount")
+
+        out = TestOutput()
+        dry_run = False
+        # We can't actually start the Eden daemon in a unit test, so we mock
+        # it instead.
+        mock_start.return_value = None
+        mock_is_starting.return_value = True
+        exit_code = doctor.cure_what_ails_you(
+            # pyre-fixme[6]: For 1st param expected `EdenInstance` but got
+            #  `FakeEdenInstance`.
+            instance,
+            dry_run,
+            min_severity_to_report=ProblemSeverity.ALL,
+            mount_table=FakeMountTable(),
+            fs_util=FakeFsUtil(),
+            proc_utils=self.make_proc_utils(),
             vscode_extensions_checker=getFakeVSCodeExtensionsChecker(),
             out=out,
         )
@@ -284,15 +458,9 @@ Repairing hg directory contents for {edenfs_path3}...<green>fixed<reset>
         self.assertRegex(
             out.getvalue(),
             r"""<yellow>- Found problem:<reset>
-EdenFS is not running\.
-To start EdenFS, run:
-
-    eden start
-
-<yellow>1 issue requires manual attention\.<reset>
-Collect an 'eden rage' and ask in the EdenFS (Windows |macOS )?Users group if you need help fixing issues with EdenFS:
-(https://fb\.workplace\.com/groups/eden\.users|https://fb\.workplace\.com/groups/edenfswindows|https://fb\.workplace\.com/groups/edenfsmacos)
-""",
+EdenFS is not running
+Running `eden start` to start EdenFS......<yellow>EdenFS still starting, use `eden status --wait` to watch progress and ensure it starts<reset>
+<red>error<reset>.*""",
         )
         self.assertEqual(1, exit_code)
 
@@ -315,8 +483,8 @@ Collect an 'eden rage' and ask in the EdenFS (Windows |macOS )?Users group if yo
             mount_table=FakeMountTable(),
             fs_util=FakeFsUtil(),
             proc_utils=self.make_proc_utils(),
-            kerberos_checker=FakeKerberosChecker(),
             vscode_extensions_checker=getFakeVSCodeExtensionsChecker(),
+            network_checker=FakeNetworkChecker(),
             out=out,
         )
 
@@ -330,12 +498,76 @@ Please wait for edenfs to finish starting\. You can watch its progress with
 If EdenFS seems to be taking too long to start you can try restarting it
 with "eden restart --force"
 
-<yellow>1 issue requires manual attention\.<reset>
+<yellow>1 issue with recommended fixes\.<reset>
 Collect an 'eden rage' and ask in the EdenFS (Windows |macOS )?Users group if you need help fixing issues with EdenFS:
 (https://fb\.workplace\.com/groups/eden\.users|https://fb\.workplace\.com/groups/edenfswindows|https://fb\.workplace\.com/groups/edenfsmacos)
 """,
         )
         self.assertEqual(1, exit_code)
+
+    @patch("eden.fs.cli.doctor.check_watchman._call_watchman")
+    @patch("eden.fs.cli.config.EdenCheckout.get_config")
+    def test_edenfs_starting_mount_error(
+        self, mock_get_config: MagicMock, mock_watchman: MagicMock
+    ) -> None:
+        # Not strictly the correct file to but easier to mock the first call
+        mock_get_config.side_effect = FileNotFoundError(
+            errno.ENOENT, os.strerror(errno.ENOENT), "SNAPSHOT"
+        )
+        instance = FakeEdenInstance(self.make_temporary_directory())
+        checkout = instance.create_test_mount("path1")
+
+        path = checkout.path
+        checkout_info = CheckoutInfo(
+            # pyre-fixme[6]: For 3rd param expected `EdenInstance` but got
+            # `FakeEdenInstance`.
+            instance,
+            path,
+            state=MountState.STARTING,
+            backing_repo=path,
+            configured_state_dir=path,
+        )
+
+        fixer, out = self.create_fixer(dry_run=False)
+        mount_table = instance.mount_table
+
+        edenfs_path = "/path/to/eden-mount"
+        watchman_roots = {edenfs_path}
+        watchman_info = check_watchman.WatchmanCheckInfo(watchman_roots)
+
+        check_mount(
+            out,
+            fixer,
+            # pyre-fixme[6]: For 3rd param expected `EdenInstance` but got
+            # `FakeEdenInstance`.
+            instance,
+            checkout_info,
+            mount_table,
+            watchman_info,
+            [checkout_info],
+            set(),
+            set(),
+            FakeNetworkChecker(),
+            True,
+            True,
+        )
+
+        self.assertEqual(
+            out.getvalue(),
+            f"""<yellow>- Found problem:<reset>
+Eden's checkout state for {path} has been corrupted: [Errno 2] No such file or directory: 'SNAPSHOT'
+To recover, you will need to remove and reclone the repo.
+Your local commits will be unaffected, but reclones will lose uncommitted work or shelves.
+However, the local changes are manually recoverable before the reclone.
+If you have local changes you would like to save before reclone, see {get_local_commit_recovery_link()}, or reachout to the EdenFS team.
+To reclone the corrupted repo, run: `fbclone $REPO --reclone --eden`
+For additional info see the wiki at {get_doctor_link()}
+
+""",
+        )
+        self.assertEqual(len(fixer.problem_types), 1)
+        self.assertEqual(fixer.num_fixed_problems, 0)
+        self.assertEqual(fixer.num_manual_fixes, 1)
 
     @patch("eden.fs.cli.doctor.check_watchman._call_watchman")
     # pyre-fixme[2]: Parameter must be annotated.
@@ -358,8 +590,8 @@ Collect an 'eden rage' and ask in the EdenFS (Windows |macOS )?Users group if yo
             mount_table=FakeMountTable(),
             fs_util=FakeFsUtil(),
             proc_utils=self.make_proc_utils(),
-            kerberos_checker=FakeKerberosChecker(),
             vscode_extensions_checker=getFakeVSCodeExtensionsChecker(),
+            network_checker=FakeNetworkChecker(),
             out=out,
         )
 
@@ -388,8 +620,8 @@ Collect an 'eden rage' and ask in the EdenFS (Windows |macOS )?Users group if yo
             mount_table=FakeMountTable(),
             fs_util=FakeFsUtil(),
             proc_utils=self.make_proc_utils(),
-            kerberos_checker=FakeKerberosChecker(),
             vscode_extensions_checker=getFakeVSCodeExtensionsChecker(),
+            network_checker=FakeNetworkChecker(),
             out=out,
         )
 
@@ -471,10 +703,10 @@ Collect an 'eden rage' and ask in the EdenFS (Windows |macOS )?Users group if yo
                 "Watchman is watching /path/to/eden-mount with the wrong watcher type: "
                 '"inotify" instead of "eden"\n'
                 "Fixing watchman watch for /path/to/eden-mount...<red>error<reset>\n"
-                "Failed to fix problem: RemediationError: Failed to replace "
+                "Failed to fix or verify fix for problem IncorrectWatchmanWatch: RemediationError: Failed to replace "
                 'watchman watch for /path/to/eden-mount with an "eden" watcher'
             ),
-            out,
+            "\n".join(out.split("\n")[:5]),
         )
         self.assert_results(fixer, num_problems=1, num_failed_fixes=1)
 
@@ -546,7 +778,10 @@ Repairing hg directory contents for {checkout.path}...<green>fixed<reset>
         )
         self.assert_dirstate_p0(checkout, snapshot_hex)
 
-    def test_snapshot_and_dirstate_file_differ_and_snapshot_invalid(self) -> None:
+    @patch("eden.fs.cli.config.EdenCheckout.get_snapshot")
+    def test_snapshot_and_dirstate_file_differ_and_snapshot_invalid(
+        self, mock_get_snapshot: MagicMock
+    ) -> None:
         def check_commit_validity(commit: str) -> bool:
             if commit == "12345678" * 5:
                 return False
@@ -554,6 +789,15 @@ Repairing hg directory contents for {checkout.path}...<green>fixed<reset>
 
         dirstate_hash_hex = "12000000" * 5
         snapshot_hex = "12345678" * 5
+
+        def snapshot_state_factory(hash_hex: str) -> SnapshotState:
+            return SnapshotState(hash_hex, hash_hex)
+
+        mock_get_snapshot.side_effect = [
+            snapshot_state_factory(snapshot_hex),
+            snapshot_state_factory(snapshot_hex),
+            snapshot_state_factory(dirstate_hash_hex),
+        ]
         checkout, fixer, out = self._test_hash_check(
             dirstate_hash_hex, snapshot_hex, commit_checker=check_commit_validity
         )
@@ -589,23 +833,35 @@ Repairing hg directory contents for {checkout.path}...<green>fixed<reset>
         "eden.fs.cli.doctor.check_hg.get_tip_commit_hash",
         return_value=b"\x87\x65\x43\x21" * 5,
     )
+    @patch("eden.fs.cli.config.EdenCheckout.get_snapshot")
+    @patch("eden.fs.cli.doctor.check_hg.DirstateChecker._is_commit_hash_valid")
     def test_snapshot_and_dirstate_file_differ_and_all_commit_hash_invalid(
         self,
-        # pyre-fixme[2]: Parameter must be annotated.
-        mock_get_tip_commit_hash,
+        mock_is_commit_hash_valid: MagicMock,
+        mock_get_snapshot: MagicMock,
+        mock_get_tip_commit_hash: MagicMock,
     ) -> None:
-        def check_commit_validity(commit: str) -> bool:
-            null_commit = "00000000" * 5
-            if commit == null_commit:
-                return True
-            return False
-
         dirstate_hash_hex = "12000000" * 5
         snapshot_hex = "12345678" * 5
         valid_commit_hash = "87654321" * 5
-        checkout, fixer, out = self._test_hash_check(
-            dirstate_hash_hex, snapshot_hex, commit_checker=check_commit_validity
-        )
+        mock_is_commit_hash_valid.side_effect = [
+            False,
+            True,
+            False,
+            True,
+            True,
+            True,
+        ]
+
+        def snapshot_state_factory(hash_hex: str) -> SnapshotState:
+            return SnapshotState(hash_hex, hash_hex)
+
+        mock_get_snapshot.side_effect = [
+            snapshot_state_factory(snapshot_hex),
+            snapshot_state_factory(snapshot_hex),
+            snapshot_state_factory(valid_commit_hash),
+        ]
+        checkout, fixer, out = self._test_hash_check(dirstate_hash_hex, snapshot_hex)
 
         self.assertEqual(
             f"""\
@@ -641,23 +897,41 @@ Repairing hg directory contents for {checkout.path}...<green>fixed<reset>
         "eden.fs.cli.doctor.check_hg.get_tip_commit_hash",
         return_value=b"\x87\x65\x43\x21" * 5,
     )
+    @patch("eden.fs.cli.config.EdenCheckout.get_snapshot")
+    @patch("eden.fs.cli.doctor.check_hg.DirstateChecker._is_commit_hash_valid")
     def test_snapshot_and_dirstate_file_differ_and_all_parents_invalid(
         self,
-        # pyre-fixme[2]: Parameter must be annotated.
-        mock_get_tip_commit_hash,
+        mock_is_commit_hash_valid: MagicMock,
+        mock_get_snapshot: MagicMock,
+        mock_get_tip_commit_hash: MagicMock,
     ) -> None:
-        def check_commit_validity(commit: str) -> bool:
-            return False
-
         dirstate_hash_hex = "12000000" * 5
         dirstate_parent2_hash_hex = "12340000" * 5
         snapshot_hex = "12345678" * 5
         valid_commit_hash = "87654321" * 5
+
+        mock_is_commit_hash_valid.side_effect = [
+            False,
+            False,
+            False,
+            True,
+            True,
+            True,
+        ]
+
+        def snapshot_state_factory(hash_hex: str) -> SnapshotState:
+            return SnapshotState(hash_hex, hash_hex)
+
+        mock_get_snapshot.side_effect = [
+            snapshot_state_factory(snapshot_hex),
+            snapshot_state_factory(snapshot_hex),
+            snapshot_state_factory(valid_commit_hash),
+        ]
+
         checkout, fixer, out = self._test_hash_check(
             dirstate_hash_hex,
             snapshot_hex,
             dirstate_parent2_hash_hex,
-            commit_checker=check_commit_validity,
         )
 
         self.assertEqual(
@@ -785,7 +1059,7 @@ which may have important bug fixes or performance improvements\.
 
 """,
         )
-        self.assert_results(fixer, num_problems=1, num_manual_fixes=1)
+        self.assert_results(fixer, num_problems=1, num_advisory_fixes=1)
 
     def _test_edenfs_version(
         self,
@@ -893,8 +1167,8 @@ Would remount {mounts[1]}
             mount_table=instance.mount_table,
             fs_util=FakeFsUtil(),
             proc_utils=self.make_proc_utils(),
-            kerberos_checker=FakeKerberosChecker(),
             vscode_extensions_checker=getFakeVSCodeExtensionsChecker(),
+            network_checker=FakeNetworkChecker(),
             out=out,
         )
         return exit_code, out.getvalue(), mounts
@@ -919,8 +1193,8 @@ Would remount {mounts[1]}
             mount_table=instance.mount_table,
             fs_util=FakeFsUtil(),
             proc_utils=self.make_proc_utils(),
-            kerberos_checker=FakeKerberosChecker(),
             vscode_extensions_checker=getFakeVSCodeExtensionsChecker(),
+            network_checker=FakeNetworkChecker(),
             out=out,
         )
 
@@ -996,8 +1270,8 @@ Checking {mount}
                 mount_table=instance.mount_table,
                 fs_util=FakeFsUtil(),
                 proc_utils=self.make_proc_utils(),
-                kerberos_checker=FakeKerberosChecker(),
                 vscode_extensions_checker=getFakeVSCodeExtensionsChecker(),
+                network_checker=FakeNetworkChecker(),
                 out=out,
             )
             return exit_code, out.getvalue()
@@ -1027,8 +1301,8 @@ Checking {mount}
             mount_table=instance.mount_table,
             fs_util=FakeFsUtil(),
             proc_utils=self.make_proc_utils(),
-            kerberos_checker=FakeKerberosChecker(),
             vscode_extensions_checker=getFakeVSCodeExtensionsChecker(),
+            network_checker=FakeNetworkChecker(),
             out=out,
         )
 
@@ -1121,7 +1395,7 @@ Checking {mount}
         checkout = instance.create_test_mount("path1")
         mount = checkout.path
 
-        # Just create a/b/c folders
+        # Just create a/b folders
         os.makedirs(mount / "a" / "b")
 
         mock_debugInodeStatus.return_value = [
@@ -1176,29 +1450,47 @@ Checking {mount}
         )
 
     @patch("eden.fs.cli.doctor.test.lib.fake_client.FakeClient.debugInodeStatus")
-    # pyre-fixme[2]: Parameter must be annotated.
-    def test_materialized_different_mode_fixer(self, mock_debugInodeStatus) -> None:
+    def test_materialized_different_mode_fixer(
+        self, mock_debugInodeStatus: MagicMock
+    ) -> None:
         instance = FakeEdenInstance(self.make_temporary_directory())
         checkout = instance.create_test_mount("path1")
-        mount = checkout.path
+        mount: Path = checkout.path
 
-        # Just create a/b/c folders
+        # Just create a/b folders
         os.makedirs(mount / "a" / "b")
 
-        mock_debugInodeStatus.return_value = [
+        mock_debugInodeStatus.side_effect = [
             # Pretend that a/b is a file (it's a directory)
-            TreeInodeDebugInfo(
-                1,
-                b"a",
-                True,
-                b"abcd",
-                [
-                    TreeInodeEntryDebugInfo(
-                        b"b", 2, stat.S_IFREG, False, True, b"dcba"
-                    ),
-                ],
-                1,
-            ),
+            [
+                TreeInodeDebugInfo(
+                    1,
+                    b"a",
+                    True,
+                    b"abcd",
+                    [
+                        TreeInodeEntryDebugInfo(
+                            b"b", 2, stat.S_IFREG, False, True, b"dcba"
+                        ),
+                    ],
+                    1,
+                )
+            ],
+            # now report it as a directory
+            [
+                TreeInodeDebugInfo(
+                    1,
+                    b"a",
+                    True,
+                    b"abcd",
+                    [
+                        TreeInodeEntryDebugInfo(
+                            b"b", 2, stat.S_IFDIR, False, True, b"dcba"
+                        ),
+                    ],
+                    1,
+                )
+            ],
         ]
 
         fixer, output = self.create_fixer(dry_run=False)
@@ -1220,14 +1512,67 @@ Fixing mismatched files/directories in {Path(mount)}...<green>fixed<reset>
         self.assert_results(fixer, num_problems=1, num_fixed_problems=1)
 
     @patch("eden.fs.cli.doctor.test.lib.fake_client.FakeClient.debugInodeStatus")
-    # pyre-fixme[2]: Parameter must be annotated.
-    def test_materialized_missing_file_fixer(self, mock_debugInodeStatus) -> None:
+    def test_materialized_different_mode_fixer_fail(
+        self, mock_debugInodeStatus: MagicMock
+    ) -> None:
         instance = FakeEdenInstance(self.make_temporary_directory())
         checkout = instance.create_test_mount("path1")
-        mount = checkout.path
+        mount: Path = checkout.path
+
+        # Just create a/b folders
+        os.makedirs(mount / "a" / "b")
+
+        # Pretend that a/b is a file (it's a directory)
+        mock_debugInodeStatus.return_value = [
+            TreeInodeDebugInfo(
+                1,
+                b"a",
+                True,
+                b"abcd",
+                [
+                    TreeInodeEntryDebugInfo(
+                        b"b", 2, stat.S_IFREG, False, True, b"dcba"
+                    ),
+                ],
+                1,
+            )
+        ]
+
+        fixer, output = self.create_fixer(dry_run=False)
+        check_materialized_are_accessible(
+            fixer,
+            typing.cast(EdenInstance, instance),
+            checkout,
+            lambda p: os.lstat(p).st_mode,
+        )
+
+        self.assertRegex(
+            output.getvalue(),
+            r"""<yellow>- Found problem:<reset>
+.* has an unexpected file type: known to EdenFS as a file, but is a directory on disk
+Fixing mismatched files/directories in .*...<red>error<reset>
+Failed to fix or verify fix for problem MaterializedInodesHaveDifferentModeOnDisk: RemediationError: Failed check for MaterializedInodesHaveDifferentModeOnDisk failed:
+Path .* is a directory on disk but file in eden
+(.|\n)*""",
+        )
+        self.assert_results(fixer, num_problems=1, num_failed_fixes=1)
+
+    @patch("eden.fs.cli.doctor.test.lib.fake_client.FakeClient.debugInodeStatus")
+    @patch("eden.fs.cli.doctor.check_filesystems.MissingFilesForInodes.perform_fix")
+    def test_materialized_missing_file_fixer(
+        self, mock_perform_fix: MagicMock, mock_debugInodeStatus: MagicMock
+    ) -> None:
+        instance = FakeEdenInstance(self.make_temporary_directory())
+        checkout = instance.create_test_mount("path1")
+        mount: Path = checkout.path
 
         # Just create a folders
         os.makedirs(mount / "a")
+
+        def side_effect() -> None:
+            (mount / "a" / "d").touch()
+
+        mock_perform_fix.side_effect = side_effect
 
         mock_debugInodeStatus.return_value = [
             # Pretend that a/d is a file (it doesn't exist)
@@ -1252,6 +1597,7 @@ Fixing mismatched files/directories in {Path(mount)}...<green>fixed<reset>
             checkout,
             lambda p: os.lstat(p).st_mode,
         )
+        mock_perform_fix.assert_called_once()
 
         self.assertEqual(
             f"""<yellow>- Found problem:<reset>
@@ -1263,7 +1609,154 @@ Fixing files known to EdenFS but not present on disk in {Path(mount)}...<green>f
         )
         self.assert_results(fixer, num_problems=1, num_fixed_problems=1)
 
+    @patch("eden.fs.cli.doctor.test.lib.fake_client.FakeClient.debugInodeStatus")
+    def test_materialized_missing_inode_fixer(
+        self, mock_debugInodeStatus: MagicMock
+    ) -> None:
+        instance = FakeEdenInstance(self.make_temporary_directory())
+        checkout = instance.create_test_mount("path1")
+        mount: Path = checkout.path
+
+        os.makedirs(mount / "a" / "b")
+
+        mock_debugInodeStatus.return_value = [
+            # Pretend that a/b is a file (it's a directory)
+            TreeInodeDebugInfo(
+                1,
+                b"a",
+                True,
+                b"abcd",
+                [],
+                1,
+            ),
+            # a/b is now missing from inodes
+        ]
+
+        fixer, output = self.create_fixer(dry_run=False)
+        check_materialized_are_accessible(
+            fixer,
+            typing.cast(EdenInstance, instance),
+            checkout,
+            lambda p: os.lstat(p).st_mode,
+        )
+
+        self.assertEqual(
+            f"""<yellow>- Found problem:<reset>
+{Path("a/b")} is not known to EdenFS but is accessible on disk
+Fixing files present on disk but not known to EdenFS in {Path(mount)}...<green>fixed<reset>
+
+""",
+            output.getvalue(),
+        )
+        self.assert_results(fixer, num_problems=1, num_fixed_problems=1)
+
     if sys.platform == "win32":
+
+        @patch("eden.fs.cli.doctor.test.lib.fake_client.FakeClient.debugInodeStatus")
+        @patch("eden.fs.cli.doctor.check_filesystems.MissingFilesForInodes.perform_fix")
+        def test_loaded_missing_file_fixer(
+            self, mock_perform_fix, mock_debugInodeStatus
+        ) -> None:
+            instance = FakeEdenInstance(self.make_temporary_directory())
+            checkout = instance.create_test_mount("path1")
+            mount = checkout.path
+
+            # Just create a folders
+            os.makedirs(mount / "a")
+
+            def side_effect():
+                (mount / "a" / "d").touch()
+
+            mock_perform_fix.side_effect = side_effect
+
+            mock_debugInodeStatus.return_value = [
+                # Pretend that a/d is a file (it doesn't exist)
+                TreeInodeDebugInfo(
+                    1,
+                    b"a",
+                    True,
+                    b"abcd",
+                    [
+                        TreeInodeEntryDebugInfo(
+                            b"d", 4, stat.S_IFREG, False, False, b"efgh"
+                        ),
+                    ],
+                    1,
+                ),
+            ]
+
+            fake_PrjGetOnDiskFileState = MagicMock()
+            fake_PrjGetOnDiskFileState.side_effect = [
+                FileNotFoundError,
+                PRJ_FILE_STATE.HydratedPlaceholder,
+            ]
+
+            fixer, output = self.create_fixer(dry_run=False)
+            check_loaded_content(
+                fixer,
+                typing.cast(EdenInstance, instance),
+                checkout,
+                fake_PrjGetOnDiskFileState,
+            )
+            mock_perform_fix.assert_called_once()
+
+            self.assertEqual(
+                f"""<yellow>- Found problem:<reset>
+{Path("a/d")} is not present on disk despite EdenFS believing it should be
+Fixing files known to EdenFS but not present on disk in {Path(mount)}...<green>fixed<reset>
+
+""",
+                output.getvalue(),
+            )
+            self.assert_results(fixer, num_problems=1, num_fixed_problems=1)
+
+        @patch("eden.fs.cli.doctor.test.lib.fake_client.FakeClient.debugInodeStatus")
+        def test_loaded_missing_inode_fixer(
+            self, mock_debugInodeStatus: MagicMock
+        ) -> None:
+            instance = FakeEdenInstance(self.make_temporary_directory())
+            checkout = instance.create_test_mount("path1")
+            mount = checkout.path
+
+            unmaterialized = checkout.path / "unmaterialized"
+            os.makedirs(unmaterialized)
+            with open(unmaterialized / "extra", "wb") as f:
+                f.write(b"read all about it")
+
+            mock_debugInodeStatus.return_value = [
+                TreeInodeDebugInfo(
+                    3,
+                    b"unmaterialized",
+                    False,
+                    b"bcde",
+                    [],
+                    1,
+                ),
+            ]
+
+            fake_PrjGetOnDiskFileState = MagicMock()
+            fake_PrjGetOnDiskFileState.side_effect = [
+                FileNotFoundError,
+                PRJ_FILE_STATE.HydratedPlaceholder,
+            ]
+
+            fixer, output = self.create_fixer(dry_run=False)
+            check_loaded_content(
+                fixer,
+                typing.cast(EdenInstance, instance),
+                checkout,
+                fake_PrjGetOnDiskFileState,
+            )
+
+            self.assertEqual(
+                f"""<yellow>- Found problem:<reset>
+{Path("unmaterialized/extra")} is not known to EdenFS but is accessible on disk
+Fixing files present on disk but not known to EdenFS in {Path(mount)}...<green>fixed<reset>
+
+""",
+                output.getvalue(),
+            )
+            self.assert_results(fixer, num_problems=1, num_fixed_problems=1)
 
         @patch("eden.fs.cli.doctor.test.lib.fake_client.FakeClient.debugInodeStatus")
         def test_materialized_different_case(self, mock_debugInodeStatus) -> None:
@@ -1455,6 +1948,46 @@ Fixing files known to EdenFS but not present on disk in {Path(mount)}...<green>f
                 },
             )
 
+        @patch("eden.fs.cli.redirect.Redirection.apply")
+        @patch("eden.fs.cli.doctor.check_redirections.get_effective_redirections")
+        def test_redirection_failed_symlink(
+            self, mock_get_effective_redirections, mock_apply
+        ) -> None:
+            instance = FakeEdenInstance(self.make_temporary_directory())
+            checkout = instance.create_test_mount("path1")
+
+            mock_get_effective_redirections.return_value = {
+                "A": Redirection(
+                    checkout.path,
+                    RedirectionType.BIND,
+                    None,
+                    "",
+                    RedirectionState.SYMLINK_MISSING,
+                )
+            }
+            mock_apply.side_effect = OSError(0, "Test error", "a", 1314, "b")
+
+            fixer, out = self.create_fixer(dry_run=False)
+            mount_table = instance.mount_table
+
+            check_redirections(
+                fixer,
+                instance,
+                checkout,
+                mount_table,
+            )
+            mock_apply.assert_called_once()
+            self.assertRegex(
+                "\n".join(out.getvalue().splitlines()[:7]),
+                r"""<yellow>- Found problem:<reset>
+Misconfigured redirection at .*
+Fixing redirection at .*...<red>error<reset>
+Failed to fix or verify fix for problem MisconfiguredRedirection: RemediationError: Error occured when trying to create symlink: \[WinError 1314\] Test error: 'a' -> 'b'.
+User is missing permissions to create symlinks.
+Check that the Developer Mode has been enabled in Windows, or that the user is allowed to create symlinks in the Local Security Policy.
+Running chef may fix this.*""",
+            )
+
     @patch("eden.fs.cli.doctor.test.lib.fake_client.FakeClient.getSHA1")
     @patch("eden.fs.cli.doctor.test.lib.fake_client.FakeClient.debugInodeStatus")
     # pyre-fixme[2]: Parameter must be annotated.
@@ -1517,22 +2050,35 @@ Fixing files known to EdenFS but not present on disk in {Path(mount)}...<green>f
             f"{Path('unmaterialized/extra')} is not known to EdenFS but is accessible on disk",
         )
 
-    def test_inode_counts(self) -> None:
+    @patch("eden.fs.cli.doctor.test.lib.fake_client.FakeClient.getStatInfo")
+    def test_inode_counts(self, mock_get_stat_info: MagicMock) -> None:
         tmp_dir = self.make_temporary_directory()
         instance = FakeEdenInstance(tmp_dir)
         checkout = instance.create_test_mount("path")
 
-        instance.get_thrift_client_legacy().set_mount_inode_info(
-            checkout.path,
-            MountInodeInfo(
+        before_mount_point_info = {
+            os.fsencode(checkout.path): MountInodeInfo(
                 unloadedInodeCount=2_000_000,
                 loadedFileCount=3_000_000,
                 loadedTreeCount=4_000_000,
-            ),
-        )
+            )
+        }
+
+        after_mount_point_info = {
+            os.fsencode(checkout.path): MountInodeInfo(
+                unloadedInodeCount=0,
+                loadedFileCount=0,
+                loadedTreeCount=0,
+            )
+        }
 
         out = TestOutput()
         dry_run = False
+        mock_get_stat_info.side_effect = [
+            InternalStats(mountPointInfo=before_mount_point_info),
+            InternalStats(mountPointInfo=after_mount_point_info),
+        ]
+
         exit_code = doctor.cure_what_ails_you(
             # pyre-fixme[6]: For 1st param expected `EdenInstance` but got
             #  `FakeEdenInstance`.
@@ -1542,8 +2088,8 @@ Fixing files known to EdenFS but not present on disk in {Path(mount)}...<green>f
             mount_table=instance.mount_table,
             fs_util=FakeFsUtil(),
             proc_utils=self.make_proc_utils(),
-            kerberos_checker=FakeKerberosChecker(),
             vscode_extensions_checker=getFakeVSCodeExtensionsChecker(),
+            network_checker=FakeNetworkChecker(),
             out=out,
         )
 
@@ -1561,7 +2107,15 @@ Starting background invalidation of not recently used files and directories in {
 """,
                 out.getvalue(),
             )
-        self.assertEqual(exit_code, 0)
+        elif sys.platform == "darwin":
+            self.assertRegex(
+                out.getvalue(),
+                rf"""Checking {checkout.path}
+<yellow>- Found problem:<reset>
+Mount point {checkout.path} has 9000000 loaded files. High inode count may impact EdenFS performance.*
+""",
+            )
+        self.assertEqual(exit_code, 1 if sys.platform == "darwin" else 0)
 
     def test_slow_hg_import(self) -> None:
         tmp_dir = self.make_temporary_directory()
@@ -1583,8 +2137,8 @@ Starting background invalidation of not recently used files and directories in {
             mount_table=instance.mount_table,
             fs_util=FakeFsUtil(),
             proc_utils=self.make_proc_utils(),
-            kerberos_checker=FakeKerberosChecker(),
             vscode_extensions_checker=getFakeVSCodeExtensionsChecker(),
+            network_checker=FakeNetworkChecker(),
             out=out,
         )
 
@@ -1597,7 +2151,7 @@ Try:
 - Checking your network connection's performance\.
 - Running `eden top` to check whether downloads are making progress\.
 
-<yellow>1 issue requires manual attention\.<reset>
+<yellow>1 issue with recommended fixes\.<reset>
 Collect an 'eden rage' and ask in the EdenFS (Windows |macOS )?Users group if you need help fixing issues with EdenFS:
 (https://fb\.workplace\.com/groups/eden\.users|https://fb\.workplace\.com/groups/edenfswindows|https://fb\.workplace\.com/groups/edenfsmacos)
 """,
@@ -1685,8 +2239,8 @@ Collect an 'eden rage' and ask in the EdenFS (Windows |macOS )?Users group if yo
             mount_table=instance.mount_table,
             fs_util=FakeFsUtil(),
             proc_utils=self.make_proc_utils(),
-            kerberos_checker=FakeKerberosChecker(),
             vscode_extensions_checker=getFakeVSCodeExtensionsChecker(),
+            network_checker=FakeNetworkChecker(),
             out=out,
         )
 
@@ -1715,8 +2269,8 @@ Collect an 'eden rage' and ask in the EdenFS (Windows |macOS )?Users group if yo
             mount_table=instance.mount_table,
             fs_util=FakeFsUtil(),
             proc_utils=self.make_proc_utils(),
-            kerberos_checker=FakeKerberosChecker(),
             vscode_extensions_checker=getFakeVSCodeExtensionsChecker(),
+            network_checker=FakeNetworkChecker(),
             out=out,
         )
 
@@ -1754,8 +2308,8 @@ Please consider the effects of this extension.
             mount_table=instance.mount_table,
             fs_util=FakeFsUtil(),
             proc_utils=self.make_proc_utils(),
-            kerberos_checker=FakeKerberosChecker(),
             vscode_extensions_checker=getFakeVSCodeExtensionsChecker(),
+            network_checker=FakeNetworkChecker(),
             out=out,
         )
 
@@ -1793,10 +2347,10 @@ Please uninstall this extension.
             mount_table=instance.mount_table,
             fs_util=FakeFsUtil(),
             proc_utils=self.make_proc_utils(),
-            kerberos_checker=FakeKerberosChecker(),
             vscode_extensions_checker=getFakeVSCodeExtensionsCheckerWithExtensions(
                 ["randomdev.unknownextension"]
             ),
+            network_checker=FakeNetworkChecker(),
             out=out,
         )
 
@@ -1821,14 +2375,740 @@ Please uninstall this extension.
             mount_table=instance.mount_table,
             fs_util=FakeFsUtil(),
             proc_utils=self.make_proc_utils(),
-            kerberos_checker=FakeKerberosChecker(),
             vscode_extensions_checker=getFakeVSCodeExtensionsCheckerWithExtensions(
                 ["randomdev.unknownextension"]
             ),
+            network_checker=FakeNetworkChecker(),
             out=out,
         )
 
         self.assertEqual(exit_code, 0)
+
+    @patch("eden.fs.cli.doctor.test.lib.fake_eden_instance.FakeEdenInstance.mount")
+    def test_missing_mount_fixed(
+        self,
+        mock_mount: MagicMock,
+    ) -> None:
+        mock_mount.side_effect = [0, 1]
+        fixer, out, checkout = self.setUpEdenMountTest()
+
+        self.assertEqual(mock_mount.call_count, 2)
+        self.assertEqual(mock_mount.mock_calls, [call(str(checkout.path), False)] * 2)
+        self.assertEqual(len(fixer.problem_types), 1)
+        self.assertEqual(fixer.num_fixed_problems, 1)
+        self.assertEqual(
+            f"""\
+<yellow>- Found problem:<reset>
+{checkout.path} is not currently mounted
+Remounting {checkout.path}...<green>fixed<reset>
+
+""",
+            out.getvalue(),
+        )
+
+    @patch("eden.fs.cli.doctor.test.lib.fake_eden_instance.FakeEdenInstance.mount")
+    def test_missing_mount_hg_fixed(
+        self,
+        mock_mount: MagicMock,
+    ) -> None:
+        mock_mount.side_effect = [Exception(), 0, 1]
+        fixer, out, checkout = self.setUpEdenMountTest()
+
+        self.assertEqual(mock_mount.call_count, 3)
+        self.assertEqual(mock_mount.mock_calls, [call(str(checkout.path), False)] * 3)
+        self.assertEqual(len(fixer.problem_types), 1)
+        self.assertEqual(fixer.num_fixed_problems, 1)
+        self.assertEqual(
+            f"""\
+<yellow>- Found problem:<reset>
+{checkout.path} is not currently mounted
+Remounting {checkout.path}...
+Mount failed. Running `hg doctor` in the backing repo and then will retry the mount.
+<green>fixed<reset>
+
+""",
+            out.getvalue(),
+        )
+
+    @patch("eden.fs.cli.doctor.test.lib.fake_eden_instance.FakeEdenInstance.mount")
+    def test_missing_mount_too_short(
+        self,
+        mock_mount: MagicMock,
+    ) -> None:
+        mock_mount.side_effect = [Exception("is too short for header"), 0, 1]
+        fixer, out, checkout = self.setUpEdenMountTest()
+
+        self.assertEqual(mock_mount.call_count, 1)
+        self.assertEqual(mock_mount.mock_calls, [call(str(checkout.path), False)] * 1)
+        self.assertEqual(len(fixer.problem_types), 1)
+        self.assertEqual(fixer.num_fixed_problems, 0)
+        self.assertEqual(fixer.num_failed_fixes, 1)
+        clean_path = self.format_win_path_for_regex(str(checkout.path))
+        self.assertRegex(
+            out.getvalue(),
+            r"""<yellow>- Found problem:<reset>
+{path} is not currently mounted
+Remounting {path}...<red>error<reset>
+Failed to fix or verify fix for problem CheckoutNotMounted: Exception: is too short for header
+
+{path} appears to have been corrupted.
+This can happen if your machine was hard-rebooted.
+To recover, you will need to remove and reclone the repo.
+Your local commits will be unaffected, but reclones will lose uncommitted work or shelves.
+However, the local changes are manually recoverable before the reclone.
+If you have local changes you would like to save before reclone, see {recovery_link}, or reachout to the EdenFS team.
+To reclone the corrupted repo, run: `fbclone \$REPO --reclone --eden`
+((.|\n)*)""".format(
+                path=clean_path, recovery_link=get_local_commit_recovery_link()
+            ),
+        )
+
+    @patch("eden.fs.cli.doctor.test.lib.fake_eden_instance.FakeEdenInstance.mount")
+    @patch("eden.fs.cli.doctor.get_doctor_link")
+    @patch("eden.fs.cli.doctor.get_local_commit_recovery_link")
+    def test_missing_mount_too_short_oss(
+        self,
+        mock_get_recovery_link: MagicMock,
+        mock_get_doctor_link: MagicMock,
+        mock_mount: MagicMock,
+    ) -> None:
+        mock_mount.side_effect = [Exception("is too short for header"), 0, 1]
+        mock_get_recovery_link.return_value = ""
+        mock_get_doctor_link.return_value = ""
+
+        fixer, out, checkout = self.setUpEdenMountTest()
+
+        self.assertEqual(mock_mount.call_count, 1)
+        self.assertEqual(mock_mount.mock_calls, [call(str(checkout.path), False)] * 1)
+        self.assertEqual(len(fixer.problem_types), 1)
+        self.assertEqual(fixer.num_fixed_problems, 0)
+        self.assertEqual(fixer.num_failed_fixes, 1)
+        clean_path = self.format_win_path_for_regex(str(checkout.path))
+        self.assertRegex(
+            out.getvalue(),
+            r"""<yellow>- Found problem:<reset>
+{path} is not currently mounted
+Remounting {path}...<red>error<reset>
+Failed to fix or verify fix for problem CheckoutNotMounted: Exception: is too short for header
+
+{path} appears to have been corrupted.
+This can happen if your machine was hard-rebooted.
+To recover, you will need to remove and reclone the repo.
+Your local commits will be unaffected, but reclones will lose uncommitted work or shelves.
+However, the local changes are manually recoverable before the reclone.
+To remove the corrupted repo, run: `eden rm {path}`
+((.|\n)*)""".format(
+                path=clean_path
+            ),
+        )
+
+    @patch("eden.fs.cli.doctor.test.lib.fake_eden_instance.FakeEdenInstance.mount")
+    def test_missing_mount_fail_recheck(
+        self,
+        mock_mount: MagicMock,
+    ) -> None:
+        mock_mount.side_effect = [0, Exception("error text"), 0, 1]
+        fixer, out, checkout = self.setUpEdenMountTest()
+
+        self.assertEqual(mock_mount.call_count, 2)
+        self.assertEqual(mock_mount.mock_calls, [call(str(checkout.path), False)] * 2)
+        self.assertEqual(len(fixer.problem_types), 1)
+        self.assertEqual(fixer.num_fixed_problems, 0)
+        self.assertEqual(fixer.num_failed_fixes, 1)
+        self.assertEqual(
+            f"""\
+<yellow>- Found problem:<reset>
+{checkout.path} is not currently mounted
+Remounting {checkout.path}...
+Attempt to fix missing mount failed: error text.
+<red>error<reset>
+Attempted and failed to fix problem CheckoutNotMounted
+
+""",
+            out.getvalue(),
+        )
+
+    @patch("eden.fs.cli.util.get_repo")
+    def test_missing_config_fix(
+        self,
+        mock_get_repo: MagicMock,
+    ) -> None:
+        instance = FakeEdenInstance(self.make_temporary_directory())
+        checkout = instance.create_test_mount("path1")
+        checkout_config = instance._checkouts_by_path[str(checkout.path)].config
+
+        path = checkout.path
+
+        hg_repo = checkout.instance.get_hg_repo(path)
+        mock_get_repo.return_value = hg_repo
+
+        checkout_info = CheckoutInfo(
+            # pyre-fixme[6]: For 3rd param expected `EdenInstance` but got
+            # `FakeEdenInstance`.
+            instance,
+            path,
+            state=None,
+            backing_repo=checkout_config.backing_repo,
+            running_state_dir=checkout.state_dir,
+            configured_state_dir=checkout.state_dir,
+        )
+
+        fixer, out = self.create_fixer(dry_run=False)
+        mount_table = instance.mount_table
+
+        edenfs_path = "/path/to/eden-mount"
+        watchman_roots = {edenfs_path}
+        watchman_info = check_watchman.WatchmanCheckInfo(watchman_roots)
+
+        os.unlink(checkout.state_dir / "config.toml")
+
+        check_running_mount(
+            fixer,
+            # pyre-fixme[6]: For 2rd param expected `EdenInstance` but got
+            # `FakeEdenInstance`.
+            instance,
+            checkout_info,
+            mount_table,
+            watchman_info,
+            False,
+            False,
+        )
+
+        self.assertTrue(os.path.exists(checkout.state_dir / "config.toml"))
+        self.assertEqual(
+            out.getvalue(),
+            f"""\
+<yellow>- Found problem:<reset>
+Eden's checkout state for {checkout.path} has been corrupted: {checkout.state_dir / "config.toml"} does not exist. [Errno 2] No such file or directory: '{self.format_win_path_for_regex(str(checkout.state_dir / "config.toml"))}'
+Reinitialize checkout config.......<green>fixed<reset>
+
+""",
+        )
+        self.assertEqual(len(fixer.problem_types), 1)
+        self.assertEqual(fixer.num_fixed_problems, 1)
+
+    @patch("eden.fs.cli.util.get_repo")
+    def test_corrupted_config_fix(
+        self,
+        mock_get_repo: MagicMock,
+    ) -> None:
+        instance = FakeEdenInstance(self.make_temporary_directory())
+        checkout = instance.create_test_mount("path1")
+        checkout_config = instance._checkouts_by_path[str(checkout.path)].config
+
+        path = checkout.path
+
+        hg_repo = checkout.instance.get_hg_repo(path)
+        mock_get_repo.return_value = hg_repo
+
+        checkout_info = CheckoutInfo(
+            # pyre-fixme[6]: For 3rd param expected `EdenInstance` but got
+            # `FakeEdenInstance`.
+            instance,
+            path,
+            state=None,
+            backing_repo=checkout_config.backing_repo,
+            running_state_dir=checkout.state_dir,
+            configured_state_dir=checkout.state_dir,
+        )
+
+        fixer, out = self.create_fixer(dry_run=False)
+        mount_table = instance.mount_table
+
+        edenfs_path = "/path/to/eden-mount"
+        watchman_roots = {edenfs_path}
+        watchman_info = check_watchman.WatchmanCheckInfo(watchman_roots)
+
+        with open(checkout.state_dir / "config.toml", "w") as f:
+            f.write("corrupted config")
+        with open(checkout.state_dir / "config.toml", "r") as f:
+            print(f.read())
+
+        check_running_mount(
+            fixer,
+            # pyre-fixme[6]: For 2rd param expected `EdenInstance` but got
+            # `FakeEdenInstance`.
+            instance,
+            checkout_info,
+            mount_table,
+            watchman_info,
+            False,
+            False,
+        )
+
+        self.assertTrue(os.path.exists(checkout.state_dir / "config.toml"))
+        self.assertEqual(
+            out.getvalue(),
+            f"""\
+<yellow>- Found problem:<reset>
+Eden's checkout state for {checkout.path} has been corrupted: toml config file {checkout.state_dir / "config.toml"} not valid: Found invalid character in key name: 'c'. Try quoting the key name. (line 1 column 11 char 10)Detected here (line 1): 
+
+corrupted config
+
+Reinitialize checkout config.......<green>fixed<reset>
+
+""",
+        )
+        self.assertEqual(len(fixer.problem_types), 1)
+        self.assertEqual(fixer.num_fixed_problems, 1)
+
+    @patch("eden.fs.cli.config.EdenCheckout.get_config")
+    def test_corrupted_config_fail(
+        self,
+        mock_get_config: MagicMock,
+    ) -> None:
+        instance = FakeEdenInstance(self.make_temporary_directory())
+        checkout = instance.create_test_mount("path1")
+        checkout_config = instance._checkouts_by_path[str(checkout.path)].config
+
+        mock_get_config.side_effect = [
+            checkout_config,
+            Exception("GenericOtherException"),
+        ]
+        path = checkout.path
+        checkout_info = CheckoutInfo(
+            # pyre-fixme[6]: For 3rd param expected `EdenInstance` but got
+            # `FakeEdenInstance`.
+            instance,
+            path,
+            state=None,
+            backing_repo=checkout.get_backing_repo_path(),
+            running_state_dir=path,
+            configured_state_dir=path,
+        )
+
+        fixer, out = self.create_fixer(dry_run=False)
+        mount_table = instance.mount_table
+
+        edenfs_path = "/path/to/eden-mount"
+        watchman_roots = {edenfs_path}
+        watchman_info = check_watchman.WatchmanCheckInfo(watchman_roots)
+
+        check_running_mount(
+            fixer,
+            # pyre-fixme[6]: For 2rd param expected `EdenInstance` but got
+            # `FakeEdenInstance`.
+            instance,
+            checkout_info,
+            mount_table,
+            watchman_info,
+            False,
+            False,
+        )
+
+        self.assertEqual(mock_get_config.call_count, 2)
+        self.assertEqual(len(fixer.problem_types), 1)
+        self.assertEqual(fixer.num_fixed_problems, 0)
+        self.assertEqual(fixer.num_manual_fixes, 1)
+        self.assertEqual(
+            f"""\
+<yellow>- Found problem:<reset>
+Eden's checkout state for {checkout.path} has been corrupted: GenericOtherException
+To recover, you will need to remove and reclone the repo.
+Your local commits will be unaffected, but reclones will lose uncommitted work or shelves.
+However, the local changes are manually recoverable before the reclone.
+If you have local changes you would like to save before reclone, see {get_local_commit_recovery_link()}, or reachout to the EdenFS team.
+To reclone the corrupted repo, run: `fbclone $REPO --reclone --eden`"""
+            + (
+                f"\nFor additional info see the wiki at {get_doctor_link()}\n\n"
+                if get_doctor_link()
+                else "\n\n"
+            ),
+            out.getvalue(),
+        )
+
+    @patch("eden.fs.cli.config.EdenCheckout.get_config")
+    @patch("eden.fs.cli.doctor.get_doctor_link")
+    @patch("eden.fs.cli.doctor.get_local_commit_recovery_link")
+    def test_corrupted_config_fail_oss(
+        self,
+        mock_get_recovery_link: MagicMock,
+        mock_get_doctor_link: MagicMock,
+        mock_get_config: MagicMock,
+    ) -> None:
+        instance = FakeEdenInstance(self.make_temporary_directory())
+        checkout = instance.create_test_mount("path1")
+        checkout_config = instance._checkouts_by_path[str(checkout.path)].config
+
+        mock_get_recovery_link.return_value = ""
+        mock_get_doctor_link.return_value = ""
+
+        mock_get_config.side_effect = [
+            checkout_config,
+            Exception("GenericOtherException"),
+        ]
+        path = checkout.path
+        checkout_info = CheckoutInfo(
+            # pyre-fixme[6]: For 3rd param expected `EdenInstance` but got
+            # `FakeEdenInstance`.
+            instance,
+            path,
+            state=None,
+            backing_repo=checkout.get_backing_repo_path(),
+            running_state_dir=path,
+            configured_state_dir=path,
+        )
+
+        fixer, out = self.create_fixer(dry_run=False)
+        mount_table = instance.mount_table
+
+        edenfs_path = "/path/to/eden-mount"
+        watchman_roots = {edenfs_path}
+        watchman_info = check_watchman.WatchmanCheckInfo(watchman_roots)
+
+        check_running_mount(
+            fixer,
+            # pyre-fixme[6]: For 2rd param expected `EdenInstance` but got
+            # `FakeEdenInstance`.
+            instance,
+            checkout_info,
+            mount_table,
+            watchman_info,
+            False,
+            False,
+        )
+
+        self.assertEqual(mock_get_config.call_count, 2)
+        self.assertEqual(len(fixer.problem_types), 1)
+        self.assertEqual(fixer.num_fixed_problems, 0)
+        self.assertEqual(fixer.num_manual_fixes, 1)
+        self.assertEqual(
+            f"""\
+<yellow>- Found problem:<reset>
+Eden's checkout state for {checkout.path} has been corrupted: GenericOtherException
+To recover, you will need to remove and reclone the repo.
+Your local commits will be unaffected, but reclones will lose uncommitted work or shelves.
+However, the local changes are manually recoverable before the reclone.
+To remove the corrupted repo, run: `eden rm {checkout.path}`
+
+""",
+            out.getvalue(),
+        )
+
+    @patch("eden.fs.cli.config.EdenCheckout.get_snapshot")
+    @patch("eden.fs.cli.config.EdenCheckout.get_config")
+    def test_corrupted_snapshot(
+        self,
+        mock_get_config: MagicMock,
+        mock_get_snapshot: MagicMock,
+    ) -> None:
+        instance = FakeEdenInstance(self.make_temporary_directory())
+        checkout = instance.create_test_mount("path1")
+        checkout_config = instance._checkouts_by_path[str(checkout.path)].config
+
+        mock_get_config.return_value = checkout_config
+        mock_get_snapshot.side_effect = RuntimeError("Missing SNAPSHOT file")
+        path = checkout.path
+        checkout_info = CheckoutInfo(
+            # pyre-fixme[6]: For 3rd param expected `EdenInstance` but got
+            # `FakeEdenInstance`.
+            instance,
+            path,
+            state=None,
+            backing_repo=checkout.get_backing_repo_path(),
+            running_state_dir=path,
+            configured_state_dir=path,
+            mount_inode_info=MountInodeInfo(1, 1, 1),
+        )
+
+        fixer, out = self.create_fixer(dry_run=False)
+        mount_table = instance.mount_table
+
+        edenfs_path = "/path/to/eden-mount"
+        watchman_roots = {edenfs_path}
+        watchman_info = check_watchman.WatchmanCheckInfo(watchman_roots)
+
+        check_running_mount(
+            fixer,
+            # pyre-fixme[6]: For 2rd param expected `EdenInstance` but got
+            # `FakeEdenInstance`.
+            instance,
+            checkout_info,
+            mount_table,
+            watchman_info,
+            False,
+            False,
+        )
+
+        self.assertEqual(
+            f"""\
+<yellow>- Found problem:<reset>
+Eden's checkout state for {checkout.path} has been corrupted: Missing SNAPSHOT file
+To recover, you will need to remove and reclone the repo.
+Your local commits will be unaffected, but reclones will lose uncommitted work or shelves.
+However, the local changes are manually recoverable before the reclone.
+If you have local changes you would like to save before reclone, see {get_local_commit_recovery_link()}, or reachout to the EdenFS team.
+To reclone the corrupted repo, run: `fbclone $REPO --reclone --eden`"""
+            + (
+                f"\nFor additional info see the wiki at {get_doctor_link()}\n\n"
+                if get_doctor_link()
+                else "\n\n"
+            ),
+            out.getvalue(),
+        )
+        self.assertEqual(mock_get_snapshot.call_count, 1)
+        self.assertEqual(len(fixer.problem_types), 1)
+        self.assertEqual(fixer.num_fixed_problems, 0)
+        self.assertEqual(fixer.num_manual_fixes, 1)
+
+    @patch("subprocess.run")
+    def test_network_fail_command_doctor(
+        self,
+        mock_subprocess_run: MagicMock,
+    ) -> None:
+        mock_subprocess_run.side_effect = subprocess.CalledProcessError(
+            1, "test", output="stdout", stderr="stderror"
+        )
+
+        fixer, out, checkout = self.setUpEdenNetworkTest()
+        self.assertEqual(
+            out.getvalue(),
+            """\
+<yellow>- Found problem:<reset>
+Encountered an error checking connection to Source Control Servers: command 'hg debugnetworkdoctor' reported an error:
+stdout
+stderror
+
+Please check your network connection. If you are connected to the VPN, please try reconnecting.
+
+""",
+        )
+        self.assertEqual(mock_subprocess_run.call_count, 1)
+        self.assertEqual(len(fixer.problem_types), 1)
+        self.assertEqual(fixer.num_fixed_problems, 0)
+        self.assertEqual(fixer.num_manual_fixes, 1)
+        problems = sorted(fixer.problem_manual_fixes)
+        self.assertEqual(problems[0], "ConnectivityProblem")
+
+    @patch("subprocess.run")
+    def test_network_fail_command_connection(
+        self,
+        mock_subprocess_run: MagicMock,
+    ) -> None:
+        mock_subprocess_run.side_effect = [
+            None,
+            subprocess.CalledProcessError(
+                1, "test", output="stdout", stderr="stderror"
+            ),
+        ]
+
+        fixer, out, checkout = self.setUpEdenNetworkTest()
+        self.assertEqual(
+            out.getvalue(),
+            """\
+<yellow>- Found problem:<reset>
+Encountered an error checking connection to Source Control Servers: hg debugnetwork --connection reported an error:
+stdout
+stderror
+
+Please check your network connection. If you are connected to the VPN, please try reconnecting.
+
+""",
+        )
+        self.assertEqual(mock_subprocess_run.call_count, 2)
+        self.assertEqual(len(fixer.problem_types), 1)
+        self.assertEqual(fixer.num_fixed_problems, 0)
+        self.assertEqual(fixer.num_manual_fixes, 1)
+        problems = sorted(fixer.problem_manual_fixes)
+        self.assertEqual(problems[0], "ConnectivityProblem")
+
+    @patch("subprocess.run")
+    def test_network_fail_command_speed(
+        self,
+        mock_subprocess_run: MagicMock,
+    ) -> None:
+        mock_subprocess_run.side_effect = [
+            None,
+            None,
+            subprocess.CalledProcessError(
+                1, "test", output="stdout", stderr="stderror"
+            ),
+        ]
+
+        fixer, out, checkout = self.setUpEdenNetworkTest()
+        self.assertEqual(
+            out.getvalue(),
+            """\
+<yellow>- Found problem:<reset>
+Failed to verify speed of connection to eden services: 
+stdout
+stderror
+
+Check the speed report in hg debugnetwork --speed
+
+""",
+        )
+        self.assertEqual(mock_subprocess_run.call_count, 3)
+        self.assertEqual(len(fixer.problem_types), 1)
+        self.assertEqual(fixer.num_fixed_problems, 0)
+        self.assertEqual(fixer.num_manual_fixes, 1)
+        problems = sorted(fixer.problem_manual_fixes)
+        self.assertEqual(problems[0], "NetworkSpeedProblem")
+
+    @patch("subprocess.run")
+    def test_network_timeout(
+        self,
+        mock_subprocess_run: MagicMock,
+    ) -> None:
+        timeout = subprocess.TimeoutExpired(
+            "test", timeout=1, output="stdout", stderr="stderror"
+        )
+        mock_subprocess_run.side_effect = [timeout, None, timeout, None, None, timeout]
+        for method in [
+            "debugnetworkdoctor",
+            "debugnetwork --connection",
+            "debugnetwork --speed",
+        ]:
+            fixer, out, checkout = self.setUpEdenNetworkTest()
+
+            self.assertEqual(len(fixer.problem_types), 1)
+            self.assertEqual(fixer.num_fixed_problems, 0)
+            self.assertEqual(fixer.num_manual_fixes, 1)
+            self.assertEqual(list(fixer.problem_manual_fixes)[0], "ConnectivityProblem")
+            self.assertEqual(
+                out.getvalue(),
+                f"""\
+<yellow>- Found problem:<reset>
+Encountered an error checking connection to Source Control Servers: command 'hg {method}' timed out.
+
+Please check your network connection. If you are connected to the VPN, please try reconnecting.
+
+""",
+            )
+
+    @patch("subprocess.run")
+    def test_network_speed_fail_check(
+        self,
+        mock_subprocess_run: MagicMock,
+    ) -> None:
+        mock_subprocess_run.side_effect = [
+            None,
+            None,
+            subprocess.CalledProcessError(
+                1, "test", output="stdout", stderr="stderror"
+            ),
+        ]
+        fixer, out, checkout = self.setUpEdenNetworkTest()
+
+        self.assertEqual(mock_subprocess_run.call_count, 3)
+        self.assertEqual(len(fixer.problem_types), 1)
+        self.assertEqual(fixer.num_fixed_problems, 0)
+        self.assertEqual(fixer.num_manual_fixes, 1)
+        problems = sorted(fixer.problem_manual_fixes)
+        self.assertEqual(problems[0], "NetworkSpeedProblem")
+        self.assertEqual(
+            out.getvalue(),
+            """\
+<yellow>- Found problem:<reset>
+Failed to verify speed of connection to eden services: 
+stdout
+stderror
+
+Check the speed report in hg debugnetwork --speed
+
+""",
+        )
+
+    @patch("subprocess.run")
+    def test_network_speed_pass(
+        self,
+        mock_subprocess_run: MagicMock,
+    ) -> None:
+        mock_subprocess_run.side_effect = [
+            None,
+            None,
+            subprocess.CompletedProcess(
+                "",
+                0,
+                stdout="""
+debugnetwork: Latency: 646.2 us (average of 5 round-trips)
+debugnetwork: Speed: (round 1) downloaded 250 MB in 437.5 ms (4793.85 Mbit/s, 571.47 MiB/s)
+debugnetwork: Speed: (round 2) downloaded 250 MB in 446.1 ms (4700.91 Mbit/s, 560.39 MiB/s)
+debugnetwork: Speed: (round 1) uploaded 50.0 MB in 134.6 ms (3116.99 Mbit/s, 371.57 MiB/s)
+debugnetwork: Speed: (round 2) uploaded 50.0 MB in 132.3 ms (3170.47 Mbit/s, 377.95 MiB/s)
+""",
+            ),
+        ]
+        fixer, out, checkout = self.setUpEdenNetworkTest()
+
+        self.assertEqual(out.getvalue(), "")
+        self.assertEqual(len(fixer.problem_types), 0)
+
+    @patch("subprocess.run")
+    def test_network_latency_fail(
+        self,
+        mock_subprocess_run: MagicMock,
+    ) -> None:
+        mock_subprocess_run.side_effect = [
+            None,
+            None,
+            subprocess.CompletedProcess(
+                "",
+                0,
+                stdout="""
+debugnetwork: Latency: 646.2 ms (average of 5 round-trips)
+debugnetwork: Speed: (round 1) downloaded 250 MB in 437.5 ms (4793.85 Mbit/s, 571.47 MiB/s)
+debugnetwork: Speed: (round 2) downloaded 250 MB in 446.1 ms (4700.91 Mbit/s, 560.39 MiB/s)
+debugnetwork: Speed: (round 1) uploaded 50.0 MB in 134.6 ms (3116.99 Mbit/s, 371.57 MiB/s)
+debugnetwork: Speed: (round 2) uploaded 50.0 MB in 132.3 ms (3170.47 Mbit/s, 377.95 MiB/s)
+""",
+            ),
+        ]
+        fixer, out, checkout = self.setUpEdenNetworkTest()
+
+        self.assertEqual(
+            out.getvalue(),
+            f"""\
+<yellow>- Found problem:<reset>
+High network latency detected: Latency 646.2 ms higher than 250ms
+Please check if anything is causing high ping on your network.{get_netinfo_link()}
+
+""",
+        )
+        self.assertEqual(mock_subprocess_run.call_count, 3)
+        self.assertEqual(len(fixer.problem_types), 1)
+        self.assertEqual(fixer.num_fixed_problems, 0)
+        self.assertEqual(fixer.num_manual_fixes, 1)
+        problems = sorted(fixer.problem_manual_fixes)
+        self.assertEqual(problems[0], "NetworkLatencyProblem")
+
+    @patch("subprocess.run")
+    def test_network_speed_fail(
+        self,
+        mock_subprocess_run: MagicMock,
+    ) -> None:
+        mock_subprocess_run.side_effect = [
+            None,
+            None,
+            subprocess.CompletedProcess(
+                "",
+                0,
+                stdout="""
+debugnetwork: Latency: 646.2 us (average of 5 round-trips)
+debugnetwork: Speed: (round 1) downloaded 250 MB in 437.5 ms (47.9385 Mbit/s, 57.147 MiB/s)
+debugnetwork: Speed: (round 2) downloaded 250 MB in 446.1 ms (47.0091 Mbit/s, 56.039 MiB/s)
+debugnetwork: Speed: (round 1) uploaded 50.0 MB in 134.6 ms (31.1699 Mbit/s, 37.157 MiB/s)
+debugnetwork: Speed: (round 2) uploaded 50.0 MB in 132.3 ms (31.7047 Mbit/s, 37.795 MiB/s)
+""",
+            ),
+        ]
+        fixer, out, checkout = self.setUpEdenNetworkTest()
+
+        self.assertEqual(
+            out.getvalue(),
+            f"""\
+<yellow>- Found problem:<reset>
+Slow network speed detected: Average download speed 47.4738Mbit/s slower than 50 Mbit/s, or average upload speed 31.4373Mbit/s slower than 10 Mbit/s
+Please check if anything is consuming an excess amount of bandwidth on your network.{get_netinfo_link()}
+
+""",
+        )
+        self.assertEqual(mock_subprocess_run.call_count, 3)
+        self.assertEqual(len(fixer.problem_types), 1)
+        self.assertEqual(fixer.num_fixed_problems, 0)
+        self.assertEqual(fixer.num_manual_fixes, 1)
+        problems = sorted(fixer.problem_manual_fixes)
+        self.assertEqual(problems[0], "NetworkSlowSpeedProblem")
 
 
 def _create_watchman_subscription(

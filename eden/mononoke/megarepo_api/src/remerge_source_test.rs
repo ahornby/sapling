@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use anyhow::Error;
-use changeset_fetcher::ChangesetFetcherRef;
+use commit_graph::CommitGraphRef;
 use context::CoreContext;
 use fbinit::FacebookInit;
 use maplit::btreemap;
@@ -18,6 +18,8 @@ use megarepo_config::Target;
 use megarepo_mapping::CommitRemappingState;
 use megarepo_mapping::SourceName;
 use megarepo_mapping::REMAPPING_STATE_FILE;
+use metaconfig_types::RepoConfigArc;
+use mononoke_macros::mononoke;
 use mononoke_types::NonRootMPath;
 use tests_utils::bookmark;
 use tests_utils::list_working_copy_utf8;
@@ -25,11 +27,12 @@ use tests_utils::resolve_cs_id;
 use tests_utils::CreateCommitContext;
 
 use crate::add_sync_target::AddSyncTarget;
+use crate::common::MegarepoOp;
 use crate::megarepo_test_utils::MegarepoTest;
 use crate::megarepo_test_utils::SyncTargetConfigBuilder;
 use crate::remerge_source::RemergeSource;
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_remerge_source_simple(fb: FacebookInit) -> Result<(), Error> {
     let ctx = CoreContext::test_mock(fb);
     let mut test = MegarepoTest::new(&ctx).await?;
@@ -48,36 +51,41 @@ async fn test_remerge_source_simple(fb: FacebookInit) -> Result<(), Error> {
         .build(&mut test.configs_storage);
 
     println!("Create initial source commits and bookmarks");
-    let first_source_cs_id = CreateCommitContext::new_root(&ctx, &test.blobrepo)
+    let first_source_cs_id = CreateCommitContext::new_root(&ctx, &test.repo)
         .add_file("first", "first")
         .commit()
         .await?;
 
-    bookmark(&ctx, &test.blobrepo, first_source_name.to_string())
+    bookmark(&ctx, &test.repo, first_source_name.to_string())
         .set_to(first_source_cs_id)
         .await?;
 
-    let second_source_root = CreateCommitContext::new_root(&ctx, &test.blobrepo)
+    let second_source_root = CreateCommitContext::new_root(&ctx, &test.repo)
         .add_file("second", "root")
         .commit()
         .await?;
-    let second_source_cs_id =
-        CreateCommitContext::new(&ctx, &test.blobrepo, vec![second_source_root])
-            .add_file("second", "second")
-            .commit()
-            .await?;
+    let second_source_cs_id = CreateCommitContext::new(&ctx, &test.repo, vec![second_source_root])
+        .add_file("second", "second")
+        .commit()
+        .await?;
 
-    bookmark(&ctx, &test.blobrepo, second_source_name.to_string())
+    bookmark(&ctx, &test.repo, second_source_name.to_string())
         .set_to(second_source_cs_id)
         .await?;
 
     let configs_storage: Arc<dyn MononokeMegarepoConfigs> = Arc::new(test.configs_storage.clone());
 
-    let sync_target_config =
-        test.configs_storage
-            .get_config_by_version(ctx.clone(), target.clone(), version.clone())?;
     let add_sync_target =
         AddSyncTarget::new(&configs_storage, &test.mononoke, &test.mutable_renames);
+    let repo = add_sync_target
+        .find_repo_by_id(&ctx, target.repo_id)
+        .await?;
+    let repo_config = repo.repo().repo_config_arc();
+
+    let sync_target_config = test
+        .configs_storage
+        .get_config_by_version(ctx.clone(), repo_config, target.clone(), version.clone())
+        .await?;
     add_sync_target
         .run(
             &ctx,
@@ -90,11 +98,11 @@ async fn test_remerge_source_simple(fb: FacebookInit) -> Result<(), Error> {
         )
         .await?;
 
-    let mut target_cs_id = resolve_cs_id(&ctx, &test.blobrepo, "target").await?;
-    let mut wc = list_working_copy_utf8(&ctx, &test.blobrepo, target_cs_id).await?;
+    let mut target_cs_id = resolve_cs_id(&ctx, &test.repo, "target").await?;
+    let mut wc = list_working_copy_utf8(&ctx, &test.repo, target_cs_id).await?;
 
     let state =
-        CommitRemappingState::read_state_from_commit(&ctx, &test.blobrepo, target_cs_id).await?;
+        CommitRemappingState::read_state_from_commit(&ctx, &test.repo, target_cs_id).await?;
     assert_eq!(
         state.get_latest_synced_changeset(&first_source_name),
         Some(&first_source_cs_id),
@@ -148,14 +156,14 @@ async fn test_remerge_source_simple(fb: FacebookInit) -> Result<(), Error> {
         .await?;
 
     let parents = test
-        .blobrepo
-        .changeset_fetcher()
-        .get_parents(&ctx, target_cs_id)
+        .repo
+        .commit_graph()
+        .changeset_parents(&ctx, target_cs_id)
         .await?;
     assert_eq!(parents[0], old_target_cs_id);
 
     let state =
-        CommitRemappingState::read_state_from_commit(&ctx, &test.blobrepo, target_cs_id).await?;
+        CommitRemappingState::read_state_from_commit(&ctx, &test.repo, target_cs_id).await?;
     assert_eq!(
         state.get_latest_synced_changeset(&first_source_name),
         Some(&first_source_cs_id),
@@ -166,7 +174,7 @@ async fn test_remerge_source_simple(fb: FacebookInit) -> Result<(), Error> {
     );
     assert_eq!(state.sync_config_version(), &version);
 
-    let mut wc = list_working_copy_utf8(&ctx, &test.blobrepo, target_cs_id).await?;
+    let mut wc = list_working_copy_utf8(&ctx, &test.repo, target_cs_id).await?;
     // Remove file with commit remapping state because it's never present in source
     assert!(
         wc.remove(&NonRootMPath::new(REMAPPING_STATE_FILE)?)
@@ -181,7 +189,7 @@ async fn test_remerge_source_simple(fb: FacebookInit) -> Result<(), Error> {
         }
     );
 
-    let resolved_target_cs_id = resolve_cs_id(&ctx, &test.blobrepo, "target").await?;
+    let resolved_target_cs_id = resolve_cs_id(&ctx, &test.repo, "target").await?;
     assert_eq!(target_cs_id, resolved_target_cs_id);
 
     Ok(())

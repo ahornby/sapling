@@ -2,6 +2,7 @@
 #require no-fsmonitor
 #debugruntest-incompatible
 
+  $ setconfig alias.ssl:doc="show a graph of your commits and associated Diff information"
 Short help:
 
   $ hg
@@ -18,6 +19,7 @@ Short help:
   
   View commits:
   
+   ssl           show a graph of your commits and associated Diff information
    show          show commit in detail
    diff          show differences between commits
   
@@ -75,6 +77,7 @@ Short help:
   
   View commits:
   
+   ssl           show a graph of your commits and associated Diff information
    show          show commit in detail
    diff          show differences between commits
   
@@ -132,6 +135,7 @@ Short help:
   
   View commits:
   
+   ssl           show a graph of your commits and associated Diff information
    show          show commit in detail
    diff          show differences between commits
   
@@ -189,6 +193,7 @@ Short help:
   
   View commits:
   
+   ssl           show a graph of your commits and associated Diff information
    show          show commit in detail
    diff          show differences between commits
   
@@ -275,7 +280,6 @@ Test extension help:
   
        conflictinfo
        eden          accelerated hg functionality in Eden checkouts (eden !)
-       copytrace     extension that does copytracing fast
        debugshell    a python shell with repo, changelog & manifest objects
        errorredirect
                      redirect error message
@@ -287,6 +291,7 @@ Test extension help:
        remotefilelog
                      minimize and speed up large repositories
        sampling      (no help text available)
+       schemes       extend schemes with shortcuts to repository swarms
        treemanifest
        tweakdefaults
                      user friendly defaults
@@ -344,17 +349,14 @@ Test extension help:
        remotenames   mercurial extension for improving client/server workflows
        reset         reset the active bookmark and working copy to a desired
                      revision
-       schemes       extend schemes with shortcuts to repository swarms
        share         share a common history between several working directories
        shelve        save and restore changes to the working directory
        sigtrace      sigtrace - dump stack and memory traces on signal
-       simplecache
        smartlog      command to display a relevant subgraph
        snapshot      stores snapshots of uncommitted changes
        sparse        allow sparse checkouts of the working directory
        stablerev     provide a way to expose the "stable" commit via a revset
        traceprof     (no help text available)
-       treemanifestserver
        undo          (no help text available)
        win32mbcs     allow the use of MBCS paths with problematic encodings
 
@@ -488,7 +490,7 @@ Test the textwidth config option
       Frequently useful in shells scripts and
       automation to run commands like:
   
-        $  ./$(sl root)/bin/script.py
+        $ $(hg root)/bin/script.py
   
       Returns 0 on success.
   
@@ -511,7 +513,7 @@ Test help on a self-referencing alias that is a rust command
   
       Frequently useful in shells scripts and automation to run commands like:
   
-        $  ./$(sl root)/bin/script.py
+        $ $(hg root)/bin/script.py
   
       Returns 0 on success.
   
@@ -531,7 +533,7 @@ Test help on a self-referencing alias that is a rust command
   
       Frequently useful in shells scripts and automation to run commands like:
   
-        $  ./$(sl root)/bin/script.py
+        $ $(hg root)/bin/script.py
   
       Returns 0 on success.
   
@@ -583,6 +585,10 @@ Test command without options
       By default, diffs are shown using the unified diff format. Specify "-g" to
       generate diffs in the git extended diff format. For more information, see
       'hg help diffs'.
+  
+      "--from-path" and "--to-path" allow diffing between directories. Files
+      outside "--from-path" in the left side are ignored. See 'hg help
+      directorybranching' for more information.
   
       Note:
          'hg diff' might generate unexpected results during merges because it
@@ -848,6 +854,7 @@ Test that default list of commands omits extension commands
   
   View commits:
   
+   ssl           show a graph of your commits and associated Diff information
    show          show commit in detail
    diff          show differences between commits
   
@@ -1005,11 +1012,6 @@ Test repeated config section name
       "smtp.host"
           Host name of mail server, e.g. "mail.example.com".
   
-Unrelated trailing paragraphs shouldn't be included
-
-  $ hg help config.extramsg | grep '^$'
-  
-
 Test capitalized section name
 
   $ hg help scripting.HGPLAIN > /dev/null

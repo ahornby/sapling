@@ -5,10 +5,12 @@
  * GNU General Public License version 2.
  */
 
-use edenapi_types::HgId;
+use std::str::FromStr;
+
+use clientinfo::ClientRequestInfo;
+use commit_cloud_types::WorkspaceHead;
 use mercurial_types::HgChangesetId;
-use serde::Deserialize;
-use serde::Serialize;
+use sql::Transaction;
 
 use crate::sql::heads_ops::DeleteArgs;
 use crate::sql::ops::Delete;
@@ -16,45 +18,52 @@ use crate::sql::ops::Insert;
 use crate::CommitCloudContext;
 use crate::SqlCommitCloud;
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct WorkspaceHead {
-    pub commit: HgChangesetId,
+#[allow(clippy::ptr_arg)]
+pub fn heads_from_list(s: &Vec<String>) -> anyhow::Result<Vec<WorkspaceHead>> {
+    s.iter()
+        .map(|s| HgChangesetId::from_str(s).map(|commit| WorkspaceHead { commit }))
+        .collect()
+}
+
+#[allow(clippy::ptr_arg)]
+pub fn heads_to_list(heads: &Vec<WorkspaceHead>) -> Vec<String> {
+    heads.iter().map(|head| head.commit.to_string()).collect()
 }
 
 pub async fn update_heads(
     sql_commit_cloud: &SqlCommitCloud,
-    ctx: CommitCloudContext,
-    removed_heads: Vec<HgId>,
-    new_heads: Vec<HgId>,
-) -> anyhow::Result<()> {
+    mut txn: Transaction,
+    cri: Option<&ClientRequestInfo>,
+    ctx: &CommitCloudContext,
+    removed_heads: Vec<HgChangesetId>,
+    new_heads: Vec<HgChangesetId>,
+) -> anyhow::Result<Transaction> {
     if !removed_heads.is_empty() {
         let delete_args = DeleteArgs {
-            removed_commits: removed_heads
-                .into_iter()
-                .map(|id| id.into())
-                .collect::<Vec<HgChangesetId>>(),
+            removed_commits: removed_heads,
         };
 
-        Delete::<WorkspaceHead>::delete(
+        txn = Delete::<WorkspaceHead>::delete(
             sql_commit_cloud,
+            txn,
+            cri,
             ctx.reponame.clone(),
             ctx.workspace.clone(),
             delete_args,
         )
         .await?;
     }
-
     for head in new_heads {
-        Insert::<WorkspaceHead>::insert(
+        txn = Insert::<WorkspaceHead>::insert(
             sql_commit_cloud,
+            txn,
+            cri,
             ctx.reponame.clone(),
             ctx.workspace.clone(),
-            WorkspaceHead {
-                commit: head.into(),
-            },
+            WorkspaceHead { commit: head },
         )
         .await?;
     }
 
-    Ok(())
+    Ok(txn)
 }

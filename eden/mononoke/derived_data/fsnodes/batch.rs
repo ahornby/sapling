@@ -159,16 +159,18 @@ pub async fn new_batch_derivation(
 mod test {
     use bonsai_hg_mapping::BonsaiHgMapping;
     use bookmarks::Bookmarks;
-    use changesets::Changesets;
     use commit_graph::CommitGraph;
     use commit_graph::CommitGraphRef;
+    use commit_graph::CommitGraphWriter;
     use fbinit::FacebookInit;
     use filestore::FilestoreConfig;
     use fixtures::Linear;
     use fixtures::TestRepoFixture;
+    use mononoke_macros::mononoke;
     use repo_blobstore::RepoBlobstore;
     use repo_derived_data::RepoDerivedData;
     use repo_derived_data::RepoDerivedDataRef;
+    use repo_identity::RepoIdentity;
     use test_repo_factory::TestRepoFactory;
     use tests_utils::bookmark;
     use tests_utils::drawdag::create_from_dag;
@@ -178,28 +180,22 @@ mod test {
 
     #[facet::container]
     #[derive(Clone)]
-    struct TestRepo {
-        #[facet]
-        bonsai_hg_mapping: dyn BonsaiHgMapping,
-        #[facet]
-        bookmarks: dyn Bookmarks,
-        #[facet]
-        repo_derived_data: RepoDerivedData,
-        #[facet]
-        commit_graph: CommitGraph,
-        #[facet]
-        repo_blobstore: RepoBlobstore,
-        #[facet]
-        filestore_config: FilestoreConfig,
-        #[facet]
-        changesets: dyn Changesets,
-    }
+    struct TestRepo(
+        dyn BonsaiHgMapping,
+        dyn Bookmarks,
+        CommitGraph,
+        dyn CommitGraphWriter,
+        RepoDerivedData,
+        RepoBlobstore,
+        FilestoreConfig,
+        RepoIdentity,
+    );
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn batch_derive(fb: FacebookInit) -> Result<(), Error> {
         let ctx = CoreContext::test_mock(fb);
         let new_batch = {
-            let repo = Linear::getrepo(fb).await;
+            let repo: TestRepo = Linear::get_repo(fb).await;
             let master_cs_id = resolve_cs_id(&ctx, &repo, "master").await?;
 
             let mut cs_ids = repo
@@ -222,7 +218,7 @@ mod test {
         };
 
         let sequential = {
-            let repo = Linear::getrepo(fb).await;
+            let repo: TestRepo = Linear::get_repo(fb).await;
             let master_cs_id = resolve_cs_id(&ctx, &repo, "master").await?;
             repo.repo_derived_data()
                 .manager()
@@ -235,7 +231,7 @@ mod test {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn batch_derive_with_merge(fb: FacebookInit) -> Result<(), Error> {
         let ctx = CoreContext::test_mock(fb);
         let new_batch = {

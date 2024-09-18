@@ -10,8 +10,6 @@ import type {ValidatedRepoInfo} from './types';
 import type {ReactNode} from 'react';
 
 import {Delayed} from './Delayed';
-import {Subtle} from './Subtle';
-import {Tooltip} from './Tooltip';
 import {codeReviewProvider} from './codeReview/CodeReviewInfo';
 import {T, t} from './i18n';
 import {
@@ -24,11 +22,15 @@ import {repositoryInfo} from './serverAPIState';
 import {processTerminalLines} from './terminalOutput';
 import {CommandRunner} from './types';
 import {short} from './utils';
-import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
-import {useAtomValue} from 'jotai';
-import {Icon} from 'shared/Icon';
-import './CommandHistoryAndProgress.css';
+import {Button} from 'isl-components/Button';
+import {Row} from 'isl-components/Flex';
+import {Icon} from 'isl-components/Icon';
+import {Subtle} from 'isl-components/Subtle';
+import {Tooltip} from 'isl-components/Tooltip';
+import {atom, useAtom, useAtomValue} from 'jotai';
 import {notEmpty, truncate} from 'shared/utils';
+
+import './CommandHistoryAndProgress.css';
 
 function OperationDescription(props: {
   info: ValidatedRepoInfo;
@@ -67,15 +69,18 @@ function OperationDescription(props: {
                   return undefined;
                 case 'repo-relative-file':
                   return arg.path;
+                case 'repo-relative-file-list':
+                  return truncate(arg.paths.join(' '), 200);
                 case 'exact-revset':
                 case 'succeedable-revset':
+                case 'optimistic-revset':
                   return props.long
                     ? arg.revset
                     : // truncate full commit hashes to short representation visually
                     // revset could also be a remote bookmark, so only do this if it looks like a hash
-                    /[a-z0-9]{40}/.test(arg.revset)
+                    /^[a-z0-9]{40}$/.test(arg.revset)
                     ? short(arg.revset)
-                    : arg.revset;
+                    : truncate(arg.revset, 80);
               }
             }
             if (/\s/.test(arg)) {
@@ -89,10 +94,14 @@ function OperationDescription(props: {
   );
 }
 
+const nextToRunCollapsedAtom = atom(false);
+
 export function CommandHistoryAndProgress() {
   const list = useAtomValue(operationList);
   const queued = useAtomValue(queuedOperations);
   const abortRunningOperation = useAbortRunningOperation();
+
+  const [collapsed, setCollapsed] = useAtom(nextToRunCollapsedAtom);
 
   const info = useAtomValue(repositoryInfo);
   if (info?.type !== 'success') {
@@ -127,8 +136,7 @@ export function CommandHistoryAndProgress() {
     const hideUntil = new Date((progress.startTime?.getTime() || 0) + slowThreshold);
     abort = (
       <Delayed hideUntil={hideUntil}>
-        <VSCodeButton
-          appearance="secondary"
+        <Button
           data-testid="abort-button"
           disabled={progress.aborting}
           onClick={() => {
@@ -136,7 +144,7 @@ export function CommandHistoryAndProgress() {
           }}>
           <Icon slot="start" icon={progress.aborting ? 'loading' : 'stop-circle'} />
           <T>Abort</T>
-        </VSCodeButton>
+        </Button>
       </Delayed>
     );
   } else if (progress.exitCode === 0) {
@@ -161,6 +169,8 @@ export function CommandHistoryAndProgress() {
   }
 
   const processedLines = processTerminalLines(progress.commandOutput ?? []);
+
+  const MAX_VISIBLE_NEXT_TO_RUN = 10;
 
   return (
     <div className="progress-container" data-testid="progress-container">
@@ -193,12 +203,37 @@ export function CommandHistoryAndProgress() {
         )}>
         {queued.length > 0 ? (
           <div className="queued-operations-container" data-testid="queued-commands">
-            <strong>Next to run</strong>
-            {queued.map(op => (
-              <div key={op.id} id={op.id} className="queued-operation">
-                <OperationDescription info={info} operation={op} />
+            <Row
+              style={{cursor: 'pointer'}}
+              onClick={() => {
+                setCollapsed(!collapsed);
+              }}>
+              <Icon icon={collapsed ? 'chevron-right' : 'chevron-down'} />
+              <strong>
+                <T>Next to run</T>
+              </strong>
+            </Row>
+            {collapsed ? (
+              <div>
+                <T count={queued.length}>moreCommandsToRun</T>
               </div>
-            ))}
+            ) : (
+              <>
+                {(queued.length > MAX_VISIBLE_NEXT_TO_RUN
+                  ? queued.slice(0, MAX_VISIBLE_NEXT_TO_RUN)
+                  : queued
+                ).map(op => (
+                  <div key={op.id} id={op.id} className="queued-operation">
+                    <OperationDescription info={info} operation={op} />
+                  </div>
+                ))}
+                {queued.length > MAX_VISIBLE_NEXT_TO_RUN && (
+                  <div>
+                    <T replace={{$count: queued.length - MAX_VISIBLE_NEXT_TO_RUN}}>+$count more</T>
+                  </div>
+                )}
+              </>
+            )}
           </div>
         ) : null}
 

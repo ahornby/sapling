@@ -13,10 +13,10 @@ use context::PerfCounterType;
 use edenapi_types::wire::WireTreeRequest;
 use edenapi_types::AnyId;
 use edenapi_types::Batch;
-use edenapi_types::DirectoryMetadata;
 use edenapi_types::FileAuxData;
 use edenapi_types::SaplingRemoteApiServerError;
 use edenapi_types::TreeAttributes;
+use edenapi_types::TreeAuxData;
 use edenapi_types::TreeChildEntry;
 use edenapi_types::TreeEntry;
 use edenapi_types::TreeRequest;
@@ -44,11 +44,14 @@ use mercurial_types::HgAugmentedManifestId;
 use mercurial_types::HgFileNodeId;
 use mercurial_types::HgManifestId;
 use mercurial_types::HgNodeHash;
+use mononoke_api::MononokeRepo;
+use mononoke_api::Repo;
 use mononoke_api_hg::HgDataContext;
 use mononoke_api_hg::HgDataId;
 use mononoke_api_hg::HgRepoContext;
 use mononoke_api_hg::HgTreeContext;
 use rate_limiting::Metric;
+use repo_blobstore::RepoBlobstoreRef;
 use serde::Deserialize;
 use types::Key;
 use types::RepoPathBuf;
@@ -88,20 +91,12 @@ pub async fn trees(state: &mut State) -> Result<impl TryIntoResponse, HttpError>
     let rctx = RequestContext::borrow_from(state).clone();
     let sctx = ServerContext::borrow_from(state);
 
-    let repo = get_repo(sctx, &rctx, &params.repo, Metric::TotalManifests).await?;
+    let repo: HgRepoContext<Repo> =
+        get_repo(sctx, &rctx, &params.repo, Metric::TotalManifests).await?;
     let request = parse_wire_request::<WireTreeRequest>(state).await?;
     if let Some(rd) = RequestDumper::try_borrow_mut_from(state) {
         rd.add_request(&request);
     };
-
-    if request.attributes.child_metadata && request.attributes.augmented_trees {
-        return Err(HttpError::e400(SaplingRemoteApiServerError::new(
-            ErrorKind::InvalidRequest(
-                "Augmented trees and child metadata cannot be requested at the same time"
-                    .to_string(),
-            ),
-        )));
-    }
 
     ScubaMiddlewareState::try_set_sampling_rate(state, nonzero_ext::nonzero!(256_u64));
 
@@ -112,8 +107,8 @@ pub async fn trees(state: &mut State) -> Result<impl TryIntoResponse, HttpError>
 }
 
 /// Fetch trees for all of the requested keys concurrently.
-fn fetch_all_trees(
-    repo: HgRepoContext,
+fn fetch_all_trees<R: MononokeRepo>(
+    repo: HgRepoContext<R>,
     request: TreeRequest,
 ) -> impl Stream<Item = Result<TreeEntry, SaplingRemoteApiServerError>> {
     let ctx = repo.ctx().clone();
@@ -133,71 +128,118 @@ fn fetch_all_trees(
 /// Fetch requested tree for a single key.
 /// Note that this function consumes the repo context in order
 /// to construct a tree context for the requested blob.
-async fn fetch_tree(
-    repo: HgRepoContext,
+async fn fetch_tree<R: MononokeRepo>(
+    repo: HgRepoContext<R>,
     key: Key,
     attributes: TreeAttributes,
 ) -> Result<TreeEntry, Error> {
     let mut entry = TreeEntry::new(key.clone());
 
     if attributes.augmented_trees {
-        // Augmented Trees always come with the hg manifest blob, parents,
-        // and child metadata in the augmented trees format.
         let id = HgAugmentedManifestId::new(HgNodeHash::from(key.hgid));
         repo.ctx()
             .perf_counters()
             .increment_counter(PerfCounterType::EdenapiAugmentedTrees);
 
-        let ctx = id
+        let maybe_ctx = id
             .context(repo.clone())
-            .await
-            .with_context(|| ErrorKind::TreeFetchFailed(key.clone()))?
-            .with_context(|| ErrorKind::KeyDoesNotExist(key.clone()))?;
-
-        entry.with_parents(Some(ctx.hg_parents().into()));
-
-        entry.with_children(Some(
-            ctx.augmented_children_entries()
-                .map(|augmented_entry| match augmented_entry {
-                    HgAugmentedManifestEntry::FileNode(file) => Ok(TreeChildEntry::new_file_entry(
-                        Key {
-                            hgid: file.filenode.into(),
-                            ..Default::default()
-                        },
-                        FileAuxData {
-                            blake3: file.content_blake3.clone().into(),
-                            sha1: file.content_sha1.clone().into(),
-                            total_size: file.total_size.clone(),
-                        }
-                        .into(),
-                    )),
-                    HgAugmentedManifestEntry::DirectoryNode(tree) => {
-                        Ok(TreeChildEntry::new_directory_entry(
-                            Key {
-                                hgid: tree.treenode.into(),
-                                ..Default::default()
-                            },
-                            DirectoryMetadata {
-                                augmented_manifest_id: tree.augmented_manifest_id.clone().into(),
-                                augmented_manifest_size: tree.augmented_manifest_size.clone(),
-                            },
-                        ))
-                    }
-                })
-                .collect(),
-        ));
-
-        let (data, _) = ctx
-            .content()
             .await
             .with_context(|| ErrorKind::TreeFetchFailed(key.clone()))?;
 
-        entry.with_data(Some(data));
+        if let Some(ctx) = maybe_ctx {
+            entry.with_tree_aux_data(TreeAuxData {
+                augmented_manifest_id: ctx.augmented_manifest_id().clone().into(),
+                augmented_manifest_size: ctx.augmented_manifest_size(),
+            });
 
-        return Ok(entry);
+            if attributes.parents {
+                entry.with_parents(Some(ctx.hg_parents().into()));
+            }
+
+            if attributes.child_metadata {
+                repo.ctx()
+                    .perf_counters()
+                    .increment_counter(PerfCounterType::EdenapiTreesAuxData);
+
+                entry.with_children(Some(
+                    ctx.augmented_children_entries()
+                        .map(|(path, augmented_entry)| match augmented_entry {
+                            HgAugmentedManifestEntry::FileNode(file) => {
+                                Ok(TreeChildEntry::new_file_entry(
+                                    Key {
+                                        hgid: file.filenode.into(),
+                                        path: RepoPathBuf::from_string(path.to_string()).map_err(
+                                            |e| {
+                                                SaplingRemoteApiServerError::with_key(
+                                                    key.clone(),
+                                                    e,
+                                                )
+                                            },
+                                        )?,
+                                    },
+                                    FileAuxData {
+                                        blake3: file.content_blake3.clone().into(),
+                                        sha1: file.content_sha1.clone().into(),
+                                        total_size: file.total_size.clone(),
+                                        file_header_metadata: Some(
+                                            file.file_header_metadata
+                                                .clone()
+                                                .unwrap_or(Bytes::new())
+                                                .into(),
+                                        ),
+                                    }
+                                    .into(),
+                                ))
+                            }
+                            HgAugmentedManifestEntry::DirectoryNode(tree) => {
+                                Ok(TreeChildEntry::new_directory_entry(
+                                    Key {
+                                        hgid: tree.treenode.into(),
+                                        path: RepoPathBuf::from_string(path.to_string()).map_err(
+                                            |e| {
+                                                SaplingRemoteApiServerError::with_key(
+                                                    key.clone(),
+                                                    e,
+                                                )
+                                            },
+                                        )?,
+                                    },
+                                    TreeAuxData {
+                                        augmented_manifest_id: tree
+                                            .augmented_manifest_id
+                                            .clone()
+                                            .into(),
+                                        augmented_manifest_size: tree
+                                            .augmented_manifest_size
+                                            .clone(),
+                                    },
+                                ))
+                            }
+                        })
+                        .collect(),
+                ));
+            }
+
+            if attributes.manifest_blob {
+                let (data, _) = ctx
+                    .content()
+                    .await
+                    .with_context(|| ErrorKind::TreeFetchFailed(key.clone()))?;
+
+                entry.with_data(Some(data.into()));
+            }
+
+            return Ok(entry);
+        } else {
+            // If we don't have an augmented tree, fallback to the old way of fetching trees
+            // Log the fallback to scuba
+            repo.ctx()
+                .perf_counters()
+                .increment_counter(PerfCounterType::EdenapiAugmentedTreesFallback);
+        }
     }
 
-    let id = HgManifestId::from_node_hash(HgNodeHash::from(key.hgid));
+    let id = <HgManifestId as HgDataId<R>>::from_node_hash(HgNodeHash::from(key.hgid));
 
     let ctx = id
         .context(repo.clone())
@@ -215,7 +257,7 @@ async fn fetch_tree(
             .await
             .with_context(|| ErrorKind::TreeFetchFailed(key.clone()))?;
 
-        entry.with_data(Some(data));
+        entry.with_data(Some(data.into()));
     }
 
     if attributes.parents {
@@ -227,7 +269,7 @@ async fn fetch_tree(
             .perf_counters()
             .increment_counter(PerfCounterType::EdenapiTreesAuxData);
 
-        if let Some(entries) = fetch_child_metadata_entries(&repo, &ctx).await? {
+        if let Some(entries) = fetch_child_file_metadata_entries(&repo, &ctx).await? {
             let children: Vec<Result<TreeChildEntry, SaplingRemoteApiServerError>> = entries
                 .buffer_unordered(MAX_CONCURRENT_METADATA_FETCHES_PER_TREE_FETCH)
                 .map(|r| r.map_err(|e| SaplingRemoteApiServerError::with_key(key.clone(), e)))
@@ -241,9 +283,9 @@ async fn fetch_tree(
     Ok(entry)
 }
 
-async fn fetch_child_metadata_entries<'a>(
-    repo: &'a HgRepoContext,
-    ctx: &'a HgTreeContext,
+async fn fetch_child_file_metadata_entries<'a, R: MononokeRepo>(
+    repo: &'a HgRepoContext<R>,
+    ctx: &'a HgTreeContext<R>,
 ) -> Result<
     Option<impl Stream<Item = impl Future<Output = Result<TreeChildEntry, Error>> + 'a> + 'a>,
     Error,
@@ -252,54 +294,58 @@ async fn fetch_child_metadata_entries<'a>(
     if manifest.content().files.len() > LARGE_TREE_METADATA_LIMIT {
         return Ok(None);
     }
-    let entries = manifest.list().collect::<Vec<_>>();
+    let file_entries = manifest
+        .list(repo.ctx(), repo.repo().repo_blobstore())
+        .await?
+        .try_collect::<Vec<_>>()
+        .await?
+        .into_iter()
+        .filter_map(|(name, entry)| {
+            if let Entry::Leaf((_, child_id)) = entry {
+                Some((name, child_id))
+            } else {
+                None
+            }
+        });
 
     Ok(Some(
-        stream::iter(entries)
+        stream::iter(file_entries)
             // .entries iterator is not `Send`
             .map({
-                move |(name, entry)| async move {
+                move |(name, child_id)| async move {
                     let name = RepoPathBuf::from_string(name.to_string())?;
-                    Ok(match entry {
-                        Entry::Leaf((_, child_id)) => {
-                            let child_key = Key::new(name, child_id.into_nodehash().into());
-                            fetch_child_file_metadata(repo, child_key.clone()).await?
-                        }
-                        // This API never returned any directory metadata
-                        Entry::Tree(child_id) => TreeChildEntry::new_directory_entry(
-                            Key::new(name, child_id.into_nodehash().into()),
-                            DirectoryMetadata::default(),
-                        ),
-                    })
+                    let child_key = Key::new(name, child_id.into_nodehash().into());
+                    fetch_child_file_metadata(repo, child_key.clone()).await
                 }
             }),
     ))
 }
 
-async fn fetch_child_file_metadata(
-    repo: &HgRepoContext,
+async fn fetch_child_file_metadata<R: MononokeRepo>(
+    repo: &HgRepoContext<R>,
     child_key: Key,
 ) -> Result<TreeChildEntry, Error> {
-    let metadata = repo
+    let ctx = repo
         .file(HgFileNodeId::new(child_key.hgid.into()))
         .await?
-        .ok_or_else(|| ErrorKind::FileFetchFailed(child_key.clone()))?
-        .content_metadata()
-        .await?;
+        .ok_or_else(|| ErrorKind::FileFetchFailed(child_key.clone()))?;
+
+    let metadata = ctx.content_metadata().await?;
     Ok(TreeChildEntry::new_file_entry(
         child_key,
         FileAuxData {
             total_size: metadata.total_size,
             sha1: metadata.sha1.into(),
             blake3: metadata.seeded_blake3.into(),
+            file_header_metadata: Some(ctx.file_header_metadata().into()),
         }
         .into(),
     ))
 }
 
 /// Store the content of a single tree
-async fn store_tree(
-    repo: HgRepoContext,
+async fn store_tree<R: MononokeRepo>(
+    repo: HgRepoContext<R>,
     item: UploadTreeRequest,
 ) -> Result<UploadTreeResponse, Error> {
     let upload_node_id = HgNodeHash::from(item.entry.node_id);
@@ -326,7 +372,7 @@ impl SaplingRemoteApiHandler for UploadTreesHandler {
     const ENDPOINT: &'static str = "/upload/trees";
 
     async fn handler(
-        ectx: SaplingRemoteApiContext<Self::PathExtractor, Self::QueryStringExtractor>,
+        ectx: SaplingRemoteApiContext<Self::PathExtractor, Self::QueryStringExtractor, Repo>,
         request: Self::Request,
     ) -> HandlerResult<'async_trait, Self::Response> {
         let repo = ectx.repo();

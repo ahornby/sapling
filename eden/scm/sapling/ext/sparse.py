@@ -281,15 +281,13 @@ def _setupupdates(_ui) -> None:
     ):
         """Filter updates to only lay out files that match the sparse rules."""
         ui = repo.ui
-        actions, diverge, renamedelete = orig(
-            repo, wctx, mctx, ancestors, branchmerge, *arg, **kwargs
-        )
+        actions = orig(repo, wctx, mctx, ancestors, branchmerge, *arg, **kwargs)
 
         # If the working context is in memory (virtual), there's no need to
         # apply the user's sparse rules at all (and in fact doing so would
         # cause unexpected behavior in the real working copy).
         if not _hassparse(repo) or wctx.isinmemory():
-            return actions, diverge, renamedelete
+            return actions
 
         files = set()
         prunedactions = {}
@@ -320,7 +318,7 @@ def _setupupdates(_ui) -> None:
             sparsematch = repo.sparsematch(mctx.rev())
 
         temporaryfiles = []
-        for file, action in pycompat.iteritems(actions):
+        for file, action in actions.items():
             type, args, msg = action
             files.add(file)
             if sparsematch(file):
@@ -354,7 +352,7 @@ def _setupupdates(_ui) -> None:
             for file in temporaryfiles:
                 if file in wctxmanifest:
                     fctx = repo[None][file]
-                    actions.append((file, (fctx.flags(), False), message))
+                    actions.append((file, (file, fctx.flags(), False), message))
 
             typeactions = collections.defaultdict(list)
             typeactions["g"] = actions
@@ -405,11 +403,11 @@ def _setupupdates(_ui) -> None:
                             new = sparsematch(file)
                             if not old and new:
                                 flags = mf.flags(file)
-                                prunedactions[file] = ("g", (flags, False), "")
+                                prunedactions[file] = ("g", (file, flags, False), "")
                             elif old and not new:
                                 prunedactions[file] = ("r", [], "")
 
-        return prunedactions, diverge, renamedelete
+        return prunedactions
 
     extensions.wrapfunction(mergemod, "calculateupdates", _calculateupdates)
 
@@ -1231,7 +1229,7 @@ def _wraprepo(ui, repo) -> None:
                             actions[file] = ("e", (fl,), "")
                             lookup.append(file)
                         else:
-                            actions[file] = ("g", (fl, False), "")
+                            actions[file] = ("g", (file, fl, False), "")
                             added.append(file)
                     # Drop files that are newly excluded, or that still exist in
                     # the dirstate.
@@ -1257,7 +1255,7 @@ def _wraprepo(ui, repo) -> None:
                 )
 
             # Check for files that were only in the dirstate.
-            for file, state in pycompat.iteritems(dirstate):
+            for file, state in dirstate.items():
                 if not file in files:
                     old = origsparsematch(file)
                     new = sparsematch(file)
@@ -1272,7 +1270,7 @@ def _wraprepo(ui, repo) -> None:
             )
 
             with progress.bar(ui, _("applying"), total=len(actions)) as prog:
-                for f, (m, args, msg) in pycompat.iteritems(actions):
+                for f, (m, args, msg) in actions.items():
                     prog.value += 1
                     if m not in typeactions:
                         typeactions[m] = []
@@ -1620,19 +1618,7 @@ def readsparseprofile(
 
 
 def getrawprofile(repo, profile, changeid):
-    try:
-        simplecache = extensions.find("simplecache")
-
-        # Use unfiltered to avoid computing hidden commits
-        node = repo[changeid].hex()
-
-        def func():
-            return pycompat.decodeutf8(repo.filectx(profile, changeid=changeid).data())
-
-        key = "sparseprofile:%s:%s" % (profile.replace("/", "__"), node)
-        return simplecache.memoize(func, key, simplecache.stringserializer, repo.ui)
-    except KeyError:
-        return pycompat.decodeutf8(repo.filectx(profile, changeid=changeid).data())
+    return pycompat.decodeutf8(repo.filectx(profile, changeid=changeid).data())
 
 
 def _getcachedprofileconfigs(repo):

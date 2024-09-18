@@ -13,6 +13,7 @@
 #include "eden/fs/inodes/InodeError.h"
 #include "eden/fs/inodes/TreeInode.h"
 #include "eden/fs/model/Tree.h"
+#include "eden/fs/model/TreeMetadata.h"
 #include "eden/fs/service/gen-cpp2/eden_types.h"
 #include "eden/fs/store/ObjectStore.h"
 
@@ -69,7 +70,7 @@ ImmediateFuture<Hash32> VirtualInode::getBlake3(
     const std::shared_ptr<ObjectStore>& objectStore,
     const ObjectFetchContextPtr& fetchContext) const {
   // Ensure this is a regular file.
-  // We intentionally want to refuse to compute the SHA1 of symlinks
+  // We intentionally want to refuse to compute the blake3 of symlinks
   switch (filteredEntryDtype(
       getDtype(), objectStore->getWindowsSymlinksEnabled())) {
     case dtype_t::Dir:
@@ -215,9 +216,12 @@ ImmediateFuture<BlobMetadata> VirtualInode::getBlobMetadata(
       });
 }
 
-EntryAttributes VirtualInode::getEntryAttributesForNonFile(
+ImmediateFuture<EntryAttributes> VirtualInode::getEntryAttributesForNonFile(
     EntryAttributeFlags requestedAttributes,
     RelativePathPiece path,
+    const std::shared_ptr<ObjectStore>& objectStore,
+    const ObjectFetchContextPtr& fetchContext,
+    bool shouldFetchTreeMetadata,
     std::optional<TreeEntryType> entryType,
     int errorCode,
     std::string additionalErrorContext) const {
@@ -227,26 +231,114 @@ EntryAttributes VirtualInode::getEntryAttributesForNonFile(
         folly::Try<Hash20>{PathError{errorCode, path, additionalErrorContext}};
   }
 
-  std::optional<folly::Try<Hash32>> blake3;
-  if (requestedAttributes.contains(ENTRY_ATTRIBUTE_BLAKE3)) {
-    blake3 =
-        folly::Try<Hash32>{PathError{errorCode, path, additionalErrorContext}};
-  }
-
-  std::optional<folly::Try<uint64_t>> size;
-  if (requestedAttributes.contains(ENTRY_ATTRIBUTE_SIZE)) {
-    size = folly::Try<uint64_t>{
-        PathError{errorCode, path, std::move(additionalErrorContext)}};
-  }
-
   std::optional<folly::Try<std::optional<TreeEntryType>>> type;
   if (requestedAttributes.contains(ENTRY_ATTRIBUTE_SOURCE_CONTROL_TYPE)) {
     type = folly::Try<std::optional<TreeEntryType>>{entryType};
   }
 
   std::optional<folly::Try<std::optional<ObjectId>>> objectId;
+  auto oid = getObjectId();
   if (requestedAttributes.contains(ENTRY_ATTRIBUTE_OBJECT_ID)) {
-    objectId = folly::Try<std::optional<ObjectId>>{getObjectId()};
+    objectId = folly::Try<std::optional<ObjectId>>{oid};
+  }
+
+  std::optional<folly::Try<uint64_t>> size;
+  if (requestedAttributes.contains(ENTRY_ATTRIBUTE_SIZE)) {
+    size = folly::Try<uint64_t>{
+        PathError{errorCode, path, additionalErrorContext}};
+  }
+
+  std::optional<folly::Try<Hash32>> blake3;
+  if (requestedAttributes.contains(ENTRY_ATTRIBUTE_BLAKE3)) {
+    blake3 =
+        folly::Try<Hash32>{PathError{errorCode, path, additionalErrorContext}};
+  }
+
+  std::optional<folly::Try<Hash32>> digestHash;
+  std::optional<folly::Try<uint64_t>> digestSize;
+
+  // The entry is a symlink, socket, or other unsupported type. We return
+  // error values for these entry types if they were requested.
+  //
+  // entryType is std::nullopt if the entry is a socket or other non-scm type
+  if (entryType.value_or(TreeEntryType::SYMLINK) != TreeEntryType::TREE) {
+    if (requestedAttributes.contains(ENTRY_ATTRIBUTE_DIGEST_SIZE)) {
+      digestSize = folly::Try<uint64_t>{
+          PathError{errorCode, path, additionalErrorContext}};
+    }
+
+    if (requestedAttributes.contains(ENTRY_ATTRIBUTE_DIGEST_HASH)) {
+      digestHash = folly::Try<Hash32>{
+          PathError{errorCode, path, std::move(additionalErrorContext)}};
+    }
+  } else {
+    // The entry is a tree, and therefore we can attempt to compute tree
+    // metadata for it. However, we can only compute the additional attributes
+    // of trees that have ObjectIds. In other words, the tree must be
+    // unmaterialized.
+    if (shouldFetchTreeMetadata &&
+        (requestedAttributes.contains(ENTRY_ATTRIBUTE_DIGEST_HASH) ||
+         requestedAttributes.contains(ENTRY_ATTRIBUTE_DIGEST_SIZE)) &&
+        oid.has_value()) {
+      auto treeMetaFut =
+          objectStore->getTreeMetadata(oid.value(), fetchContext)
+              .thenValue([requestedAttributes,
+                          sha1,
+                          type,
+                          objectId,
+                          blake3,
+                          size,
+                          digestSize,
+                          digestHash](TreeMetadata treeMeta) mutable {
+                if (requestedAttributes.contains(ENTRY_ATTRIBUTE_DIGEST_HASH)) {
+                  digestHash =
+                      std::optional<folly::Try<Hash32>>{treeMeta.blake3};
+                }
+                if (requestedAttributes.contains(ENTRY_ATTRIBUTE_DIGEST_SIZE)) {
+                  digestSize = std::optional<folly::Try<uint64_t>>{
+                      std::move(treeMeta.digestSize)};
+                }
+                return EntryAttributes{
+                    std::move(sha1),
+                    std::move(blake3),
+                    std::move(size),
+                    std::move(type),
+                    std::move(objectId),
+                    std::move(digestSize),
+                    std::move(digestHash)};
+              });
+      return std::move(treeMetaFut)
+          .thenError([requestedAttributes,
+                      treeSha1 = std::move(sha1),
+                      treeType = std::move(type),
+                      treeObjectId = std::move(objectId),
+                      treeBlake3 = std::move(blake3),
+                      treeSize = std::move(size),
+                      treeDigestSize = std::move(digestSize),
+                      treeDigestHash = std::move(digestHash)](
+                         const folly::exception_wrapper& ex) mutable {
+            // We failed to get tree aux data. This shouldn't cause the
+            // entire result to be an error. We can return whichever
+            // attributes we successfully fetched.
+            if (requestedAttributes.contains(ENTRY_ATTRIBUTE_DIGEST_HASH)) {
+              treeDigestHash = folly::Try<Hash32>{ex};
+            }
+
+            if (requestedAttributes.contains(ENTRY_ATTRIBUTE_DIGEST_SIZE)) {
+              treeDigestSize = folly::Try<uint64_t>{ex};
+            }
+
+            return EntryAttributes{
+                std::move(treeSha1),
+                std::move(treeBlake3),
+                std::move(treeSize),
+                std::move(treeType),
+                std::move(treeObjectId),
+                std::move(treeDigestSize),
+                std::move(treeDigestHash)};
+          });
+    }
+    // We return empty tree metadata attributes for materialized directories
   }
 
   return EntryAttributes{
@@ -254,14 +346,17 @@ EntryAttributes VirtualInode::getEntryAttributesForNonFile(
       std::move(blake3),
       std::move(size),
       std::move(type),
-      std::move(objectId)};
+      std::move(objectId),
+      std::move(digestSize),
+      std::move(digestHash)};
 }
 
 ImmediateFuture<EntryAttributes> VirtualInode::getEntryAttributes(
     EntryAttributeFlags requestedAttributes,
     RelativePathPiece path,
     const std::shared_ptr<ObjectStore>& objectStore,
-    const ObjectFetchContextPtr& fetchContext) const {
+    const ObjectFetchContextPtr& fetchContext,
+    bool shouldFetchTreeMetadata) const {
   bool windowsSymlinksEnabled = objectStore->getWindowsSymlinksEnabled();
   // For non regular files we return errors for hashes and sizes.
   // We intentionally want to refuse to compute the SHA1 of symlinks.
@@ -271,11 +366,21 @@ ImmediateFuture<EntryAttributes> VirtualInode::getEntryAttributes(
       break;
     case dtype_t::Dir:
       return getEntryAttributesForNonFile(
-          requestedAttributes, path, TreeEntryType::TREE, EISDIR);
+          requestedAttributes,
+          path,
+          objectStore,
+          fetchContext,
+          shouldFetchTreeMetadata,
+          TreeEntryType::TREE,
+          EISDIR,
+          {});
     case dtype_t::Symlink:
       return getEntryAttributesForNonFile(
           requestedAttributes,
           path,
+          objectStore,
+          fetchContext,
+          shouldFetchTreeMetadata,
           TreeEntryType::SYMLINK,
           EINVAL,
           "file is a symlink");
@@ -283,6 +388,9 @@ ImmediateFuture<EntryAttributes> VirtualInode::getEntryAttributes(
       return getEntryAttributesForNonFile(
           requestedAttributes,
           path,
+          objectStore,
+          fetchContext,
+          shouldFetchTreeMetadata,
           std::nullopt,
           EINVAL,
           fmt::format(
@@ -304,13 +412,14 @@ ImmediateFuture<EntryAttributes> VirtualInode::getEntryAttributes(
   // sha1, blake3 and size come together so, there isn't much point of splitting
   // them up
   if (requestedAttributes.containsAnyOf(
-          ENTRY_ATTRIBUTE_SIZE | ENTRY_ATTRIBUTE_SHA1 |
-          ENTRY_ATTRIBUTE_BLAKE3)) {
+          ENTRY_ATTRIBUTE_SIZE | ENTRY_ATTRIBUTE_SHA1 | ENTRY_ATTRIBUTE_BLAKE3 |
+          ENTRY_ATTRIBUTE_DIGEST_SIZE | ENTRY_ATTRIBUTE_DIGEST_HASH)) {
     blobMetadataFuture = getBlobMetadata(
         path,
         objectStore,
         fetchContext,
-        requestedAttributes.contains(ENTRY_ATTRIBUTE_BLAKE3));
+        requestedAttributes.containsAnyOf(
+            ENTRY_ATTRIBUTE_BLAKE3 | ENTRY_ATTRIBUTE_DIGEST_HASH));
   }
 
   std::optional<ObjectId> objectId;
@@ -320,7 +429,9 @@ ImmediateFuture<EntryAttributes> VirtualInode::getEntryAttributes(
 
   return collectAll(std::move(entryTypeFuture), std::move(blobMetadataFuture))
       .thenValue(
-          [requestedAttributes, entryObjectId = std::move(objectId)](
+          [requestedAttributes,
+           entryObjectId = std::move(objectId),
+           filePath = RelativePath{path}](
               std::tuple<
                   folly::Try<std::optional<TreeEntryType>>,
                   folly::Try<BlobMetadata>> rawAttributeData) mutable
@@ -339,13 +450,6 @@ ImmediateFuture<EntryAttributes> VirtualInode::getEntryAttributes(
               if (blobMetadata.hasException()) {
                 blake3 = folly::Try<Hash32>(blobMetadata.exception());
               } else {
-                if (blobMetadata.value().blake3) {
-                  blake3 =
-                      folly::Try<Hash32>(blobMetadata.value().blake3.value());
-                } else {
-                  blake3 =
-                      folly::Try<Hash32>(blobMetadata.value().blake3.value());
-                }
                 blake3 = blobMetadata.value().blake3
                     ? folly::Try<Hash32>(blobMetadata.value().blake3.value())
                     : folly::Try<Hash32>(
@@ -373,13 +477,34 @@ ImmediateFuture<EntryAttributes> VirtualInode::getEntryAttributes(
                   folly::Try<std::optional<ObjectId>>{std::move(entryObjectId)};
             }
 
-            // TODO: add blake3 support
+            std::optional<folly::Try<uint64_t>> digestSize;
+            if (requestedAttributes.contains(ENTRY_ATTRIBUTE_DIGEST_SIZE)) {
+              digestSize = blobMetadata.hasException()
+                  ? folly::Try<uint64_t>(blobMetadata.exception())
+                  : folly::Try<uint64_t>(blobMetadata.value().size);
+            }
+
+            std::optional<folly::Try<Hash32>> digestHash;
+            if (requestedAttributes.contains(ENTRY_ATTRIBUTE_DIGEST_HASH)) {
+              if (blobMetadata.hasException()) {
+                digestHash = folly::Try<Hash32>(blobMetadata.exception());
+              } else {
+                digestHash = blobMetadata.value().blake3
+                    ? folly::Try<Hash32>(blobMetadata.value().blake3.value())
+                    : folly::Try<Hash32>(
+                          folly::make_exception_wrapper<std::runtime_error>(
+                              "no blake3 available"));
+              }
+            }
+
             return EntryAttributes{
                 std::move(sha1),
                 std::move(blake3),
                 std::move(size),
                 std::move(type),
-                std::move(objectId)};
+                std::move(objectId),
+                std::move(digestSize),
+                std::move(digestHash)};
           });
 }
 
@@ -538,7 +663,8 @@ VirtualInode::getChildrenAttributes(
     EntryAttributeFlags requestedAttributes,
     RelativePath path,
     const std::shared_ptr<ObjectStore>& objectStore,
-    const ObjectFetchContextPtr& fetchContext) {
+    const ObjectFetchContextPtr& fetchContext,
+    bool shouldFetchTreeMetadata) {
   auto children = this->getChildren(path.piece(), objectStore, fetchContext);
 
   if (children.hasException()) {
@@ -560,10 +686,14 @@ VirtualInode::getChildrenAttributes(
             .thenValue([requestedAttributes,
                         subPath = path + nameAndvirtualInode.first,
                         objectStore,
-                        fetchContext =
-                            fetchContext.copy()](VirtualInode virtualInode) {
+                        fetchContext = fetchContext.copy(),
+                        shouldFetchTreeMetadata](VirtualInode virtualInode) {
               return virtualInode.getEntryAttributes(
-                  requestedAttributes, subPath, objectStore, fetchContext);
+                  requestedAttributes,
+                  subPath,
+                  objectStore,
+                  fetchContext,
+                  shouldFetchTreeMetadata);
             }));
   }
   return collectAll(std::move(attributesFutures))

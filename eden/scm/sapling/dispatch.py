@@ -331,42 +331,6 @@ def dispatch(req):
         ui = req.ui
         if ui.logmeasuredtimes:
             ui.log("measuredtimes", **(ui._measuredtimes))
-        hgmetrics = bindings.hgmetrics.summarize()
-        if hgmetrics:
-            # Comma-separated list of metric prefixes to skip
-            # TODO(meyer): Just skip printing metrics, rather than skipping logging them entirely.
-            skip = ui.configlist("devel", "skip-metrics", [])
-            # Re-arrange metrics so "a_b_c", "a_b_d", "a_c" becomes
-            # {'a': {'b': {'c': ..., 'd': ...}, 'c': ...}
-            metrics = {}
-            splitre = re.compile(r"_|/|\.")
-            for key, value in hgmetrics.items():
-                for prefix in skip:
-                    if key.startswith(prefix):
-                        break
-                else:
-                    cur = metrics
-                    names = splitre.split(key)
-                    for name in names[:-1]:
-                        cur = cur.setdefault(name, {})
-                    cur[names[-1]] = value
-            # pprint.pformat stablizes the output
-            from pprint import pformat
-
-            if metrics:
-                # developer config: devel.print-metrics
-
-                # This used to be a bool, but I changed it to a prefix list. Keep previous
-                # behavior around by using empty prefix to mean print everything.
-                prefix = ui.config("devel", "print-metrics")
-                if prefix == "":
-                    # Print it out.
-                    msg = "%s\n" % pformat({"metrics": metrics}).replace("'", " ")
-                    ui.flush()
-                    ui.write_err(msg, label="hgmetrics")
-
-                # Write to blackbox
-                ui.log("metrics", pformat({"metrics": metrics}, width=1024))
         blackbox.sync()
 
     versionthresholddays = req.ui.configint("ui", "version-age-threshold-days")
@@ -633,6 +597,11 @@ def _callcatch(ui, req, func):
             debugmod = getdebugmod()
             if not ui.tracebackflag:
                 ui.write_err(util.smartformatexc())
+
+            # disable progress bar to avoid polluting the pdb debugger when typing
+            if ui.configbool("devel", "debugger.noprogress", True):
+                util.get_main_io().disable_progress()
+
             debugmod.post_mortem(sys.exc_info()[2])
             os._exit(255)
         if not handlecommandexception(ui):
@@ -784,6 +753,7 @@ def runcommand(
 
     try:
         hintutil.loadhintconfig(lui)
+        bindings.dag.configure(lui._rcfg)
         ui.log("jobid", jobid=encoding.environ.get("HG_JOB_ID", "unknown"))
         ret = _runcommand(ui, options, cmd, d)
 
@@ -826,8 +796,7 @@ def runcommand(
 
 def _log_exception(lui, e):
     try:
-        lui.log(
-            "exceptions",
+        lui.log_exception(
             exception_type=type(e).__name__,
             exception_msg=str(e),
             source="log_exception",
@@ -835,8 +804,7 @@ def _log_exception(lui, e):
     except Exception as e:
         try:
             wrapped = error.ProgrammingError("failed to log exception: {!r}".format(e))
-            lui.log(
-                "exceptions",
+            lui.log_exception(
                 exception_type=type(wrapped).__name__,
                 exception_msg=str(wrapped),
                 source="log_exception_wrapped",
@@ -940,7 +908,9 @@ def _dispatch(req):
 
         cmd, func, args, options, cmdoptions, foundaliases = _parse(lui, args)
 
-        tracing.debug(target="command_info", command=cmd)
+        tracing.debug(
+            target="command_info", command=getattr(func, "legacyname", None) or cmd
+        )
 
         lui.cmdname = ui.cmdname = cmd
         lui.cmdtype = ui.cmdtype = getattr(func, "cmdtype", None)
@@ -965,20 +935,30 @@ def _dispatch(req):
         i18n.init()
 
         if options["config"] != req.earlyoptions["config"]:
-            raise error.Abort(_("option --config may not be abbreviated!"))
+            raise error.Abort(
+                _(
+                    "option --config may not be abbreviated, used in aliases, or used as a value for another option"
+                )
+            )
         if options["configfile"] != req.earlyoptions["configfile"]:
-            raise error.Abort(_("option --configfile may not be abbreviated!"))
+            raise error.Abort(
+                _("option --configfile may not be abbreviated or used in aliases")
+            )
         if options["cwd"] != req.earlyoptions["cwd"]:
-            raise error.Abort(_("option --cwd may not be abbreviated!"))
+            raise error.Abort(
+                _("option --cwd may not be abbreviated or used in aliases")
+            )
         if options["repository"] != req.earlyoptions["repository"]:
             raise error.Abort(
                 _(
-                    "option -R has to be separated from other options (e.g. not "
-                    "-qR) and --repository may only be abbreviated as --repo!"
+                    "option -R must appear alone, and --repository may not be "
+                    "abbreviated or used in aliases"
                 )
             )
         if options["debugger"] != req.earlyoptions["debugger"]:
-            raise error.Abort(_("option --debugger may not be abbreviated!"))
+            raise error.Abort(
+                _("option --debugger may not be abbreviated or used in aliases")
+            )
         # don't validate --profile/--traceback, which can be enabled from now
 
         if options["time"]:

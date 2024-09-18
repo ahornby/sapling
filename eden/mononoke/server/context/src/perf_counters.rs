@@ -78,6 +78,7 @@ define_perf_counters! {
         EdenapiTrees,
         EdenapiTreesAuxData,
         EdenapiAugmentedTrees,
+        EdenapiAugmentedTreesFallback,
         GetbundleFilenodesTotalWeight,
         GetbundleNumCommits,
         GetbundleNumDrafts,
@@ -184,6 +185,7 @@ impl PerfCounterType {
             | EdenapiTrees
             | EdenapiTreesAuxData
             | EdenapiAugmentedTrees
+            | EdenapiAugmentedTreesFallback
             | GetbundleFilenodesTotalWeight
             | GetbundleNumCommits
             | GetbundleNumDrafts
@@ -300,9 +302,11 @@ impl PerfCounters {
 
 #[cfg(test)]
 mod test {
+    use mononoke_macros::mononoke;
+
     use super::*;
 
-    #[test]
+    #[mononoke::test]
     fn test_perf_counter() {
         // NOTE: This test doesn't try to do anything fancy or test concurrency. It does however
         // check that we pass valid values for Ordering (invalid values panic on atomics).

@@ -584,11 +584,13 @@ impl Arbitrary for BonsaiAnnotatedTag {
 mod test {
     use std::str::FromStr;
 
+    use mononoke_macros::mononoke;
     use quickcheck::quickcheck;
     use sorted_vector_map::sorted_vector_map;
 
     use super::*;
     use crate::file_change::FileType;
+    use crate::file_change::GitLfs;
     use crate::hash::Blake2;
     use crate::typed_hash::ContentId;
 
@@ -608,7 +610,7 @@ mod test {
         }
     }
 
-    #[test]
+    #[mononoke::test]
     fn fixed_blob() {
         let tc = BonsaiChangesetMut {
             parents: vec![ChangesetId::from_byte_array([3; 32])],
@@ -626,6 +628,7 @@ mod test {
                     FileType::Regular,
                     42,
                     None,
+                    GitLfs::FullContent,
                 ),
                 NonRootMPath::new("c/d").unwrap() => FileChange::tracked(
                     ContentId::from_byte_array([2; 32]),
@@ -635,6 +638,7 @@ mod test {
                         NonRootMPath::new("e/f").unwrap(),
                         ChangesetId::from_byte_array([3; 32]),
                     )),
+                    GitLfs::FullContent,
                 ),
                 NonRootMPath::new("g/h").unwrap() => FileChange::Deletion,
                 NonRootMPath::new("i/j").unwrap() => FileChange::Deletion,
@@ -655,7 +659,7 @@ mod test {
         );
     }
 
-    #[test]
+    #[mononoke::test]
     fn invalid_author_committer() {
         let invalid_author = BonsaiChangesetMut {
             parents: vec![],
@@ -692,7 +696,7 @@ mod test {
         assert!(invalid_committer.freeze().is_err());
     }
 
-    #[test]
+    #[mononoke::test]
     fn bonsai_snapshots() {
         fn create(untracked: bool, missing: bool, is_snapshot: bool) -> Result<BonsaiChangeset> {
             let mut file_changes = sorted_vector_map! [
@@ -701,6 +705,7 @@ mod test {
                     FileType::Regular,
                     42,
                     None,
+                    GitLfs::canonical_pointer(),
                 ),
                 NonRootMPath::new("b").unwrap() => FileChange::Deletion,
             ];
@@ -744,7 +749,7 @@ mod test {
         create(true, true, false).unwrap_err();
     }
 
-    #[test]
+    #[mononoke::test]
     fn invalid_git_tree_bonsai_changeset() {
         let changeset = BonsaiChangesetMut {
             parents: vec![ChangesetId::from_byte_array([3; 32])],
@@ -783,6 +788,7 @@ mod test {
                     FileType::Regular,
                     42,
                     None,
+                    GitLfs::FullContent,
                 ),
                 NonRootMPath::new("b").unwrap() => FileChange::Deletion,
             ],
@@ -799,7 +805,7 @@ mod test {
             .expect_err("Changeset representing Git trees can't have file changes");
     }
 
-    #[test]
+    #[mononoke::test]
     fn valid_git_tree_bonsai_changeset() {
         let changeset = BonsaiChangesetMut {
             parents: vec![],
@@ -822,7 +828,7 @@ mod test {
         changeset.freeze().unwrap();
     }
 
-    #[test]
+    #[mononoke::test]
     fn valid_git_extra_headers_bonsai_changeset() {
         let changeset = BonsaiChangesetMut {
             parents: vec![ChangesetId::from_byte_array([3; 32])],
@@ -841,6 +847,7 @@ mod test {
                     FileType::Regular,
                     42,
                     None,
+                    GitLfs::canonical_pointer(),
                 ),
                 NonRootMPath::new("b").unwrap() => FileChange::Deletion,
             ],
@@ -851,7 +858,7 @@ mod test {
         changeset.freeze().unwrap();
     }
 
-    #[test]
+    #[mononoke::test]
     fn invalid_git_tag_bonsai_changeset() {
         let changeset = BonsaiChangesetMut {
             parents: vec![ChangesetId::from_byte_array([3; 32])],
@@ -893,6 +900,7 @@ mod test {
                     FileType::Regular,
                     42,
                     None,
+                    GitLfs::FullContent,
                 ),
                 NonRootMPath::new("b").unwrap() => FileChange::Deletion,
             ],
@@ -933,7 +941,7 @@ mod test {
         );
     }
 
-    #[test]
+    #[mononoke::test]
     fn valid_git_tag_bonsai_changeset() {
         let changeset = BonsaiChangesetMut {
             parents: vec![],
@@ -955,7 +963,7 @@ mod test {
         changeset.freeze().unwrap();
     }
 
-    #[test]
+    #[mononoke::test]
     fn valid_git_tag_bonsai_changeset_with_author_and_message() {
         let changeset = BonsaiChangesetMut {
             parents: vec![],

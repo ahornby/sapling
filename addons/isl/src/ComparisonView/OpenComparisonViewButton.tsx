@@ -10,11 +10,10 @@ import type {Comparison} from 'shared/Comparison';
 
 import {T, t} from '../i18n';
 import {short} from '../utils';
-import {currentComparisonMode} from './atoms';
-import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
-import {useSetAtom} from 'jotai';
+import {showComparison} from './atoms';
+import {Button} from 'isl-components/Button';
+import {Icon} from 'isl-components/Icon';
 import {ComparisonType} from 'shared/Comparison';
-import {Icon} from 'shared/Icon';
 
 export function OpenComparisonViewButton({
   comparison,
@@ -27,19 +26,18 @@ export function OpenComparisonViewButton({
 }) {
   const isFake =
     comparison.type === ComparisonType.Committed && comparison.hash.startsWith('OPTIMISTIC');
-  const setComparisonMode = useSetAtom(currentComparisonMode);
   return (
-    <VSCodeButton
+    <Button
       data-testid={`open-comparison-view-button-${comparison.type}`}
-      appearance="icon"
+      icon
       disabled={isFake}
       onClick={() => {
         onClick?.();
-        setComparisonMode({comparison, visible: true});
+        showComparison(comparison);
       }}>
       <Icon icon="files" slot="start" />
       {isFake ? <T>View Changes</T> : buttonText ?? buttonLabelForComparison(comparison)}
-    </VSCodeButton>
+    </Button>
   );
 }
 

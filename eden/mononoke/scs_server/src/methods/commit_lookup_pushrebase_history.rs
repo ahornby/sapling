@@ -5,12 +5,14 @@
  * GNU General Public License version 2.
  */
 
+use std::cmp::Ordering;
 use std::iter::once;
 use std::sync::Arc;
 
 use context::CoreContext;
 use metaconfig_types::CommonCommitSyncConfig;
 use mononoke_api::Mononoke;
+use mononoke_api::Repo;
 use mononoke_api::RepoContext;
 use mononoke_types::ChangesetId;
 use phases::PhasesRef;
@@ -43,7 +45,7 @@ impl RepoChangeset {
 // mappings.
 struct RepoChangesetsPushrebaseHistory {
     ctx: CoreContext,
-    mononoke: Arc<Mononoke>,
+    mononoke: Arc<Mononoke<Repo>>,
     head: RepoChangeset,
     changesets: Vec<RepoChangeset>,
 }
@@ -51,7 +53,7 @@ struct RepoChangesetsPushrebaseHistory {
 impl RepoChangesetsPushrebaseHistory {
     fn new(
         ctx: CoreContext,
-        mononoke: Arc<Mononoke>,
+        mononoke: Arc<Mononoke<Repo>>,
         repo_name: String,
         changeset: ChangesetId,
     ) -> Self {
@@ -70,7 +72,15 @@ impl RepoChangesetsPushrebaseHistory {
         }
     }
 
-    async fn repo(&self, repo_name: &String) -> Result<RepoContext, errors::ServiceError> {
+    fn second_last(&self) -> Option<RepoChangeset> {
+        match self.changesets.len().cmp(&1) {
+            Ordering::Greater => self.changesets.get(self.changesets.len() - 2).cloned(),
+            Ordering::Equal => Some(self.head.clone()),
+            Ordering::Less => None,
+        }
+    }
+
+    async fn repo(&self, repo_name: &String) -> Result<RepoContext<Repo>, errors::ServiceError> {
         let repo = self
             .mononoke
             .repo(self.ctx.clone(), repo_name)
@@ -85,7 +95,7 @@ impl RepoChangesetsPushrebaseHistory {
         let RepoChangeset(repo_name, bcs_id) = &self.head;
         let repo = self.repo(repo_name).await?;
         let is_public = repo
-            .blob_repo()
+            .repo()
             .phases()
             .get_public(&self.ctx, vec![*bcs_id], true /* ephemeral_derive */)
             .await
@@ -105,7 +115,7 @@ impl RepoChangesetsPushrebaseHistory {
         let RepoChangeset(repo_name, bcs_id) = self.last();
         let repo = self.repo(&repo_name).await?;
         let bcs_ids = repo
-            .blob_repo()
+            .repo()
             .pushrebase_mutation_mapping()
             .get_prepushrebase_ids(&self.ctx, bcs_id)
             .await
@@ -113,10 +123,17 @@ impl RepoChangesetsPushrebaseHistory {
         let mut iter = bcs_ids.iter();
         match (iter.next(), iter.next()) {
             (None, _) => Ok(false),
-            (Some(bcs_id), None) => {
-                self.changesets
-                    .push(RepoChangeset(repo_name.clone(), *bcs_id));
-                Ok(true)
+            (Some(prepushrebase_bcs_id), None) => {
+                if *prepushrebase_bcs_id == bcs_id {
+                    // When no actual pushrebase is performed, we have the situation where the
+                    // prepushrebase commit is the same as the landed commit. We should report that
+                    // there was no pushrebase performed to be correct.
+                    Ok(false)
+                } else {
+                    self.changesets
+                        .push(RepoChangeset(repo_name.clone(), *prepushrebase_bcs_id));
+                    Ok(true)
+                }
             }
             (Some(_), Some(_)) => Err(errors::internal_error(format!(
                 "pushrebase mapping is ambiguous in repo {} for {}: {:?} (expected only one)",
@@ -126,8 +143,15 @@ impl RepoChangesetsPushrebaseHistory {
         }
     }
 
-    async fn try_traverse_commit_sync(&mut self) -> Result<bool, errors::ServiceError> {
-        let RepoChangeset(repo_name, bcs_id) = self.last();
+    async fn try_traverse_commit_sync(
+        &mut self,
+        changeset: Option<RepoChangeset>,
+    ) -> Result<bool, errors::ServiceError> {
+        let RepoChangeset(repo_name, bcs_id) = match changeset {
+            Some(changeset) => changeset,
+            None => self.last(),
+        };
+
         let repo = self.repo(&repo_name).await?;
 
         let maybe_common_commit_sync_config = repo
@@ -147,7 +171,7 @@ impl RepoChangesetsPushrebaseHistory {
     // Only needed for better code readability
     async fn try_traverse_commit_sync_inner(
         &mut self,
-        repo: RepoContext,
+        repo: RepoContext<Repo>,
         bcs_id: ChangesetId,
         config: CommonCommitSyncConfig,
     ) -> Result<bool, errors::ServiceError> {
@@ -164,27 +188,25 @@ impl RepoChangesetsPushrebaseHistory {
         for target_repo_id in target_repo_ids.into_iter() {
             let entries = repo
                 .synced_commit_mapping()
-                .get(&self.ctx, repo.repoid(), bcs_id, target_repo_id)
+                .get_maybe_stale(&self.ctx, repo.repoid(), bcs_id, target_repo_id)
                 .await
                 .map_err(errors::internal_error)?;
             if let Some(target_repo_name) = self.mononoke.repo_name_from_id(target_repo_id) {
-                synced_changesets.extend(entries.into_iter().filter_map(
-                    |(cs, _, maybe_source_repo)| {
-                        let traverse = match maybe_source_repo {
-                            // source_repo information can be absent e.g. for old commits but
-                            // let's still traverse the mapping because in most cases we will
-                            // get the correct result.
-                            None => true,
-                            Some(source_repo) if source_repo == expected_sync_origin => true,
-                            _ => false,
-                        };
-                        if traverse {
-                            Some(RepoChangeset(target_repo_name.clone(), cs))
-                        } else {
-                            None
-                        }
-                    },
-                ));
+                synced_changesets.extend(entries.into_iter().filter_map(|entry| {
+                    let traverse = match entry.maybe_source_repo {
+                        // source_repo information can be absent e.g. for old commits but
+                        // let's still traverse the mapping because in most cases we will
+                        // get the correct result.
+                        None => true,
+                        Some(source_repo) if source_repo == expected_sync_origin => true,
+                        _ => false,
+                    };
+                    if traverse {
+                        Some(RepoChangeset(target_repo_name.clone(), entry.target_bcs_id))
+                    } else {
+                        None
+                    }
+                }));
             }
         }
 
@@ -242,12 +264,20 @@ impl SourceControlServiceImpl {
         let mut pushrebased = false;
         if history.try_traverse_pushrebase().await? {
             pushrebased = true;
-        } else if history.try_traverse_commit_sync().await? {
+        } else if history.try_traverse_commit_sync(None).await? {
             pushrebased = history.try_traverse_pushrebase().await?;
         }
 
         if pushrebased {
-            history.try_traverse_commit_sync().await?;
+            if !history.try_traverse_commit_sync(None).await? {
+                // In some scenarios, like the forward sync, we do not add the mapping for `small
+                // repository commit -> prepushrebase commit in large repository`. So, we just use
+                // a workaround here which is to look for the `small repository commit -> synced
+                // large repository commit` mapping which does always exist.
+                history
+                    .try_traverse_commit_sync(history.second_last())
+                    .await?;
+            }
         }
 
         Ok(history.into_thrift())

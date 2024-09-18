@@ -3,7 +3,6 @@
 
 #inprocess-hg-incompatible
 
-  $ disable treemanifest
 test command parsing and dispatch
 
   $ hg init a
@@ -44,30 +43,28 @@ Missing parameter for early option:
 
 Parsing of early options should stop at "--":
 
-  $ hg cat -- --config=hooks.pre-cat=false
-  --config=hooks.pre-cat=false: no such file in rev cb9a9f314b8b
-  [1]
-  $ hg cat -- --debugger
-  --debugger: no such file in rev cb9a9f314b8b
-  [1]
+  $ hg debug-args -- --config=hooks.pre-cat=false
+  ["--config=hooks.pre-cat=false"]
+  $ hg debug-args -- --debugger
+  ["--debugger"]
 
 Unparsable form of early options:
 
   $ hg cat --debugg
-  abort: option --debugger may not be abbreviated!
+  abort: option --debugger may not be abbreviated or used in aliases
   [255]
 
 Parsing failure of early options should be detected before executing the
 command:
 
   $ hg log -b '--config=hooks.pre-log=false' default
-  abort: option --config may not be abbreviated!
+  abort: option --config may not be abbreviated, used in aliases, or used as a value for another option
   [255]
   $ hg log -b -R. default
-  abort: option -R has to be separated from other options (e.g. not -qR) and --repository may only be abbreviated as --repo!
+  abort: option -R must appear alone, and --repository may not be abbreviated or used in aliases
   [255]
   $ hg log --cwd .. -b --cwd=. default
-  abort: option --cwd may not be abbreviated!
+  abort: option --cwd may not be abbreviated or used in aliases
   [255]
 
 However, we can't prevent it from loading extensions and configs:
@@ -77,10 +74,11 @@ However, we can't prevent it from loading extensions and configs:
   > EOF
   $ hg log -b '--config=extensions.bad=bad.py' default
   warning: extension bad is disabled because it cannot be imported from bad.py: bad
-  abort: option --config may not be abbreviated!
+  abort: option --config may not be abbreviated, used in aliases, or used as a value for another option
   [255]
 
   $ mkdir -p badrepo/.hg
+  $ touch badrepo/.hg/requires
   $ echo 'invalid-syntax' > badrepo/.hg/hgrc
   $ hg log -b -Rbadrepo default
   hg: parse errors: "$TESTTMP/a/badrepo/.hg/hgrc":
@@ -102,18 +100,18 @@ Early options can't be specified in [aliases] and [defaults] because they are
 applied before the command name is resolved:
 
   $ hg log -b '--config=alias.log=log --config=hooks.pre-log=false'
-  abort: option --config may not be abbreviated!
+  abort: option --config may not be abbreviated, used in aliases, or used as a value for another option
   [255]
 
   $ hg log -b '--config=defaults.log=--config=hooks.pre-log=false'
-  abort: option --config may not be abbreviated!
+  abort: option --config may not be abbreviated, used in aliases, or used as a value for another option
   [255]
 
 XXX: Should we support this?
 Shell aliases bypass any command parsing rules but for the early one:
 
   $ hg log -b '--config=alias.log=!echo howdy'
-  abort: option --config may not be abbreviated!
+  abort: option --config may not be abbreviated, used in aliases, or used as a value for another option
   [255]
 
 For compatibility reasons, HGPLAIN=+strictflags is not enabled by plain HGPLAIN:
@@ -133,7 +131,6 @@ For compatibility reasons, HGPLAIN=+strictflags is not enabled by plain HGPLAIN:
   > cat = -r null
   > EOF
   $ hg cat a
-  a: no such file in rev 000000000000
   [1]
 
   $ cd "$TESTTMP"

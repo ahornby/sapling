@@ -12,7 +12,7 @@ clidispatch = { version = "0.1.0", path = "../../lib/clidispatch" }
 commands = { version = "0.1.0", path = "../../lib/commands", default-features = false }
 configparser = { package = "configloader", version = "0.1.0", path = "../../lib/config/loader" }
 pyblackbox = { path = "../../saplingnative/bindings/modules/pyblackbox" }
-tracing = { version = "0.1.40", features = ["attributes"] }
+tracing = { version = "0.1.40", features = ["attributes", "valuable"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 dirs = { version = "2.0", optional = true }
@@ -28,8 +28,8 @@ libc = "0.2.139"
 webview-app = { version = "0.1.0", path = "../../lib/webview-app" }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-anyhow = "1.0.75"
-winapi = { version = "0.3", features = ["everything"] }
+anyhow = "1.0.86"
+winapi = { version = "0.3", features = ["everything", "std"] }
 
 [features]
 buildinfo = []

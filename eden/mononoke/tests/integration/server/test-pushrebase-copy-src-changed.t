@@ -7,7 +7,8 @@
   $ . "${TEST_FIXTURES}/library.sh"
 
 setup configuration
-  $ setup_common_config "blob_files"
+  $ setconfig push.edenapi=true
+  $ ENABLE_API_WRITES=1 setup_common_config "blob_files"
   $ cd $TESTTMP
 
 setup common configuration
@@ -19,9 +20,8 @@ setup common configuration
   > EOF
 
 setup repo
-  $ hg init repo-hg
-  $ cd repo-hg
-  $ setup_hg_server
+  $ hginit_treemanifest repo
+  $ cd repo
   $ hg debugdrawdag <<EOF
   > C
   > |
@@ -32,18 +32,16 @@ setup repo
 
 Clone the repo
   $ cd ..
-  $ hgclone_treemanifest ssh://user@dummy/repo-hg repo2 --noupdate --config extensions.remotenames= -q
+  $ hg clone -q mono:repo repo2 --noupdate
   $ cd repo2
-  $ setup_hg_client
   $ cat >> .hg/hgrc <<EOF
   > [extensions]
   > pushrebase =
-  > remotenames =
   > EOF
 
 
 Modify a file
-  $ cd ../repo-hg
+  $ cd ../repo
   $ hg up -q tip
   $ echo B > A
   $ hg ci -m 'modify copy source'
@@ -54,7 +52,7 @@ create master bookmark
 
 blobimport them into Mononoke storage and start Mononoke
   $ cd ..
-  $ blobimport repo-hg/.hg repo
+  $ blobimport repo/.hg repo
 
 start mononoke
   $ start_and_wait_for_mononoke_server
@@ -63,17 +61,14 @@ Create a copy on a client and push it
   $ hg up -q tip
   $ hg cp A D
   $ hg ci -m 'make a copy'
-  $ hgmn push -r . --to master_bookmark
-  pushing rev 726a45528732 to destination mononoke://$LOCALIP:$LOCAL_PORT/repo bookmark master_bookmark
-  searching for changes
-  remote: Command failed
-  remote:   Error:
-  remote:     pushrebase failed Conflicts([PushrebaseConflict { left: NonRootMPath("A"), right: NonRootMPath("A") }])
-  remote: 
-  remote:   Root cause:
-  remote:     pushrebase failed Conflicts([PushrebaseConflict { left: NonRootMPath("A"), right: NonRootMPath("A") }])
-  remote: 
-  remote:   Debug context:
-  remote:     "pushrebase failed Conflicts([PushrebaseConflict { left: NonRootMPath(\"A\"), right: NonRootMPath(\"A\") }])"
-  abort: unexpected EOL, expected netstring digit
+  $ hg push -r . --to master_bookmark
+  pushing rev 726a45528732 to destination https://localhost:$LOCAL_PORT/edenapi/ bookmark master_bookmark
+  edenapi: queue 1 commit for upload
+  edenapi: queue 1 file for upload
+  edenapi: uploaded 1 file
+  edenapi: queue 1 tree for upload
+  edenapi: uploaded 1 tree
+  edenapi: uploaded 1 changeset
+  pushrebasing stack (26805aba1e60, 726a45528732] (1 commit) to remote bookmark master_bookmark
+  abort: Server error: Conflicts while pushrebasing: [PushrebaseConflict { left: NonRootMPath("A"), right: NonRootMPath("A") }]
   [255]

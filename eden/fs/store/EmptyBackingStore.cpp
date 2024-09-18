@@ -52,6 +52,14 @@ SemiFuture<BackingStore::GetTreeResult> EmptyBackingStore::getTree(
       std::domain_error("empty backing store"));
 }
 
+folly::SemiFuture<BackingStore::GetTreeMetaResult>
+EmptyBackingStore::getTreeMetadata(
+    const ObjectId& /*id*/,
+    const ObjectFetchContextPtr& /*context*/) {
+  return makeSemiFuture<BackingStore::GetTreeMetaResult>(
+      std::domain_error("empty backing store"));
+}
+
 SemiFuture<BackingStore::GetBlobResult> EmptyBackingStore::getBlob(
     const ObjectId& /* id */,
     const ObjectFetchContextPtr& /* context */) {
@@ -63,6 +71,14 @@ SemiFuture<BackingStore::GetBlobMetaResult> EmptyBackingStore::getBlobMetadata(
     const ObjectId& /* id */,
     const ObjectFetchContextPtr& /* context */) {
   return makeSemiFuture<GetBlobMetaResult>(
+      std::domain_error("empty backing store"));
+}
+
+ImmediateFuture<BackingStore::GetGlobFilesResult>
+EmptyBackingStore::getGlobFiles(
+    const RootId& /* id */,
+    const std::vector<std::string>& /* globs */) {
+  return makeSemiFuture<GetGlobFilesResult>(
       std::domain_error("empty backing store"));
 }
 

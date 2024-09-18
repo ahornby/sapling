@@ -18,6 +18,7 @@
 #include <folly/logging/Logger.h>
 #include <folly/portability/GFlags.h>
 #include <chrono>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -37,9 +38,12 @@
 #include "eden/fs/inodes/InodeTimestamps.h"
 #include "eden/fs/inodes/Overlay.h"
 #include "eden/fs/inodes/VirtualInode.h"
+#include "eden/fs/journal/JournalDelta.h"
 #include "eden/fs/model/RootId.h"
 #include "eden/fs/service/gen-cpp2/eden_types.h"
 #include "eden/fs/store/BlobAccess.h"
+#include "eden/fs/store/ScmStatusCache.h"
+#include "eden/fs/store/ScmStatusDiffCallback.h"
 #include "eden/fs/takeover/TakeoverData.h"
 #include "eden/fs/telemetry/ActivityBuffer.h"
 #include "eden/fs/telemetry/IActivityRecorder.h"
@@ -288,8 +292,18 @@ struct ParentCommitState {
    */
   struct NoOngoingCheckout {};
 
-  /** A NORMAL or FORCE checkout is ongoing. */
-  struct CheckoutInProgress {};
+  /* Any kind of checkout (DRY_RUN, NORMAL or FORCE) is ongoing. */
+  struct CheckoutInProgress {
+    // Checkout progress info should exist iff a checkout is ongoing, and
+    // its existence should change in the same way a ParentCommitState does.
+    // We also want this progress info to be accessible in other places, which
+    // is why this is a shared pointer to the (current) checkout info struct.
+    // For now this is only an uint64_t, but soon this will change to hold
+    // a different struct.
+    // TODO(sggutier): remove the line above once the progress info becomes
+    // more complex.
+    std::shared_ptr<std::atomic<uint64_t>> checkoutProgress;
+  };
 
   /** A checkout was previously interrupted */
   struct InterruptedCheckout {
@@ -548,6 +562,8 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
     return parentState_.rlock()->workingCopyParentRootId;
   }
 
+  std::optional<int64_t> getCheckoutProgress() const;
+
   /**
    * Return the ObjectStore used by this mount point.
    */
@@ -601,7 +617,7 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
    *
    * The Journal is guaranteed to be valid for the lifetime of the EdenMount.
    */
-  Journal& getJournal() {
+  Journal& getJournal() const {
     return *journal_;
   }
 
@@ -1209,7 +1225,7 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
    */
   FOLLY_NODISCARD ImmediateFuture<folly::Unit> diff(
       TreeInodePtr rootInode,
-      DiffCallback* callback,
+      ScmStatusDiffCallback* callback,
       const RootId& commitHash,
       bool listIgnored,
       bool enforceCurrentParent,
@@ -1325,7 +1341,10 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
  private:
   ParentLock parentState_;
 
-  std::unique_ptr<Journal> journal_;
+  std::shared_ptr<Journal>
+      journal_; // since ScmStatusCache depends on Journal we would like Journal
+                // to outlive the cache
+
   folly::Synchronized<std::unique_ptr<IActivityRecorder>> activityRecorder_;
 
   /**
@@ -1444,6 +1463,8 @@ class EdenMount : public std::enable_shared_from_this<EdenMount> {
    * can be inline without having to include ServerState.h in this file.
    */
   std::shared_ptr<Clock> clock_;
+
+  mutable folly::Synchronized<std::shared_ptr<ScmStatusCache>> scmStatusCache_;
 };
 
 /**

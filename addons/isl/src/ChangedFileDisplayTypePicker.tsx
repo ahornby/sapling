@@ -6,14 +6,14 @@
  */
 
 import {Row} from './ComponentUtils';
-import {Tooltip} from './Tooltip';
 import {t, T} from './i18n';
 import {configBackedAtom} from './jotaiUtils';
-import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
+import {Button} from 'isl-components/Button';
+import {Icon} from 'isl-components/Icon';
+import {isMac} from 'isl-components/OperatingSystem';
+import {Tooltip} from 'isl-components/Tooltip';
 import {useAtom} from 'jotai';
 import {useContextMenu} from 'shared/ContextMenu';
-import {Icon} from 'shared/Icon';
-import {isMac} from 'shared/OperatingSystem';
 
 export type ChangedFilesDisplayType = 'short' | 'fullPaths' | 'tree' | 'fish';
 
@@ -58,13 +58,13 @@ export function ChangedFileDisplayTypePicker() {
           ? 'Change how file paths are displayed.\n\nTip: Hold the alt key to quickly see full file paths.'
           : 'Change how file paths are displayed.\n\nTip: Hold the ctrl key to quickly see full file paths.',
       )}>
-      <VSCodeButton
-        appearance="icon"
+      <Button
+        icon
         className="changed-file-display-type-picker"
         data-testid="changed-file-display-type-picker"
         onClick={contextMenu}>
         <Icon icon={ChangedFileDisplayTypeOptions[displayType].icon} />
-      </VSCodeButton>
+      </Button>
     </Tooltip>
   );
 }

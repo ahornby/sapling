@@ -40,7 +40,12 @@ from eden.fs.cli import util
 from eden.test_support.testcase import EdenTestCaseBase
 from eden.thrift import legacy
 
-from facebook.eden.ttypes import FaultDefinition, RemoveFaultArg, UnblockFaultArg
+from facebook.eden.ttypes import (
+    FaultDefinition,
+    GetBlockedFaultsRequest,
+    RemoveFaultArg,
+    UnblockFaultArg,
+)
 
 from . import edenclient, gitrepo, hgrepo, repobase, skip
 from .find_executables import FindExe
@@ -105,6 +110,9 @@ class EdenTestCase(EdenTestCaseBase):
         # during integration tests
         self.setenv("INTEGRATION_TEST", "1")
 
+        # Set this environment variable to enable Sl tracing during the test
+        # self.setenv("SL_LOG", "trace")
+
         self.setup_eden_test()
         self.report_time("test setup done")
 
@@ -139,11 +147,7 @@ class EdenTestCase(EdenTestCaseBase):
 
         extra_config = self.edenfs_extra_config()
         if extra_config:
-            with open(self.eden.system_rc_path, "w") as edenfsrc:
-                for key, values in extra_config.items():
-                    edenfsrc.write(f"[{key}]\n")
-                    for setting in values:
-                        edenfsrc.write(f"{setting}\n")
+            self.write_configs(extra_config, self.eden.system_rc_path)
 
         # Default to using the Rust version of commands when running
         # integration tests. An empty edenfsctl_rollout file means that all
@@ -175,6 +179,15 @@ class EdenTestCase(EdenTestCaseBase):
             extra_args=extra_args,
             storage_engine=storage_engine,
         )
+
+    def write_configs(
+        self, config_dict: Dict[str, List[str]], config_file_path
+    ) -> None:
+        with open(config_file_path, "w") as edenfs_config_file:
+            for section_name, lines in config_dict.items():
+                edenfs_config_file.write(f"[{section_name}]\n")
+                for setting in lines:
+                    edenfs_config_file.write(f"{setting}\n")
 
     @property
     def eden_dir(self) -> str:
@@ -247,7 +260,8 @@ class EdenTestCase(EdenTestCaseBase):
         {"namespace": ["key1=value1", "key2=value2"}
         """
         configs = {
-            "experimental": ["enable-nfs-server = true\nwindows-symlinks = false"]
+            "experimental": ["enable-nfs-server = true\nwindows-symlinks = false"],
+            "thrift": ["request-tree-metadata = true"],
         }
         if self.use_nfs():
             configs["clone"] = ['default-mount-protocol = "NFS"']
@@ -259,6 +273,8 @@ class EdenTestCase(EdenTestCaseBase):
             configs["nfs"] = ["allow-apple-double = false"]
             if "SANDCASTLE" in os.environ:
                 configs["redirections"] = ['darwin-redirection-type = "symlink"']
+        elif sys.platform == "win32":
+            configs["notifications"] = ['enable-eden-menu = "false"']
         return configs
 
     def create_hg_repo(
@@ -386,6 +402,11 @@ class EdenTestCase(EdenTestCaseBase):
         with open(self.eden.system_rollout_path, "w") as edenfsctl_rollout:
             edenfsctl_rollout.write(json.dumps(config))
 
+    def stat(self, path: str) -> os.stat_result:
+        """Stat the file at the specified path relative to the clone."""
+        fullpath = self.get_path(path)
+        return os.lstat(fullpath)
+
     @staticmethod
     def unix_only(fn):
         """
@@ -455,6 +476,26 @@ class EdenTestCase(EdenTestCaseBase):
         for _ in range(numToUnblock):
             util.poll_until(unblock, timeout=30)
 
+    def wait_on_fault_hit(self, key_class: str, num_to_hit=1) -> None:
+        """
+        This waits until we have 'num_to_hit' faults currently blocking.
+        """
+
+        def faults_hit() -> Optional[bool]:
+            with self.eden.get_thrift_client_legacy() as client:
+                blocked_faults = client.getBlockedFaults(
+                    GetBlockedFaultsRequest(keyclass=key_class)
+                ).keyValues
+            return True if len(blocked_faults) == num_to_hit else None
+
+        try:
+            util.poll_until(faults_hit, timeout=30)
+        except TimeoutError as e:
+            with self.eden.get_thrift_client_legacy() as client:
+                # this unblock all faults to avoid tests hang
+                client.unblockFault(UnblockFaultArg())
+            raise e
+
     @contextmanager
     def run_with_blocking_fault(
         self,
@@ -487,7 +528,6 @@ class EdenTestCase(EdenTestCaseBase):
                 )
 
 
-# pyre-ignore[13]: T62487924
 class EdenRepoTest(EdenTestCase):
     """
     Base class for EdenHgTest and EdenGitTest.
@@ -499,9 +539,13 @@ class EdenRepoTest(EdenTestCase):
     your tests once per supported repository type.
     """
 
+    # pyre-fixme[13]: Attribute `repo` is never initialized.
     repo: repobase.Repository
+    # pyre-fixme[13]: Attribute `repo_name` is never initialized.
     repo_name: str
+    # pyre-fixme[13]: Attribute `repo_type` is never initialized.
     repo_type: str
+    # pyre-fixme[13]: Attribute `inode_catalog_type` is never initialized.
     inode_catalog_type: str
 
     enable_logview: bool = False
@@ -764,7 +808,9 @@ class HgRepoTestMixin:
         # breaking resolution of create_repo().
         # pyre-fixme[16]: `HgRepoTestMixin` has no attribute `create_hg_repo`.
         return self.create_hg_repo(
-            name, init_configs=["experimental.windows-symlinks=True"], filtered=filtered
+            name,
+            init_configs=["experimental.windows-symlinks=True"],
+            filtered=filtered,
         )
 
 

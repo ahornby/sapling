@@ -6,11 +6,12 @@
  */
 
 use std::collections::HashMap;
+use std::str::FromStr;
 
-use edenapi_types::HgId;
+use clientinfo::ClientRequestInfo;
+use commit_cloud_types::WorkspaceLocalBookmark;
 use mercurial_types::HgChangesetId;
-use serde::Deserialize;
-use serde::Serialize;
+use sql::Transaction;
 
 use crate::sql::local_bookmarks_ops::DeleteArgs;
 use crate::sql::ops::Delete;
@@ -18,48 +19,55 @@ use crate::sql::ops::Insert;
 use crate::sql::ops::SqlCommitCloud;
 use crate::CommitCloudContext;
 
-#[derive(Clone, Serialize, Deserialize, Debug, PartialEq)]
-pub struct WorkspaceLocalBookmark {
-    pub name: String,
-    pub commit: HgChangesetId,
+pub fn lbs_from_map(map: &HashMap<String, String>) -> anyhow::Result<Vec<WorkspaceLocalBookmark>> {
+    map.iter()
+        .map(|(name, commit)| {
+            HgChangesetId::from_str(commit)
+                .and_then(|commit_id| WorkspaceLocalBookmark::new(name.to_string(), commit_id))
+        })
+        .collect()
+}
+
+pub fn lbs_to_map(list: Vec<WorkspaceLocalBookmark>) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for bookmark in list {
+        map.insert(bookmark.name().clone(), bookmark.commit().to_string());
+    }
+    map
 }
 
 pub async fn update_bookmarks(
     sql_commit_cloud: &SqlCommitCloud,
-    ctx: CommitCloudContext,
-    updated_bookmarks: HashMap<String, HgId>,
-    removed_bookmarks: Vec<HgId>,
-) -> anyhow::Result<()> {
+    mut txn: Transaction,
+    cri: Option<&ClientRequestInfo>,
+    ctx: &CommitCloudContext,
+    updated_bookmarks: HashMap<String, HgChangesetId>,
+    removed_bookmarks: Vec<String>,
+) -> anyhow::Result<Transaction> {
     if !removed_bookmarks.is_empty() {
-        let removed_commits = removed_bookmarks
-            .into_iter()
-            .map(|id| id.into())
-            .collect::<Vec<HgChangesetId>>();
-        let delete_args = DeleteArgs {
-            removed_bookmarks: removed_commits,
-        };
+        let delete_args = DeleteArgs { removed_bookmarks };
 
-        Delete::<WorkspaceLocalBookmark>::delete(
+        txn = Delete::<WorkspaceLocalBookmark>::delete(
             sql_commit_cloud,
+            txn,
+            cri,
             ctx.reponame.clone(),
             ctx.workspace.clone(),
             delete_args,
         )
         .await?;
     }
-
     for (name, book) in updated_bookmarks {
-        Insert::<WorkspaceLocalBookmark>::insert(
+        txn = Insert::<WorkspaceLocalBookmark>::insert(
             sql_commit_cloud,
+            txn,
+            cri,
             ctx.reponame.clone(),
             ctx.workspace.clone(),
-            WorkspaceLocalBookmark {
-                name,
-                commit: book.into(),
-            },
+            WorkspaceLocalBookmark::new(name, book)?,
         )
         .await?;
     }
 
-    Ok(())
+    Ok(txn)
 }

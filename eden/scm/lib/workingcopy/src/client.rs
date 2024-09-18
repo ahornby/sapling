@@ -8,11 +8,14 @@
 use std::any::Any;
 use std::collections::BTreeMap;
 
+use anyhow::bail;
 use anyhow::Result;
-use gitcompat::rungit::RunGitOptions;
+use gitcompat::rungit::RepoGit;
+use gitcompat::GitCmd;
 use types::workingcopy_client::CheckoutConflict;
 use types::workingcopy_client::CheckoutMode;
 use types::workingcopy_client::FileStatus;
+use types::workingcopy_client::ProgressInfo;
 use types::HgId;
 use types::RepoPathBuf;
 
@@ -34,6 +37,11 @@ pub trait WorkingCopyClient: Send + Sync {
     /// Set parents (tracked by the external program) without changing the working copy content.
     /// This is used by commands like `reset -k`.
     fn set_parents(&self, p1: HgId, p2: Option<HgId>, p1_tree: HgId) -> Result<()>;
+
+    /// Progress as reported by the external program (in reported units of
+    /// progress, not percentage).
+    /// When a checkout is not ongoing it returns None.
+    fn checkout_progress(&self) -> Result<Option<ProgressInfo>>;
 
     /// Checkout. Set parents and update working copy content.
     fn checkout(
@@ -73,12 +81,16 @@ impl WorkingCopyClient for edenfs_client::EdenFsClient {
         edenfs_client::EdenFsClient::checkout(self, node, tree_node, mode)
     }
 
+    fn checkout_progress(&self) -> Result<Option<ProgressInfo>> {
+        edenfs_client::EdenFsClient::checkout_progress(self)
+    }
+
     fn as_any(&self) -> &dyn Any {
         self as &dyn Any
     }
 }
 
-impl WorkingCopyClient for RunGitOptions {
+impl WorkingCopyClient for RepoGit {
     fn get_status(
         &self,
         node: HgId,
@@ -167,5 +179,9 @@ impl WorkingCopyClient for RunGitOptions {
 
     fn as_any(&self) -> &dyn Any {
         self as &dyn Any
+    }
+
+    fn checkout_progress(&self) -> Result<Option<ProgressInfo>> {
+        bail!("Progress for Git checkout not yet implemented!");
     }
 }

@@ -133,12 +133,13 @@ mod tests {
     use bonsai_hg_mapping::BonsaiHgMapping;
     use bookmarks::Bookmarks;
     use borrowed::borrowed;
-    use changesets::Changesets;
     use commit_graph::CommitGraph;
+    use commit_graph::CommitGraphWriter;
     use context::CoreContext;
     use fbinit::FacebookInit;
     use filenodes::Filenodes;
     use filestore::FilestoreConfig;
+    use mononoke_macros::mononoke;
     use mononoke_types::NonRootMPath;
     use repo_blobstore::RepoBlobstore;
     use repo_derived_data::RepoDerivedData;
@@ -164,14 +165,14 @@ mod tests {
         #[facet]
         pub(crate) commit_graph: CommitGraph,
         #[facet]
-        pub(crate) changesets: dyn Changesets,
+        pub(crate) commit_graph_writer: dyn CommitGraphWriter,
         #[facet]
         pub(crate) filenodes: dyn Filenodes,
         #[facet]
         pub(crate) repo_identity: RepoIdentity,
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_find_unode_rename_sources(fb: FacebookInit) -> Result<()> {
         let ctx = CoreContext::test_mock(fb);
         let repo: TestRepo = test_repo_factory::build_empty(ctx.fb).await?;

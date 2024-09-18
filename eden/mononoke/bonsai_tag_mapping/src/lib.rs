@@ -40,6 +40,14 @@ impl BonsaiTagMappingEntry {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum Freshness {
+    /// The mapping is guaranteed to be up to date
+    Latest,
+    /// The mapping may be stale and is subject to replication lag
+    MaybeStale,
+}
+
 #[facet::facet]
 #[async_trait]
 /// Facet trait representing Bonsai Changeset to Git Tag mapping
@@ -62,6 +70,7 @@ pub trait BonsaiTagMapping: Send + Sync {
     async fn get_entry_by_tag_name(
         &self,
         tag_name: String,
+        freshness: Freshness,
     ) -> Result<Option<BonsaiTagMappingEntry>>;
 
     /// Fetch the tag mapping entries corresponding to the input changeset id
@@ -83,4 +92,7 @@ pub trait BonsaiTagMapping: Send + Sync {
 
     /// Add new tag name to bonsai changeset mappings
     async fn add_or_update_mappings(&self, entries: Vec<BonsaiTagMappingEntry>) -> Result<()>;
+
+    /// Delete existing bonsai tag mappings based on the input tag names
+    async fn delete_mappings_by_name(&self, tag_names: Vec<String>) -> Result<()>;
 }

@@ -10,21 +10,24 @@ use std::str::FromStr;
 
 use anyhow::Error;
 use assert_matches::assert_matches;
+use bulk_derivation::BulkDerivation;
 use bytes::Bytes;
 use chrono::FixedOffset;
 use chrono::TimeZone;
-use derived_data_utils::derived_data_utils;
 use fbinit::FacebookInit;
 use fixtures::Linear;
 use fixtures::ManyFilesDirs;
 use fixtures::TestRepoFixture;
 use futures::try_join;
+use mononoke_macros::mononoke;
 use mononoke_types::hash::Sha256;
 use mononoke_types::path::MPath;
 use mononoke_types::DerivableType;
 use repo_derived_data::RepoDerivedDataArc;
+use repo_derived_data::RepoDerivedDataRef;
 use smallvec::SmallVec;
 
+use crate::repo::create_changeset::CreateChangeFileContents;
 use crate::ChangesetContext;
 use crate::ChangesetId;
 use crate::CoreContext;
@@ -34,10 +37,11 @@ use crate::CreateInfo;
 use crate::FileType;
 use crate::Mononoke;
 use crate::MononokeError;
+use crate::MononokeRepo;
 use crate::RepoContext;
 use crate::StoreRequest;
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_create_commit(fb: FacebookInit) -> Result<(), Error> {
     create_commit(fb, DerivableType::SkeletonManifests).await?;
 
@@ -52,11 +56,8 @@ async fn create_commit(
     derived_data_to_derive: DerivableType,
 ) -> Result<(), Error> {
     let ctx = CoreContext::test_mock(fb);
-    let mononoke = Mononoke::new_test(vec![(
-        "test".to_string(),
-        Linear::get_custom_test_repo(fb).await,
-    )])
-    .await?;
+    let mononoke =
+        Mononoke::new_test(vec![("test".to_string(), Linear::get_repo(fb).await)]).await?;
     let repo = mononoke
         .repo(ctx.clone(), "test")
         .await?
@@ -79,13 +80,7 @@ async fn create_commit(
     let mut changes: BTreeMap<MPath, CreateChange> = BTreeMap::new();
     changes.insert(
         MPath::try_from("TEST_CREATE")?,
-        CreateChange::Tracked(
-            CreateChangeFile::New {
-                bytes: Bytes::from("TEST CREATE\n"),
-                file_type: FileType::Regular,
-            },
-            None,
-        ),
+        CreateChange::Tracked(CreateChangeFile::new_regular("TEST CREATE\n"), None),
     );
 
     // Pre-upload the file content for the second commit, and check its hash
@@ -102,7 +97,7 @@ async fn create_commit(
         )
         .await?;
 
-    let cs = repo
+    let (_hg_extra, cs) = repo
         .create_changeset(
             parents,
             CreateInfo {
@@ -122,15 +117,18 @@ async fn create_commit(
     changes.insert(
         MPath::try_from("TEST_CREATE")?,
         CreateChange::Tracked(
-            CreateChangeFile::Existing {
-                file_id,
+            CreateChangeFile {
+                contents: CreateChangeFileContents::Existing {
+                    file_id,
+                    maybe_size: None,
+                },
                 file_type: FileType::Regular,
-                maybe_size: None,
+                git_lfs: None,
             },
             None,
         ),
     );
-    let second_cs = repo
+    let (_hg_extra, second_cs) = repo
         .create_changeset(
             vec![cs.id()],
             CreateInfo {
@@ -185,30 +183,23 @@ async fn create_commit(
 // We expect that after creating a commit only derived a single specific derived data
 // type is derived for a parent changeset, and none derived for the newly created changeset.
 // This function validates it's actualy the case
-async fn validate_unnecessary_derived_data_is_not_derived(
+async fn validate_unnecessary_derived_data_is_not_derived<R: MononokeRepo>(
     ctx: &CoreContext,
-    repo: &RepoContext,
+    repo: &RepoContext<R>,
     parent_cs_id: ChangesetId,
     cs_id: ChangesetId,
     derived_data_to_derive: DerivableType,
 ) -> Result<(), Error> {
-    for ty in &repo
-        .blob_repo()
-        .repo_derived_data_arc()
-        .active_config()
-        .types
-    {
+    for ty in &repo.repo().repo_derived_data_arc().active_config().types {
         if *ty == DerivableType::GitTrees {
             // Derived data utils doesn't support git_trees, so we have to skip it
             continue;
         }
-        let utils = derived_data_utils(ctx.fb, repo.blob_repo(), *ty)?;
-        let not_derived = utils
-            .pending(
-                ctx.clone(),
-                repo.blob_repo().repo_derived_data_arc(),
-                vec![parent_cs_id, cs_id],
-            )
+        let not_derived = repo
+            .repo()
+            .repo_derived_data()
+            .manager()
+            .pending(ctx, &[parent_cs_id, cs_id], None, *ty)
             .await?;
         // It's expected to derive skeleton manifests for the parent commit
         if *ty == derived_data_to_derive {
@@ -221,12 +212,12 @@ async fn validate_unnecessary_derived_data_is_not_derived(
     Ok(())
 }
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn create_commit_bad_changes(fb: FacebookInit) -> Result<(), Error> {
     let ctx = CoreContext::test_mock(fb);
     let mononoke = Mononoke::new_test(vec![(
         "test".to_string(),
-        ManyFilesDirs::get_custom_test_repo(fb).await,
+        ManyFilesDirs::get_repo(fb).await,
     )])
     .await?;
     let repo = mononoke
@@ -236,10 +227,10 @@ async fn create_commit_bad_changes(fb: FacebookInit) -> Result<(), Error> {
         .build()
         .await?;
 
-    async fn create_changeset(
-        repo: &RepoContext,
+    async fn create_changeset<R: MononokeRepo>(
+        repo: &RepoContext<R>,
         changes: BTreeMap<MPath, CreateChange>,
-    ) -> Result<ChangesetContext, MononokeError> {
+    ) -> Result<ChangesetContext<R>, MononokeError> {
         let parent_hash = "b0d1bf77898839595ee0f0cba673dd6e3be9dadaaa78bc6dd2dea97ca6bee77e";
         let parents = vec![ChangesetId::from_str(parent_hash)?];
         let author = String::from("Test Author <test@example.com>");
@@ -269,6 +260,7 @@ async fn create_commit_bad_changes(fb: FacebookInit) -> Result<(), Error> {
             bubble,
         )
         .await
+        .map(|(_hg_extra, cs)| cs)
     }
 
     // Cannot delete a file that is not there
@@ -283,13 +275,7 @@ async fn create_commit_bad_changes(fb: FacebookInit) -> Result<(), Error> {
     let mut changes: BTreeMap<MPath, CreateChange> = BTreeMap::new();
     changes.insert(
         MPath::try_from("1/TEST_CREATE")?,
-        CreateChange::Tracked(
-            CreateChangeFile::New {
-                bytes: Bytes::from("test"),
-                file_type: FileType::Regular,
-            },
-            None,
-        ),
+        CreateChange::Tracked(CreateChangeFile::new_regular("test"), None),
     );
     assert_matches!(
         create_changeset(&repo, changes.clone()).await,
@@ -304,23 +290,11 @@ async fn create_commit_bad_changes(fb: FacebookInit) -> Result<(), Error> {
     let mut changes: BTreeMap<MPath, CreateChange> = BTreeMap::new();
     changes.insert(
         MPath::try_from("TEST_CREATE")?,
-        CreateChange::Tracked(
-            CreateChangeFile::New {
-                bytes: Bytes::from("test"),
-                file_type: FileType::Regular,
-            },
-            None,
-        ),
+        CreateChange::Tracked(CreateChangeFile::new_regular("test"), None),
     );
     changes.insert(
         MPath::try_from("TEST_CREATE/TEST_CREATE")?,
-        CreateChange::Tracked(
-            CreateChangeFile::New {
-                bytes: Bytes::from("test"),
-                file_type: FileType::Regular,
-            },
-            None,
-        ),
+        CreateChange::Tracked(CreateChangeFile::new_regular("test"), None),
     );
     assert_matches!(
         create_changeset(&repo, changes).await,
@@ -331,13 +305,7 @@ async fn create_commit_bad_changes(fb: FacebookInit) -> Result<(), Error> {
     let mut changes: BTreeMap<MPath, CreateChange> = BTreeMap::new();
     changes.insert(
         MPath::try_from("dir1")?,
-        CreateChange::Tracked(
-            CreateChangeFile::New {
-                bytes: Bytes::from("test"),
-                file_type: FileType::Regular,
-            },
-            None,
-        ),
+        CreateChange::Tracked(CreateChangeFile::new_regular("test"), None),
     );
     let cs1 = create_changeset(&repo, changes.clone()).await?;
 
@@ -358,14 +326,11 @@ async fn create_commit_bad_changes(fb: FacebookInit) -> Result<(), Error> {
     Ok(())
 }
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_create_merge_commit(fb: FacebookInit) -> Result<(), Error> {
     let ctx = CoreContext::test_mock(fb);
-    let mononoke = Mononoke::new_test(vec![(
-        "test".to_string(),
-        Linear::get_custom_test_repo(fb).await,
-    )])
-    .await?;
+    let mononoke =
+        Mononoke::new_test(vec![("test".to_string(), Linear::get_repo(fb).await)]).await?;
     let repo = mononoke
         .repo(ctx.clone(), "test")
         .await?
@@ -373,11 +338,11 @@ async fn test_create_merge_commit(fb: FacebookInit) -> Result<(), Error> {
         .build()
         .await?;
 
-    async fn create_changeset(
-        repo: &RepoContext,
+    async fn create_changeset<R: MononokeRepo>(
+        repo: &RepoContext<R>,
         changes: BTreeMap<MPath, CreateChange>,
         parents: Vec<ChangesetId>,
-    ) -> Result<ChangesetContext, MononokeError> {
+    ) -> Result<ChangesetContext<R>, MononokeError> {
         let author = String::from("Test Author <test@example.com>");
         let author_date = FixedOffset::east_opt(0)
             .unwrap()
@@ -404,6 +369,7 @@ async fn test_create_merge_commit(fb: FacebookInit) -> Result<(), Error> {
             bubble,
         )
         .await
+        .map(|(_hg_extra, cs)| cs)
     }
 
     let initial_hash = "7785606eb1f26ff5722c831de402350cf97052dc44bc175da6ac0d715a3dbbf6";
@@ -411,24 +377,12 @@ async fn test_create_merge_commit(fb: FacebookInit) -> Result<(), Error> {
     let mut p1_changes: BTreeMap<MPath, CreateChange> = BTreeMap::new();
     p1_changes.insert(
         MPath::try_from("TEST_CREATE_p1")?,
-        CreateChange::Tracked(
-            CreateChangeFile::New {
-                bytes: Bytes::from("TEST CREATE\n"),
-                file_type: FileType::Regular,
-            },
-            None,
-        ),
+        CreateChange::Tracked(CreateChangeFile::new_regular("TEST CREATE\n"), None),
     );
     let mut p2_changes: BTreeMap<MPath, CreateChange> = BTreeMap::new();
     p2_changes.insert(
         MPath::try_from("TEST_CREATE_p2")?,
-        CreateChange::Tracked(
-            CreateChangeFile::New {
-                bytes: Bytes::from("TEST CREATE\n"),
-                file_type: FileType::Regular,
-            },
-            None,
-        ),
+        CreateChange::Tracked(CreateChangeFile::new_regular("TEST CREATE\n"), None),
     );
 
     let (p1, p2) = try_join!(
@@ -439,40 +393,25 @@ async fn test_create_merge_commit(fb: FacebookInit) -> Result<(), Error> {
     let mut merge_changes: BTreeMap<MPath, CreateChange> = BTreeMap::new();
     merge_changes.insert(
         MPath::try_from("TEST_MERGE")?,
-        CreateChange::Tracked(
-            CreateChangeFile::New {
-                bytes: Bytes::from("TEST CREATE\n"),
-                file_type: FileType::Regular,
-            },
-            None,
-        ),
+        CreateChange::Tracked(CreateChangeFile::new_regular("TEST CREATE\n"), None),
     );
     create_changeset(&repo, merge_changes, vec![p1.id(), p2.id()]).await?;
 
     let mut merge_changes: BTreeMap<MPath, CreateChange> = BTreeMap::new();
     merge_changes.insert(
         MPath::try_from("TEST_CREATE_p1")?,
-        CreateChange::Tracked(
-            CreateChangeFile::New {
-                bytes: Bytes::from("TEST MERGE OVERRIDE\n"),
-                file_type: FileType::Regular,
-            },
-            None,
-        ),
+        CreateChange::Tracked(CreateChangeFile::new_regular("TEST MERGE OVERRIDE\n"), None),
     );
     create_changeset(&repo, merge_changes, vec![p1.id(), p2.id()]).await?;
 
     Ok(())
 }
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_merge_commit_parent_file_conflict(fb: FacebookInit) -> Result<(), Error> {
     let ctx = CoreContext::test_mock(fb);
-    let mononoke = Mononoke::new_test(vec![(
-        "test".to_string(),
-        Linear::get_custom_test_repo(fb).await,
-    )])
-    .await?;
+    let mononoke =
+        Mononoke::new_test(vec![("test".to_string(), Linear::get_repo(fb).await)]).await?;
     let repo = mononoke
         .repo(ctx.clone(), "test")
         .await?
@@ -480,11 +419,11 @@ async fn test_merge_commit_parent_file_conflict(fb: FacebookInit) -> Result<(), 
         .build()
         .await?;
 
-    async fn create_changeset(
-        repo: &RepoContext,
+    async fn create_changeset<R: MononokeRepo>(
+        repo: &RepoContext<R>,
         changes: BTreeMap<MPath, CreateChange>,
         parents: Vec<ChangesetId>,
-    ) -> Result<ChangesetContext, MononokeError> {
+    ) -> Result<ChangesetContext<R>, MononokeError> {
         let author = String::from("Test Author <test@example.com>");
         let author_date = FixedOffset::east_opt(0)
             .unwrap()
@@ -512,6 +451,7 @@ async fn test_merge_commit_parent_file_conflict(fb: FacebookInit) -> Result<(), 
             bubble,
         )
         .await
+        .map(|(_hg_extra, cs)| cs)
     }
 
     let initial_hash = "7785606eb1f26ff5722c831de402350cf97052dc44bc175da6ac0d715a3dbbf6";
@@ -519,36 +459,18 @@ async fn test_merge_commit_parent_file_conflict(fb: FacebookInit) -> Result<(), 
     let mut p1_changes: BTreeMap<MPath, CreateChange> = BTreeMap::new();
     p1_changes.insert(
         MPath::try_from("TEST_FILE")?,
-        CreateChange::Tracked(
-            CreateChangeFile::New {
-                bytes: Bytes::from("TEST CREATE_p1\n"),
-                file_type: FileType::Regular,
-            },
-            None,
-        ),
+        CreateChange::Tracked(CreateChangeFile::new_regular("TEST CREATE_p1\n"), None),
     );
     let mut p2_changes: BTreeMap<MPath, CreateChange> = BTreeMap::new();
     p2_changes.insert(
         MPath::try_from("TEST_CREATE")?,
-        CreateChange::Tracked(
-            CreateChangeFile::New {
-                bytes: Bytes::from("TEST CREATE_p2\n"),
-                file_type: FileType::Regular,
-            },
-            None,
-        ),
+        CreateChange::Tracked(CreateChangeFile::new_regular("TEST CREATE_p2\n"), None),
     );
 
     let mut p3_changes: BTreeMap<MPath, CreateChange> = BTreeMap::new();
     p3_changes.insert(
         MPath::try_from("TEST_FILE")?,
-        CreateChange::Tracked(
-            CreateChangeFile::New {
-                bytes: Bytes::from("TEST CREATE_p3\n"),
-                file_type: FileType::Regular,
-            },
-            None,
-        ),
+        CreateChange::Tracked(CreateChangeFile::new_regular("TEST CREATE_p3\n"), None),
     );
 
     let (p1, p2, p3) = try_join!(
@@ -582,14 +504,11 @@ async fn test_merge_commit_parent_file_conflict(fb: FacebookInit) -> Result<(), 
     Ok(())
 }
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_merge_commit_parent_tree_file_conflict(fb: FacebookInit) -> Result<(), Error> {
     let ctx = CoreContext::test_mock(fb);
-    let mononoke = Mononoke::new_test(vec![(
-        "test".to_string(),
-        Linear::get_custom_test_repo(fb).await,
-    )])
-    .await?;
+    let mononoke =
+        Mononoke::new_test(vec![("test".to_string(), Linear::get_repo(fb).await)]).await?;
     let repo = mononoke
         .repo(ctx.clone(), "test")
         .await?
@@ -597,11 +516,11 @@ async fn test_merge_commit_parent_tree_file_conflict(fb: FacebookInit) -> Result
         .build()
         .await?;
 
-    async fn create_changeset(
-        repo: &RepoContext,
+    async fn create_changeset<R: MononokeRepo>(
+        repo: &RepoContext<R>,
         changes: BTreeMap<MPath, CreateChange>,
         parents: Vec<ChangesetId>,
-    ) -> Result<ChangesetContext, MononokeError> {
+    ) -> Result<ChangesetContext<R>, MononokeError> {
         let author = String::from("Test Author <test@example.com>");
         let author_date = FixedOffset::east_opt(0)
             .unwrap()
@@ -629,6 +548,7 @@ async fn test_merge_commit_parent_tree_file_conflict(fb: FacebookInit) -> Result
             bubble,
         )
         .await
+        .map(|(_hg_extra, cs)| cs)
     }
 
     let initial_hash = "7785606eb1f26ff5722c831de402350cf97052dc44bc175da6ac0d715a3dbbf6";
@@ -636,36 +556,18 @@ async fn test_merge_commit_parent_tree_file_conflict(fb: FacebookInit) -> Result
     let mut p1_changes: BTreeMap<MPath, CreateChange> = BTreeMap::new();
     p1_changes.insert(
         MPath::try_from("TEST_FILE/REALLY_A_DIR")?,
-        CreateChange::Tracked(
-            CreateChangeFile::New {
-                bytes: Bytes::from("TEST CREATE_p1\n"),
-                file_type: FileType::Regular,
-            },
-            None,
-        ),
+        CreateChange::Tracked(CreateChangeFile::new_regular("TEST CREATE_p1\n"), None),
     );
     let mut p2_changes: BTreeMap<MPath, CreateChange> = BTreeMap::new();
     p2_changes.insert(
         MPath::try_from("TEST_CREATE")?,
-        CreateChange::Tracked(
-            CreateChangeFile::New {
-                bytes: Bytes::from("TEST CREATE_p2\n"),
-                file_type: FileType::Regular,
-            },
-            None,
-        ),
+        CreateChange::Tracked(CreateChangeFile::new_regular("TEST CREATE_p2\n"), None),
     );
 
     let mut p3_changes: BTreeMap<MPath, CreateChange> = BTreeMap::new();
     p3_changes.insert(
         MPath::try_from("TEST_FILE")?,
-        CreateChange::Tracked(
-            CreateChangeFile::New {
-                bytes: Bytes::from("TEST CREATE_p3\n"),
-                file_type: FileType::Regular,
-            },
-            None,
-        ),
+        CreateChange::Tracked(CreateChangeFile::new_regular("TEST CREATE_p3\n"), None),
     );
 
     let (p1, p2, p3) = try_join!(

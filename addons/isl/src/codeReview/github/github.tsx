@@ -19,12 +19,12 @@ import type {ReactNode} from 'react';
 
 import {OSSCommitMessageFieldSchema} from '../../CommitInfoView/OSSCommitMessageFieldsSchema';
 import {Internal} from '../../Internal';
-import {Tooltip} from '../../Tooltip';
 import {t, T} from '../../i18n';
 import {GhStackSubmitOperation} from '../../operations/GhStackSubmitOperation';
 import {PrSubmitOperation} from '../../operations/PrSubmitOperation';
+import {Icon} from 'isl-components/Icon';
+import {Tooltip} from 'isl-components/Tooltip';
 import {PullRequestReviewDecision, PullRequestState} from 'isl-server/src/github/generated/graphql';
-import {Icon} from 'shared/Icon';
 import {MS_PER_DAY} from 'shared/constants';
 
 import './GitHubPRBadge.css';
@@ -86,6 +86,15 @@ export class GithubUICodeReviewProvider implements UICodeReviewProvider {
       </span>
     );
   };
+
+  getRemoteTrackingBranch(): string | null {
+    return null;
+  }
+
+  getRemoteTrackingBranchFromDiffSummary(): string | null {
+    return null;
+  }
+
   isSplitSuggestionSupported(): boolean {
     return false;
   }
@@ -114,6 +123,10 @@ export class GithubUICodeReviewProvider implements UICodeReviewProvider {
 
   isDiffEligibleForCleanup(diff: DiffSummary & {type: 'github'}): boolean {
     return diff.state === PullRequestState.Closed;
+  }
+
+  getUpdateDiffActions(_summary: DiffSummary) {
+    return [];
   }
 
   commitMessageFieldsSchema =

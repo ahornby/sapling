@@ -13,7 +13,6 @@ use blobstore::Loadable;
 use bookmarks::BookmarkKey;
 use bookmarks::BookmarksRef;
 use context::CoreContext;
-use derived_data::BonsaiDerived;
 use futures::future;
 use futures::future::try_join;
 use futures::TryStreamExt;
@@ -32,6 +31,7 @@ use mononoke_types::NonRootMPath;
 use pushrebase::do_pushrebase_bonsai;
 use regex::Regex;
 use repo_blobstore::RepoBlobstoreRef;
+use repo_derived_data::RepoDerivedDataRef;
 use slog::error;
 use slog::info;
 use tokio::time::sleep;
@@ -112,8 +112,12 @@ pub async fn validate(
     to_merge_commit: ChangesetId,
     path_regex: Regex,
 ) -> Result<(), Error> {
-    let head_root_unode = RootUnodeManifestId::derive(ctx, repo, head_commit);
-    let to_merge_commit_root_unode = RootUnodeManifestId::derive(ctx, repo, to_merge_commit);
+    let head_root_unode = repo
+        .repo_derived_data()
+        .derive::<RootUnodeManifestId>(ctx, head_commit);
+    let to_merge_commit_root_unode = repo
+        .repo_derived_data()
+        .derive::<RootUnodeManifestId>(ctx, to_merge_commit);
 
     let (head_root_unode, to_merge_commit_root_unode) =
         try_join(head_root_unode, to_merge_commit_root_unode).await?;
@@ -183,8 +187,12 @@ async fn find_files_that_need_to_be_deleted(
     let head_bookmark_val =
         maybe_head_bookmark_val.ok_or_else(|| anyhow!("{} not found", head_bookmark))?;
 
-    let head_root_unode = RootUnodeManifestId::derive(ctx, repo, head_bookmark_val);
-    let commit_to_merge_root_unode = RootUnodeManifestId::derive(ctx, repo, commit_to_merge);
+    let head_root_unode = repo
+        .repo_derived_data()
+        .derive::<RootUnodeManifestId>(ctx, head_bookmark_val);
+    let commit_to_merge_root_unode = repo
+        .repo_derived_data()
+        .derive::<RootUnodeManifestId>(ctx, commit_to_merge);
 
     let (head_root_unode, commit_to_merge_root_unode) =
         try_join(head_root_unode, commit_to_merge_root_unode).await?;
@@ -225,6 +233,7 @@ mod test {
     use fbinit::FacebookInit;
     use futures::StreamExt;
     use megarepolib::common::ChangesetArgs;
+    use mononoke_macros::mononoke;
     use mononoke_types::DateTime;
     use tests_utils::bookmark;
     use tests_utils::resolve_cs_id;
@@ -234,7 +243,7 @@ mod test {
 
     const PATH_REGEX: &str = "^(unchanged/.*|changed/.*|toremove/.*)";
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_find_files_that_needs_to_be_deleted(fb: FacebookInit) -> Result<(), Error> {
         let ctx = CoreContext::test_mock(fb);
         let repo = prepare_repo(&ctx).await?;
@@ -264,7 +273,7 @@ mod test {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_find_changed_files_with_revert(fb: FacebookInit) -> Result<(), Error> {
         let ctx = CoreContext::test_mock(fb);
 
@@ -306,7 +315,7 @@ mod test {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_create_deletion_head_commits(fb: FacebookInit) -> Result<(), Error> {
         let ctx = CoreContext::test_mock(fb);
         let repo = prepare_repo(&ctx).await?;

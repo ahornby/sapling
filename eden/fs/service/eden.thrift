@@ -169,6 +169,7 @@ struct DaemonInfo {
 */
 struct PrivHelperInfo {
   1: bool connected;
+  2: pid_t pid;
 }
 
 /**
@@ -308,6 +309,8 @@ enum FileAttributes {
   SHA1_HASH = 1,
   /**
    * Returns the size of a file. Returns an error for symlinks and directories.
+   * See DIGEST_SIZE if you would like to request the size of a file/directory
+   * that's stored in a Content Addressed Store (i.e. RE CAS).
    */
   FILE_SIZE = 2,
   /**
@@ -328,14 +331,44 @@ enum FileAttributes {
   OBJECT_ID = 8,
 
   /**
-   * Returns the BLAKE3 hash of a file. Returns an error for symlinks and directories,
-   * and non-regular files.
+   * Returns the BLAKE3 hash of a file. Returns an error for
+   * symlinks, directories, and non-regular files. Note: the digest_hash can be
+   * requested for directories as an alternative to blake3_hash.
    */
   BLAKE3_HASH = 16,
+
+  /**
+   * Returns the digest size of a given file or directory. This can be used
+   * together with DIGEST_HASH to determine the key that should be used to
+   * fetch a given file/directory from Content Addressed Stores (i.e. RE CAS).
+   * For directories, the size of the augmented manifest that represents the
+   * the directory is returned. For files, this field is the same as FILE_SIZE.
+   * Returns an error for any non-directory/non-file types (symlink, exe, etc).
+   */
+  DIGEST_SIZE = 32,
+
+  /**
+   * Returns the digest hash of a given file or directory. This can be used
+   * together with DIGEST_SIZE to determine the key that should be used to
+   * fetch a given file/directory from Content Addressed Stores (i.e. RE CAS).
+   * For files, this hash is just the blake3 hash of the given file. For
+   * directories, this hash is blake3 hash of all the directory's descendents.
+   */
+  DIGEST_HASH = 64,
 /* NEXT_ATTR = 2^x */
 } (cpp2.enum_type = 'uint64_t')
 
 typedef unsigned64 RequestedAttributes
+
+/**
+ * Indicates whether getAttributesForFiles requests should include results for
+ * files, trees, or both.
+ */
+enum AttributesRequestScope {
+  TREES = 0,
+  FILES = 1,
+  TREES_AND_FILES = 2,
+}
 
 /**
  * Subset of attributes for a single file returned by getAttributesFromFiles()
@@ -391,6 +424,26 @@ union ObjectIdOrError {
   2: EdenError error;
 }
 
+union DigestSizeOrError {
+  // Similar to ObjectIdOrError, it's possible for `digest size` to be unset
+  // even if there is no error.
+  //
+  // Notably, no digest size will be returned if any child file or directory
+  // has been modified.
+  1: i64 digestSize;
+  2: EdenError error;
+}
+
+union DigestHashOrError {
+  // Similar to ObjectIdOrError, it's possible for `digest hash` to be unset
+  // even if there is no error.
+  //
+  // Notably, no digest hash will be returned if any child file or directory
+  // has been modified.
+  1: BinaryHash digestHash;
+  2: EdenError error;
+}
+
 /**
  * Subset of attributes for a single file returned by getAttributesFromFiles()
  *
@@ -404,6 +457,8 @@ struct FileAttributeDataV2 {
   3: optional SourceControlTypeOrError sourceControlType;
   4: optional ObjectIdOrError objectId;
   5: optional Blake3OrError blake3;
+  6: optional DigestSizeOrError digestSize;
+  7: optional DigestHashOrError digestHash;
 }
 
 /**
@@ -456,13 +511,16 @@ struct SyncBehavior {
 }
 
 /**
- * Parameters for the getAttributesFromFiles() function
+ * Parameters for the getAttributesFromFiles() function. By default, results
+ * for both files and trees will be returned. Clients can request for only one
+ * of trees or files by passing in an AttributesRequestScope.
  */
 struct GetAttributesFromFilesParams {
   1: PathString mountPoint;
   2: list<PathString> paths;
   3: RequestedAttributes requestedAttributes;
   4: SyncBehavior sync;
+  5: optional AttributesRequestScope scope;
 }
 
 /**
@@ -872,6 +930,30 @@ struct DebugGetBlobMetadataResponse {
   1: list<BlobMetadataWithOrigin> metadatas;
 }
 
+struct DebugGetScmTreeRequest {
+  1: MountId mountId;
+  # id of the blob we would like to fetch SCM tree for
+  2: ThriftObjectId id;
+  # where we should fetch the blob SCM tree from
+  3: DataFetchOriginSet origins; # DataFetchOrigin
+}
+
+union ScmTreeOrError {
+  1: list<ScmTreeEntry> treeEntries;
+  2: EdenError error;
+}
+
+struct ScmTreeWithOrigin {
+  # the SCM tree data
+  1: ScmTreeOrError scmTreeData;
+  # where the SCM tree was fetched from
+  2: DataFetchOrigin origin;
+}
+
+struct DebugGetScmTreeResponse {
+  1: list<ScmTreeWithOrigin> trees;
+}
+
 struct ActivityRecorderResult {
   // 0 if the operation has failed. For example,
   // fail to start recording due to file permission issue
@@ -1038,6 +1120,7 @@ enum HgResourceType {
   BLOB = 1,
   TREE = 2,
   BLOBMETA = 3,
+  TREEMETA = 4,
 }
 
 enum HgImportPriority {
@@ -1637,6 +1720,30 @@ struct ChangeOwnershipRequest {
 
 struct ChangeOwnershipResponse {}
 
+struct GetBlockedFaultsRequest {
+  1: string keyclass;
+}
+
+struct GetBlockedFaultsResponse {
+  1: list<string> keyValues;
+}
+
+struct CheckoutProgressInfo {
+  1: i64 updatedInodes;
+  2: i64 totalInodes;
+}
+
+struct CheckoutNotInProgress {}
+
+struct CheckoutProgressInfoRequest {
+  1: PathString mountPoint;
+}
+
+union CheckoutProgressInfoResponse {
+  1: CheckoutProgressInfo checkoutProgressInfo;
+  2: CheckoutNotInProgress noProgress;
+}
+
 service EdenService extends fb303_core.BaseService {
   list<MountInfo> listMounts() throws (1: EdenError ex);
   void mount(1: MountArgument info) throws (1: EdenError ex);
@@ -1671,6 +1778,16 @@ service EdenService extends fb303_core.BaseService {
     2: ThriftRootId snapshotHash,
     3: CheckoutMode checkoutMode,
     4: CheckOutRevisionParams params,
+  ) throws (1: EdenError ex);
+
+  /**
+   * Given an Eden mount point returns progress for the checkOutRevision end
+   * point. When a checkout is not in progress it returns CheckoutNotInProgress
+   *
+   * It errors out when no valid mountPoint is provided.
+   */
+  CheckoutProgressInfoResponse getCheckoutProgressInfo(
+    1: CheckoutProgressInfoRequest params,
   ) throws (1: EdenError ex);
 
   /**
@@ -1874,9 +1991,10 @@ service EdenService extends fb303_core.BaseService {
    *
    * Unlike the getAttributesFromFiles endpoint, this does not assume that all
    * the inputs are regular files. This endpoint will attempt to return
-   * attributes for any type of file (directory included). Note that some
-   * attributes are not currently supported, like sha1 and size for directories
-   * and symlinks. At some point EdenFS may be able to support such attributes.
+   * attributes for any type of file (directory included) unless instructed
+   * otherwise. Note that some attributes are not currently supported, like
+   * sha1 and size for directories and symlinks. At some point EdenFS may be
+   * able to support such attributes.
    *
    * Note: may return stale data if synchronizeWorkingCopy isn't called, and if
    * the SyncBehavior specifies a 0 timeout. See the documentation for both of
@@ -1887,7 +2005,8 @@ service EdenService extends fb303_core.BaseService {
   ) throws (1: EdenError ex);
 
   /**
-   * DEPRECATED - prefer getAttributesFromFilesV2.
+   * DEPRECATED - prefer getAttributesFromFilesV2. Some parameters are not
+   * supported by this endpoint (namely the request scope param).
    *
    * Returns the requested file attributes for the provided list of files.
    *
@@ -2082,6 +2201,9 @@ service EdenService extends fb303_core.BaseService {
   //////// Debugging APIs ////////
 
   /**
+   * DEPRECATED: Use debugGetTree().
+   * TODO: remove this API after 07/01/2024
+   *
    * Get the contents of a source control Tree.
    *
    * This can be used to confirm if eden's LocalStore contains information
@@ -2096,6 +2218,10 @@ service EdenService extends fb303_core.BaseService {
     1: PathString mountPoint,
     2: ThriftObjectId id,
     3: bool localStoreOnly,
+  ) throws (1: EdenError ex);
+
+  DebugGetScmTreeResponse debugGetTree(
+    1: DebugGetScmTreeRequest request,
   ) throws (1: EdenError ex);
 
   /**
@@ -2184,6 +2310,11 @@ service EdenService extends fb303_core.BaseService {
    * Get the list of outstanding Thrift requests
    */
   list<ThriftRequestMetadata> debugOutstandingThriftRequests();
+
+  /**
+   * Get the list of outstanding file download events from source control servers
+   */
+  list<HgEvent> debugOutstandingHgEvents(1: PathString mountPoint);
 
   /**
    * Start recording performance metrics such as files read
@@ -2395,6 +2526,10 @@ service EdenService extends fb303_core.BaseService {
    * Returns the number of pending calls that were unblocked
    */
   i64 unblockFault(1: UnblockFaultArg info) throws (1: EdenError ex);
+
+  GetBlockedFaultsResponse getBlockedFaults(
+    1: GetBlockedFaultsRequest request,
+  ) throws (1: EdenError ex);
 
   /**
    * Directly load a BackingStore object identified by id at the given path.

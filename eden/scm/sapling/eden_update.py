@@ -239,7 +239,7 @@ def _determine_actions_for_conflicts(repo, src, conflicts, wctx, destctx):
                 #  - if the file is ignored in the wctx, but tracked in the dest,
                 #    we can just take the remote version.
                 action_type = "g"
-                action = (destctx.manifest().flags(path), False)
+                action = (path, destctx.manifest().flags(path), False)
                 prompt = "remote created"
             else:
                 # In core Mercurial, this is the case where the file does not exist
@@ -283,7 +283,7 @@ def _determine_actions_for_conflicts(repo, src, conflicts, wctx, destctx):
 def _check_actions_and_raise_if_there_are_conflicts(actions):
     # In stock Hg, update() performs this check once it gets the set of actions.
     conflict_paths = []
-    for action_type, list_of_tuples in pycompat.iteritems(actions):
+    for action_type, list_of_tuples in actions.items():
         if len(list_of_tuples) == 0:
             continue  # Note `actions` defaults to [] for all keys.
         if action_type not in ("g", "k", "e", "r", "rg", "pr"):

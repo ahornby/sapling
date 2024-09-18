@@ -1,5 +1,4 @@
 load("@fbcode_macros//build_defs:rust_binary.bzl", "rust_binary")
-load("@fbsource//tools/build_defs:glob_defs.bzl", "glob")
 
 oncall("scm_client_infra")
 
@@ -11,6 +10,7 @@ rust_binary(
     },
     deps = [
         "fbsource//third-party/rust:anyhow",
+        "fbsource//third-party/rust:clap-3",
         "fbsource//third-party/rust:hex",
         "fbsource//third-party/rust:log",
         "fbsource//third-party/rust:tokio",

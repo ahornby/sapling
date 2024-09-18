@@ -31,26 +31,6 @@
   > }
   > EOF
 
-  $ setup_configerator_configs
-  $ cat > "$PUSHREDIRECT_CONF/enable" <<EOF
-  > {
-  > "per_repo": {
-  >   "1": {
-  >      "draft_push": false,
-  >      "public_push": true
-  >    },
-  >   "2": {
-  >      "draft_push": false,
-  >      "public_push": false
-  >    },
-  >   "3": {
-  >      "draft_push": false,
-  >      "public_push": false
-  >    }
-  >   }
-  > }
-  > EOF
-
 -- Init the imported repos
   $ IMPORTED_REPO_NAME="imported_repo"
   $ REPOID="$IMPORTED_REPO_ID" REPONAME="$IMPORTED_REPO_NAME" setup_common_config "blob_files"
@@ -67,6 +47,11 @@
   $ large_small_megarepo_config
   $ large_small_setup
   Adding synced mapping entry
+  $ setup_configerator_configs
+  $ enable_pushredirect 1 false true
+  $ enable_pushredirect 2 false false
+  $ enable_pushredirect 3 false false
+
   $ start_large_small_repo
   Starting Mononoke server
   $ init_local_large_small_clones
@@ -88,13 +73,13 @@
 Before config change
 -- push to a large repo
   $ cd "$TESTTMP"/large-hg-client
-  $ REPONAME=$LARGE_REPO_NAME hgmn up -q $MASTER_BOOKMARK
+  $ hg up -q $MASTER_BOOKMARK
 
   $ mkdir -p smallrepofolder
   $ echo bla > smallrepofolder/bla
   $ hg ci -Aqm "before merge"
   $ PREV_BOOK_VALUE=$(get_bookmark_value_edenapi $SMALL_REPO_NAME $MASTER_BOOKMARK)
-  $ REPONAME=$LARGE_REPO_NAME hgmn push -r . --to $MASTER_BOOKMARK -q
+  $ hg push -r . --to $MASTER_BOOKMARK -q
   $ log_globalrev -r $MASTER_BOOKMARK
   o  before merge [public;globalrev=1000157971;a94d137602c0] default/master_bookmark
   │
@@ -105,8 +90,8 @@ Before config change
 
 -- check the same commit in the small repo
   $ cd "$TESTTMP/small-hg-client"
-  $ REPONAME=$SMALL_REPO_NAME hgmn pull -q
-  $ REPONAME=$SMALL_REPO_NAME hgmn up -q $MASTER_BOOKMARK
+  $ hg pull -q
+  $ hg up -q $MASTER_BOOKMARK
   $ log_globalrev -r $MASTER_BOOKMARK
   @  before merge [public;globalrev=1000157971;61807722d4ec] default/master_bookmark
   │
@@ -135,12 +120,14 @@ Before config change
 
   $ with_stripped_logs mononoke_x_repo_sync "$IMPORTED_REPO_ID"  "$LARGE_REPO_ID" initial-import -i "$IC" --version-name "imported_noop"
   Starting session with id * (glob)
+  Starting up X Repo Sync from small repo imported_repo to large repo large-mon
   Checking if 65f0b76c034d87adf7dac6f0b5a5442ab3f62edda21adb8e8ec57d1a99fb5905 is already synced 2->0
   Syncing 65f0b76c034d87adf7dac6f0b5a5442ab3f62edda21adb8e8ec57d1a99fb5905 for inital import
   Source repo: imported_repo / Target repo: large-mon
   Found 3 unsynced ancestors
   changeset 65f0b76c034d87adf7dac6f0b5a5442ab3f62edda21adb8e8ec57d1a99fb5905 synced as ecc8ec74d00988653ae64ebf206a9ed42898449125b91f59ecd1d8a0a93f4a97 in *ms (glob)
   successful sync of head 65f0b76c034d87adf7dac6f0b5a5442ab3f62edda21adb8e8ec57d1a99fb5905
+  X Repo Sync execution finished from small repo imported_repo to large repo large-mon
 
   $ mononoke_newadmin fetch -R $LARGE_REPO_NAME  -i ecc8ec74d00988653ae64ebf206a9ed42898449125b91f59ecd1d8a0a93f4a97 --json | jq .parents
   [
@@ -165,8 +152,8 @@ Before config change
 
 -- check that merge has made into large repo
   $ cd "$TESTTMP"/large-hg-client
-  $ REPONAME=$LARGE_REPO_NAME hgmn -q pull
-  $ REPONAME=$LARGE_REPO_NAME hgmn up -q $MASTER_BOOKMARK
+  $ hg -q pull
+  $ hg up -q $MASTER_BOOKMARK
   $ log_globalrev -r $MASTER_BOOKMARK
   @    [MEGAREPO GRADUAL MERGE] gradual merge (0) [public;globalrev=1000157972;9af7a2bbf0f5] default/master_bookmark
   ├─╮
@@ -178,7 +165,7 @@ Before config change
   $ echo baz > smallrepofolder/baz
   $ hg ci -Aqm "after merge"
   $ PREV_BOOK_VALUE=$(get_bookmark_value_edenapi $SMALL_REPO_NAME $MASTER_BOOKMARK)
-  $ REPONAME=$LARGE_REPO_NAME hgmn push -r . --to $MASTER_BOOKMARK -q
+  $ hg push -r . --to $MASTER_BOOKMARK -q
   $ log_globalrev -r $MASTER_BOOKMARK
   o  after merge [public;globalrev=1000157973;1220098b4cde] default/master_bookmark
   │
@@ -188,8 +175,8 @@ Before config change
 
 -- check the same commit in the small repo
   $ cd "$TESTTMP/small-hg-client"
-  $ REPONAME=$SMALL_REPO_NAME hgmn pull -q
-  $ REPONAME=$SMALL_REPO_NAME hgmn up -q $MASTER_BOOKMARK
+  $ hg pull -q
+  $ hg up -q $MASTER_BOOKMARK
   $ log_globalrev -r $MASTER_BOOKMARK^::$MASTER_BOOKMARK
   @  after merge [public;globalrev=1000157973;3381b75593e5] default/master_bookmark
   │
@@ -199,7 +186,7 @@ Before config change
 
   $ echo baz_from_small > baz
   $ hg ci -Aqm "after merge from small"
-  $ REPONAME=$SMALL_REPO_NAME hgmn push -r . --to $MASTER_BOOKMARK -q
+  $ hg push -r . --to $MASTER_BOOKMARK -q
   $ log_globalrev -r $MASTER_BOOKMARK^::$MASTER_BOOKMARK
   o  after merge from small [public;globalrev=1000157974;c17052372d27] default/master_bookmark
   │
@@ -207,7 +194,7 @@ Before config change
   │
   ~
   $ cd "$TESTTMP/large-hg-client"
-  $ REPONAME=$LARGE_REPO_NAME hgmn pull -q
+  $ hg pull -q
   $ log_globalrev -r $MASTER_BOOKMARK^::$MASTER_BOOKMARK
   o  after merge from small [public;globalrev=1000157974;4d44ba9e1ca3] default/master_bookmark
   │
@@ -227,6 +214,7 @@ Before config change
   $ PREV_BOOK_VALUE=$(get_bookmark_value_edenapi $SMALL_REPO_NAME $MASTER_BOOKMARK)
   $ with_stripped_logs mononoke_x_repo_sync "$IMPORTED_REPO_ID"  "$LARGE_REPO_ID" once --commit "$ID" --unsafe-change-version-to "new_version" --target-bookmark $MASTER_BOOKMARK
   Starting session with id * (glob)
+  Starting up X Repo Sync from small repo imported_repo to large repo large-mon
   changeset resolved as: ChangesetId(Blake2(a14dee507f7605083e9a99901971ac7c5558d8b28d7d01090bd2cff2432fa707))
   Checking if a14dee507f7605083e9a99901971ac7c5558d8b28d7d01090bd2cff2432fa707 is already synced 2->0
   Changing mapping version during pushrebase to new_version
@@ -236,10 +224,11 @@ Before config change
   syncing a14dee507f7605083e9a99901971ac7c5558d8b28d7d01090bd2cff2432fa707 via pushrebase for master_bookmark
   changeset a14dee507f7605083e9a99901971ac7c5558d8b28d7d01090bd2cff2432fa707 synced as 402c52f0f2156a83bf5354aae35c3cae55e92b23da3ed61bc10ee7960e172c8e in *ms (glob)
   successful sync
+  X Repo Sync execution finished from small repo imported_repo to large repo large-mon
   $ wait_for_bookmark_move_away_edenapi $SMALL_REPO_NAME $MASTER_BOOKMARK  "$PREV_BOOK_VALUE"
 
   $ cd "$TESTTMP/small-hg-client"
-  $ REPONAME=$SMALL_REPO_NAME hgmn pull -q
+  $ hg pull -q
   $ hg update $MASTER_BOOKMARK
   0 files updated, 0 files merged, 0 files removed, 0 files unresolved
   $ log_globalrev -r .^::.
@@ -251,7 +240,7 @@ Before config change
   $ echo baz_from_small2 > bar
   $ hg add bar
   $ hg ci -Aqm "after mapping change from small"
-  $ REPONAME=$SMALL_REPO_NAME hgmn push -r . --to $MASTER_BOOKMARK -q
+  $ hg push -r . --to $MASTER_BOOKMARK -q
 
   $ log_globalrev -r $MASTER_BOOKMARK^::$MASTER_BOOKMARK
   o  after mapping change from small [public;globalrev=1000157976;ecca553b5690] default/master_bookmark
@@ -261,7 +250,7 @@ Before config change
   ~
 
   $ cd "$TESTTMP/large-hg-client"
-  $ REPONAME=$LARGE_REPO_NAME hgmn pull -q
+  $ hg pull -q
   $ log_globalrev -r $MASTER_BOOKMARK^::$MASTER_BOOKMARK
   o  after mapping change from small [public;globalrev=1000157976;54bd67a132c8] default/master_bookmark
   │
@@ -290,7 +279,7 @@ Before config change
   $ quiet mononoke_x_repo_sync "$IMPORTED_REPO_ID"  "$LARGE_REPO_ID" tail --bookmark-regex "heads/$MASTER_BOOKMARK" --catch-up-once
   $ wait_for_bookmark_move_away_edenapi $LARGE_REPO_NAME $MASTER_BOOKMARK  "$PREV_BOOK_VALUE"
 
-  $ REPONAME=$LARGE_REPO_NAME hgmn pull -q
+  $ hg pull -q
   $ log_globalrev -r $MASTER_BOOKMARK^^^::$MASTER_BOOKMARK
   o  IG [public;globalrev=1000157979;0d969c3e772c] default/master_bookmark
   │
@@ -320,12 +309,14 @@ Before config change
 
   $ with_stripped_logs mononoke_x_repo_sync "$ANOTHER_REPO_ID"  "$LARGE_REPO_ID" initial-import -i "$AC" --version-name "another_noop"
   Starting session with id * (glob)
+  Starting up X Repo Sync from small repo another_repo to large repo large-mon
   Checking if 156943c35cda314d72b0177b06d5edf3c92dc9c9505d7b3171b9230f7c1768bb is already synced 3->0
   Syncing 156943c35cda314d72b0177b06d5edf3c92dc9c9505d7b3171b9230f7c1768bb for inital import
   Source repo: another_repo / Target repo: large-mon
   Found 3 unsynced ancestors
   changeset 156943c35cda314d72b0177b06d5edf3c92dc9c9505d7b3171b9230f7c1768bb synced as 0a9797a0fa6b3284b9d73ec43357f06a9b00d6fa402122d1bbfbeac16e3a2c39 in *ms (glob)
   successful sync of head 156943c35cda314d72b0177b06d5edf3c92dc9c9505d7b3171b9230f7c1768bb
+  X Repo Sync execution finished from small repo another_repo to large repo large-mon
 
   $ mononoke_newadmin fetch -R $LARGE_REPO_NAME  -i 0a9797a0fa6b3284b9d73ec43357f06a9b00d6fa402122d1bbfbeac16e3a2c39 --json | jq .parents
   [
@@ -350,8 +341,8 @@ Before config change
 
 -- check that merge has made into large repo
   $ cd "$TESTTMP"/large-hg-client
-  $ REPONAME=$LARGE_REPO_NAME hgmn -q pull
-  $ REPONAME=$LARGE_REPO_NAME hgmn up -q $MASTER_BOOKMARK
+  $ hg -q pull
+  $ hg up -q $MASTER_BOOKMARK
   $ log_globalrev -r $MASTER_BOOKMARK
   @    [MEGAREPO GRADUAL MERGE] another merge (0) [public;globalrev=1000157980;c58d6329efff] default/master_bookmark
   ├─╮
@@ -369,6 +360,7 @@ Before config change
   $ PREV_BOOK_VALUE=$(get_bookmark_value_edenapi $SMALL_REPO_NAME $MASTER_BOOKMARK)
   $ with_stripped_logs mononoke_x_repo_sync "$ANOTHER_REPO_ID"  "$LARGE_REPO_ID" once --commit "$AD" --unsafe-change-version-to "another_version" --target-bookmark $MASTER_BOOKMARK
   Starting session with id * (glob)
+  Starting up X Repo Sync from small repo another_repo to large repo large-mon
   changeset resolved as: ChangesetId(Blake2(1d0bbdb162c2887a5b93893d7a48fd852a304ab58be2245899bb795e80aa10e9))
   Checking if 1d0bbdb162c2887a5b93893d7a48fd852a304ab58be2245899bb795e80aa10e9 is already synced 3->0
   Changing mapping version during pushrebase to another_version
@@ -378,6 +370,7 @@ Before config change
   syncing 1d0bbdb162c2887a5b93893d7a48fd852a304ab58be2245899bb795e80aa10e9 via pushrebase for master_bookmark
   changeset 1d0bbdb162c2887a5b93893d7a48fd852a304ab58be2245899bb795e80aa10e9 synced as 76b08a5702ff09571621ca88b107d886963d2c8265f508edc6e4d8f95777fd3e in *ms (glob)
   successful sync
+  X Repo Sync execution finished from small repo another_repo to large repo large-mon
   $ wait_for_bookmark_move_away_edenapi $SMALL_REPO_NAME $MASTER_BOOKMARK  "$PREV_BOOK_VALUE"
 
   $ PREV_BOOK_VALUE=$(get_bookmark_value_edenapi "$IMPORTED_REPO_NAME" heads/$MASTER_BOOKMARK)
@@ -390,7 +383,7 @@ Before config change
   IH=390213545a07b8f0b3452f97e862443d56b58375
   II=6738aefcbd6e1d868fa73a489b55aab543fd0c53
   $ wait_for_bookmark_move_away_edenapi "$IMPORTED_REPO_NAME" heads/$MASTER_BOOKMARK  "$PREV_BOOK_VALUE"
-  $ quiet with_stripped_logs mononoke_x_repo_sync "$IMPORTED_REPO_ID"  "$LARGE_REPO_ID" tail --bookmark-regex "heads/$MASTER_BOOKMARK" --catch-up-once 
+  $ quiet with_stripped_logs mononoke_x_repo_sync "$IMPORTED_REPO_ID"  "$LARGE_REPO_ID" tail --bookmark-regex "heads/$MASTER_BOOKMARK" --catch-up-once
 
   $ FINAL_BOOK_VALUE=$(x_repo_lookup $IMPORTED_REPO_NAME $LARGE_REPO_NAME $II)
 
@@ -441,9 +434,14 @@ so they'll be dumped to files to keep this (already long) integration test short
   > "INSERT INTO mutable_counters (repo_id, name, value) \
   > VALUES ($LARGE_REPO_ID, 'xreposync_from_$SUBMODULE_REPO_ID', 1)";
 
-  $ ENABLE_API_WRITES=1 REPOID="$SUBMODULE_REPO_ID" REPONAME="$SUBMODULE_REPO_NAME" setup_common_config "$REPOTYPE"
-  $ ENABLE_API_WRITES=1 REPOID="$REPO_C_ID" REPONAME="repo_c" setup_common_config "$REPOTYPE"
-  $ ENABLE_API_WRITES=1 REPOID="$REPO_B_ID" REPONAME="repo_b" setup_common_config "$REPOTYPE"
+  $ ENABLE_API_WRITES=1 REPOID="$SUBMODULE_REPO_ID" REPONAME="$SUBMODULE_REPO_NAME" \
+  > COMMIT_IDENTITY_SCHEME=3 setup_common_config "$REPOTYPE"
+
+  $ ENABLE_API_WRITES=1 REPOID="$REPO_C_ID" REPONAME="repo_c" \
+  > COMMIT_IDENTITY_SCHEME=3  setup_common_config "$REPOTYPE"
+
+  $ ENABLE_API_WRITES=1 REPOID="$REPO_B_ID" REPONAME="repo_b" \
+  > COMMIT_IDENTITY_SCHEME=3 setup_common_config "$REPOTYPE"
 
 -- Setup git repos A, B and C
   $ setup_git_repos_a_b_c &> $TESTTMP/setup_git_repos_a_b_c.out
@@ -472,7 +470,7 @@ so they'll be dumped to files to keep this (already long) integration test short
   $ echo "baz after merging submodule expansion" > smallrepofolder/baz
   $ hg ci -Aqm "after merging submodule expansion"
   $ PREV_BOOK_VALUE=$(get_bookmark_value_edenapi $SMALL_REPO_NAME $MASTER_BOOKMARK)
-  $ REPONAME=$LARGE_REPO_NAME hgmn push -r . --to $MASTER_BOOKMARK -q
+  $ hg push -r . --to $MASTER_BOOKMARK -q
   $ log_globalrev -r $MASTER_BOOKMARK -l 10
   @  after merging submodule expansion [public;globalrev=;ffe35354096c] default/master_bookmark
   │
@@ -482,9 +480,9 @@ so they'll be dumped to files to keep this (already long) integration test short
 -- wait a second to give backsyncer some time to catch up
   $ wait_for_bookmark_move_away_edenapi $SMALL_REPO_NAME $MASTER_BOOKMARK  "$PREV_BOOK_VALUE"
 
--- Check if changes were backsynced properly  
+-- Check if changes were backsynced properly
   $ cd "$TESTTMP/small-hg-client"
-  $ REPONAME=$SMALL_REPO_NAME hgmn pull -q
+  $ hg pull -q
   $ log_globalrev -l 10
   o  after merging submodule expansion [public;globalrev=;5bc83a834e83] default/master_bookmark
   │
@@ -520,7 +518,7 @@ so they'll be dumped to files to keep this (already long) integration test short
   $ echo "file.txt after making changes to the submodule repo" > smallrepofolder/file.txt
   $ hg ci -Aqm "after live sync and changes to submodule repo"
   $ PREV_BOOK_VALUE=$(get_bookmark_value_edenapi $SMALL_REPO_NAME $MASTER_BOOKMARK)
-  $ REPONAME=$LARGE_REPO_NAME hgmn push -r . --to $MASTER_BOOKMARK -q
+  $ hg push -r . --to $MASTER_BOOKMARK -q
   $ log_globalrev -r $MASTER_BOOKMARK -l 30
   o  after live sync and changes to submodule repo [public;globalrev=1000157989;cf2c14f12677] default/master_bookmark
   │
@@ -532,7 +530,7 @@ so they'll be dumped to files to keep this (already long) integration test short
 
 -- Check if changes were backsynced properly to small repo
   $ cd "$TESTTMP/small-hg-client"
-  $ REPONAME=$SMALL_REPO_NAME hgmn pull -q
+  $ hg pull -q
   $ hg log -G -T "{desc} [{node|short}]\n" -l 30 --stat
   o  after live sync and changes to submodule repo [7bea9eac2447]
   │   file.txt |  2 +-

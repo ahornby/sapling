@@ -260,13 +260,15 @@ class ObjectCache : public std::enable_shared_from_this<
    * Return information about the current size of the cache and the total number
    * of hits and misses.
    */
-  Stats getStats() const;
+  Stats getStats(const std::map<std::string, int64_t>& counters) const;
 
  protected:
   explicit ObjectCache(
       size_t maximumCacheSizeBytes,
       size_t minimumEntryCount,
       EdenStatsPtr stats);
+
+  void invalidate(const ObjectId& id) noexcept;
 
  private:
   /*
@@ -318,11 +320,66 @@ class ObjectCache : public std::enable_shared_from_this<
     folly::CountedIntrusiveList<CacheItem, &CacheItem::hook> evictionQueue;
 
     EdenStatsPtr stats;
-    uint64_t hitCount{0};
-    uint64_t missCount{0};
-    uint64_t evictionCount{0};
-    uint64_t dropCount{0};
   };
+
+  // for less typing
+  using LockedState =
+      typename folly::Synchronized<State, folly::DistributedMutex>::LockedPtr;
+
+  /**
+   * The "core" implementation for the method getInterestHandle().
+   *
+   * This method is not thread safe in any version of ObjectCache so it expects
+   * to be only called by a single thread, meaning that a lock should be held
+   * for the duration of the call.
+   */
+  template <ObjectCacheFlavor F = Flavor>
+  typename std::enable_if_t<
+      F == ObjectCacheFlavor::InterestHandle,
+      typename ObjectCache<ObjectType, Flavor, ObjectCacheStats>::GetResult>
+  getInterestHandleCore(
+      LockedState& state,
+      const ObjectId& hash,
+      Interest interest) noexcept;
+
+  /**
+   * The "core" implementation for the method insertInterestHandle().
+   *
+   * This method is not thread safe in any version of ObjectCache so it expects
+   * to be only called by a single thread, meaning that a lock should be held
+   * for the duration of the call.
+   */
+  template <ObjectCacheFlavor F = Flavor>
+  typename std::enable_if_t<
+      F == ObjectCacheFlavor::InterestHandle,
+      ObjectInterestHandle<ObjectType, ObjectCacheStats>>
+  insertInterestHandleCore(
+      ObjectId id,
+      ObjectPtr object,
+      Interest interest,
+      LockedState& state,
+      uint64_t cacheItemGeneration,
+      ObjectInterestHandle<ObjectType, ObjectCacheStats> interestHandle);
+
+  struct PreProcessInterestHandleResult {
+    ObjectInterestHandle<ObjectType, ObjectCacheStats> interestHandle;
+    uint64_t cacheItemGeneration;
+  };
+
+  /**
+   * Preprocess the interest handle for the given ID and object based on the
+   * interest.
+   * Returns a PreProcessInterestHandleResult object which contains the handle
+   * we might need to insert or there is no need to insert when "ready" is True.
+   *
+   * We are doing this step in a separate function because this is a thread-safe
+   * step that can be decoupled from the main insertion logic.
+   */
+  template <ObjectCacheFlavor F>
+  typename std::enable_if_t<
+      F == ObjectCacheFlavor::InterestHandle,
+      PreProcessInterestHandleResult>
+  preProcessInterestHandle(ObjectId id, ObjectPtr object, Interest interest);
 
   /**
    * If an object for the given hash is in cache, return it. If the object is

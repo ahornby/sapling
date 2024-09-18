@@ -16,11 +16,13 @@ from typing import Dict, List, Optional, Set
 
 from eden.fs.cli import (
     config as config_mod,
+    daemon,
     filesystem,
     mtab,
     prjfs,
     proc_utils as proc_utils_mod,
     ui,
+    util as util_mod,
     version,
 )
 from eden.fs.cli.config import EdenInstance
@@ -39,7 +41,7 @@ from fb303_core.ttypes import fb303_status
 from . import (
     check_filesystems,
     check_hg,
-    check_kerberos,
+    check_network,
     check_os,
     check_recent_writes,
     check_redirections,
@@ -77,9 +79,49 @@ except ImportError:
             pass
 
 
+try:
+    from .facebook.internal_consts import (
+        get_doctor_link,
+        get_local_commit_recovery_link,
+    )
+except ImportError:
+
+    def get_doctor_link() -> str:
+        return ""
+
+    def get_local_commit_recovery_link() -> str:
+        return ""
+
+
+try:
+    from .facebook.internal_error_messages import get_reclone_advice_link
+except ImportError:
+
+    def get_reclone_advice_link() -> str:
+        return ""
+
+
 # working_directory_was_stale may be set to True by the CLI main module
 # if the original working directory referred to a stale eden mount point.
 working_directory_was_stale = False
+
+
+def get_reclone_msg(checkout_path: str) -> str:
+    reclone_msg = """To recover, you will need to remove and reclone the repo.
+Your local commits will be unaffected, but reclones will lose uncommitted work or shelves.
+However, the local changes are manually recoverable before the reclone."""
+
+    if get_local_commit_recovery_link():
+        reclone_msg += f"\nIf you have local changes you would like to save before reclone, see {get_local_commit_recovery_link()}, or reachout to the EdenFS team."
+
+    if get_doctor_link():
+        reclone_msg += (
+            "\nTo reclone the corrupted repo, run: `fbclone $REPO --reclone --eden`"
+        )
+        reclone_msg += f"\nFor additional info see the wiki at {get_doctor_link()}"
+    else:
+        reclone_msg += f"\nTo remove the corrupted repo, run: `eden rm {checkout_path}`"
+    return reclone_msg
 
 
 def cure_what_ails_you(
@@ -92,8 +134,8 @@ def cure_what_ails_you(
     mount_table: Optional[mtab.MountTable] = None,
     fs_util: Optional[filesystem.FsUtil] = None,
     proc_utils: Optional[proc_utils_mod.ProcUtils] = None,
-    kerberos_checker: Optional[check_kerberos.KerberosChecker] = None,
     vscode_extensions_checker: Optional[VSCodeExtensionsChecker] = None,
+    network_checker: Optional[check_network.NetworkChecker] = None,
     out: Optional[ui.Output] = None,
 ) -> int:
     return EdenDoctor(
@@ -105,8 +147,8 @@ def cure_what_ails_you(
         mount_table,
         fs_util,
         proc_utils,
-        kerberos_checker,
         vscode_extensions_checker,
+        network_checker,
         out,
     ).cure_what_ails_you()
 
@@ -145,8 +187,8 @@ class EdenDoctorChecker:
     mount_table: mtab.MountTable
     fs_util: filesystem.FsUtil
     proc_utils: proc_utils_mod.ProcUtils
-    kerberos_checker: check_kerberos.KerberosChecker
     vscode_extensions_checker: VSCodeExtensionsChecker
+    network_checker: check_network.NetworkChecker
     tracker: ProblemTracker
     out: ui.Output
     # Setting run_system_wide_checks to False causes EdenDoctor to skip checks that
@@ -165,8 +207,8 @@ class EdenDoctorChecker:
         mount_table: Optional[mtab.MountTable] = None,
         fs_util: Optional[filesystem.FsUtil] = None,
         proc_utils: Optional[proc_utils_mod.ProcUtils] = None,
-        kerberos_checker: Optional[check_kerberos.KerberosChecker] = None,
         vscode_extensions_checker: Optional[VSCodeExtensionsChecker] = None,
+        network_checker: Optional[check_network.NetworkChecker] = None,
         out: Optional[ui.Output] = None,
     ) -> None:
         self.instance = instance
@@ -176,15 +218,15 @@ class EdenDoctorChecker:
         self.mount_table = mount_table if mount_table is not None else mtab.new()
         self.fs_util = fs_util if fs_util is not None else filesystem.new()
         self.proc_utils = proc_utils if proc_utils is not None else proc_utils_mod.new()
-        self.kerberos_checker = (
-            kerberos_checker
-            if kerberos_checker is not None
-            else check_kerberos.KerberosChecker()
-        )
         self.vscode_extensions_checker = (
             vscode_extensions_checker
             if vscode_extensions_checker is not None
             else VSCodeExtensionsChecker()
+        )
+        self.network_checker = (
+            network_checker
+            if network_checker is not None
+            else check_network.NetworkChecker()
         )
         self.out = out if out is not None else ui.get_output()
 
@@ -198,10 +240,6 @@ class EdenDoctorChecker:
             # check multiple edenfs running with some rogue stale PIDs
             check_rogue_edenfs.check_many_edenfs_are_running(
                 self.tracker, self.proc_utils
-            )
-
-            self.kerberos_checker.run_kerberos_certificate_checks(
-                self.instance, self.tracker
             )
 
         status = self.instance.check_health()
@@ -226,7 +264,16 @@ class EdenDoctorChecker:
     def run_edenfs_not_healthy_checks(self) -> None:
         configured_mounts = self.instance.get_mount_paths()
         if configured_mounts:
-            self.tracker.add_problem(EdenfsNotHealthy())
+            if not self.fast:
+                # Run network checks without a backing repo
+                try:
+                    self.network_checker.check_network(
+                        self.tracker, Path(os.getcwd()), set(), False
+                    )
+                except Exception as ex:
+                    raise RuntimeError("Failed to check network for mount") from ex
+
+            self.tracker.add_problem(EdenfsNotHealthy(self.instance, self.out))
         else:
             self.tracker.using_edenfs = False
             return
@@ -273,6 +320,7 @@ class EdenDoctorChecker:
                 checkouts[path] = checkout
 
         # Get information about the checkouts listed in the config file
+        missing_checkouts = []
         for configured_checkout in self.instance.get_checkouts():
             checkout_info = checkouts.get(configured_checkout.path, None)
             if checkout_info is None:
@@ -281,10 +329,24 @@ class EdenDoctorChecker:
                 checkouts[checkout_info.path] = checkout_info
 
             if checkout_info.backing_repo is None:
-                checkout_info.backing_repo = (
-                    configured_checkout.get_config().backing_repo
-                )
+                try:
+                    checkout_info.backing_repo = (
+                        configured_checkout.get_config().backing_repo
+                    )
+                except Exception as ex:
+                    # Config file is missing or invalid.
+                    # Without it we can't know what the backing repo is, so
+                    # we collect all checkouts with missing configs and report
+                    # a single error at the end.
+                    missing_checkouts.append(
+                        f"{configured_checkout.path} (error: {ex})"
+                    )
+                    continue
+
             checkout_info.configured_state_dir = configured_checkout.state_dir
+        if missing_checkouts:
+            errmsg = "\n".join(missing_checkouts)
+            raise RuntimeError(errmsg)
 
         return checkouts
 
@@ -323,8 +385,13 @@ class EdenDoctorChecker:
 
     def run_normal_checks(self) -> None:
         check_edenfs_version(self.tracker, self.instance)
-        checkouts = self._get_checkouts_info()
+        try:
+            checkouts = self._get_checkouts_info()
+        except RuntimeError as ex:
+            self.tracker.add_problem(EdenCheckoutInfosCorruption(ex))
+            return
         checked_backing_repos = set()
+        checked_network_backing_repos = set()
 
         if sys.platform == "win32":
             self.check_running_elevated()
@@ -363,6 +430,8 @@ class EdenDoctorChecker:
                     watchman_info,
                     list(checkouts.values()),
                     checked_backing_repos,
+                    checked_network_backing_repos,
+                    self.network_checker,
                     self.debug,
                     self.fast,
                 )
@@ -385,8 +454,8 @@ class EdenDoctor(EdenDoctorChecker):
         mount_table: Optional[mtab.MountTable] = None,
         fs_util: Optional[filesystem.FsUtil] = None,
         proc_utils: Optional[proc_utils_mod.ProcUtils] = None,
-        kerberos_checker: Optional[check_kerberos.KerberosChecker] = None,
         vscode_extensions_checker: Optional[VSCodeExtensionsChecker] = None,
+        network_checker: Optional[check_network.NetworkChecker] = None,
         out: Optional[ui.Output] = None,
     ) -> None:
         self.dry_run = dry_run
@@ -415,8 +484,8 @@ class EdenDoctor(EdenDoctorChecker):
             mount_table=mount_table,
             fs_util=fs_util,
             proc_utils=proc_utils,
-            kerberos_checker=kerberos_checker,
             vscode_extensions_checker=vscode_extensions_checker,
+            network_checker=network_checker,
             out=out,
         )
 
@@ -434,6 +503,34 @@ class EdenDoctor(EdenDoctorChecker):
                 num_problems=fixer.num_problems,
                 problems=fixer.problem_types.union(fixer.ignored_problem_types),
                 problem_description=fixer.problem_description,
+                num_fixed_problems=fixer.num_fixed_problems,
+                num_failed_fixes=fixer.num_failed_fixes,
+                num_manual_fixes=fixer.num_manual_fixes,
+                num_no_fixes=fixer.num_no_fixes,
+                num_advisory_fixes=fixer.num_advisory_fixes,
+                problem_failed_fixes=fixer.problem_failed_fixes,
+                problem_successful_fixes=fixer.problem_successful_fixes,
+                problem_manual_fixes=fixer.problem_manual_fixes,
+                problem_no_fixes=fixer.problem_no_fixes,
+                problem_advisory_fixes=fixer.problem_advisory_fixes,
+                exception=fixer.problem_failed_fixes_exceptions,
+            )
+        elif sys.platform == "win32":
+            # dry run doesn't run fixes so we count the number of fixable problems rather
+            # than the number of failed fixes
+            self.instance.log_sample(
+                "eden_doctor_dry_run",
+                num_problems=fixer.num_problems,
+                problems=fixer.problem_types.union(fixer.ignored_problem_types),
+                problem_description=fixer.problem_description,
+                num_fixable=fixer.num_fixable,
+                num_manual_fixes=fixer.num_manual_fixes,
+                num_no_fixes=fixer.num_no_fixes,
+                num_advisory_fixes=fixer.num_advisory_fixes,
+                problem_fixable=fixer.problem_fixable,
+                problem_manual_fixes=fixer.problem_manual_fixes,
+                problem_no_fixes=fixer.problem_no_fixes,
+                problem_advisory_fixes=fixer.problem_advisory_fixes,
             )
 
         if fixer.num_problems == 0:
@@ -464,12 +561,26 @@ class EdenDoctor(EdenDoctorChecker):
             out.writeln(
                 f"Failed to fix {problem_count(fixer.num_failed_fixes)}.", fg=out.RED
             )
+
+        if fixer.num_advisory_fixes:
+            out.writeln(
+                f"{fixer.num_advisory_fixes} issue{'' if fixer.num_advisory_fixes==1 else 's'} with recommended fixes.",
+                fg=out.YELLOW,
+            )
+
         if fixer.num_manual_fixes:
             if fixer.num_manual_fixes == 1:
                 msg = "1 issue requires manual attention."
             else:
                 msg = f"{fixer.num_manual_fixes} issues require manual attention."
             out.writeln(msg, fg=out.YELLOW)
+
+        if fixer.num_no_fixes:
+            if fixer.num_no_fixes == 1:
+                msg = "No standard fix for 1 issue."
+            else:
+                msg = f"No standard fix for {fixer.num_no_fixes} issues."
+            out.writeln(msg, fg=out.RED)
 
         if fixer.num_fixed_problems == fixer.num_problems:
             return 0
@@ -491,12 +602,46 @@ class EdenDoctor(EdenDoctorChecker):
         return 1
 
 
-class EdenfsNotHealthy(Problem):
-    def __init__(self) -> None:
-        super().__init__(
-            "EdenFS is not running.",
-            remediation="To start EdenFS, run:\n\n    eden start",
-        )
+class EdenfsNotHealthy(FixableProblem):
+
+    def __init__(
+        self,
+        instance: EdenInstance,
+        out: ui.Output,
+    ) -> None:
+        self._instance = instance
+        self._out = out
+
+    def description(self) -> str:
+        return "EdenFS is not running"
+
+    def dry_run_msg(self) -> str:
+        return "Would run `eden start` to start EdenFS"
+
+    def start_msg(self) -> str:
+        return "Running `eden start` to start EdenFS..."
+
+    def perform_fix(self) -> None:
+        """Try to start EdenFS. If Eden is running, an exception will be thrown (and ignored)."""
+        try:
+            daemon.start_edenfs_service(self._instance, None, None)
+        except Exception:
+            # Eden start failed, or Eden is already running/starting. Either way,
+            # check_fix will determine if the fix worked.
+            pass
+
+    def check_fix(self) -> bool:
+        health = self._instance.check_health()
+        if health.is_starting():
+            self._out.writeln(
+                "EdenFS still starting, use `eden status --wait` to watch progress and ensure it starts",
+                fg=self._out.YELLOW,
+            )
+            return False
+        elif health.is_healthy():
+            return True
+        else:
+            return False
 
 
 class EdenfsPrivHelperNotHealthy(Problem):
@@ -515,7 +660,11 @@ Please wait for edenfs to finish starting. You can watch its progress with
 
 If EdenFS seems to be taking too long to start you can try restarting it
 with "eden restart --force"'''
-        super().__init__("EdenFS is currently still starting.", remediation=remediation)
+        super().__init__(
+            "EdenFS is currently still starting.",
+            remediation=remediation,
+            severity=ProblemSeverity.ADVICE,
+        )
 
 
 class EdenfsStopping(Problem):
@@ -575,7 +724,9 @@ class NestedCheckout(Problem):
         super().__init__(
             f"""\
 edenfs reports that checkout {checkout.path} is nested within an existing checkout {existing_checkout.path}
-Nested checkouts are usually not intended and can cause spurious behavior. Consider running `eden rm {checkout.path}` to remove misplaced repo(s)\n"""
+Nested checkouts are usually not intended and can cause spurious behavior.""",
+            f"Consider running `eden rm {checkout.path}` to remove misplaced repo(s)\n",
+            severity=ProblemSeverity.ADVICE,
         )
 
 
@@ -586,13 +737,148 @@ class CheckoutInsideBackingRepo(Problem):
         super().__init__(
             f"""\
 edenfs reports that checkout {checkout.path} is created within backing repo of an existing checkout {existing_checkout.path} (backing repo: {existing_checkout.get_backing_repo_path()})
-Checkouts inside backing repo are usually not intended and can cause spurious behavior. Consider running `eden rm {checkout.path}` to remove misplaced repo(s)\n"""
+Checkouts inside backing repo are usually not intended and can cause spurious behavior.""",
+            f"Consider running `eden rm {checkout.path}` to remove misplaced repo(s)\n",
+            severity=ProblemSeverity.ADVICE,
         )
 
 
-class ConfigurationParsingProblem(Problem):
+class EdenCheckoutCorruption(Problem):
     def __init__(self, checkout: CheckoutInfo, ex: Exception) -> None:
-        super().__init__(f"error parsing the configuration for {checkout.path}: {ex}")
+        remediation = get_reclone_msg(str(checkout.path))
+
+        super().__init__(
+            f"Eden's checkout state for {checkout.path} has been corrupted: {ex}",
+            remediation=remediation,
+        )
+
+
+class EdenCheckoutConfigCorruption(FixableProblem):
+    _checkout_info: CheckoutInfo
+    _ex: Exception
+
+    def __init__(self, checkout_info: CheckoutInfo, ex: Exception) -> None:
+        self._checkout_info = checkout_info
+        self._ex = ex
+
+    def is_nfs_default(self) -> bool:
+        default_protocol = "PrjFS" if sys.platform == "win32" else "FUSE"
+        return (
+            self._checkout_info.instance.get_config_value(
+                "clone.default-mount-protocol", default_protocol
+            ).upper()
+            == "NFS"
+        )
+
+    def description(self) -> str:
+        return f"Eden's checkout state for {self._checkout_info.path} has been corrupted: {self._ex}"
+
+    def dry_run_msg(self) -> str:
+        return "Would reinitialize the checkout config"
+
+    def start_msg(self) -> str:
+        return "Reinitialize checkout config...."
+
+    def get_repo_type(self, state_dir: Path) -> str:
+        hgpath = state_dir / ".hg"
+        if not hgpath.exists():
+            return "other"
+        if (hgpath / "requires").exists():
+            with open(hgpath / "requires", "r") as f:
+                for line in f:
+                    if line.startswith("edensparse"):
+                        return "filteredhg"
+        return "hg"
+
+    def get_backup_path(self, config_path: Path) -> Path:
+        for i in range(1, 9):
+            backup_path = config_path.with_suffix(f".bak{i}")
+            if not backup_path.exists():
+                return backup_path
+        print(
+            f"Maximum number of Eden CheckoutConfig backup files reached. Please delete some of the backup files at {config_path} manually.",
+            file=sys.stderr,
+        )
+        return config_path.with_suffix(".bak_final")
+
+    def perform_fix(self) -> None:
+        """
+        Attempts to regenerate the config.toml file for the checkout from
+        the running state's checkout info. This does not work if eden is not
+        running.
+        """
+        # Get the state dir. This is where the config will be written to.
+        if self._checkout_info.running_state_dir is not None:
+            state_dir = self._checkout_info.running_state_dir
+        elif self._checkout_info.configured_state_dir is not None:
+            state_dir = self._checkout_info.configured_state_dir
+        else:
+            raise Exception("checkout info missing state dir")
+
+        # Determine the repo type from the running mount.
+        # We can regenerate the config for hg and
+        # filteredhg repos.
+        repotype = self.get_repo_type(self._checkout_info.path)
+        if repotype not in config_mod.HG_REPO_TYPES:
+            raise Exception("Cannot fix config for non-hg repo")
+
+        # Get the backing repo. This info links the checkout to the
+        # correct backing repo and is written into the config.
+        if self._checkout_info.backing_repo is None:
+            raise Exception("checkout info missing backing repo")
+
+        repo = util_mod.get_repo(str(self._checkout_info.backing_repo), repotype)
+        if repo is None:
+            raise util_mod.RepoError(
+                f"{self._checkout_info.backing_repo!r} does not look like a valid repository"
+            )
+        # Double check that this repo is hg
+        if repo.type not in config_mod.HG_REPO_TYPES:
+            raise Exception("Cannot fix config for non-hg repo")
+
+        # using defaults
+        checkout_config = config_mod.create_checkout_config(
+            repo,
+            self._checkout_info.instance,
+            nfs=self.is_nfs_default(),
+            case_sensitive=sys.platform == "linux",
+            overlay_type=None,
+            enable_windows_symlinks=self._checkout_info.instance.get_config_bool(
+                "experimental.windows-symlinks", False
+            ),
+        )
+        checkout = config_mod.EdenCheckout(
+            self._checkout_info.instance, self._checkout_info.path, state_dir
+        )
+        config_path = checkout._config_path()
+        backup_path = self.get_backup_path(config_path)
+        print(
+            f"Recreated config for checkout {checkout.path}. Previous config file backed up at {backup_path}\n"
+            f"This config is created using default values. If further issues persist consider recloning {get_reclone_advice_link()}"
+        )
+        if os.path.exists(config_path):
+            os.rename(config_path, backup_path)
+        checkout.save_config(checkout_config)
+
+    def check_fix(self) -> bool:
+        # Tries to read checkout again
+        checkout = self._checkout_info.get_checkout()
+        try:
+            checkout.get_config()
+        except Exception as ex:
+            print("Could not fix corrupted config.toml")
+            raise ex
+        return True
+
+
+class EdenCheckoutInfosCorruption(Problem):
+    def __init__(self, ex: Exception) -> None:
+        remediation = get_reclone_msg("$CHECKOUT_PATH")
+
+        super().__init__(
+            f"Encountered errors reading Eden's checkout info for the following checkouts:\n{ex}",
+            remediation=remediation,
+        )
 
 
 def check_mount(
@@ -604,6 +890,8 @@ def check_mount(
     watchman_info: check_watchman.WatchmanCheckInfo,
     all_checkouts: List[CheckoutInfo],
     checked_backing_repos: Set[str],
+    checked_network_backing_repos: Set[str],
+    network_checker: check_network.NetworkChecker,
     debug: bool,
     fast: bool,
 ) -> None:
@@ -631,7 +919,18 @@ def check_mount(
         MountState.INITIALIZED,
         MountState.STARTING,
     ):
-        tracker.add_problem(CheckoutIsStartingUp(checkout))
+        try:
+            check_starting_mount(
+                tracker,
+                instance,
+                checkout,
+                mount_table,
+                watchman_info,
+                debug,
+                fast,
+            )
+        except Exception as ex:
+            raise RuntimeError("Failed to check initializing/starting mount") from ex
     elif checkout.state in (
         MountState.SHUTTING_DOWN,
         MountState.SHUT_DOWN,
@@ -663,6 +962,57 @@ def check_mount(
     except Exception as ex:
         raise RuntimeError("Failed to detect nested checkout") from ex
 
+    # Network issues could prevent a mount from starting
+    if not fast:
+        try:
+            backing_repo = checkout.get_backing_repo()
+            run_repo_check = True
+        except AssertionError:
+            # This can happen if the backing repo is not yet configured
+            backing_repo = Path(os.getcwd())
+            run_repo_check = False
+        try:
+            network_checker.check_network(
+                tracker,
+                backing_repo,
+                checked_network_backing_repos,
+                run_repo_check,
+            )
+        except Exception as ex:
+            raise RuntimeError("Failed to check network for mount") from ex
+
+
+def check_starting_mount(
+    tracker: ProblemTracker,
+    instance: EdenInstance,
+    checkout_info: CheckoutInfo,
+    mount_table: mtab.MountTable,
+    watchman_info: check_watchman.WatchmanCheckInfo,
+    debug: bool,
+    fast: bool,
+) -> None:
+    checkout = checkout_info.get_checkout()
+    try:
+        checkout.get_config()
+        checkout.get_snapshot()
+    except config_mod.CheckoutConfigCorruptedError as ex:
+        # Config file is missing or invalid
+        tracker.add_problem(
+            EdenCheckoutConfigCorruption(checkout_info, ex),
+        )
+        return
+    except Exception as ex:
+        # Other error
+        tracker.add_problem(
+            EdenCheckoutCorruption(
+                checkout_info,
+                ex,
+            )
+        )
+        return
+    # Return this if there are no other problems
+    tracker.add_problem(CheckoutIsStartingUp(checkout_info))
+
 
 def check_running_mount(
     tracker: ProblemTracker,
@@ -683,8 +1033,20 @@ def check_running_mount(
     checkout = checkout_info.get_checkout()
     try:
         config = checkout.get_config()
+    except config_mod.CheckoutConfigCorruptedError as ex:
+        # Config file is missing or invalid
+        tracker.add_problem(
+            EdenCheckoutConfigCorruption(checkout_info, ex),
+        )
+        return
     except Exception as ex:
-        tracker.add_problem(ConfigurationParsingProblem(checkout_info, ex))
+        # Other error
+        tracker.add_problem(
+            EdenCheckoutCorruption(
+                checkout_info,
+                ex,
+            )
+        )
         # Just skip the remaining checks.
         # Most of them rely on values from the configuration.
         return
@@ -736,6 +1098,10 @@ def check_running_mount(
     if config.scm_type in ["hg", "filteredhg"]:
         try:
             check_hg.check_hg(tracker, checkout)
+        except RuntimeError as ex:
+            tracker.add_problem(EdenCheckoutCorruption(checkout_info, ex))
+            # Exit here but don't reraise since we're already reporting a problem.
+            return
         except Exception as ex:
             raise RuntimeError("Failed to check Mercurial status") from ex
 
@@ -817,14 +1183,8 @@ class CheckoutNotMounted(FixableProblem):
 {ex}
 
 {self._mount_path} appears to have been corrupted.
-This can happen if your devserver was hard-rebooted.
-To recover, you will need to remove and reclone the repo.
-You will lose uncommitted work or shelves, but all your local
-commits are safe.
-If you have non-trivial uncommitted work that you need to recover
-you may be able to restore it from your system backup.
-
-To remove the corrupted repo, run: `eden rm {self._mount_path}`"""
+This can happen if your machine was hard-rebooted.
+{get_reclone_msg(str(self._mount_path))}"""
                 )
 
             # if it is not this ^ eden corruption then it could be hg
@@ -858,6 +1218,32 @@ Failed to remount this mount with error:
                 )
             else:
                 raise
+
+    def check_fix(self) -> bool:
+        """
+        Check that mount return value is 1(already mounted) when rerunning command
+        """
+        try:
+            mount_value = self._instance.mount(str(self._mount_path), False)
+        except Exception as ex:
+            """
+            This should only happen if the mount becomes corrupted
+            between the time of the remount and the time of the check.
+            """
+            self._out.write(
+                f"\nAttempt to fix missing mount failed: {ex}.\n",
+                flush=True,
+            )
+            return False
+        if mount_value == 1:
+            return True
+        elif mount_value == 0:
+            """
+            This should only happen if the mount somehow gets unmounted
+            between the time of the remount and the time of the check.
+            """
+            return True
+        return False
 
 
 class StaleWorkingDirectory(Problem):
@@ -923,10 +1309,12 @@ The version of EdenFS that is running on your machine is:
     {running_version}
 This version is known to have issue:
     {reasons_string}
-
-Run `edenfsctl restart{"" if sys.platform == "win32" else " --graceful"}` to migrate to the newer version to avoid these issues.
 """
-        super().__init__(dedent(help_string), severity=ProblemSeverity.ADVICE)
+
+        remediation_string = 'Run `edenfsctl restart{"" if sys.platform == "win32" else " --graceful"}` to migrate to the newer version to avoid these issues.'
+        super().__init__(
+            dedent(help_string), remediation_string, severity=ProblemSeverity.ADVICE
+        )
 
 
 class OutOfDateVersion(Problem):
@@ -936,11 +1324,16 @@ The version of EdenFS that is installed on your machine is:
     {installed_version}
 but the version of EdenFS that is currently running is:
     {running_version}
+"""
 
-Consider running `edenfsctl restart --graceful` to migrate to the newer version,
+        remediation_string = """Consider running `edenfsctl restart --graceful` to migrate to the newer version,
 which may have important bug fixes or performance improvements.
 """
-        super().__init__(dedent(help_string), severity=ProblemSeverity.ADVICE)
+        super().__init__(
+            dedent(help_string),
+            dedent(remediation_string),
+            severity=ProblemSeverity.ADVICE,
+        )
 
 
 def check_edenfs_version(tracker: ProblemTracker, instance: EdenInstance) -> None:

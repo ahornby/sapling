@@ -9,16 +9,16 @@ import type {UICodeReviewProvider} from './codeReview/UICodeReviewProvider';
 import type {DiffSummary, CommitInfo, Hash} from './types';
 
 import {OperationDisabledButton} from './OperationDisabledButton';
-import {latestSuccessorUnlessExplicitlyObsolete} from './SuccessionTracker';
-import {Tooltip} from './Tooltip';
 import {codeReviewProvider, allDiffSummaries} from './codeReview/CodeReviewInfo';
 import {t, T} from './i18n';
 import {HideOperation} from './operations/HideOperation';
 import {useRunOperation} from './operationsState';
 import {type Dag, dagWithPreviews} from './previews';
-import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
+import {latestSuccessorUnlessExplicitlyObsolete} from './successionUtils';
+import {Button} from 'isl-components/Button';
+import {Icon} from 'isl-components/Icon';
+import {Tooltip} from 'isl-components/Tooltip';
 import {useAtomValue} from 'jotai';
-import {Icon} from 'shared/Icon';
 import {nullthrows} from 'shared/utils';
 
 export function isStackEligibleForCleanup(
@@ -62,14 +62,14 @@ export function CleanupButton({commit, hasChildren}: {commit: CommitInfo; hasChi
           : t('You can safely "clean up" by hiding this commit.')
       }
       placement="bottom">
-      <VSCodeButton
-        appearance="icon"
+      <Button
+        icon
         onClick={() => {
           runOperation(new HideOperation(latestSuccessorUnlessExplicitlyObsolete(commit)));
         }}>
         <Icon icon="eye-closed" slot="start" />
         {hasChildren ? <T>Clean up stack</T> : <T>Clean up</T>}
-      </VSCodeButton>
+      </Button>
     </Tooltip>
   );
 }
@@ -104,7 +104,6 @@ export function CleanupAllButton() {
           });
         }}
         icon={<Icon icon="eye-closed" slot="start" />}
-        appearance="secondary"
         disabled={disabled}>
         <T>Clean up all</T>
       </OperationDisabledButton>

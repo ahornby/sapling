@@ -20,7 +20,6 @@
 #include "eden/fs/config/ConfigSetting.h"
 #include "eden/fs/config/ConfigSource.h"
 #include "eden/fs/config/ConfigVariables.h"
-#include "eden/fs/config/FileChangeMonitor.h"
 #include "eden/fs/config/HgObjectIdFormat.h"
 #include "eden/fs/config/InodeCatalogType.h"
 #include "eden/fs/config/MountProtocol.h"
@@ -296,6 +295,53 @@ class EdenConfig : private ConfigSettingManager {
       std::chrono::seconds(30),
       this};
 
+  /**
+   * Use a SmallSerialExecutor for serial Thrift requests.
+   */
+  ConfigSetting<bool> thriftUseSmallSerialExecutor{
+      "thrift:use-small-serial-executor",
+      true,
+      this};
+
+  /**
+   * Whether Eden should use resource pools
+   */
+  ConfigSetting<bool> thriftUseResourcePools{
+      "thrift:use-resource-pools",
+      false,
+      this};
+
+  /**
+   * Whether Eden should use serial execution for each request. Resource pools
+   * must be enabled for this to take effect
+   */
+  ConfigSetting<bool> thriftUseSerialExecution{
+      "thrift:use-serial-execution",
+      false,
+      this};
+
+  ConfigSetting<bool> shouldFetchTreeMetadata{
+      "thrift:request-tree-metadata",
+      false,
+      this};
+
+  /**
+   * How often to collect Thrift server metrics. The default value mirrors the
+   * value from facebook::fb303::TServerCounters::kDefaultSampleRate
+   */
+  ConfigSetting<uint32_t> thriftServerObserverSamplingRate{
+      "thrift:server-observer-sampling-rate",
+      32,
+      this};
+
+  /**
+   * How often to publish Thrift server metrics in milliseconds.
+   */
+  ConfigSetting<std::chrono::nanoseconds> thriftServerObserverPublishInterval{
+      "thrift:server-observer-publish-interval",
+      std::chrono::milliseconds(1000),
+      this};
+
   // [ssl]
 
   ConfigSetting<AbsolutePath> clientCertificate{
@@ -441,6 +487,17 @@ class EdenConfig : private ConfigSettingManager {
   ConfigSetting<uint64_t> metadataCacheSize{
       "store:metadata-cache-size",
       1'000'000,
+      this};
+
+  /**
+   * Controls if RocksDbLocalStore operations should run asynchronously or
+   * synchronously.
+   *
+   * This is a temporary option to help us mitigate S433447.
+   */
+  ConfigSetting<bool> asyncRocksDbLocalStore{
+      "store:async-rocksdb-local-store",
+      false,
       this};
 
   // [fuse]
@@ -783,6 +840,15 @@ class EdenConfig : private ConfigSettingManager {
       this};
 
   /**
+   * Controls the max number of tree metadata import requests we batch in
+   * SaplingBackingStore
+   */
+  ConfigSetting<uint32_t> importBatchSizeTreeMeta{
+      "hg:import-batch-size-treemeta",
+      1024,
+      this};
+
+  /**
    * Whether fetching objects should fall back to hg importer process.
    */
   ConfigSetting<bool> hgImporterFetchFallback{
@@ -800,6 +866,15 @@ class EdenConfig : private ConfigSettingManager {
       true,
       this};
 
+  ConfigSetting<bool> hgEnableTreeLocalStoreCaching{
+      "hg:cache-trees-in-localstore",
+      true,
+      this};
+
+  ConfigSetting<bool> hgEnableBlobLocalStoreCaching{
+      "hg:cache-blobs-in-localstore",
+      false,
+      this};
   /**
    * List of paths to filter out when importing Mercurial trees.
    *
@@ -814,6 +889,41 @@ class EdenConfig : private ConfigSettingManager {
           "hg:filtered-paths",
           std::make_shared<std::unordered_set<RelativePath>>(),
           this};
+
+  /**
+   * Should we use the cached `sl status` results or not
+   */
+  ConfigSetting<bool> hgEnableCachedResultForStatusRequest{
+      "hg:enable-scm-status-cache",
+      false,
+      this};
+
+  /**
+   *  The maximum size of SCM status cache in bytes:
+   *  1. Generally, a file path is about 50 chars long.
+   *  2. We only cache status when the number of diff files is less than 10k.
+   *  3. And we allow at most 5 such "huge" status
+   */
+  ConfigSetting<size_t> scmStatusCacheMaxSize{
+      "hg:scm-status-cache-max-size",
+      50 * 10 * 1024 * 5, // 2.5 MB
+      this};
+
+  /**
+   *  The minimum number of items to keep in SCM status cache
+   */
+  ConfigSetting<size_t> scmStatusCacheMininumItems{
+      "hg:scm-status-cache-min-items",
+      3,
+      this};
+
+  /**
+   *  The maximum number of entries we want to cache within a single status
+   */
+  ConfigSetting<size_t> scmStatusCacheMaxEntriesPerItem{
+      "hg:scm-status-cache-max-entires-per-item",
+      10000,
+      this};
 
   // [backingstore]
 
@@ -1366,6 +1476,14 @@ class EdenConfig : private ConfigSettingManager {
   ConfigSetting<bool> globUseMountCaseSensitivity{
       "glob:use-mount-case-sensitivity",
       true,
+      this};
+
+  /**
+   * Controls whether EdenFS uses EdenAPI to make suffix queries
+   */
+  ConfigSetting<bool> enableEdenAPISuffixQuery{
+      "glob:use-edenapi-suffix-query",
+      false,
       this};
 
   // [doctor]

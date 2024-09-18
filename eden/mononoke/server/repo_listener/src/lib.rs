@@ -28,6 +28,7 @@ use fbinit::FacebookInit;
 use futures::channel::oneshot;
 use metaconfig_types::CommonConfig;
 use mononoke_api::Mononoke;
+use mononoke_api::Repo;
 use mononoke_app::fb303::ReadyFlagService;
 use mononoke_configs::MononokeConfigs;
 use openssl::ssl::SslAcceptor;
@@ -47,7 +48,7 @@ pub async fn create_repo_listeners<'a>(
     fb: FacebookInit,
     configs: Arc<MononokeConfigs>,
     common_config: CommonConfig,
-    mononoke: Arc<Mononoke>,
+    mononoke: Arc<Mononoke<Repo>>,
     root_log: Logger,
     sockname: String,
     tls_acceptor: SslAcceptor,
@@ -61,6 +62,7 @@ pub async fn create_repo_listeners<'a>(
     bound_addr_file: Option<PathBuf>,
     acl_provider: &dyn AclProvider,
     readonly: bool,
+    mtls_disabled: bool,
 ) -> Result<()> {
     let rate_limiter = {
         let handle = config_store
@@ -91,6 +93,7 @@ pub async fn create_repo_listeners<'a>(
             configs.clone(),
             &common_config,
             readonly,
+            mtls_disabled,
         )
         .context("Error instantiating SaplingRemoteAPI")?
     };
@@ -119,6 +122,7 @@ pub async fn create_repo_listeners<'a>(
         bound_addr_file,
         acl_provider,
         readonly,
+        mtls_disabled,
     )
     .await
 }

@@ -10,6 +10,7 @@ use std::num::NonZeroU64;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use edenapi_types::cloud::SmartlogDataResponse;
 use edenapi_types::AlterSnapshotRequest;
 use edenapi_types::AlterSnapshotResponse;
 use edenapi_types::AnyFileContentId;
@@ -18,6 +19,8 @@ use edenapi_types::BlameResult;
 use edenapi_types::BonsaiChangesetContent;
 use edenapi_types::BookmarkEntry;
 use edenapi_types::CloneData;
+use edenapi_types::CloudShareWorkspaceRequest;
+use edenapi_types::CloudShareWorkspaceResponse;
 use edenapi_types::CommitGraphEntry;
 use edenapi_types::CommitGraphSegmentsEntry;
 use edenapi_types::CommitHashLookupResponse;
@@ -36,24 +39,33 @@ use edenapi_types::FetchSnapshotResponse;
 use edenapi_types::FileResponse;
 use edenapi_types::FileSpec;
 use edenapi_types::GetReferencesParams;
+use edenapi_types::GetSmartlogByVersionParams;
+use edenapi_types::GetSmartlogParams;
 use edenapi_types::HgFilenodeData;
 use edenapi_types::HgMutationEntryContent;
+use edenapi_types::HistoricalVersionsParams;
+use edenapi_types::HistoricalVersionsResponse;
 use edenapi_types::HistoryEntry;
 use edenapi_types::LandStackResponse;
 use edenapi_types::LookupResponse;
-use edenapi_types::ReferencesData;
+use edenapi_types::ReferencesDataResponse;
+use edenapi_types::RenameWorkspaceRequest;
+use edenapi_types::RenameWorkspaceResponse;
 use edenapi_types::SaplingRemoteApiServerError;
 use edenapi_types::SetBookmarkResponse;
 use edenapi_types::SuffixQueryResponse;
 use edenapi_types::TreeAttributes;
 use edenapi_types::TreeEntry;
+use edenapi_types::UpdateArchiveParams;
+use edenapi_types::UpdateArchiveResponse;
 use edenapi_types::UpdateReferencesParams;
 use edenapi_types::UploadHgChangeset;
 use edenapi_types::UploadToken;
 use edenapi_types::UploadTokensResponse;
 use edenapi_types::UploadTreeEntry;
 use edenapi_types::UploadTreeResponse;
-use edenapi_types::WorkspaceData;
+use edenapi_types::WorkspaceDataResponse;
+use edenapi_types::WorkspacesDataResponse;
 use minibytes::Bytes;
 use types::HgId;
 use types::Key;
@@ -377,15 +389,25 @@ pub trait SaplingRemoteApi: Send + Sync + 'static {
         &self,
         workspace: String,
         reponame: String,
-    ) -> Result<WorkspaceData, SaplingRemoteApiError> {
+    ) -> Result<WorkspaceDataResponse, SaplingRemoteApiError> {
         let _ = (workspace, reponame);
+        Err(SaplingRemoteApiError::NotSupported)
+    }
+
+    /// Retrieves workspaces that match a prefix in from commit cloud
+    async fn cloud_workspaces(
+        &self,
+        prefix: String,
+        reponame: String,
+    ) -> Result<WorkspacesDataResponse, SaplingRemoteApiError> {
+        let _ = (prefix, reponame);
         Err(SaplingRemoteApiError::NotSupported)
     }
 
     async fn cloud_references(
         &self,
         data: GetReferencesParams,
-    ) -> Result<ReferencesData, SaplingRemoteApiError> {
+    ) -> Result<ReferencesDataResponse, SaplingRemoteApiError> {
         let _ = data;
         Err(SaplingRemoteApiError::NotSupported)
     }
@@ -393,7 +415,55 @@ pub trait SaplingRemoteApi: Send + Sync + 'static {
     async fn cloud_update_references(
         &self,
         data: UpdateReferencesParams,
-    ) -> Result<ReferencesData, SaplingRemoteApiError> {
+    ) -> Result<ReferencesDataResponse, SaplingRemoteApiError> {
+        let _ = data;
+        Err(SaplingRemoteApiError::NotSupported)
+    }
+
+    async fn cloud_smartlog(
+        &self,
+        data: GetSmartlogParams,
+    ) -> Result<SmartlogDataResponse, SaplingRemoteApiError> {
+        let _ = data;
+        Err(SaplingRemoteApiError::NotSupported)
+    }
+
+    async fn cloud_share_workspace(
+        &self,
+        data: CloudShareWorkspaceRequest,
+    ) -> Result<CloudShareWorkspaceResponse, SaplingRemoteApiError> {
+        let _ = data;
+        Err(SaplingRemoteApiError::NotSupported)
+    }
+
+    async fn cloud_update_archive(
+        &self,
+        data: UpdateArchiveParams,
+    ) -> Result<UpdateArchiveResponse, SaplingRemoteApiError> {
+        let _ = data;
+        Err(SaplingRemoteApiError::NotSupported)
+    }
+
+    async fn cloud_rename_workspace(
+        &self,
+        data: RenameWorkspaceRequest,
+    ) -> Result<RenameWorkspaceResponse, SaplingRemoteApiError> {
+        let _ = data;
+        Err(SaplingRemoteApiError::NotSupported)
+    }
+
+    async fn cloud_smartlog_by_version(
+        &self,
+        data: GetSmartlogByVersionParams,
+    ) -> Result<SmartlogDataResponse, SaplingRemoteApiError> {
+        let _ = data;
+        Err(SaplingRemoteApiError::NotSupported)
+    }
+
+    async fn cloud_historical_versions(
+        &self,
+        data: HistoricalVersionsParams,
+    ) -> Result<HistoricalVersionsResponse, SaplingRemoteApiError> {
         let _ = data;
         Err(SaplingRemoteApiError::NotSupported)
     }
@@ -403,8 +473,9 @@ pub trait SaplingRemoteApi: Send + Sync + 'static {
         &self,
         commit: CommitId,
         suffixes: Vec<String>,
+        prefixes: Option<Vec<String>>,
     ) -> Result<Response<SuffixQueryResponse>, SaplingRemoteApiError> {
-        let _ = (commit, suffixes);
+        let _ = (commit, suffixes, prefixes);
         Err(SaplingRemoteApiError::NotSupported)
     }
 }

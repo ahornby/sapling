@@ -1,12 +1,12 @@
 load("//eden/mononoke/facebook/fbpkg:lib.bzl", "mononoke_fbpkg")
 load("//tupperware/cm/antlir2/bzl:buck2_container.bzl", "tw")
+load("//tupperware/config/common:tw.mixin.zkdaemon.bzl", zkdaemon_mixin = "mixin")
 
 oncall("mononoke")
 
 mononoke_fbpkg(
     name = "mononoke.server",
     path_actions = {
-        "config": "fbcode//eden/mononoke/facebook/config:config",
         "mononoke": "fbcode//eden/mononoke:mononoke",
     },
 )
@@ -14,6 +14,11 @@ mononoke_fbpkg(
 mononoke_fbpkg(
     name = "mononoke.scs_server",
     path_actions = {
+        # deps temporarily needed to satisfy metagit repo creation reqs
+        "hipstercli": "fbcode//infrasec/authorization/tools/py/hipstercli:hipstercli",
+        "oncalls": "fbcode//oncall/py:oncalls",
+        "scmadmin": "fbcode//scm/scmadmin:client",
+        # actual scs server binary
         "scs_server": "fbcode//eden/mononoke/scs_server:scs_server",
     },
 )
@@ -24,13 +29,6 @@ mononoke_fbpkg(
     path_actions = {
         "admin": "//eden/mononoke:admin",
         "newadmin": "//eden/mononoke/tools/admin:newadmin",
-    },
-)
-
-mononoke_fbpkg(
-    name = "mononoke.backfill_derived_data",
-    path_actions = {
-        "backfill_derived_data": "//eden/mononoke:backfill_derived_data",
     },
 )
 
@@ -67,7 +65,7 @@ mononoke_fbpkg(
 mononoke_fbpkg(
     name = "mononoke.megarepo_async_requests_worker",
     path_actions = {
-        "async_requests_worker": "//eden/mononoke/megarepo_api:async_requests_worker",
+        "async_requests_worker": "//eden/mononoke/async_requests:worker",
     },
 )
 
@@ -90,13 +88,6 @@ mononoke_fbpkg(
     name = "mononoke.new_streaming_clone",
     path_actions = {
         "new_streaming_clone": "//eden/mononoke/streaming_clone:new_streaming_clone",
-    },
-)
-
-mononoke_fbpkg(
-    name = "mononoke.segmented_changelog_tailer",
-    path_actions = {
-        "segmented_changelog_tailer": "//eden/mononoke:segmented_changelog_tailer",
     },
 )
 
@@ -192,15 +183,6 @@ mononoke_fbpkg(
 )
 
 mononoke_fbpkg(
-    name = "mononoke.locked_repo_reporter",
-    compress_type = None,
-    override_log_paths = ["eden/mononoke/facebook/locked_repo_reporter"],
-    path_actions = {
-        "locked_repo_reporter.par": "//eden/mononoke/facebook/locked_repo_reporter:locked_repo_reporter",
-    },
-)
-
-mononoke_fbpkg(
     name = "mononoke.review-bookmarks",
     compress_type = None,
     override_log_paths = ["eden/mononoke/facebook/monitoring"],
@@ -219,6 +201,14 @@ mononoke_fbpkg(
 )
 
 mononoke_fbpkg(
+    name = "mononoke.gitimport",
+    compress_type = None,
+    path_actions = {
+        "gitimport": "//eden/mononoke/git/gitimport:gitimport",
+    },
+)
+
+mononoke_fbpkg(
     name = "mononoke.gitexport",
     compress_type = None,
     path_actions = {
@@ -230,6 +220,13 @@ mononoke_fbpkg(
     name = "mononoke.bookmark_service",
     path_actions = {
         "bookmark_service_server": "//eden/mononoke/facebook/bookmark_service:bookmark_service_server",
+    },
+)
+
+mononoke_fbpkg(
+    name = "mononoke.cas_sync_job",
+    path_actions = {
+        "mononoke_cas_sync_job": "//eden/mononoke/mononoke_cas_sync_job:mononoke_cas_sync_job",
     },
 )
 
@@ -246,4 +243,22 @@ tw.container(
         ),
     ],
     oncall = "scm_server_infra",
+)
+
+tw.container(
+    name = "tw.mononoke.git_server_push_poller",
+    custom_image_opts = tw.image.opts(),
+    features = [
+        tw.build_fbpkg(
+            mononoke_fbpkg(
+                name = "mononoke.git_server_push_poller",
+                path_actions = {
+                    "git_server_push_poller": "//eden/mononoke/facebook/git_server/push_poller:git_server_push_poller",
+                },
+            ),
+        ),
+    ],
+    mixins = [zkdaemon_mixin],
+    oncall = "scm_server_infra",
+    parent = "//tupperware/image/source_control:scm",
 )

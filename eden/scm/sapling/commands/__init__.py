@@ -97,6 +97,7 @@ with hgdemandimport.deactivated():
         eden,
         fs,
         isl,
+        subtree,
         uncommit,
     )
 
@@ -193,6 +194,7 @@ diffopts2 = cmdutil.diffopts2
 mergetoolopts = cmdutil.mergetoolopts
 similarityopts = cmdutil.similarityopts
 debugrevlogopts = cmdutil.debugrevlogopts
+diffgraftopts = cmdutil.diffgraftopts
 
 # Commands start here, listed alphabetically
 
@@ -795,7 +797,7 @@ def _dobackout(ui, repo, node=None, rev=None, **opts):
             _replayrenames(repo, node)
 
             dsguard.close()
-            hg._showstats(repo, stats)
+            hg.showstats(repo, stats)
             if stats[3]:
                 repo.ui.status(
                     _("use '@prog@ resolve' to retry unresolved " "file merges\n")
@@ -1055,9 +1057,6 @@ the sparse profile from the known %s changeset %s\n"
         return (node, changesets, bgood)
 
     displayer = cmdutil.show_changeset(ui, repo, {})
-    if "eden" in repo.requirements:
-        # skip the sparseskip logic if it's an Eden repo
-        nosparseskip = True
 
     if command:
         changesets = 1
@@ -2075,7 +2074,7 @@ def uncopy(ui, repo, *pats, **opts):
 @command("debugcommands", [], _("[COMMAND]"), norepo=True)
 def debugcommands(ui, cmd="", *args):
     """list all available commands and options"""
-    for cmd, vals in sorted(pycompat.iteritems(table)):
+    for cmd, vals in sorted(table.items()):
         cmd = cmd.split("|")[0].strip("^")
         opts = ", ".join([i[1] for i in vals[1]])
         ui.write("%s: %s\n" % (cmd, opts))
@@ -2141,7 +2140,8 @@ def debugcomplete(ui, cmd="", **opts):
     ]
     + diffopts
     + diffopts2
-    + walkopts,
+    + walkopts
+    + diffgraftopts,
     _("[OPTION]... ([-c REV] | [-r REV1 [-r REV2]]) [FILE]..."),
     inferrepo=True,
     cmdtype=readonly,
@@ -2163,6 +2163,10 @@ def diff(ui, repo, *pats, **opts):
     By default, diffs are shown using the unified diff format. Specify ``-g``
     to generate diffs in the git extended diff format. For more information,
     see :prog:`help diffs`.
+
+    ``--from-path`` and ``--to-path`` allow diffing between directories.
+    Files outside ``--from-path`` in the left side are ignored. See
+    :prog:`help directorybranching` for more information.
 
     .. note::
 
@@ -2216,9 +2220,17 @@ def diff(ui, repo, *pats, **opts):
 
     if reverse:
         ctx1, ctx2 = ctx2, ctx1
+        opts["from_path"], opts["to_path"] = opts.get("to_path"), opts.get("from_path")
+
+    from_paths = scmutil.rootrelpaths(ctx1, opts.get("from_path"))
+    to_paths = scmutil.rootrelpaths(ctx1, opts.get("to_path"))
+    cmdutil.registerdiffgrafts(from_paths, to_paths, ctx1)
 
     if onlyfilesinrevs:
         files1 = set(ctx1.files())
+        m1 = ctx1.manifest()
+        if m1.hasgrafts():
+            files1 = set(f for f in files1 for f in m1.graftedpaths(f))
         files2 = set(ctx2.files())
         pats = pats + tuple(repo.wvfs.join(f) for f in files1 | files2)
 
@@ -2463,7 +2475,8 @@ def forget(ui, repo, *pats, **opts):
     ]
     + commitopts2
     + mergetoolopts
-    + dryrunopts,
+    + dryrunopts
+    + diffgraftopts,
     _("[OPTION]... REV..."),
     legacyaliases=["gra", "graf"],
 )
@@ -2496,6 +2509,11 @@ def graft(ui, repo, *revs, **opts):
     so that the current merge can be manually resolved. Once all
     conflicts are resolved, the graft process can be continued with
     the ``-c/--continue`` option.
+
+    ``--from-path`` and ``--to-path`` allow copying commits between
+    directories. Files in the grafted commit(s) outside of
+    ``--from-path`` are ignored. See :prog:`help directorybranching` for
+    more information.
 
     .. note::
 
@@ -2552,8 +2570,6 @@ def _dograft(ui, repo, *revs, **opts):
     if not opts.get("date") and opts.get("currentdate"):
         opts["date"] = "%d %d" % util.makedate()
 
-    editor = cmdutil.getcommiteditor(editform="graft", **opts)
-
     cont = False
     if opts.get("continue") or opts.get("abort"):
         if revs and opts.get("continue"):
@@ -2597,7 +2613,7 @@ def _dograft(ui, repo, *revs, **opts):
     # way to the graftstate. With --force, any revisions we would have otherwise
     # skipped would not have been filtered out, and if they hadn't been applied
     # already, they'd have been in the graftstate.
-    if not (cont or opts.get("force")):
+    if not (cont or opts.get("force") or opts.get("from_path")):
         # check for ancestors of dest branch
         crev = repo["."].rev()
         ancestors = repo.changelog.ancestors([crev], inclusive=True)
@@ -2611,6 +2627,9 @@ def _dograft(ui, repo, *revs, **opts):
 
         if not revs:
             return -1
+
+    from_paths = scmutil.rootrelpaths(repo["."], opts.get("from_path"))
+    to_paths = scmutil.rootrelpaths(repo["."], opts.get("to_path"))
 
     for pos, ctx in enumerate(repo.set("%ld", revs)):
         desc = '%s "%s"' % (ctx, ctx.description().split("\n", 1)[0])
@@ -2634,9 +2653,10 @@ def _dograft(ui, repo, *revs, **opts):
         date = ctx.date()
         if opts.get("date"):
             date = opts["date"]
-        message = ctx.description()
-        if opts.get("log"):
-            message += "\n(grafted from %s)" % ctx.hex()
+
+        # Apply --from-path/--to-path mappings to manifest being grafted, and its
+        # parent manifest.
+        cmdutil.registerdiffgrafts(from_paths, to_paths, ctx, ctx.p1())
 
         # we don't merge the first commit when continuing
         if not cont:
@@ -2644,7 +2664,12 @@ def _dograft(ui, repo, *revs, **opts):
             try:
                 # ui.forcemerge is an internal variable, do not document
                 repo.ui.setconfig("ui", "forcemerge", opts.get("tool", ""), "graft")
-                stats = mergemod.graft(repo, ctx, ctx.p1(), ["local", "graft"])
+                stats = mergemod.graft(
+                    repo,
+                    ctx,
+                    ctx.p1(),
+                    ["local", "graft"],
+                )
             finally:
                 repo.ui.setconfig("ui", "forcemerge", "", "graft")
             # report any conflicts
@@ -2665,10 +2690,15 @@ def _dograft(ui, repo, *revs, **opts):
             cont = False
 
         # commit
+        editor = cmdutil.getcommiteditor(editform="graft", **opts)
+        message = _makegraftmessage(ctx, opts)
         node = repo.commit(
             text=message, user=user, date=date, extra=extra, editor=editor
         )
         if node is None:
+            # users might provide wrong from paths, this validate function will
+            # provide more info for users to understand why no changes to commit
+            scmutil.validate_path_exist(ui, ctx, from_paths)
             ui.warn(_("note: graft of %s created no changes to commit\n") % (ctx))
 
     # remove state when we complete successfully
@@ -2676,6 +2706,22 @@ def _dograft(ui, repo, *revs, **opts):
         repo.localvfs.unlinkpath("graftstate", ignoremissing=True)
 
     return 0
+
+
+def _makegraftmessage(ctx, opts):
+    description = ctx.description()
+    message = []
+    if opts.get("from_path"):
+        # For xdir grafts, include "grafted from" breadcrumb by default.
+        if opts.get("log") is not False:
+            message.append("Grafted from %s" % ctx.hex())
+            for f, t in zip(opts.get("from_path"), opts.get("to_path")):
+                message.append("- Grafted path %s to %s" % (f, t))
+    else:
+        if opts.get("log"):
+            message.append("(grafted from %s)" % ctx.hex())
+    message = "\n".join(message)
+    return cmdutil.add_summary_footer(ctx.repo().ui, description, message)
 
 
 @command(
@@ -3606,7 +3652,7 @@ def identify(
                 hexremoterev = hex(remoterev)
                 bms = [
                     bm
-                    for bm, bmr in pycompat.iteritems(peer.listkeys("bookmarks"))
+                    for bm, bmr in peer.listkeys("bookmarks").items()
                     if bmr == hexremoterev
                 ]
 
@@ -4260,7 +4306,7 @@ def log(ui, repo, *pats, **opts):
     "manifest|mani",
     [
         ("r", "rev", "", _("revision to display"), _("REV")),
-        ("", "all", False, _("list files from all revisions")),
+        ("", "all", False, _("list files from all revisions (DEPRECATED)")),
     ]
     + formatteropts,
     _("[-r REV]"),
@@ -4286,24 +4332,7 @@ def manifest(ui, repo, node=None, rev=None, **opts):
     fm = ui.formatter("manifest", opts)
 
     if opts.get("all"):
-        if rev or node:
-            raise error.Abort(_("can't specify a revision with --all"))
-
-        res = []
-        prefix = "data/"
-        suffix = ".i"
-        plen = len(prefix)
-        slen = len(suffix)
-        with repo.lock():
-            for fn, b, size in repo.store.datafiles():
-                if size != 0 and fn[-slen:] == suffix and fn[:plen] == prefix:
-                    res.append(fn[plen:-slen])
-        ui.pager("manifest")
-        for f in res:
-            fm.startitem()
-            fm.write("path", "%s\n", f)
-        fm.end()
-        return
+        raise error.Abort(_("--all not supported"))
 
     if rev and node:
         raise error.Abort(_("please specify just one revision"))
@@ -4532,13 +4561,9 @@ def paths(ui, repo, search=None, **opts):
 
     ui.pager("paths")
     if search:
-        pathitems = [
-            (name, path)
-            for name, path in pycompat.iteritems(ui.paths)
-            if name == search
-        ]
+        pathitems = [(name, path) for name, path in ui.paths.items() if name == search]
     else:
-        pathitems = sorted(pycompat.iteritems(ui.paths))
+        pathitems = sorted(ui.paths.items())
 
     fm = ui.formatter("paths", opts)
     if fm.isplain():
@@ -6017,7 +6042,7 @@ def summary(ui, repo, **opts):
 
     c = repo.dirstate.copies()
     copied, renamed = [], []
-    for d, s in pycompat.iteritems(c):
+    for d, s in c.items():
         if s in status.removed:
             status.removed.remove(s)
             renamed.append(d)
@@ -6495,12 +6520,7 @@ def update(
         )
 
         if merge:
-            ms = mergemod.mergestate.read(repo)
-            # Are conflicts resolved?
-            # If so, exit the updatemergestate.
-            if not ms.active() or ms.unresolvedcount() == 0:
-                ms.reset()
-                repo.localvfs.tryunlink("updatemergestate")
+            mergemod.try_conclude_merge_state(repo)
 
         return result
 

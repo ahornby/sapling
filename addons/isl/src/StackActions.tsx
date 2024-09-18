@@ -14,7 +14,6 @@ import {shouldShowSubmitStackConfirmation, useShowConfirmSubmitStack} from './Co
 import {HighlightCommitsWhileHovering} from './HighlightedCommits';
 import {OperationDisabledButton} from './OperationDisabledButton';
 import {showSuggestedRebaseForStack, SuggestedRebaseButton} from './SuggestedRebase';
-import {Tooltip, DOCUMENTATION_DELAY} from './Tooltip';
 import {codeReviewProvider, allDiffSummaries} from './codeReview/CodeReviewInfo';
 import {SyncStatus, syncStatusAtom} from './codeReview/syncStatus';
 import {T, t} from './i18n';
@@ -26,10 +25,11 @@ import {useConfirmUnsavedEditsBeforeSplit} from './stackEdit/ui/ConfirmUnsavedEd
 import {StackEditIcon} from './stackEdit/ui/StackEditIcon';
 import {editingStackIntentionHashes, loadingStackState} from './stackEdit/ui/stackEditState';
 import {succeedableRevset} from './types';
-import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
+import {Button} from 'isl-components/Button';
+import {Icon} from 'isl-components/Icon';
+import {Tooltip, DOCUMENTATION_DELAY} from 'isl-components/Tooltip';
 import {useAtom, useAtomValue} from 'jotai';
 import {type ContextMenuItem, useContextMenu} from 'shared/ContextMenu';
-import {Icon} from 'shared/Icon';
 
 import './StackActions.css';
 
@@ -129,7 +129,7 @@ export function StackActions({hash}: {hash: Hash}): React.ReactElement | null {
             <OperationDisabledButton
               // Use the diffId in the key so that only this "resubmit stack" button shows the spinner.
               contextKey={`resubmit-stack-on-${info.diffId}`}
-              appearance="icon"
+              kind="icon"
               icon={icon}
               runOperation={async () => {
                 const confirmation = await confirmShouldSubmit('resubmit', resubmittableStack);
@@ -199,7 +199,7 @@ export function StackActions({hash}: {hash: Hash}): React.ReactElement | null {
           <HighlightCommitsWhileHovering toHighlight={submittableStack}>
             <OperationDisabledButton
               contextKey={contextKey}
-              appearance="icon"
+              kind="icon"
               icon={<Icon icon="cloud-upload" slot="start" />}
               runOperation={async () => {
                 const allCommits = submittableStack;
@@ -229,6 +229,7 @@ export function StackActions({hash}: {hash: Hash}): React.ReactElement | null {
     actions.push(<CleanupButton key="cleanup" commit={info} hasChildren={hasChildren} />);
     // cleanup button implies no need to rebase this stack
   } else if (suggestedRebase) {
+    // FIXME: Support optimistic commits, requires CommitInfo instead of just Hash
     actions.push(<SuggestedRebaseButton key="suggested-rebase" source={succeedableRevset(hash)} />);
   }
 
@@ -237,9 +238,9 @@ export function StackActions({hash}: {hash: Hash}): React.ReactElement | null {
   }
   const moreActionsButton =
     moreActions.length === 0 ? null : (
-      <VSCodeButton key="more-actions" appearance="icon" onClick={contextMenu}>
+      <Button key="more-actions" icon onClick={contextMenu}>
         <Icon icon="ellipsis" />
-      </VSCodeButton>
+      </Button>
     );
   return (
     <div className="commit-tree-stack-actions" data-testid="commit-tree-stack-actions">
@@ -296,10 +297,10 @@ function StackEditButton({info}: {info: DagCommitInfo}): React.ReactElement | nu
   return (
     <HighlightCommitsWhileHovering key="submit-stack" toHighlight={highlight}>
       <Tooltip title={title} delayMs={tooltipDelay} placement="bottom">
-        <VSCodeButton
+        <Button
           className={`edit-stack-button${disabled ? ' disabled' : ''}`}
           disabled={disabled}
-          appearance="icon"
+          icon
           onClick={async () => {
             if (!(await confirmUnsavedEditsBeforeSplit(stackCommits, 'edit_stack'))) {
               return;
@@ -308,7 +309,7 @@ function StackEditButton({info}: {info: DagCommitInfo}): React.ReactElement | nu
           }}>
           {icon}
           <T>Edit stack</T>
-        </VSCodeButton>
+        </Button>
       </Tooltip>
     </HighlightCommitsWhileHovering>
   );

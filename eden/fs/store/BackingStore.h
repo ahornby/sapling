@@ -19,6 +19,7 @@
 #include "eden/fs/model/ObjectId.h"
 #include "eden/fs/model/RootId.h"
 #include "eden/fs/model/TreeFwd.h"
+#include "eden/fs/model/TreeMetadataFwd.h"
 #include "eden/fs/store/BackingStoreType.h"
 #include "eden/fs/store/ImportPriority.h"
 #include "eden/fs/store/ObjectFetchContext.h"
@@ -65,7 +66,10 @@ class BackingStore : public RootIdCodec, public ObjectIdCodec {
     Trees = 1 << 0,
     Blobs = 1 << 1,
     BlobMetadata = 1 << 2,
+    // TODO(T192128228): Add caching policy for TreeMetadata
+    TreesAndBlobs = Trees | Blobs,
     TreesAndBlobMetadata = Trees | BlobMetadata,
+    BlobsAndBlobMetadata = Blobs | BlobMetadata,
     Anything = Trees | Blobs | BlobMetadata,
   };
 
@@ -102,6 +106,18 @@ class BackingStore : public RootIdCodec, public ObjectIdCodec {
   };
 
   /**
+   * Return value of the getTreeMetadata method.
+   */
+  struct GetTreeMetaResult {
+    /**
+     * The retrieved tree metadata.
+     */
+    TreeMetadataPtr treeMeta;
+    /** The fetch origin of the tree metadata. */
+    ObjectFetchContext::Origin origin;
+  };
+
+  /**
    * Return value of the getBlob method.
    */
   struct GetBlobResult {
@@ -128,6 +144,21 @@ class BackingStore : public RootIdCodec, public ObjectIdCodec {
     BlobMetadataPtr blobMeta;
     /** The fetch origin of the blob metadata. */
     ObjectFetchContext::Origin origin;
+  };
+
+  /**
+   * Return value of the getGlobFiles method.
+   */
+  struct GetGlobFilesResult {
+    /**
+     * The retrieved glob entries
+     * This command is unimplemented on some backing store impls
+     * and will return an error. This will trigger the client to fallback to
+     * looking up the globs locally.
+     */
+    std::vector<std::string> globFiles;
+    RootId rootId;
+    bool isLocal = false;
   };
 
   virtual void periodicManagementTask() {}
@@ -220,6 +251,15 @@ class BackingStore : public RootIdCodec, public ObjectIdCodec {
       const ObjectFetchContextPtr& context) = 0;
 
   /**
+   * Fetch the tree metadata from the backing store.
+   *
+   * Return the tree metadata and where it was found.
+   */
+  virtual folly::SemiFuture<GetTreeMetaResult> getTreeMetadata(
+      const ObjectId& id,
+      const ObjectFetchContextPtr& context) = 0;
+
+  /**
    * Fetch a blob from the backing store.
    *
    * Return the blob and where it was found.
@@ -236,6 +276,18 @@ class BackingStore : public RootIdCodec, public ObjectIdCodec {
   virtual folly::SemiFuture<GetBlobMetaResult> getBlobMetadata(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) = 0;
+
+  /**
+   * Fetch file paths matching the given glob suffixes
+   *
+   * Return the Glob result containing the list of file paths, dtype, and commit
+   * If the implementing BackingStore does not impolement this method, it will
+   * return an error. The caller should fallback to resolving globFiles locally
+   * in this case.
+   */
+  virtual ImmediateFuture<GetGlobFilesResult> getGlobFiles(
+      const RootId& id,
+      const std::vector<std::string>& globs) = 0;
 
   /**
    * Prefetch all the blobs represented by the HashRange.

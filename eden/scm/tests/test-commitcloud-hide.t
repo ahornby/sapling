@@ -1,8 +1,8 @@
 #modern-config-incompatible
+#inprocess-hg-incompatible
 
 #require no-eden
 
-  $ setconfig format.use-segmented-changelog=true
   $ setconfig experimental.allowfilepeer=True
 
   $ configure modern

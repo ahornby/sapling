@@ -11,23 +11,25 @@ import serverAPI from './ClientToServerAPI';
 import {Row} from './ComponentUtils';
 import {DropdownField, DropdownFields} from './DropdownFields';
 import {useCommandEvent} from './ISLShortcuts';
-import {Kbd} from './Kbd';
-import {Subtle} from './Subtle';
-import {Tooltip} from './Tooltip';
 import {codeReviewProvider} from './codeReview/CodeReviewInfo';
-import {Badge} from './components/Badge';
-import {Button} from './components/Button';
-import {ButtonDropdown} from './components/ButtonDropdown';
-import {Divider} from './components/Divider';
-import {RadioGroup} from './components/Radio';
 import {T, t} from './i18n';
 import {writeAtom} from './jotaiUtils';
+import foundPlatform from './platform';
 import {serverCwd} from './repositoryData';
 import {repositoryInfo} from './serverAPIState';
 import {registerCleanup, registerDisposable} from './utils';
+import {Badge} from 'isl-components/Badge';
+import {Button} from 'isl-components/Button';
+import {ButtonDropdown} from 'isl-components/ButtonDropdown';
+import {Divider} from 'isl-components/Divider';
+import {Icon} from 'isl-components/Icon';
+import {Kbd} from 'isl-components/Kbd';
+import {KeyCode, Modifier} from 'isl-components/KeyboardShortcuts';
+import {RadioGroup} from 'isl-components/Radio';
+import {Subtle} from 'isl-components/Subtle';
+import {Tooltip} from 'isl-components/Tooltip';
 import {atom, useAtomValue} from 'jotai';
-import {Icon} from 'shared/Icon';
-import {KeyCode, Modifier} from 'shared/KeyboardShortcuts';
+import {Suspense} from 'react';
 import {basename} from 'shared/utils';
 
 /**
@@ -93,7 +95,7 @@ export function CwdSelector() {
     <Tooltip
       trigger="click"
       component={dismiss => <CwdDetails dismiss={dismiss} />}
-      additionalToggles={additionalToggles}
+      additionalToggles={additionalToggles.asEventTarget()}
       group="topbar"
       placement="bottom"
       title={
@@ -138,9 +140,15 @@ function CwdDetails({dismiss}: {dismiss: () => unknown}) {
   const repoRoot = info?.type === 'success' ? info.repoRoot : null;
   const provider = useAtomValue(codeReviewProvider);
   const cwd = useAtomValue(serverCwd);
+  const AddMoreCwdsHint = foundPlatform.AddMoreCwdsHint;
   return (
     <DropdownFields title={<T>Repository info</T>} icon="folder" data-testid="cwd-details-dropdown">
       <CwdSelections dismiss={dismiss} divider />
+      {AddMoreCwdsHint && (
+        <Suspense>
+          <AddMoreCwdsHint />
+        </Suspense>
+      )}
       <DropdownField title={<T>Active working directory</T>}>
         <code>{cwd}</code>
       </DropdownField>

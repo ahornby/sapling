@@ -42,8 +42,11 @@ if sys.platform == "win32":
 @hg_test
 # pyre-ignore[13]: T62487924
 class UpdateTest(EdenHgTestCase):
+    # pyre-fixme[13]: Attribute `commit1` is never initialized.
     commit1: str
+    # pyre-fixme[13]: Attribute `commit2` is never initialized.
     commit2: str
+    # pyre-fixme[13]: Attribute `commit3` is never initialized.
     commit3: str
     enable_fault_injection: bool = True
 
@@ -966,9 +969,13 @@ class PrjFsState(Enum):
 @hg_test
 # pyre-ignore[13]: T62487924
 class UpdateCacheInvalidationTest(EdenHgTestCase):
+    # pyre-fixme[13]: Attribute `commit1` is never initialized.
     commit1: str
+    # pyre-fixme[13]: Attribute `commit2` is never initialized.
     commit2: str
+    # pyre-fixme[13]: Attribute `commit3` is never initialized.
     commit3: str
+    # pyre-fixme[13]: Attribute `commit4` is never initialized.
     commit4: str
     enable_fault_injection: bool = True
 
@@ -1422,6 +1429,8 @@ class PrjFSStressTornReads(EdenHgTestCase):
 
         read_thread = Thread(target=read_file)
         read_thread.start()
+
+        self.wait_on_fault_hit(key_class="PrjfsDispatcherImpl::read")
 
         try:
             self.repo.update(self.short_file_commit)

@@ -15,7 +15,6 @@ use anyhow::Context;
 use anyhow::Error;
 use context::CoreContext;
 use context::PerfCounterType;
-use derived_data::BonsaiDerived;
 use filestore::FilestoreConfigRef;
 use fsnodes::RootFsnodeId;
 use manifest::Entry;
@@ -32,6 +31,7 @@ use mononoke_types::ChangesetId;
 use mononoke_types::ContentId;
 use mononoke_types::FileChange;
 use mononoke_types::FileType;
+use mononoke_types::GitLfs;
 use mononoke_types::NonRootMPath;
 use repo_blobstore::RepoBlobstoreRef;
 use repo_derived_data::RepoDerivedDataRef;
@@ -160,7 +160,10 @@ impl CommitRemappingState {
         repo: &impl Repo,
         cs_id: ChangesetId,
     ) -> Result<Option<Self>, Error> {
-        let root_fsnode_id = RootFsnodeId::derive(ctx, repo, cs_id).await?;
+        let root_fsnode_id = repo
+            .repo_derived_data()
+            .derive::<RootFsnodeId>(ctx, cs_id)
+            .await?;
 
         let path = MPath::new(REMAPPING_STATE_FILE)?;
         let maybe_entry = root_fsnode_id
@@ -198,7 +201,13 @@ impl CommitRemappingState {
         let (content_id, size) = self.save(ctx, repo).await?;
         let path = NonRootMPath::new(REMAPPING_STATE_FILE)?;
 
-        let fc = FileChange::tracked(content_id, FileType::Regular, size, None);
+        let fc = FileChange::tracked(
+            content_id,
+            FileType::Regular,
+            size,
+            None,
+            GitLfs::FullContent,
+        );
         if bcs.file_changes.insert(path, fc).is_some() {
             return Err(anyhow!(
                 "New bonsai changeset already has {} file",
@@ -448,13 +457,14 @@ impl SqlConstructFromMetadataDatabaseConfig for MegarepoMapping {}
 mod test {
     use fbinit::FacebookInit;
     use maplit::btreemap;
+    use mononoke_macros::mononoke;
     use mononoke_types_mocks::changesetid::ONES_CSID;
     use mononoke_types_mocks::changesetid::THREES_CSID;
     use mononoke_types_mocks::changesetid::TWOS_CSID;
 
     use super::*;
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_simple_mapping(fb: FacebookInit) -> Result<(), Error> {
         let ctx = CoreContext::test_mock(fb);
         let mapping = MegarepoMapping::with_sqlite_in_memory()?;
@@ -502,7 +512,7 @@ mod test {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_reverse_mapping(fb: FacebookInit) -> Result<(), Error> {
         let ctx = CoreContext::test_mock(fb);
         let mapping = MegarepoMapping::with_sqlite_in_memory()?;
@@ -546,7 +556,7 @@ mod test {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_serialize(_fb: FacebookInit) -> Result<(), Error> {
         let state = CommitRemappingState::new(
             btreemap! {
@@ -574,7 +584,7 @@ mod test {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_deserialization_ignores_extra_fields(_fb: FacebookInit) -> Result<(), Error> {
         let s = r#"{
   "latest_synced_changesets": {

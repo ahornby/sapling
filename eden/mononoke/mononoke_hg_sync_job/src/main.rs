@@ -40,8 +40,6 @@ use bookmarks::BookmarkUpdateLogEntry;
 use bookmarks::BookmarkUpdateLogId;
 use bookmarks::Freshness;
 use borrowed::borrowed;
-use changeset_fetcher::ChangesetFetcher;
-use changesets::Changesets;
 use clap_old::Arg;
 use clap_old::ArgGroup;
 use clap_old::SubCommand;
@@ -52,6 +50,7 @@ use cmdlib::args;
 use cmdlib::args::MononokeMatches;
 use cmdlib::helpers::block_execute;
 use commit_graph::CommitGraph;
+use commit_graph::CommitGraphRef;
 use context::CoreContext;
 use darkstorm_verifier::DarkstormVerifier;
 use dbbookmarks::SqlBookmarksBuilder;
@@ -135,6 +134,8 @@ const JOB_TYPE: &str = "job-type";
 const JOB_TYPE_PROD: &str = "prod";
 const JOB_TYPE_BACKUP: &str = "backup";
 const LATEST_REPLAYED_REQUEST_KEY: &str = "latest-replayed-request";
+const LATEST_OPERATIONAL_SHADOW_REPLAYED_REQUEST_KEY: &str =
+    "latest-operational-shadow-replayed-request";
 const SLEEP_SECS: u64 = 1;
 const SCUBA_TABLE: &str = "mononoke_hg_sync";
 const LOCK_REASON: &str = "Locked due to sync failure, check Source Control @ Meta";
@@ -166,12 +167,6 @@ pub struct HgSyncProcess {
 #[facet::container]
 #[derive(Clone)]
 pub struct Repo {
-    #[facet]
-    pub changeset_fetcher: dyn ChangesetFetcher,
-
-    #[facet]
-    pub changesets: dyn Changesets,
-
     #[facet]
     pub commit_graph: CommitGraph,
 
@@ -348,6 +343,13 @@ impl HgSyncProcess {
         .about(
             "Special job that takes bundles that were sent to Mononoke and \
              applies them to mercurial",
+        )
+        .arg(
+            Arg::with_name("operational-shadow")
+                .long("operational-shadow")
+                .takes_value(false)
+                .required(false)
+                .help("This flag sets use of a different mutable counter"),
         );
 
         let sync_once = SubCommand::with_name(MODE_SYNC_ONCE)
@@ -999,15 +1001,13 @@ impl LatestReplayedSyncCounter {
         }
     }
 
-    async fn get_counter(&self, ctx: &CoreContext) -> Result<Option<i64>, Error> {
-        self.mutable_counters
-            .get_counter(ctx, LATEST_REPLAYED_REQUEST_KEY)
-            .await
+    async fn get_counter(&self, ctx: &CoreContext, key: &str) -> Result<Option<i64>, Error> {
+        self.mutable_counters.get_counter(ctx, key).await
     }
 
-    async fn set_counter(&self, ctx: &CoreContext, value: i64) -> Result<bool, Error> {
+    async fn set_counter(&self, ctx: &CoreContext, key: &str, value: i64) -> Result<bool, Error> {
         self.mutable_counters
-            .set_counter(ctx, LATEST_REPLAYED_REQUEST_KEY, value, None)
+            .set_counter(ctx, key, value, None)
             .await
     }
 }
@@ -1039,12 +1039,9 @@ impl FilterExistingChangesets for DarkstormBackupChangesetsFilter {
         let bcs_ids: Vec<_> = cs_ids.iter().map(|(cs_id, _hg_cs_id)| *cs_id).collect();
         let existing_bcs_ids: Vec<_> = self
             .repo
-            .changesets
-            .get_many(ctx, bcs_ids)
-            .await?
-            .into_iter()
-            .map(|entry| entry.cs_id)
-            .collect();
+            .commit_graph()
+            .known_changesets(ctx, bcs_ids)
+            .await?;
         let existing_hg_cs_id: BTreeSet<_> = self
             .repo
             .bonsai_hg_mapping
@@ -1251,7 +1248,7 @@ async fn run<'a>(
             cloned!(repo);
             async move {
                 match globalrev_config {
-                    Some(config) if config.small_repo_id.is_none() => {
+                    Some(config) if config.globalrevs_small_repo_id.is_none() => {
                         match maybe_darkstorm_backup_repo {
                             Some(darkstorm_backup_repo) => {
                                 Ok(GlobalrevSyncer::darkstorm(&repo, darkstorm_backup_repo))
@@ -1440,8 +1437,13 @@ async fn run<'a>(
                 };
                 !exit_file_exists && !cancelled
             };
+            let key = match matches.is_present("operational-shadow") {
+                true => LATEST_OPERATIONAL_SHADOW_REPLAYED_REQUEST_KEY,
+                false => LATEST_REPLAYED_REQUEST_KEY,
+            };
+
             let counter = replayed_sync_counter
-                .get_counter(ctx)
+                .get_counter(ctx, key)
                 .and_then(move |maybe_counter| {
                     future::ready(maybe_counter.map(|counter| counter.try_into().expect("Counter must be positive")).or(start_id).ok_or_else(|| {
                         format_err!(
@@ -1568,7 +1570,7 @@ async fn run<'a>(
                         ctx.logger(),
                         |_| async {
                             let success = replayed_sync_counter
-                                .set_counter(ctx, next_id.try_into()?)
+                                .set_counter(ctx, key, next_id.try_into()?)
                                 .watched(ctx.logger())
                                 .await?;
 

@@ -13,6 +13,7 @@ base_app::subcommands! {
     mod blame;
     mod common_base;
     mod create_git_bundle;
+    mod create_repos if "SCSC_ADMIN_ENABLED";
     mod create_bookmark if "SCSC_WRITES_ENABLED";
     mod delete_bookmark if "SCSC_WRITES_ENABLED";
     mod diff;
@@ -28,9 +29,11 @@ base_app::subcommands! {
     mod move_bookmark if "SCSC_WRITES_ENABLED";
     mod prepare_commits if "SCSC_WRITES_ENABLED";
     mod pushrebase_history;
+    mod repo_info;
     mod repos;
     mod run_hooks;
     mod sparse_profile_delta;
     mod sparse_profile_size;
+    mod update_submodule_expansion;
     mod xrepo_lookup;
 }

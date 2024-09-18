@@ -198,6 +198,7 @@
    ancestor: 4c60f11aa304, local: 6b9e5368ca4e+, remote: 5345cd5c0f38
   committing files:
   e
+  reusing remotefilelog node bc7ebe2d260cff30d2a39a130d84add36216f791
   committing manifest
   committing changelog
   $ HGEDITOR=cat hg graft 4 3 --log --debug
@@ -413,7 +414,8 @@
   grafting 4c60f11aa304 "3"
   warning: can't find ancestor for 'c' copied from 'b'!
   $ hg log --template '{rev}:{node|short} {parents} {desc}\n' -r tip
-  14:0c921c65ef1e 5d205f8b35b6  3
+  14:2618d22676d7 5d205f8b35b6  3
+  
   (grafted from 4c60f11aa304a54ae1c199feb94e7fc771e51ed8)
 
 # Resolve conflicted graft
@@ -526,7 +528,6 @@
   [255]
   $ hg graft to-backout --force
   grafting b2fde3ce6adf "to-backout" (to-backout)
-  merging A
   $ cat A
   abc
 

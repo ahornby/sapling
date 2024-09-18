@@ -17,6 +17,7 @@ use anyhow::Context;
 use anyhow::Result;
 use cached_config::ConfigHandle;
 use cached_config::ConfigStore;
+use metaconfig_types::AsyncRequestsConfig;
 use metaconfig_types::BackupRepoConfig;
 use metaconfig_types::BlobConfig;
 use metaconfig_types::CensoredScubaParams;
@@ -85,6 +86,14 @@ pub fn load_repo_configs(
 ) -> Result<RepoConfigs> {
     let raw_config = crate::raw::read_raw_configs(config_path.as_ref(), config_store)?;
     load_configs_from_raw(raw_config).map(|(repo_configs, _)| repo_configs)
+}
+
+/// Empty repo configs useful for testing purposes
+pub fn load_empty_repo_configs() -> RepoConfigs {
+    RepoConfigs {
+        repos: HashMap::new(),
+        common: CommonConfig::default(),
+    }
 }
 
 /// Load configuration based on the provided raw configs.
@@ -212,7 +221,6 @@ fn parse_with_repo_definition(
         scuba_local_path_hooks,
         enforce_lfs_acl_check,
         repo_client_use_warm_bookmarks_cache,
-        segmented_changelog_config,
         repo_client_knobs,
         phabricator_callsign,
         walker_config,
@@ -224,9 +232,14 @@ fn parse_with_repo_definition(
         commit_graph_config,
         deep_sharding_config,
         everstore_local_path,
-        git_concurrency,
         metadata_logger_config,
+        commit_cloud_config,
         zelos_config,
+        bookmark_name_for_objects_count,
+        default_objects_count,
+        x_repo_sync_source_mapping,
+        mononoke_cas_sync_config,
+        git_configs,
         ..
     } = named_repo_config;
 
@@ -316,8 +329,6 @@ fn parse_with_repo_definition(
     let repo_client_use_warm_bookmarks_cache =
         repo_client_use_warm_bookmarks_cache.unwrap_or(false);
 
-    let segmented_changelog_config = segmented_changelog_config.convert()?.unwrap_or_default();
-
     let repo_client_knobs = repo_client_knobs.convert()?.unwrap_or_default();
 
     let acl_region_config = acl_region_config
@@ -342,10 +353,16 @@ fn parse_with_repo_definition(
 
     let commit_graph_config = commit_graph_config.convert()?.unwrap_or_default();
     let deep_sharding_config = deep_sharding_config.convert()?;
-    let git_concurrency = git_concurrency.convert()?;
     let metadata_logger_config = metadata_logger_config.convert()?.unwrap_or_default();
     let zelos_config = zelos_config.convert()?;
+    let x_repo_sync_source_mapping = x_repo_sync_source_mapping.convert()?;
 
+    let raw_git_configs = git_configs.unwrap_or_default();
+
+    let git_configs = raw_git_configs.convert()?;
+
+    let commit_cloud_config = commit_cloud_config.convert()?.unwrap_or_default();
+    let mononoke_cas_sync_config = mononoke_cas_sync_config.convert()?;
     Ok(RepoConfig {
         enabled,
         storage_config,
@@ -373,7 +390,6 @@ fn parse_with_repo_definition(
         derived_data_config,
         enforce_lfs_acl_check,
         repo_client_use_warm_bookmarks_cache,
-        segmented_changelog_config,
         repo_client_knobs,
         phabricator_callsign,
         backup_repo_config,
@@ -388,9 +404,14 @@ fn parse_with_repo_definition(
         default_commit_identity_scheme,
         deep_sharding_config,
         everstore_local_path,
-        git_concurrency,
         metadata_logger_config,
         zelos_config,
+        bookmark_name_for_objects_count,
+        default_objects_count,
+        x_repo_sync_source_mapping,
+        commit_cloud_config,
+        mononoke_cas_sync_config,
+        git_configs,
     })
 }
 
@@ -470,6 +491,14 @@ fn parse_common_config(
         redaction_sets_location: redaction_config.redaction_sets_location,
     };
 
+    let async_requests_config = match common.async_requests_config {
+        Some(config) => AsyncRequestsConfig {
+            db_config: Some(config.db_config.convert()?),
+            blobstore: Some(config.blobstore_config.convert()?),
+        },
+        None => AsyncRequestsConfig::default(),
+    };
+
     Ok(CommonConfig {
         trusted_parties_hipster_tier,
         trusted_parties_allowlist,
@@ -481,6 +510,7 @@ fn parse_common_config(
         internal_identity,
         git_memory_upper_bound,
         edenapi_dumper_scuba_table,
+        async_requests_config,
     })
 }
 
@@ -516,6 +546,7 @@ mod test {
     use metaconfig_types::BookmarkParams;
     use metaconfig_types::BubbleDeletionMode;
     use metaconfig_types::CacheWarmupParams;
+    use metaconfig_types::CommitCloudConfig;
     use metaconfig_types::CommitGraphConfig;
     use metaconfig_types::CommitIdentityScheme;
     use metaconfig_types::CommitSyncConfig;
@@ -528,6 +559,7 @@ mod test {
     use metaconfig_types::EphemeralBlobstoreConfig;
     use metaconfig_types::FilestoreParams;
     use metaconfig_types::GitConcurrencyParams;
+    use metaconfig_types::GitConfigs;
     use metaconfig_types::HgSyncConfig;
     use metaconfig_types::HookBypass;
     use metaconfig_types::HookConfig;
@@ -550,8 +582,6 @@ mod test {
     use metaconfig_types::RemoteDatabaseConfig;
     use metaconfig_types::RemoteMetadataDatabaseConfig;
     use metaconfig_types::RepoClientKnobs;
-    use metaconfig_types::SegmentedChangelogConfig;
-    use metaconfig_types::SegmentedChangelogHeadConfig;
     use metaconfig_types::ShardableRemoteDatabaseConfig;
     use metaconfig_types::ShardedDatabaseConfig;
     use metaconfig_types::ShardedRemoteDatabaseConfig;
@@ -563,6 +593,9 @@ mod test {
     use metaconfig_types::UnodeVersion;
     use metaconfig_types::UpdateLoggingConfig;
     use metaconfig_types::WalkerConfig;
+    use metaconfig_types::XRepoSyncSourceConfig;
+    use metaconfig_types::XRepoSyncSourceConfigMapping;
+    use mononoke_macros::mononoke;
     use mononoke_types::path::MPath;
     use mononoke_types::DerivableType;
     use mononoke_types::NonRootMPath;
@@ -610,7 +643,7 @@ mod test {
         tmp_dir
     }
 
-    #[test]
+    #[mononoke::test]
     fn test_commit_sync_config_correct() {
         let commit_sync_config = r#"
             [mega]
@@ -679,7 +712,7 @@ mod test {
         assert_eq!(commit_sync, expected);
     }
 
-    #[test]
+    #[mononoke::test]
     fn test_commit_sync_config_large_is_small() {
         let commit_sync_config = r#"
             [mega]
@@ -713,7 +746,7 @@ mod test {
         }
     }
 
-    #[test]
+    #[mononoke::test]
     fn test_commit_sync_config_duplicated_small_repos() {
         let commit_sync_config = r#"
             [mega]
@@ -749,7 +782,7 @@ mod test {
             assert!(msg.contains("present multiple times in the same CommitSyncConfig"));
         }
     }
-    #[test]
+    #[mononoke::test]
     fn test_duplicated_repo_ids() {
         let www_content = r#"
             scuba_table_hooks="scm_hooks"
@@ -800,7 +833,7 @@ mod test {
         assert!(msg.contains("DuplicatedRepoId"));
     }
 
-    #[test]
+    #[mononoke::test]
     fn test_read_manifest() {
         let fbsource_content = r#"
             generation_cache_size=1048576
@@ -826,6 +859,7 @@ mod test {
             types = ["fsnodes", "unodes", "blame"]
             unode_version = 2
             blame_filesize_limit = 101
+            derivation_batch_sizes = { "fsnodes" = 20, "unodes" = 20, "blame" = 20 }
 
             [[bookmarks]]
             name="master"
@@ -850,6 +884,7 @@ mod test {
             [[hooks]]
             name="hook2a"
             implementation="hook2"
+            log_only=true
             config_ints={ int1 = 44 }
             config_ints_64={ int2 = 42 }
             [hooks.config_string_lists]
@@ -873,6 +908,7 @@ mod test {
             threshold = 1000
             rollout_percentage = 56
             generate_lfs_blob_in_hg_sync_job = true
+            use_upstream_lfs_server = false
 
             [infinitepush]
             allow_writes = true
@@ -888,18 +924,6 @@ mod test {
             [repo_client_knobs]
             allow_short_getpack_history = true
 
-            [segmented_changelog_config]
-            enabled = true
-            master_bookmark = "test_bookmark"
-            tailer_update_period_secs = 0
-            skip_dag_load_at_startup = true
-            reload_dag_save_period_secs = 0
-            update_to_master_bookmark_period_secs = 120
-            heads_to_include = [
-                { bookmark = "test_bookmark" },
-            ]
-            extra_heads_to_include_in_background_jobs = []
-
             [backup_config]
             verification_enabled = false
 
@@ -907,7 +931,7 @@ mod test {
             scrub_enabled = true
             validate_enabled = true
 
-            [git_concurrency]
+            [git_configs.git_concurrency]
             trees_and_blobs = 500
             commits = 1000
             tags = 1000
@@ -938,6 +962,10 @@ mod test {
             [metadata_logger_config]
             bookmarks = ["master", "release"]
             sleep_interval_secs = 100
+
+            [x_repo_sync_source_mapping.mapping.aros]
+            bookmark_regex = "master"
+            backsync_enabled = true            
             
             [deep_sharding_config.status]
         "#;
@@ -954,10 +982,6 @@ mod test {
             scuba_table_hooks="scm_hooks"
             storage_config="files"
             phabricator_callsign="WWW"
-            [segmented_changelog_config]
-            heads_to_include = [
-                { all_public_bookmarks_except = [] }
-            ]
         "#;
         let www_repo_def = r#"
             repo_id=1
@@ -1163,6 +1187,7 @@ mod test {
                         config: HookConfig {
                             bypass: Some(HookBypass::new_with_commit_msg("@allow_hook1".into())),
                             options: Some(r#"{"test": "abcde"}"#.to_string()),
+                            log_only: false,
                             strings: hashmap! {},
                             ints: hashmap! {},
                             ints_64: hashmap! {},
@@ -1177,6 +1202,7 @@ mod test {
                         config: HookConfig {
                             bypass: None,
                             options: None,
+                            log_only: true,
                             strings: hashmap! {},
                             ints: hashmap! {
                                 "int1".into() => 44,
@@ -1219,6 +1245,7 @@ mod test {
                     threshold: Some(1000),
                     rollout_percentage: 56,
                     generate_lfs_blob_in_hg_sync_job: true,
+                    use_upstream_lfs_server: false,
                 },
                 hash_validation_percentage: 0,
                 readonly: RepoReadOnly::ReadWrite,
@@ -1256,28 +1283,25 @@ mod test {
                             DerivableType::Unodes,
                             DerivableType::BlameV2,
                         },
+                        ephemeral_bubbles_disabled_types: Default::default(),
                         mapping_key_prefixes: hashmap! {},
                         unode_version: UnodeVersion::V2,
                         blame_filesize_limit: Some(101),
                         hg_set_committer_extra: false,
                         blame_version: BlameVersion::V2,
                         git_delta_manifest_version: Default::default(),
+                        git_delta_manifest_v2_config: Default::default(),
+                        derivation_batch_sizes: hashmap! {
+                            DerivableType::Fsnodes => 20,
+                            DerivableType::Unodes => 20,
+                            DerivableType::BlameV2 => 20,
+                        }
+
                     },],
                     scuba_table: None,
                 },
                 enforce_lfs_acl_check: false,
                 repo_client_use_warm_bookmarks_cache: true,
-                segmented_changelog_config: SegmentedChangelogConfig {
-                    enabled: true,
-                    tailer_update_period: None,
-                    skip_dag_load_at_startup: true,
-                    reload_dag_save_period: None,
-                    update_to_master_bookmark_period: Some(Duration::from_secs(120)),
-                    heads_to_include: vec![SegmentedChangelogHeadConfig::Bookmark(
-                        BookmarkKey::new("test_bookmark").unwrap(),
-                    )],
-                    extra_heads_to_include_in_background_jobs: vec![],
-                },
                 repo_client_knobs: RepoClientKnobs {
                     allow_short_getpack_history: true,
                 },
@@ -1332,14 +1356,11 @@ mod test {
                 commit_graph_config: CommitGraphConfig {
                     scuba_table: Some("commit_graph".to_string()),
                     preloaded_commit_graph_blobstore_key: None,
+                    disable_commit_graph_v2_with_empty_common: false,
                 },
                 deep_sharding_config: Some(ShardingModeConfig { status: hashmap!() }),
                 everstore_local_path: None,
-                git_concurrency: Some(GitConcurrencyParams {
-                    trees_and_blobs: 500,
-                    commits: 1000,
-                    tags: 1000,
-                }),
+
                 metadata_logger_config: MetadataLoggerConfig {
                     bookmarks: vec![
                         BookmarkKey::new("master").unwrap(),
@@ -1347,7 +1368,33 @@ mod test {
                     ],
                     sleep_interval_secs: 100,
                 },
+                x_repo_sync_source_mapping: Some(XRepoSyncSourceConfigMapping {
+                    mapping: hashmap! {
+                        "aros".to_string() => XRepoSyncSourceConfig {
+                            bookmark_regex: "master".to_string(),
+                            backsync_enabled: true,
+                        }
+                    }
+                    .into_iter()
+                    .collect(),
+                }),
                 zelos_config: None,
+                bookmark_name_for_objects_count: None,
+                default_objects_count: None,
+                commit_cloud_config: CommitCloudConfig {
+                    mocked_employees: Vec::new(),
+                    disable_interngraph_notification: false,
+                },
+                mononoke_cas_sync_config: None,
+                git_configs: GitConfigs {
+                    git_concurrency: Some(GitConcurrencyParams {
+                        trees_and_blobs: 500,
+                        commits: 1000,
+                        tags: 1000,
+                    }),
+                    git_lfs_interpret_pointers: false,
+                    fetch_message: None,
+                },
             },
         );
 
@@ -1399,17 +1446,6 @@ mod test {
                 derived_data_config: DerivedDataConfig::default(),
                 enforce_lfs_acl_check: false,
                 repo_client_use_warm_bookmarks_cache: false,
-                segmented_changelog_config: SegmentedChangelogConfig {
-                    enabled: false,
-                    tailer_update_period: Some(Duration::from_secs(45)),
-                    skip_dag_load_at_startup: false,
-                    reload_dag_save_period: Some(Duration::from_secs(3600)),
-                    update_to_master_bookmark_period: Some(Duration::from_secs(60)),
-                    heads_to_include: vec![SegmentedChangelogHeadConfig::AllPublicBookmarksExcept(
-                        vec![],
-                    )],
-                    extra_heads_to_include_in_background_jobs: vec![],
-                },
                 repo_client_knobs: RepoClientKnobs::default(),
                 phabricator_callsign: Some("WWW".to_string()),
                 backup_repo_config: None,
@@ -1423,9 +1459,18 @@ mod test {
                 commit_graph_config: CommitGraphConfig::default(),
                 deep_sharding_config: None,
                 everstore_local_path: None,
-                git_concurrency: None,
                 metadata_logger_config: MetadataLoggerConfig::default(),
                 zelos_config: None,
+                bookmark_name_for_objects_count: None,
+                default_objects_count: None,
+                x_repo_sync_source_mapping: None,
+                commit_cloud_config: CommitCloudConfig::default(),
+                mononoke_cas_sync_config: None,
+                git_configs: GitConfigs {
+                    git_concurrency: None,
+                    git_lfs_interpret_pointers: false,
+                    fetch_message: None,
+                },
             },
         );
         assert_eq!(
@@ -1454,6 +1499,10 @@ mod test {
                 },
                 git_memory_upper_bound: Some(100),
                 edenapi_dumper_scuba_table: Some("dumped_requests".to_string()),
+                async_requests_config: AsyncRequestsConfig {
+                    db_config: None,
+                    blobstore: None
+                },
             }
         );
         assert_eq!(
@@ -1482,7 +1531,7 @@ mod test {
         )
     }
 
-    #[test]
+    #[mononoke::test]
     fn test_broken_bypass_config() {
         // Incorrect bypass string
         let content = r#"
@@ -1524,7 +1573,7 @@ mod test {
         assert!(msg.contains("InvalidPushvar"));
     }
 
-    #[test]
+    #[mononoke::test]
     fn test_broken_common_config() {
         fn check_fails(common: &str, expect: &str) {
             let content = r#"
@@ -1577,7 +1626,7 @@ mod test {
         check_fails(common, "identity type and data must be specified");
     }
 
-    #[test]
+    #[mononoke::test]
     fn test_common_storage() {
         const STORAGE: &str = r#"
         [multiplex_store.metadata.remote]
@@ -1694,7 +1743,7 @@ mod test {
         )
     }
 
-    #[test]
+    #[mononoke::test]
     fn test_common_blobstores_local_override() {
         const STORAGE: &str = r#"
         [multiplex_store.metadata.remote]
@@ -1793,7 +1842,7 @@ mod test {
         )
     }
 
-    #[test]
+    #[mononoke::test]
     fn test_stray_fields() {
         const REPO: &str = r#"
         storage_config = "randomstore"
@@ -1828,7 +1877,7 @@ mod test {
         assert!(msg.contains("unknown keys in config parsing"));
     }
 
-    #[test]
+    #[mononoke::test]
     fn test_multiplexed_store_types() {
         const STORAGE: &str = r#"
         [multiplex_store.metadata.remote]

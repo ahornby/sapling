@@ -1,5 +1,4 @@
 load("@fbcode_macros//build_defs:rust_library.bzl", "rust_library")
-load("@fbsource//tools/build_defs:glob_defs.bzl", "glob")
 
 oncall("mononoke")
 
@@ -14,13 +13,18 @@ rust_library(
         "//common/rust/shed/fbinit:fbinit",
         "//common/rust/shed/fbinit:fbinit-tokio",
         "//common/rust/shed/justknobs_stub:justknobs",
+        "//eden/mononoke/mononoke_macros:mononoke_macros",
         "//eden/mononoke/repo_factory:test_repo_factory",
     ],
     deps = [
         "fbsource//third-party/rust:anyhow",
         "fbsource//third-party/rust:thiserror",
+        "//common/rust/shed/futures_stats:futures_stats",
         "//eden/mononoke/acl_regions:acl_regions",
         "//eden/mononoke/bookmarks:bookmarks",
+        "//eden/mononoke/commit_cloud:commit_cloud",
+        "//eden/mononoke/commit_cloud/helpers:commit_cloud_helpers",
+        "//eden/mononoke/facebook/commit_cloud:commit_cloud_intern_utils",
         "//eden/mononoke/metaconfig:metaconfig_types",
         "//eden/mononoke/mononoke_types:mononoke_types",
         "//eden/mononoke/permission_checker:permission_checker",

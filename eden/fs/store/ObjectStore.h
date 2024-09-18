@@ -179,6 +179,17 @@ class ObjectStore : public IObjectStore,
       const ObjectFetchContextPtr& context) const override;
 
   /**
+   * Get metadata about a tree.
+   *
+   * This returns an ImmediateFuture object that will produce the TreeMetadata
+   * when it is ready.  It may result in a std::domain_error if the specified
+   * tree does not exist, or possibly other exceptions on error.
+   */
+  ImmediateFuture<TreeMetadata> getTreeMetadata(
+      const ObjectId& id,
+      const ObjectFetchContextPtr& context) const;
+
+  /**
    * Prefetch all the blobs represented by the HashRange.
    *
    * The caller is responsible for making sure that the HashRange stays valid
@@ -255,10 +266,25 @@ class ObjectStore : public IObjectStore,
       const ObjectFetchContextPtr& context) const;
 
   /**
+   * Get file paths matching the given globs
+   */
+  ImmediateFuture<BackingStore::GetGlobFilesResult> getGlobFiles(
+      const RootId& id,
+      const std::vector<std::string>& globs,
+      const ObjectFetchContextPtr& context) const;
+
+  /**
    * Get the BackingStore used by this ObjectStore
    */
   const std::shared_ptr<BackingStore>& getBackingStore() const {
     return backingStore_;
+  }
+
+  /**
+   * Get the TreeCache used by this ObjectStore
+   */
+  const std::shared_ptr<TreeCache>& getTreeCache() const {
+    return treeCache_;
   }
 
   /**
@@ -334,6 +360,11 @@ class ObjectStore : public IObjectStore,
 
   folly::SemiFuture<BackingStore::GetTreeResult> getTreeImpl(
       const ObjectId& id,
+      const ObjectFetchContextPtr& context,
+      folly::stop_watch<std::chrono::milliseconds> watch) const;
+
+  folly::SemiFuture<BackingStore::GetTreeMetaResult> getTreeMetadataImpl(
+      const ObjectId& id,
       const ObjectFetchContextPtr& context) const;
 
   folly::SemiFuture<BackingStore::GetBlobResult> getBlobImpl(
@@ -342,6 +373,12 @@ class ObjectStore : public IObjectStore,
 
   folly::SemiFuture<BackingStore::GetBlobMetaResult> getBlobMetadataImpl(
       const ObjectId& id,
+      const ObjectFetchContextPtr& context,
+      folly::stop_watch<std::chrono::milliseconds> watch) const;
+
+  ImmediateFuture<BackingStore::GetGlobFilesResult> getGlobFilesImpl(
+      const RootId& id,
+      const std::vector<std::string>& globs,
       const ObjectFetchContextPtr& context) const;
 
   /**

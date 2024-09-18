@@ -42,7 +42,12 @@ fn python_fallback() -> Result<Command> {
             .next()
             .ok_or_else(|| anyhow!("invalid fallback environment variable: {:?}", args))?;
         let mut cmd = Command::new(binary);
+        #[cfg(windows)]
+        if binary.ends_with(".par") {
+            cmd = execute_par(binary.into())?;
+        }
         cmd.args(parts);
+        tracing::debug!("Using binary set by EDENFSCTL_REAL {:?}", &cmd);
         return Ok(cmd);
     }
 
@@ -221,18 +226,43 @@ where
 {
     // This is gross, but clap v3 doesn't let us make --help a normal bool flag.
     // This means we can't successfully parse a command when --help is
-    // requested, so here we manually extract the subcommand name in order to
-    // check whether it's enabled for Rust.
-    let subcommand_name = args
-        .skip(1)
-        .find(|a| !a.starts_with('-'))
-        .ok_or(anyhow!("missing subcommand"))?;
-
-    Ok(is_command_enabled_in_rust(
-        &subcommand_name,
-        &etc_eden_dir_override.map(Path::to_owned),
-        experimental_commands_override,
-    ))
+    // requested.
+    // But we know that if this function is called, the subcommand requested is
+    // defined in Rust. So we can just manually parse the args by skipping any
+    // options provided for 'edenfsctl' until we find the subcommand name.
+    let mut subcommand_name = None;
+    let mut skipping = false;
+    for arg in args.skip(1) {
+        if [
+            "--config-dir".to_string(),
+            "--etc-eden-dir".to_string(),
+            "--home-dir".to_string(),
+        ]
+        .contains(&arg)
+        {
+            // handle skipping global option pair names
+            skipping = true;
+            continue;
+        } else if skipping {
+            // handle skipping global option pair values
+            skipping = false;
+            continue;
+        } else if arg.starts_with("-") {
+            // handle skipping global option flags, e.g. --version, -v, --debug
+            continue;
+        } else {
+            subcommand_name = Some(arg);
+            break;
+        }
+    }
+    match subcommand_name {
+        Some(name) => Ok(is_command_enabled_in_rust(
+            &name,
+            &etc_eden_dir_override.map(Path::to_owned),
+            experimental_commands_override,
+        )),
+        None => Ok(false), // we are safe by always falling back to Python
+    }
 }
 
 #[fbinit::main]
@@ -303,7 +333,27 @@ mod tests {
                 &Some(vec!["debug"])
             )?,);
             assert!(!should_use_rust_help(
-                args!["eden.exe", "--xyz", "debug"],
+                args![
+                    "eden.exe",
+                    "--config-dir",
+                    "/home/scm/local/eden-dev-state",
+                    "debug"
+                ],
+                &Some(dir.path()),
+                &Some(vec!["debug"])
+            )?,);
+            assert!(!should_use_rust_help(
+                args!["eden.exe", "debug"],
+                &Some(dir.path()),
+                &Some(vec!["debug"])
+            )?,);
+            assert!(should_use_rust_help(
+                args!["eden.exe", "--debug", "debug"],
+                &Some(dir.path()),
+                &None
+            )?,);
+            assert!(!should_use_rust_help(
+                args!["eden.exe", "--debug", "debug"],
                 &Some(dir.path()),
                 &Some(vec!["debug"])
             )?,);

@@ -20,6 +20,7 @@ use crate::AclProvider;
 use crate::BoxMembershipChecker;
 use crate::BoxPermissionChecker;
 use crate::MembershipChecker;
+use crate::MononokeIdentity;
 use crate::MononokeIdentitySet;
 use crate::PermissionChecker;
 
@@ -38,6 +39,9 @@ pub struct Acls {
 
     #[serde(default)]
     pub tiers: HashMap<String, Arc<Acl>>,
+
+    #[serde(default)]
+    pub workspaces: HashMap<String, Arc<Acl>>,
 
     #[serde(default)]
     pub groups: HashMap<String, Arc<MononokeIdentitySet>>,
@@ -115,6 +119,16 @@ impl AclProvider for InternalAclProvider {
         }))
     }
 
+    async fn commitcloud_workspace_acl(
+        &self,
+        name: &str,
+        _create_with_owner: &Option<MononokeIdentity>,
+    ) -> Result<Option<BoxPermissionChecker>> {
+        Ok(Some(Box::new(AclPermissionChecker {
+            acl: self.acls.workspaces.get(name).cloned().unwrap_or_default(),
+        })))
+    }
+
     async fn group(&self, name: &str) -> Result<BoxMembershipChecker> {
         Ok(Box::new(AclMembershipChecker {
             group: self.acls.groups.get(name).cloned().unwrap_or_default(),
@@ -133,6 +147,7 @@ impl AclProvider for InternalAclProvider {
 #[cfg(test)]
 mod test {
     use fbinit::FacebookInit;
+    use mononoke_macros::mononoke;
 
     use super::*;
 
@@ -144,7 +159,7 @@ mod test {
         Ok(set)
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn json_acls(_fb: FacebookInit) -> Result<()> {
         let json = r#"
             {

@@ -23,6 +23,7 @@ Prefetch (and also check we get counters):
   scmstore.file.api.hg_prefetch.calls: 1
   scmstore.file.api.hg_prefetch.keys: 1
   scmstore.file.api.hg_prefetch.singles: 1
+  scmstore.file.api.hg_refresh.calls: 3
   scmstore.file.fetch.aux.cache.keys: 1
   scmstore.file.fetch.aux.cache.misses: 1
   scmstore.file.fetch.aux.cache.requests: 1
@@ -30,6 +31,7 @@ Prefetch (and also check we get counters):
   scmstore.file.fetch.edenapi.hits: 1
   scmstore.file.fetch.edenapi.keys: 1
   scmstore.file.fetch.edenapi.requests: 1
+  scmstore.file.fetch.edenapi.time: * (glob) (?)
   scmstore.file.fetch.indexedlog.cache.keys: 1
   scmstore.file.fetch.indexedlog.cache.misses: 1
   scmstore.file.fetch.indexedlog.cache.requests: 1
@@ -41,14 +43,13 @@ Prefetch (and also check we get counters):
   scmstore.tree.fetch.edenapi.keys: 1
   scmstore.tree.fetch.edenapi.requests: 1
   scmstore.tree.fetch.edenapi.time: * (glob) (?)
-  scmstore.tree.fetch.indexedlog.cache.hits: 2
-  scmstore.tree.fetch.indexedlog.cache.keys: 3
+  scmstore.tree.fetch.indexedlog.cache.keys: 1
   scmstore.tree.fetch.indexedlog.cache.misses: 1
-  scmstore.tree.fetch.indexedlog.cache.requests: 4
+  scmstore.tree.fetch.indexedlog.cache.requests: 3
   scmstore.tree.fetch.indexedlog.cache.time: * (glob) (?)
   scmstore.tree.fetch.indexedlog.local.keys: 1
   scmstore.tree.fetch.indexedlog.local.misses: 1
-  scmstore.tree.fetch.indexedlog.local.requests: 4
+  scmstore.tree.fetch.indexedlog.local.requests: 3
   scmstore.tree.fetch.indexedlog.local.time: * (glob) (?)
 
 Now we do have aux data locally:
@@ -79,6 +80,7 @@ Now we do have aux data locally:
               total_size: 1,
               sha1: Sha1("6dcd4ce23d88e2ee9568ba546c007c63d9131c1b"),
               blake3: Blake3("5ad3ba58a716e5fc04296ac9af7a1420f726b401fdf16d270beb5b6b30bc0cda"),
+              file_header_metadata: None,
           },
       ),
   }
@@ -123,6 +125,7 @@ Fetching only aux data does not trigger a remote query:
               total_size: 1,
               sha1: Sha1("ae4f281df5a5d0ff3cad6371f76d5c29b6d953ec"),
               blake3: Blake3("5667f2421ac250c4bb9af657b5ead3cdbd940bfbc350b2bfee47454643832b48"),
+              file_header_metadata: None,
           },
       ),
   }

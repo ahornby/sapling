@@ -11,7 +11,6 @@ use anyhow::Result;
 use async_trait::async_trait;
 use blobstore::BlobstoreGetData;
 use context::CoreContext;
-use derived_data::impl_bonsai_derived_via_manager;
 use derived_data_manager::dependencies;
 use derived_data_manager::BonsaiDerivable;
 use derived_data_manager::DerivableType;
@@ -42,7 +41,7 @@ pub fn format_key(derivation_ctx: &DerivationContext, changeset_id: ChangesetId)
 impl TryFrom<BlobstoreBytes> for RootBssmV3DirectoryId {
     type Error = Error;
     fn try_from(blob_bytes: BlobstoreBytes) -> Result<Self> {
-        BssmV3DirectoryId::from_bytes(&blob_bytes.into_bytes()).map(RootBssmV3DirectoryId)
+        BssmV3DirectoryId::from_bytes(blob_bytes.into_bytes()).map(RootBssmV3DirectoryId)
     }
 }
 
@@ -153,5 +152,3 @@ impl BonsaiDerivable for RootBssmV3DirectoryId {
         ))
     }
 }
-
-impl_bonsai_derived_via_manager!(RootBssmV3DirectoryId);

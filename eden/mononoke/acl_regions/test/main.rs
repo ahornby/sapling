@@ -13,19 +13,21 @@ use acl_regions::AssociatedRulesResult;
 use anyhow::Result;
 use bonsai_hg_mapping::BonsaiHgMapping;
 use bookmarks::Bookmarks;
-use changeset_fetcher::ChangesetFetcher;
-use changesets::Changesets;
+use commit_graph::CommitGraph;
+use commit_graph::CommitGraphWriter;
 use context::CoreContext;
 use fbinit::FacebookInit;
 use filestore::FilestoreConfig;
 use metaconfig_types::AclRegion;
 use metaconfig_types::AclRegionConfig;
 use metaconfig_types::AclRegionRule;
+use mononoke_macros::mononoke;
 use mononoke_types::path::MPath;
 use mononoke_types::ChangesetId;
 use pretty_assertions::assert_eq;
 use repo_blobstore::RepoBlobstore;
 use repo_derived_data::RepoDerivedData;
+use repo_identity::RepoIdentity;
 use test_repo_factory::TestRepoFactory;
 use tests_utils::drawdag::create_from_dag;
 
@@ -42,7 +44,10 @@ struct Repo {
     bookmarks: dyn Bookmarks,
 
     #[facet]
-    changesets: dyn Changesets,
+    commit_graph: CommitGraph,
+
+    #[facet]
+    commit_graph_writer: dyn CommitGraphWriter,
 
     #[facet]
     filestore_config: FilestoreConfig,
@@ -54,7 +59,7 @@ struct Repo {
     repo_derived_data: RepoDerivedData,
 
     #[facet]
-    changeset_fetcher: dyn ChangesetFetcher,
+    repo_identity: RepoIdentity,
 }
 
 fn path(p: &str) -> MPath {
@@ -102,7 +107,7 @@ impl TestData {
     }
 }
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_acl_regions(fb: FacebookInit) -> Result<()> {
     let ctx = CoreContext::test_mock(fb);
     let mut factory = TestRepoFactory::new(fb)?;

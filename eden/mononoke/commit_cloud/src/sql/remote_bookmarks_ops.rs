@@ -6,11 +6,17 @@
  */
 
 use async_trait::async_trait;
+use clientinfo::ClientRequestInfo;
+use commit_cloud_types::RemoteBookmarksMap;
+use commit_cloud_types::WorkspaceRemoteBookmark;
+use sql::Transaction;
 use sql_ext::mononoke_queries;
 
-use crate::references::remote_bookmarks::WorkspaceRemoteBookmark;
+use crate::ctx::CommitCloudContext;
+use crate::sql::common::UpdateWorkspaceNameArgs;
 use crate::sql::ops::Delete;
 use crate::sql::ops::Get;
+use crate::sql::ops::GetAsMap;
 use crate::sql::ops::Insert;
 use crate::sql::ops::SqlCommitCloud;
 use crate::sql::ops::Update;
@@ -37,6 +43,10 @@ mononoke_queries! {
         mysql("INSERT INTO `remotebookmarks` (`reponame`, `workspace`, `remote`,`name`, `node` ) VALUES ({reponame}, {workspace}, {remote}, {name}, {commit})")
         sqlite("INSERT INTO `remotebookmarks` (`reponame`, `workspace`, `remote`,`name`, `commit` ) VALUES ({reponame}, {workspace}, {remote}, {name}, {commit})")
     }
+    write UpdateWorkspaceName( reponame: String, workspace: String, new_workspace: String) {
+        none,
+        "UPDATE remotebookmarks SET workspace = {new_workspace} WHERE workspace = {workspace} and reponame = {reponame}"
+    }
 }
 
 #[async_trait]
@@ -54,13 +64,45 @@ impl Get<WorkspaceRemoteBookmark> for SqlCommitCloud {
         .await?;
         rows.into_iter()
             .map(|(remote, name, commit)| {
-                Ok(WorkspaceRemoteBookmark {
-                    name,
-                    commit: changeset_from_bytes(&commit, self.uses_mysql)?,
+                WorkspaceRemoteBookmark::new(
                     remote,
-                })
+                    name,
+                    changeset_from_bytes(&commit, self.uses_mysql)?,
+                )
             })
             .collect::<anyhow::Result<Vec<WorkspaceRemoteBookmark>>>()
+    }
+}
+
+#[async_trait]
+impl GetAsMap<RemoteBookmarksMap> for SqlCommitCloud {
+    async fn get_as_map(
+        &self,
+        reponame: String,
+        workspace: String,
+    ) -> anyhow::Result<RemoteBookmarksMap> {
+        let rows = GetRemoteBookmarks::query(
+            &self.connections.read_connection,
+            &reponame.clone(),
+            &workspace,
+        )
+        .await?;
+
+        let mut map = RemoteBookmarksMap::new();
+        for (remote, name, commit) in rows {
+            match changeset_from_bytes(&commit, self.uses_mysql) {
+                Ok(hgid) => {
+                    let rb = WorkspaceRemoteBookmark::new(remote, name, hgid)?;
+                    if let Some(val) = map.get_mut(&hgid) {
+                        val.push(rb);
+                    } else {
+                        map.insert(hgid, vec![rb]);
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(map)
     }
 }
 
@@ -68,34 +110,45 @@ impl Get<WorkspaceRemoteBookmark> for SqlCommitCloud {
 impl Insert<WorkspaceRemoteBookmark> for SqlCommitCloud {
     async fn insert(
         &self,
+        txn: Transaction,
+        cri: Option<&ClientRequestInfo>,
         reponame: String,
         workspace: String,
         data: WorkspaceRemoteBookmark,
-    ) -> anyhow::Result<()> {
-        InsertRemoteBookmark::query(
-            &self.connections.write_connection,
+    ) -> anyhow::Result<Transaction> {
+        let (txn, _) = InsertRemoteBookmark::maybe_traced_query_with_transaction(
+            txn,
+            cri,
             &reponame,
             &workspace,
-            &data.remote,
-            &data.name,
-            &changeset_as_bytes(&data.commit, self.uses_mysql)?,
+            data.remote(),
+            data.name(),
+            &changeset_as_bytes(data.commit(), self.uses_mysql)?,
         )
         .await?;
-        Ok(())
+        Ok(txn)
     }
 }
 
 #[async_trait]
 impl Update<WorkspaceRemoteBookmark> for SqlCommitCloud {
-    type UpdateArgs = ();
+    type UpdateArgs = UpdateWorkspaceNameArgs;
     async fn update(
         &self,
-        _reponame: String,
-        _workspace: String,
-        _args: Self::UpdateArgs,
-    ) -> anyhow::Result<()> {
-        //To be implemented among other Update queries
-        return Err(anyhow::anyhow!("Not implemented yet"));
+        txn: Transaction,
+        cri: Option<&ClientRequestInfo>,
+        cc_ctx: CommitCloudContext,
+        args: Self::UpdateArgs,
+    ) -> anyhow::Result<(Transaction, u64)> {
+        let (txn, result) = UpdateWorkspaceName::maybe_traced_query_with_transaction(
+            txn,
+            cri,
+            &cc_ctx.reponame,
+            &cc_ctx.workspace,
+            &args.new_workspace,
+        )
+        .await?;
+        Ok((txn, result.affected_rows()))
     }
 }
 
@@ -104,17 +157,20 @@ impl Delete<WorkspaceRemoteBookmark> for SqlCommitCloud {
     type DeleteArgs = DeleteArgs;
     async fn delete(
         &self,
+        txn: Transaction,
+        cri: Option<&ClientRequestInfo>,
         reponame: String,
         workspace: String,
         args: Self::DeleteArgs,
-    ) -> anyhow::Result<()> {
-        DeleteRemoteBookmark::query(
-            &self.connections.write_connection,
+    ) -> anyhow::Result<Transaction> {
+        let (txn, _) = DeleteRemoteBookmark::maybe_traced_query_with_transaction(
+            txn,
+            cri,
             &reponame,
             &workspace,
             args.removed_bookmarks.as_slice(),
         )
         .await?;
-        Ok(())
+        Ok(txn)
     }
 }

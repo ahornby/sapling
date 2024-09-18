@@ -14,6 +14,7 @@ cpp_library(
         "//eden/common/telemetry:telemetry",
         "//eden/common/utils:utils",
         "//eden/fs/model:model",
+        "//eden/fs/model:model-fwd",
         "//eden/fs/store:context",
         "//folly/futures:core",
     ],
@@ -46,6 +47,7 @@ cpp_library(
         ":sapling_import_request",
         "//eden/common/telemetry:structured_logger",
         "//eden/common/utils:enum",
+        "//eden/common/utils:fault_injector",
         "//eden/common/utils:path",
         "//eden/common/utils:throw",
         "//eden/common/utils:utils",
@@ -77,8 +79,8 @@ cpp_library(
         "//eden/fs/store:store",
         "//eden/fs/telemetry:activity_buffer",
         "//eden/scm/lib/backingstore:backingstore",  # @manual
-        "//eden/scm/lib/backingstore:backingstore_bridge@header",  # @manual
-        "//eden/scm/lib/backingstore:sapling_native_backingstore-include",
+        "//eden/scm/lib/backingstore:backingstore@header",  # @manual
+        "//eden/scm/lib/backingstore:sapling_native_backingstore",
         "//folly:range",
         "//folly:synchronized",
     ],

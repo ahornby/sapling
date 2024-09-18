@@ -14,7 +14,7 @@
 //! We should favour top-level commands that either:
 //!
 //! * Perform a specific task that is clear from their name (e.g.
-//!   `dump-changesets`, `list-repos`).
+//!   `list-repos`).
 //!
 //! * Contain subcommands that apply to a clear concept within
 //!   Mononoke (e.g. `locking`, `redaction`).
@@ -35,8 +35,10 @@ mononoke_app::subcommands! {
     mod commit;
     mod commit_graph;
     mod convert;
+    mod cross_repo;
+    mod cross_repo_config;
+    mod derivation_queue;
     mod derived_data;
-    mod dump_changesets;
     mod ephemeral_store;
     mod fetch;
     mod filestore;
@@ -46,6 +48,7 @@ mononoke_app::subcommands! {
     mod hg_sync;
     mod list_repos;
     mod locking;
+    mod megarepo;
     mod mutable_counters;
     mod mutable_renames;
     mod redaction;

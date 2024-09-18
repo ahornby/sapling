@@ -121,7 +121,7 @@ def _ctxdesc(ctx) -> str:
     desc = '%s "%s"' % (ctx, ctx.description().split("\n", 1)[0])
     repo = ctx.repo()
     names = []
-    for nsname, ns in pycompat.iteritems(repo.names):
+    for nsname, ns in repo.names.items():
         if nsname == "branches":
             continue
         names.extend(ns.names(repo, ctx.node()))
@@ -301,7 +301,7 @@ class rebaseruntime:
             activebookmark = pycompat.encodeutf8(self.activebookmark)
         f.write(b"%s\n" % activebookmark)
         destmap = self.destmap.node2node
-        for d, v in pycompat.iteritems(self.state.node2node):
+        for d, v in self.state.node2node.items():
             destnode = hex(destmap[d])
             f.write(pycompat.encodeutf8("%s:%s:%s\n" % (hex(d), hex(v), destnode)))
         repo.ui.debug("rebase status stored\n")
@@ -414,7 +414,7 @@ class rebaseruntime:
         if not mutation.enabled(self.repo):
             _checkobsrebase(self.repo, self.ui, obsoleteset, skippedset)
 
-    def _prepareabortorcontinue(self, isabort):
+    def _prepareabortcontinueorquit(self, isabort, isquit):
         try:
             self.restorestatus()
             if self.collapsef:
@@ -442,6 +442,8 @@ class rebaseruntime:
                 self.state,
                 activebookmark=self.activebookmark,
             )
+        if isquit:
+            return quit_rebase(self.repo, activebookmark=self.activebookmark)
 
     def _preparenewrebase(self, destmap):
         if not destmap:
@@ -551,7 +553,7 @@ class rebaseruntime:
         # if we fail before the transaction closes.
         self.storestatus()
 
-        cands = [k for k, v in pycompat.iteritems(self.state) if v == revtodo]
+        cands = [k for k, v in self.state.items() if v == revtodo]
         total = len(cands)
         pos = 0
         with progress.bar(ui, _("rebasing"), _("changesets"), total) as prog:
@@ -1075,6 +1077,12 @@ def _simplemerge(ui, basectx, ctx, p1ctx, manifestbuilder):
         ("a", "abort", False, _("abort an interrupted rebase")),
         (
             "",
+            "quit",
+            False,
+            _("quit an interrupted rebase and keep the already rebased commits"),
+        ),
+        (
+            "",
             "noconflict",
             False,
             _("cancel the rebase if there are conflicts (EXPERIMENTAL)"),
@@ -1151,7 +1159,8 @@ def rebase(ui, repo, templ=None, **opts):
     After manually resolving conflicts, resume the rebase with
     :prog:`rebase --continue`. If you are not able to successfully
     resolve all conflicts, run :prog:`rebase --abort` to abort the
-    rebase.
+    entire rebase; or run :prog:`rebase --quit` to quit the interrupted
+    rebase state and keep the already rebased commits.
 
     Alternatively, you can use a custom merge tool to automate conflict
     resolution. To specify a custom merge tool, use the ``--tool`` flag. See
@@ -1209,7 +1218,12 @@ def rebase(ui, repo, templ=None, **opts):
     if not opts.get("date"):
         opts["date"] = _defaultdate(ui)
 
-    if not (opts.get("continue") or opts.get("abort") or opts.get("restack")):
+    if not (
+        opts.get("continue")
+        or opts.get("abort")
+        or opts.get("restack")
+        or opts.get("quit")
+    ):
         # 'hg rebase' w/o args should do nothing
         if not opts.get("dest"):
             raise error.Abort("you must specify a destination (-d) for the rebase")
@@ -1240,8 +1254,8 @@ def rebase(ui, repo, templ=None, **opts):
         whynotimm = None
 
         # in-memory rebase is not compatible with resuming rebases.
-        if opts.get("continue") or opts.get("abort"):
-            whynotimm = "--continue or --abort passed"
+        if opts.get("continue") or opts.get("abort") or opts.get("quit"):
+            whynotimm = "--continue, --abort or --quit passed"
 
         # in-memory rebase cannot currently run within a parent transaction,
         # since the restarting logic will fail the entire transaction.
@@ -1317,8 +1331,9 @@ def _origrebase(ui, repo, rbsrt, **opts):
         # search default destination in this space
         # used in the 'hg pull --rebase' case, see issue 5214.
         destspace = opts.get("_destspace")
-        contf = opts.get("continue")
-        abortf = opts.get("abort")
+        contf = opts.get("continue", False)
+        abortf = opts.get("abort", False)
+        quitf = opts.get("quit", False)
         if opts.get("interactive"):
             try:
                 if extensions.find("histedit"):
@@ -1338,22 +1353,24 @@ def _origrebase(ui, repo, rbsrt, **opts):
         if rbsrt.collapsemsg and not rbsrt.collapsef:
             raise error.Abort(_("message can only be specified with collapse"))
 
-        if contf or abortf:
-            if contf and abortf:
-                raise error.Abort(_("cannot use both abort and continue"))
+        if contf or abortf or quitf:
+            if (contf + abortf + quitf) > 1:
+                raise error.Abort(
+                    _("can only use one of the following: abort, continue or quit")
+                )
             if rbsrt.collapsef:
-                raise error.Abort(_("cannot use collapse with continue or abort"))
+                raise error.Abort(_("cannot use collapse with continue, abort or quit"))
             if srcf or basef or dests:
                 raise error.Abort(
-                    _("abort and continue do not allow specifying revisions")
+                    _("abort, continue and quit do not allow specifying revisions")
                 )
-            if abortf and opts.get("tool", False):
+            if (abortf or quitf) and opts.get("tool", False):
                 ui.warn(_("tool option will be ignored\n"))
             if contf:
                 ms = mergemod.mergestate.read(repo)
                 mergeutil.checkunresolved(ms)
 
-            retcode = rbsrt._prepareabortorcontinue(abortf)
+            retcode = rbsrt._prepareabortcontinueorquit(abortf, quitf)
             if retcode is not None:
                 return retcode
         else:
@@ -1485,7 +1502,7 @@ def _definedestmap(
             # behavior may be abort with "cannot find branching point" error)
             bpbase.clear()
         tonodes = repo.changelog.tonodes
-        for bp, bs in pycompat.iteritems(bpbase):  # calculate roots
+        for bp, bs in bpbase.items():  # calculate roots
             rootnodes += list(
                 repo.dageval(lambda: children(tonodes([bp])) & ancestors(tonodes(bs)))
             )
@@ -1749,7 +1766,10 @@ def concludenode(
 
 
 def rebasenode(repo, rev, p1, base, state, collapse, dest, wctx):
-    "Rebase a single revision rev on top of p1 using base as merge ancestor"
+    """Rebase a single revision rev on top of p1 using base as merge ancestor
+
+    Return a tuple of counts (updated, merged, removed, unresolved).
+    """
     # Merge phase
     # Update to destination and merge it with local
     if wctx.isinmemory():
@@ -2158,9 +2178,7 @@ def needupdate(repo, state) -> bool:
         return False
 
     # We should be standing on the first as-of-yet unrebased commit.
-    firstunrebased = min(
-        [old for old, new in pycompat.iteritems(state) if new == nullrev]
-    )
+    firstunrebased = min([old for old, new in state.items() if new == nullrev])
     if firstunrebased in parents:
         return True
 
@@ -2225,6 +2243,19 @@ def abort(repo, originalwd, destmap, state, activebookmark=None) -> int:
         clearstatus(repo)
         clearcollapsemsg(repo)
         repo.ui.warn(_("rebase aborted\n"))
+    return 0
+
+
+def quit_rebase(repo, activebookmark=None) -> int:
+    """Quit an interrupted rebase and keep the already rebased commits."""
+    try:
+        mergemod.goto(repo, repo["."].rev(), force=True)
+        if activebookmark and activebookmark in repo._bookmarks:
+            bookmarks.activate(repo, activebookmark)
+    finally:
+        clearstatus(repo)
+        clearcollapsemsg(repo)
+        repo.ui.warn(_("rebase quited\n"))
     return 0
 
 

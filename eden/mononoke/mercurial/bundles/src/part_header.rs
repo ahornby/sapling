@@ -357,11 +357,8 @@ impl PartHeaderBuilder {
         let key = key.into();
         let val = val.into();
         self.check_param(&key, &val)?;
-        if self.mparams.len() >= u8::max_value() as usize {
-            bail!(
-                "number of mandatory params exceeds maximum {}",
-                u8::max_value()
-            );
+        if self.mparams.len() >= u8::MAX as usize {
+            bail!("number of mandatory params exceeds maximum {}", u8::MAX);
         }
         self.mparams.insert(key, val);
         Ok(self)
@@ -375,11 +372,8 @@ impl PartHeaderBuilder {
         let key = key.into();
         let val = val.into();
         self.check_param(&key, &val)?;
-        if self.aparams.len() >= u8::max_value() as usize {
-            bail!(
-                "number of advisory params exceeds maximum {}",
-                u8::max_value()
-            );
+        if self.aparams.len() >= u8::MAX as usize {
+            bail!("number of advisory params exceeds maximum {}", u8::MAX);
         }
         self.aparams.insert(key, val);
         Ok(self)
@@ -414,20 +408,20 @@ impl PartHeaderBuilder {
         if key.is_empty() {
             bail!("part '{:?}': empty key", self.part_type);
         }
-        if key.len() > u8::max_value() as usize {
+        if key.len() > u8::MAX as usize {
             bail!(
                 "part '{:?}': key '{}' exceeds max length {}",
                 self.part_type,
                 key,
-                u8::max_value()
+                u8::MAX
             );
         }
-        if val.len() > u8::max_value() as usize {
+        if val.len() > u8::MAX as usize {
             bail!(
                 "part '{:?}': value for key '{}' exceeds max length {}",
                 self.part_type,
                 key,
-                u8::max_value()
+                u8::MAX
             );
         }
         Ok(())
@@ -452,15 +446,16 @@ impl Arbitrary for PartHeaderType {
 
 #[cfg(test)]
 mod test {
+    use mononoke_macros::mononoke;
     use quickcheck::quickcheck;
     use quickcheck::TestResult;
 
     use super::*;
     use crate::quickcheck_types::QCBytes;
 
-    const MAX_LEN: usize = ::std::u8::MAX as usize;
+    const MAX_LEN: usize = u8::MAX as usize;
 
-    #[test]
+    #[mononoke::test]
     fn test_check_params() {
         let mut header = PartHeaderBuilder::new(PartHeaderType::Changegroup, false).unwrap();
 
@@ -475,7 +470,7 @@ mod test {
         assert_param(&mut header, "key3", "v".repeat(MAX_LEN + 1), false);
     }
 
-    #[test]
+    #[mononoke::test]
     fn test_roundtrip() {
         quickcheck(
             roundtrip

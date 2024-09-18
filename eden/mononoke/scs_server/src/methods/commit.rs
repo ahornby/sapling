@@ -28,12 +28,15 @@ use mononoke_api::ChangesetDiffItem;
 use mononoke_api::ChangesetFileOrdering;
 use mononoke_api::ChangesetHistoryOptions;
 use mononoke_api::ChangesetId;
+use mononoke_api::ChangesetLinearHistoryOptions;
 use mononoke_api::ChangesetPathContentContext;
 use mononoke_api::ChangesetPathDiffContext;
 use mononoke_api::ChangesetSpecifier;
 use mononoke_api::CopyInfo;
 use mononoke_api::MetadataDiff;
 use mononoke_api::MononokeError;
+use mononoke_api::MononokeRepo;
+use mononoke_api::Repo;
 use mononoke_api::RepoContext;
 use mononoke_api::UnifiedDiff;
 use mononoke_api::UnifiedDiffMode;
@@ -90,7 +93,7 @@ impl CommitComparePath {
     }
 
     async fn from_path_diff(
-        path_diff: ChangesetPathDiffContext,
+        path_diff: ChangesetPathDiffContext<Repo>,
     ) -> Result<Self, errors::ServiceError> {
         if path_diff.path().is_file().await? {
             let (base_file, other_file) = try_join!(
@@ -120,7 +123,7 @@ impl CommitComparePath {
 
 /// Helper for commit_compare to add mutable rename information if appropriate
 async fn add_mutable_renames(
-    base_changeset: &mut ChangesetContext,
+    base_changeset: &mut ChangesetContext<Repo>,
     params: &thrift::CommitCompareParams,
 ) -> Result<(), errors::ServiceError> {
     if params.follow_mutable_file_history.unwrap_or(false) {
@@ -139,7 +142,7 @@ async fn add_mutable_renames(
 }
 
 struct CommitFileDiffsItem {
-    path_diff_context: ChangesetPathDiffContext,
+    path_diff_context: ChangesetPathDiffContext<Repo>,
     placeholder: bool,
 }
 
@@ -157,7 +160,7 @@ impl CommitFileDiffsItem {
             Ok(0)
         } else {
             async fn file_size(
-                path: Option<&ChangesetPathContentContext>,
+                path: Option<&ChangesetPathContentContext<Repo>>,
             ) -> Result<u64, errors::ServiceError> {
                 if let Some(path) = path {
                     if let Some(file) = path.file().await? {
@@ -531,10 +534,10 @@ impl SourceControlServiceImpl {
     /// to a human and not handled automatically.
     async fn find_commit_compare_parent(
         &self,
-        repo: &RepoContext,
-        base_changeset: &mut ChangesetContext,
+        repo: &RepoContext<Repo>,
+        base_changeset: &mut ChangesetContext<Repo>,
         params: &thrift::CommitCompareParams,
-    ) -> Result<Option<ChangesetContext>, errors::ServiceError> {
+    ) -> Result<Option<ChangesetContext<Repo>>, errors::ServiceError> {
         let commit_parents = base_changeset.parents().await?;
         let mut other_changeset_id = commit_parents.first().copied();
 
@@ -872,6 +875,65 @@ impl SourceControlServiceImpl {
         })
     }
 
+    pub async fn commit_linear_history(
+        &self,
+        ctx: CoreContext,
+        commit: thrift::CommitSpecifier,
+        params: thrift::CommitLinearHistoryParams,
+    ) -> Result<thrift::CommitLinearHistoryResponse, errors::ServiceError> {
+        let (repo, changeset) = self.repo_changeset(ctx, &commit).await?;
+        let (descendants_of, exclude_changeset_and_ancestors) = try_join!(
+            async {
+                if let Some(descendants_of) = &params.descendants_of {
+                    Ok::<_, errors::ServiceError>(Some(
+                        self.changeset_id(&repo, descendants_of).await?,
+                    ))
+                } else {
+                    Ok(None)
+                }
+            },
+            async {
+                if let Some(exclude_changeset_and_ancestors) =
+                    &params.exclude_changeset_and_ancestors
+                {
+                    Ok::<_, errors::ServiceError>(Some(
+                        self.changeset_id(&repo, exclude_changeset_and_ancestors)
+                            .await?,
+                    ))
+                } else {
+                    Ok(None)
+                }
+            }
+        )?;
+
+        let limit: usize = check_range_and_convert("limit", params.limit, 0..)?;
+        let skip: u64 = check_range_and_convert("skip", params.skip, 0..)?;
+
+        let history_stream = changeset
+            .linear_history(ChangesetLinearHistoryOptions {
+                descendants_of,
+                exclude_changeset_and_ancestors,
+                skip,
+            })
+            .await?;
+        let history = collect_history(
+            history_stream,
+            // We set the skip to 0 as skipping is already done as part of ChangesetContext::linear_history.
+            0,
+            limit,
+            None,
+            None,
+            params.format,
+            &params.identity_schemes,
+        )
+        .await?;
+
+        Ok(thrift::CommitLinearHistoryResponse {
+            history,
+            ..Default::default()
+        })
+    }
+
     pub(crate) async fn commit_list_descendant_bookmarks(
         &self,
         ctx: CoreContext,
@@ -910,7 +972,7 @@ impl SourceControlServiceImpl {
         };
 
         async fn filter_descendant(
-            changeset: Arc<ChangesetContext>,
+            changeset: Arc<ChangesetContext<Repo>>,
             bookmark: (String, ChangesetId),
         ) -> Result<Option<(String, ChangesetId)>, MononokeError> {
             if changeset.is_ancestor_of(bookmark.1).await? {
@@ -977,6 +1039,7 @@ impl SourceControlServiceImpl {
         for outcome in outcomes {
             let (name, execution) = match outcome {
                 HookOutcome::FileHook(id, exec) => (id.hook_name, exec),
+                HookOutcome::BookmarkHook(id, exec) => (id.hook_name, exec),
                 HookOutcome::ChangesetHook(id, exec) => (id.hook_name, exec),
             };
 

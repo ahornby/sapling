@@ -75,7 +75,7 @@ impl Cache {
                         BookmarkCategory::ALL,
                         BookmarkKind::ALL_PUBLISHING,
                         &BookmarkPagination::FromStart,
-                        std::u64::MAX,
+                        u64::MAX,
                     )
                     .try_fold(
                         BTreeMap::new(),
@@ -458,9 +458,9 @@ impl BookmarkTransaction for CachedBookmarksTransaction {
             .boxed()
     }
 
-    fn commit_with_hook(
+    fn commit_with_hooks(
         self: Box<Self>,
-        txn_hook: BookmarkTransactionHook,
+        txn_hooks: Vec<BookmarkTransactionHook>,
     ) -> BoxFuture<'static, Result<Option<u64>>> {
         let CachedBookmarksTransaction {
             transaction,
@@ -470,7 +470,7 @@ impl BookmarkTransaction for CachedBookmarksTransaction {
         } = *self;
 
         transaction
-            .commit_with_hook(txn_hook)
+            .commit_with_hooks(txn_hooks)
             .map_ok(move |maybe_log_id| {
                 if maybe_log_id.is_some() && dirty {
                     cache.purge(ctx);
@@ -498,6 +498,7 @@ mod tests {
     use justknobs::test_helpers::JustKnobsInMemory;
     use justknobs::test_helpers::KnobVal;
     use maplit::hashmap;
+    use mononoke_macros::mononoke;
     use mononoke_types_mocks::changesetid::ONES_CSID;
     use mononoke_types_mocks::changesetid::THREES_CSID;
     use mononoke_types_mocks::changesetid::TWOS_CSID;
@@ -684,9 +685,9 @@ mod tests {
             future::ok(Some(0)).boxed()
         }
 
-        fn commit_with_hook(
+        fn commit_with_hooks(
             self: Box<Self>,
-            _txn_hook: BookmarkTransactionHook,
+            _txn_hooks: Vec<BookmarkTransactionHook>,
         ) -> BoxFuture<'static, Result<Option<u64>>> {
             unimplemented!()
         }
@@ -753,7 +754,7 @@ mod tests {
         with_just_knobs_async(just_knobs, fut)
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     fn test_cached_bookmarks(fb: FacebookInit) {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -784,7 +785,7 @@ mod tests {
                         BookmarkCategory::ALL,
                         BookmarkKind::ALL_PUBLISHING,
                         &BookmarkPagination::FromStart,
-                        std::u64::MAX,
+                        u64::MAX,
                     )
                     .try_collect::<Vec<_>>()
                     .await;

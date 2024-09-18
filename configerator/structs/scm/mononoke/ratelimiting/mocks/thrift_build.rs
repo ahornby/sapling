@@ -6,9 +6,11 @@ use std::path::Path;
 use thrift_compiler::Config;
 use thrift_compiler::GenContext;
 const CRATEMAP: &str = "\
-cpp cpp //thrift/annotation:cpp-rust
-ratelimits crate //configerator/structs/scm/mononoke/ratelimiting:rate_limiting_config-rust
-rust rust //thrift/annotation:rust-rust
+configerator/structs/scm/mononoke/ratelimiting/ratelimits.thrift crate //configerator/structs/scm/mononoke/ratelimiting:rate_limiting_config-rust
+thrift/annotation/cpp.thrift cpp //thrift/annotation:cpp-rust
+thrift/annotation/rust.thrift rust //thrift/annotation:rust-rust
+thrift/annotation/scope.thrift cpp->scope //thrift/annotation:scope-rust
+thrift/annotation/thrift.thrift cpp->thrift //thrift/annotation:thrift-rust
 ";
 #[rustfmt::skip]
 fn main() {
@@ -16,21 +18,12 @@ fn main() {
     let out_dir = env::var_os("OUT_DIR").expect("OUT_DIR env not provided");
     let cratemap_path = Path::new(&out_dir).join("cratemap");
     fs::write(cratemap_path, CRATEMAP).expect("Failed to write cratemap");
-    let mut conf = Config::from_env(GenContext::Mocks)
-        .expect("Failed to instantiate thrift_compiler::Config");
-    let cargo_manifest_dir = env::var_os("CARGO_MANIFEST_DIR")
-        .expect("CARGO_MANIFEST_DIR not provided");
-    let mut base_path = Path::new(&cargo_manifest_dir)
-        .join("../../../../../..")
-        .canonicalize()
-        .expect("Failed to canonicalize base_path");
-    if cfg!(windows) {
-        base_path = base_path.to_string_lossy().trim_start_matches(r"\\?\").into();
-    }
-    conf.base_path(base_path);
-    conf.types_crate("rate_limiting_config__types");
-    conf.clients_crate("rate_limiting_config__clients");
-    conf.options("deprecated_default_enum_min_i32,serde");
-    let srcs: &[&str] = &["../ratelimits.thrift"];
-    conf.run(srcs).expect("Failed while running thrift compilation");
+    Config::from_env(GenContext::Mocks)
+        .expect("Failed to instantiate thrift_compiler::Config")
+        .base_path("../../../../../..")
+        .types_crate("rate_limiting_config__types")
+        .clients_crate("rate_limiting_config__clients")
+        .options("deprecated_default_enum_min_i32,serde")
+        .run(["../ratelimits.thrift"])
+        .expect("Failed while running thrift compilation");
 }

@@ -31,11 +31,70 @@ pub struct TrackedFileChange {
     copy_from: Option<(NonRootMPath, ChangesetId)>,
 }
 
+#[derive(
+    Debug,
+    Default,
+    Copy,
+    Clone,
+    Eq,
+    PartialEq,
+    Hash,
+    Serialize,
+    Deserialize
+)]
+/// Controls file representation when served over Git protocol
+pub enum GitLfs {
+    /// Full contents of the file should be served over Git protocol
+    #[default]
+    FullContent,
+    /// A Git-LFS pointer should be served over git protocol
+    GitLfsPointer {
+        /// The content id of the pointer if different from the default
+        /// one created by Git LFS or Mononoke.
+        non_canonical_pointer: Option<ContentId>,
+    },
+}
+
+impl GitLfs {
+    pub fn full_content() -> Self {
+        Self::FullContent
+    }
+
+    pub fn canonical_pointer() -> Self {
+        Self::GitLfsPointer {
+            non_canonical_pointer: None,
+        }
+    }
+
+    pub fn non_canonical_pointer(content_id: ContentId) -> Self {
+        Self::GitLfsPointer {
+            non_canonical_pointer: Some(content_id),
+        }
+    }
+
+    pub fn is_lfs_pointer(&self) -> bool {
+        match self {
+            GitLfs::GitLfsPointer { .. } => true,
+            GitLfs::FullContent => false,
+        }
+    }
+
+    pub fn non_canonical_pointer_content_id(&self) -> Option<ContentId> {
+        match self {
+            GitLfs::GitLfsPointer {
+                non_canonical_pointer,
+            } => *non_canonical_pointer,
+            GitLfs::FullContent => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct BasicFileChange {
     content_id: ContentId,
     file_type: FileType,
     size: u64,
+    git_lfs: GitLfs,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -53,12 +112,14 @@ impl TrackedFileChange {
         file_type: FileType,
         size: u64,
         copy_from: Option<(NonRootMPath, ChangesetId)>,
+        git_lfs: GitLfs,
     ) -> Self {
         Self {
             inner: BasicFileChange {
                 content_id,
                 file_type,
                 size,
+                git_lfs,
             },
             copy_from,
         }
@@ -70,6 +131,19 @@ impl TrackedFileChange {
             self.inner.file_type,
             self.inner.size,
             copy_from,
+            self.inner.git_lfs,
+        )
+    }
+
+    /// Drops the Git-LFS information from file change
+    /// useful when mirroring commits to repos that don't support Git-LFS.
+    pub fn without_git_lfs(&self) -> Self {
+        Self::new(
+            self.inner.content_id,
+            self.inner.file_type,
+            self.inner.size,
+            self.copy_from.clone(),
+            GitLfs::FullContent,
         )
     }
 
@@ -84,6 +158,16 @@ impl TrackedFileChange {
                     file: file.into_thrift(),
                     cs_id: cs_id.into_thrift(),
                 }),
+            git_lfs: match self.inner.git_lfs {
+                GitLfs::GitLfsPointer {
+                    non_canonical_pointer,
+                } => Some(thrift::bonsai::GitLfs {
+                    non_canonical_pointer_content_id: non_canonical_pointer
+                        .map(|id| id.into_thrift()),
+                    ..Default::default()
+                }),
+                GitLfs::FullContent => None,
+            },
         }
     }
 
@@ -93,6 +177,10 @@ impl TrackedFileChange {
 
     pub fn file_type(&self) -> FileType {
         self.inner.file_type
+    }
+
+    pub fn git_lfs(&self) -> GitLfs {
+        self.inner.git_lfs
     }
 
     pub fn size(&self) -> u64 {
@@ -117,6 +205,15 @@ impl TrackedFileChange {
                     content_id: ContentId::from_thrift(fc.content_id)?,
                     file_type: FileType::from_thrift(fc.file_type)?,
                     size: fc.size as u64,
+                    git_lfs: match fc.git_lfs {
+                        Some(git_lfs) => GitLfs::GitLfsPointer {
+                            non_canonical_pointer: git_lfs
+                                .non_canonical_pointer_content_id
+                                .map(ContentId::from_thrift)
+                                .transpose()?,
+                        },
+                        None => GitLfs::FullContent,
+                    },
                 },
                 copy_from: match fc.copy_from {
                     Some(copy_info) => Some((
@@ -138,11 +235,12 @@ impl TrackedFileChange {
 }
 
 impl BasicFileChange {
-    pub fn new(content_id: ContentId, file_type: FileType, size: u64) -> Self {
+    pub fn new(content_id: ContentId, file_type: FileType, size: u64, git_lfs: GitLfs) -> Self {
         Self {
             content_id,
             file_type,
             size,
+            git_lfs,
         }
     }
 
@@ -152,6 +250,10 @@ impl BasicFileChange {
 
     pub fn file_type(&self) -> FileType {
         self.file_type
+    }
+
+    pub fn git_lfs(&self) -> GitLfs {
+        self.git_lfs
     }
 
     pub fn size(&self) -> u64 {
@@ -171,6 +273,7 @@ impl BasicFileChange {
             content_id: ContentId::from_thrift(uc.content_id)?,
             file_type: FileType::from_thrift(uc.file_type)?,
             size: uc.size as u64,
+            git_lfs: GitLfs::FullContent,
         })
     }
 }
@@ -181,9 +284,10 @@ impl FileChange {
         file_type: FileType,
         size: u64,
         copy_from: Option<(NonRootMPath, ChangesetId)>,
+        git_lfs: GitLfs,
     ) -> Self {
         Self::Change(TrackedFileChange::new(
-            content_id, file_type, size, copy_from,
+            content_id, file_type, size, copy_from, git_lfs,
         ))
     }
 
@@ -192,6 +296,7 @@ impl FileChange {
             content_id,
             file_type,
             size,
+            git_lfs: GitLfs::FullContent,
         })
     }
 
@@ -216,6 +321,14 @@ impl FileChange {
         match &self {
             Self::Change(tc) => Some(tc.size()),
             Self::UntrackedChange(uc) => Some(uc.size),
+            Self::Deletion | Self::UntrackedDeletion => None,
+        }
+    }
+
+    pub fn git_lfs(&self) -> Option<GitLfs> {
+        match &self {
+            Self::Change(tc) => Some(tc.git_lfs()),
+            Self::UntrackedChange(uc) => Some(uc.git_lfs),
             Self::Deletion | Self::UntrackedDeletion => None,
         }
     }
@@ -289,6 +402,7 @@ impl FileChange {
             FileType::arbitrary(g),
             u64::arbitrary(g),
             copy_from,
+            GitLfs::FullContent,
         ))
     }
 }
@@ -305,6 +419,7 @@ impl Arbitrary for FileChange {
             FileType::arbitrary(g),
             u64::arbitrary(g),
             copy_from,
+            GitLfs::FullContent,
         ))
     }
 
@@ -455,6 +570,18 @@ impl FromStr for FileType {
     }
 }
 
+impl FromStr for GitLfs {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "full_content" => Ok(GitLfs::full_content()),
+            "lfs_pointer" | "lfs" => Ok(GitLfs::canonical_pointer()),
+            _ => bail!("Invalid GitLfs flag: {s}"),
+        }
+    }
+}
+
 impl Arbitrary for FileType {
     fn arbitrary(g: &mut Gen) -> Self {
         match u64::arbitrary(g) % 100 {
@@ -472,6 +599,7 @@ impl Arbitrary for FileType {
 
 #[cfg(test)]
 mod test {
+    use mononoke_macros::mononoke;
     use quickcheck::quickcheck;
 
     use super::*;
@@ -492,13 +620,13 @@ mod test {
         }
     }
 
-    #[test]
+    #[mononoke::test]
     fn bad_filetype_thrift() {
         let thrift_ft = thrift::bonsai::FileType(42);
         FileType::from_thrift(thrift_ft).expect_err("unexpected OK - unknown file type");
     }
 
-    #[test]
+    #[mononoke::test]
     fn bad_filechange_thrift() {
         let thrift_fc = thrift::bonsai::FileChange {
             content_id: thrift::id::ContentId(thrift::id::Id::Blake2(thrift::id::Blake2(
@@ -507,6 +635,7 @@ mod test {
             file_type: thrift::bonsai::FileType::Regular,
             size: 0,
             copy_from: None,
+            git_lfs: None,
         };
         TrackedFileChange::from_thrift(thrift_fc, &NonRootMPath::new("foo").unwrap())
             .expect_err("unexpected OK - bad content ID");

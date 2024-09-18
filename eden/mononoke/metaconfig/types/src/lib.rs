@@ -10,6 +10,7 @@
 
 #![deny(missing_docs)]
 
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt;
@@ -21,6 +22,7 @@ use std::str;
 use std::str::FromStr;
 use std::time::Duration;
 
+use abomonation_derive::Abomonation;
 use anyhow::anyhow;
 use anyhow::Context;
 use anyhow::Error;
@@ -92,7 +94,7 @@ impl PartialEq for ComparableRegex {
 impl Eq for ComparableRegex {}
 
 /// Structure representing general purpose identity.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Default, Debug, Eq, PartialEq)]
 pub struct Identity {
     /// Type of this identity.
     pub id_type: String,
@@ -111,9 +113,18 @@ pub struct RedactionConfig {
     pub redaction_sets_location: String,
 }
 
+/// Configuration for the async requests system
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AsyncRequestsConfig {
+    /// The database used for the queue table
+    pub db_config: Option<DatabaseConfig>,
+    /// The blobstore used for request params and response
+    pub blobstore: Option<BlobConfig>,
+}
+
 /// Configuration for all repos
 #[facet::facet]
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Default, Debug, Eq, PartialEq)]
 pub struct CommonConfig {
     /// Hipster tier that is permitted to act as a trusted proxy.
     pub trusted_parties_hipster_tier: Option<String>,
@@ -137,6 +148,8 @@ pub struct CommonConfig {
     pub git_memory_upper_bound: Option<u64>,
     /// Scuba table to dump edenapi requests to (for replay).
     pub edenapi_dumper_scuba_table: Option<String>,
+    /// Configuration for the async requests system.
+    pub async_requests_config: AsyncRequestsConfig,
 }
 
 /// Configuration for logging of censored blobstore accesses
@@ -204,8 +217,6 @@ pub struct RepoConfig {
     pub enforce_lfs_acl_check: bool,
     /// Whether to use warm bookmark cache while serving data hg wireprotocol
     pub repo_client_use_warm_bookmarks_cache: bool,
-    /// Configuration for Segmented Changelog.
-    pub segmented_changelog_config: SegmentedChangelogConfig,
     /// Configuration for repo_client module
     pub repo_client_knobs: RepoClientKnobs,
     /// Callsign to check phabricator commits
@@ -238,12 +249,24 @@ pub struct RepoConfig {
     pub deep_sharding_config: Option<ShardingModeConfig>,
     /// Local directory to write files to instead of uploading to everstore
     pub everstore_local_path: Option<String>,
-    /// The concurrency setting to be used during git protocol for this repo
-    pub git_concurrency: Option<GitConcurrencyParams>,
     /// Configuration for the repo metadata logger
     pub metadata_logger_config: MetadataLoggerConfig,
     /// Configuration for connecting to Zelos
     pub zelos_config: Option<ZelosConfig>,
+    /// The name of the bookmark used to compute repo size
+    pub bookmark_name_for_objects_count: Option<String>,
+    /// Default value for the objects count metric if it cannot be determined via TreeInfo.
+    pub default_objects_count: Option<i64>,
+    /// Map of XRepoSyncSourceConfig for the current repo keyed by the name of the target repo, e.g.
+    /// XRepoSyncSourceConfig for the sync from whatsapp/server to fbsource will be stored as
+    /// whatsapp_server_config.x_repo_sync_source_mapping["fbsource"] = config
+    pub x_repo_sync_source_mapping: Option<XRepoSyncSourceConfigMapping>,
+    /// Commit cloud configuration
+    pub commit_cloud_config: CommitCloudConfig,
+    /// Mononoke Cas Sync Configuration
+    pub mononoke_cas_sync_config: Option<MononokeCasSyncConfig>,
+    /// All Git related configs (e.g. Git Server and Git-only repos)
+    pub git_configs: GitConfigs,
 }
 
 /// Config determining if the repo is deep sharded in the context of a service.
@@ -377,6 +400,9 @@ pub struct DerivedDataTypesConfig {
     /// The configured types.
     pub types: HashSet<DerivableType>,
 
+    /// Types that shouldn't be derived in ephemeral bubbles.
+    pub ephemeral_bubbles_disabled_types: HashSet<DerivableType>,
+
     /// Key prefixes for mappings.  These are used to generate unique
     /// mapping keys when rederiving existing derived data types.
     ///
@@ -403,6 +429,12 @@ pub struct DerivedDataTypesConfig {
 
     /// What `GitDeltaManifest` version should be used.
     pub git_delta_manifest_version: GitDeltaManifestVersion,
+
+    /// Config for git delta manifest v2
+    pub git_delta_manifest_v2_config: Option<GitDeltaManifestV2Config>,
+
+    /// For each Derived Data Type, what batch size should we use during derivation?
+    pub derivation_batch_sizes: HashMap<DerivableType, usize>,
 }
 
 /// What type of unode derived data to generate
@@ -424,9 +456,20 @@ pub enum BlameVersion {
 /// What `GitDeltaManifest` version should be used.
 #[derive(Eq, Clone, Copy, Debug, Default, PartialEq)]
 pub enum GitDeltaManifestVersion {
-    /// GitDeltaManifest v1
     #[default]
-    V1,
+    /// GitDeltaManifest v2
+    V2,
+}
+
+/// Config for git delta manifest v2
+#[derive(Eq, Clone, Copy, Debug, Default, PartialEq)]
+pub struct GitDeltaManifestV2Config {
+    /// Maximum size allowed for an inlined full object.
+    pub max_inlined_object_size: usize,
+    /// Maximum size allowed for an inlined delta.
+    pub max_inlined_delta_size: u64,
+    /// Chunk size for delta instructions.
+    pub delta_chunk_size: u64,
 }
 
 impl RepoConfig {
@@ -620,6 +663,8 @@ pub struct HookConfig {
     pub bypass: Option<HookBypass>,
     /// Configuration options (in JSON format)
     pub options: Option<String>,
+    /// Whether this hook is log-only
+    pub log_only: bool,
 
     // Deprecated config options
     /// Map of config to it's value. Values here are strings
@@ -734,8 +779,9 @@ pub enum PushrebaseRemoteMode {
 pub struct GlobalrevConfig {
     /// On which bookmark to assign globalrevs
     pub publishing_bookmark: BookmarkKey,
-    /// Present if this is a large repo and globalrevs go to the small repo
-    pub small_repo_id: Option<RepositoryId>,
+    /// Present if this is a large repo and globalrevs go to a particular small repo.
+    /// Contains the id of the small repo with globalrevs.
+    pub globalrevs_small_repo_id: Option<RepositoryId>,
 }
 
 /// Pushrebase configuration options
@@ -784,6 +830,8 @@ pub struct LfsParams {
     pub rollout_percentage: u32,
     /// Whether hg sync job should generate lfs blobs
     pub generate_lfs_blob_in_hg_sync_job: bool,
+    /// Whether to use upstream LFS server
+    pub use_upstream_lfs_server: bool,
 }
 
 /// Id used to discriminate diffirent underlying blobstore instances
@@ -1351,7 +1399,7 @@ pub enum CommitSyncDirection {
 }
 
 /// CommitSyncConfig version name
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Abomonation, Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[derive(mysql::OptTryFromRowField)]
 pub struct CommitSyncConfigVersion(pub String);
 
@@ -1590,123 +1638,6 @@ impl AsRef<String> for HgsqlGlobalrevsName {
     }
 }
 
-/// An unit of configuration for what should be indexed by Segmented Changelog.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum SegmentedChangelogHeadConfig {
-    /// All public bookmarks with exceptions.
-    AllPublicBookmarksExcept(Vec<BookmarkKey>),
-    /// A single bookmark.
-    Bookmark(BookmarkKey),
-    /// A single changeset.
-    Changeset(ChangesetId),
-}
-
-impl From<Option<BookmarkKey>> for SegmentedChangelogHeadConfig {
-    fn from(f: Option<BookmarkKey>) -> Self {
-        match f {
-            None => Self::AllPublicBookmarksExcept(vec![]),
-            Some(n) => Self::Bookmark(n),
-        }
-    }
-}
-
-impl From<BookmarkKey> for SegmentedChangelogHeadConfig {
-    fn from(n: BookmarkKey) -> Self {
-        Self::Bookmark(n)
-    }
-}
-
-impl From<ChangesetId> for SegmentedChangelogHeadConfig {
-    fn from(c: ChangesetId) -> Self {
-        Self::Changeset(c)
-    }
-}
-
-impl From<&ChangesetId> for SegmentedChangelogHeadConfig {
-    fn from(c: &ChangesetId) -> Self {
-        Self::Changeset(*c)
-    }
-}
-
-/// Configuration for Segmented Changelog.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct SegmentedChangelogConfig {
-    /// Signals whether segmented changelog functionality is enabled for the current repository.
-    /// This can mean that functionality is disabled to shed load, that the required data is not
-    /// curretly being computed or that it was never computed for this repository.
-    pub enabled: bool,
-    /// How often the tailer should check for updates on the master_bookmark.
-    /// Defaults to 5 minutes.
-    pub tailer_update_period: Option<Duration>,
-    /// By default a mononoke process will look for Dags to load from blobstore.  In tests we may
-    /// not have prebuilt Dags to load so we have this setting to allow us to skip that step and
-    /// initialize with an empty Dag.
-    /// We don't want to set this in production.
-    pub skip_dag_load_at_startup: bool,
-    /// How often an Dag will be reloaded from saves.
-    /// The Dag will not reload when unset.
-    pub reload_dag_save_period: Option<Duration>,
-    /// How often the in process Dag will check the master bookmark to update itself.
-    /// The Dag will not check master when unset.
-    pub update_to_master_bookmark_period: Option<Duration>,
-    /// All the heads that should be part of segmented changelog.
-    pub heads_to_include: Vec<SegmentedChangelogHeadConfig>,
-    /// Heads that should be indexed by segmented changelog offline jobs but
-    /// shouldn't be kept-up-to-date in online serving jobs.
-    ///
-    /// There are two usecases for including extra stuff there:
-    ///
-    /// The first one is repo imports, we don't want to overwhelm prod jobs with
-    /// doing the job for the branches we aren't going to be serving anytime
-    /// soon.
-    ///
-    /// The second usecase is backwards master moves:  say we have a commit
-    /// graph like this:
-    /// ```text
-    ///  B <- master
-    ///  |
-    ///  A
-    ///  |
-    /// ...
-    /// ```
-    /// Then we move a master bookmark backwards to A and create a new commit on top
-    /// (this is a very rare situation, but it might happen during sevs)
-    ///
-    /// ```text
-    ///  C <- master
-    ///  |
-    ///  |  B
-    ///  | /
-    ///  A
-    ///  |
-    /// ...
-    /// ```
-    ///
-    /// Clients might have already pulled commit B, and so they assume it's present on
-    /// the server. However if we reseed segmented changelog then commit B won't be
-    /// a part of a new reseeded changelog because B is not an ancestor of master anymore.
-    /// It might lead to problems - clients might fail because server doesn't know about
-    /// a commit they assume it should know of, and server would do expensive sql requests
-    /// (see S242328).
-    pub extra_heads_to_include_in_background_jobs: Vec<SegmentedChangelogHeadConfig>,
-}
-
-impl Default for SegmentedChangelogConfig {
-    fn default() -> Self {
-        SegmentedChangelogConfig {
-            enabled: false,
-            tailer_update_period: Some(Duration::from_secs(45)),
-            skip_dag_load_at_startup: false,
-            reload_dag_save_period: Some(Duration::from_secs(3600)),
-            update_to_master_bookmark_period: Some(Duration::from_secs(60)),
-            heads_to_include: vec![SegmentedChangelogHeadConfig::AllPublicBookmarksExcept(
-                vec![],
-            )],
-            extra_heads_to_include_in_background_jobs: vec![],
-        }
-    }
-}
-
 /// Define a region of the repository, in terms of commits and path prefixes.
 ///
 /// The commit range is equivalent to the Mercurial revset
@@ -1869,6 +1800,15 @@ pub struct HgSyncConfig {
     pub darkstorm_backup_repo_id: Option<i32>,
 }
 
+/// Repo-specific configuration parameters for mononoke cas sync job
+#[derive(Debug, Default, Clone, Eq, PartialEq)]
+pub struct MononokeCasSyncConfig {
+    /// The name of the main bookmark to sync to RE CAS
+    pub main_bookmark_to_sync: String,
+    /// Enabling it would expand the sync to all the bookmarks
+    pub sync_all_bookmarks: bool,
+}
+
 /// Destination for telemetry logging.
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum LoggingDestination {
@@ -1897,6 +1837,8 @@ pub struct CommitGraphConfig {
     pub scuba_table: Option<String>,
     /// Blobstore key for a preloaded commit graph
     pub preloaded_commit_graph_blobstore_key: Option<String>,
+    /// Whether to disable commit_graph_v2 queries that specify an empty common set for this repo.
+    pub disable_commit_graph_v2_with_empty_common: bool,
 }
 
 /// Configuration for the repo metadata logger
@@ -1910,7 +1852,7 @@ pub struct MetadataLoggerConfig {
 }
 
 /// Configuration for connecting to Zelos
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub enum ZelosConfig {
     /// Connect to a local Zelos server
     Local {
@@ -1942,4 +1884,50 @@ pub struct GitConcurrencyParams {
     pub commits: usize,
     /// The concurrency value for tag fetches
     pub tags: usize,
+}
+
+/// All Git related configs (e.g. Git Server and Git-only repos)
+#[derive(Debug, Default, Clone, Eq, PartialEq)]
+pub struct GitConfigs {
+    /// The concurrency setting to be used during git protocol for this repo
+    pub git_concurrency: Option<GitConcurrencyParams>,
+    /// Determines the behaviour on converting from Git commits
+    /// to bonsais for this repo.
+    ///  - With the flag ON the git lfs pointers will be interpreted and the actual file contents will
+    ///    be stored. File contents have to be available in Mononoke.
+    ///  - With this flag OFF the git lfs pointers are treated like any other file in the repo.
+    pub git_lfs_interpret_pointers: bool,
+    /// Optional messages to display to users after they run fetch commands (e.g.
+    /// pull, clone).
+    ///
+    /// NOTE: Adding a message is not enough! The message will only be displayed
+    /// if the repo enables this feature through a JK.
+    pub fetch_message: Option<String>,
+}
+
+/// Configuration for x repo syncs
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct XRepoSyncSourceConfig {
+    /// Regex matching the bookmarks that need to be synced
+    pub bookmark_regex: String,
+    /// Flag determining if backsyncing is enabled for this repo
+    pub backsync_enabled: bool,
+}
+
+/// Configuration for x repo sync keyed by the target repo name
+#[derive(Debug, Clone, Default, Eq, PartialEq)]
+pub struct XRepoSyncSourceConfigMapping {
+    /// Map of XRepoSyncSourceConfig for the current repo keyed by the name of the target repo, e.g.
+    /// XRepoSyncSourceConfig for the sync from whatsapp/server to fbsource will be stored as
+    /// whatsapp_server_config.mapping["fbsource"] = config
+    pub mapping: BTreeMap<String, XRepoSyncSourceConfig>,
+}
+
+/// Configs that are being passed to commit cloud
+#[derive(Debug, Default, Clone, Eq, PartialEq)]
+pub struct CommitCloudConfig {
+    /// Mock emails or usernames used for tests
+    pub mocked_employees: Vec<String>,
+    /// Disables interngraph notification whenever a commit is synced to commit cloud
+    pub disable_interngraph_notification: bool,
 }

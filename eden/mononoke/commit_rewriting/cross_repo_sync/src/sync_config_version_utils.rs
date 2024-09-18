@@ -12,7 +12,6 @@ use anyhow::Context;
 use anyhow::Error;
 use changeset_info::ChangesetInfo;
 use context::CoreContext;
-use derived_data::BonsaiDerived;
 use metaconfig_types::CommitSyncConfigVersion;
 use mononoke_types::BonsaiChangesetMut;
 use mononoke_types::ChangesetId;
@@ -33,7 +32,10 @@ pub async fn get_version_for_merge<'a>(
     source_cs_id: ChangesetId,
     parent_outcomes: impl IntoIterator<Item = &'a CommitSyncOutcome>,
 ) -> Result<CommitSyncConfigVersion, Error> {
-    let cs_info = ChangesetInfo::derive(ctx, repo, source_cs_id).await?;
+    let cs_info = repo
+        .repo_derived_data()
+        .derive::<ChangesetInfo>(ctx, source_cs_id)
+        .await?;
     get_version_for_merge_with_info(ctx, &cs_info, parent_outcomes)
 }
 
@@ -86,7 +88,10 @@ pub async fn get_version<'a>(
     source_cs_id: ChangesetId,
     parent_versions: impl IntoIterator<Item = &'a CommitSyncConfigVersion>,
 ) -> Result<Option<CommitSyncConfigVersion>, Error> {
-    let cs_info = ChangesetInfo::derive(ctx, repo, source_cs_id).await?;
+    let cs_info = repo
+        .repo_derived_data()
+        .derive::<ChangesetInfo>(ctx, source_cs_id)
+        .await?;
     get_version_with_info(ctx, &cs_info, parent_versions)
 }
 
@@ -183,11 +188,12 @@ pub fn set_mapping_change_version(
 #[cfg(test)]
 mod tests {
     use fbinit::FacebookInit;
+    use mononoke_macros::mononoke;
     use mononoke_types_mocks::changesetid as bonsai;
 
     use super::*;
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     fn test_merge_version_determinator_success_single_rewritten(_fb: FacebookInit) {
         // Basic test: there's a single non-preserved parent, determining
         // Mover version should succeed
@@ -202,7 +208,7 @@ mod tests {
         assert_eq!(rv, v1);
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     fn test_merge_version_determinator_success(_fb: FacebookInit) {
         // There are two rewritten parents, both preserved with the same
         // version. Determining Mover version should succeed
@@ -217,7 +223,7 @@ mod tests {
         assert_eq!(rv, v1);
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     fn test_merge_version_determinator_failure_different_versions(_fb: FacebookInit) {
         // There are two rewritten parents, with different versions
         // Determining Mover version should fail
@@ -235,7 +241,7 @@ mod tests {
         );
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     fn test_merge_version_determinator_failure_all_not_candidates(_fb: FacebookInit) {
         // All parents are preserved, this function should not have been called
         use CommitSyncOutcome::*;

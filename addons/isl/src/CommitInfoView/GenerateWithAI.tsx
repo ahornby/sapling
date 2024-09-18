@@ -6,12 +6,10 @@
  */
 
 import type {Result} from '../types';
-import type {MutableRefObject} from 'react';
+import type {RefObject} from 'react';
 import type {Comparison} from 'shared/Comparison';
 
-import {ErrorNotice} from '../ErrorNotice';
 import {Internal} from '../Internal';
-import {Tooltip} from '../Tooltip';
 import {tracker} from '../analytics';
 import {useFeatureFlagSync} from '../featureFlags';
 import {T, t} from '../i18n';
@@ -23,12 +21,14 @@ import {
   commitMode,
   latestCommitMessageFieldsWithEdits,
 } from './CommitInfoState';
-import {getInnerTextareaForVSCodeTextArea} from './utils';
-import {VSCodeButton, VSCodeTextArea} from '@vscode/webview-ui-toolkit/react';
+import {Button} from 'isl-components/Button';
+import {ErrorNotice} from 'isl-components/ErrorNotice';
+import {Icon} from 'isl-components/Icon';
+import {TextArea} from 'isl-components/TextArea';
+import {Tooltip} from 'isl-components/Tooltip';
 import {atom, useAtom, useAtomValue, useSetAtom} from 'jotai';
 import {useCallback} from 'react';
 import {ComparisonType} from 'shared/Comparison';
-import {Icon} from 'shared/Icon';
 import {useThrottledEffect} from 'shared/hooks';
 import {randomId, nullthrows} from 'shared/utils';
 
@@ -41,7 +41,7 @@ export function GenerateAICommitMessageButton({
   textAreaRef,
   appendToTextArea,
 }: {
-  textAreaRef: MutableRefObject<unknown>;
+  textAreaRef: RefObject<HTMLTextAreaElement>;
   appendToTextArea: (toAdd: string) => unknown;
 }) {
   const currentCommit = useAtomValue(commitInfoViewCurrentCommits)?.[0];
@@ -87,15 +87,15 @@ export function GenerateAICommitMessageButton({
           <GenerateAICommitMessageModal
             dismiss={dismiss}
             hashKey={hashKey}
-            textArea={getInnerTextareaForVSCodeTextArea(textAreaRef.current as HTMLElement)}
+            textArea={textAreaRef.current}
             appendToTextArea={appendToTextArea}
           />
         )}
         onDismiss={onDismiss}
         title={t('Generate a commit message suggestion with AI')}>
-        <VSCodeButton appearance="icon" data-testid="generate-commit-message-button">
+        <Button icon data-testid="generate-commit-message-button">
           <Icon icon="sparkle" />
-        </VSCodeButton>
+        </Button>
       </Tooltip>
     </span>
   );
@@ -207,15 +207,15 @@ function GenerateAICommitMessageModal({
 
   return (
     <div className="generated-ai-commit-message-modal">
-      <VSCodeButton appearance="icon" className="dismiss-modal" onClick={dismiss}>
+      <Button icon className="dismiss-modal" onClick={dismiss}>
         <Icon icon="x" />
-      </VSCodeButton>
+      </Button>
       <b>Generate Summary</b>
       {error ? (
         <ErrorNotice error={error} title={t('Unable to generate commit message')}></ErrorNotice>
       ) : (
         <div className="generated-message-textarea-container">
-          <VSCodeTextArea
+          <TextArea
             readOnly
             value={content.state === 'hasData' ? content.data.value ?? '' : ''}
             rows={14}
@@ -224,9 +224,8 @@ function GenerateAICommitMessageModal({
         </div>
       )}
       <div className="generated-message-button-bar">
-        <VSCodeButton
+        <Button
           disabled={content.state === 'loading' || error != null}
-          appearance="secondary"
           onClick={() => {
             FunnelTracker.get(hashKey)?.track(GeneratedMessageTrackEventName.RetryClick);
             cachedSuggestions.delete(hashKey); // make sure we don't re-use cached value
@@ -234,10 +233,11 @@ function GenerateAICommitMessageModal({
             FunnelTracker.restartFunnel(hashKey);
             refetch();
           }}>
-          <Icon icon="refresh" slot="start" />
+          <Icon icon="refresh" />
           <T>Try Again</T>
-        </VSCodeButton>
-        <VSCodeButton
+        </Button>
+        <Button
+          primary
           disabled={content.state === 'loading' || error != null}
           onClick={() => {
             const value = content.state === 'hasData' ? content.data.value : null;
@@ -248,9 +248,9 @@ function GenerateAICommitMessageModal({
             setHasAccepted(true);
             dismiss();
           }}>
-          <Icon icon="check" slot="start" />
+          <Icon icon="check" />
           <T>Insert into Summary</T>
-        </VSCodeButton>
+        </Button>
       </div>
     </div>
   );

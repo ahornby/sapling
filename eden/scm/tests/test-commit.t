@@ -431,21 +431,21 @@ specific template keywords work well
   $ cat >> .hg/hgrc <<EOF
   > [committemplate]
   > changeset.commit.normal = 'HG: this is "commit.normal" template
-  >     HG: {extramsg}
+  >     HG: Leave message empty to abort commit.
   >     {if(activebookmark,
   >    "HG: bookmark '{activebookmark}' is activated\n",
   >    "HG: no bookmark is activated\n")}{subrepos %
   >    "HG: subrepo '{subrepo}' is changed\n"}'
   > 
   > changeset.commit = HG: this is "commit" template
-  >     HG: {extramsg}
+  >     HG: Leave message empty to abort commit.
   >     {if(activebookmark,
   >    "HG: bookmark '{activebookmark}' is activated\n",
   >    "HG: no bookmark is activated\n")}{subrepos %
   >    "HG: subrepo '{subrepo}' is changed\n"}
   > 
   > changeset = HG: this is customized commit template
-  >     HG: {extramsg}
+  >     HG: Leave message empty to abort commit.
   >     {if(activebookmark,
   >    "HG: bookmark '{activebookmark}' is activated\n",
   >    "HG: no bookmark is activated\n")}{subrepos %
@@ -671,11 +671,8 @@ verify pathauditor blocks evil filepaths
   [255]
 #else
   $ hg co --clean tip
-  abort: Can't write 'RepoPath(".h\u{200c}g/hgrc")' after handling error "Can't write into .h‌g/hgrc
-  
-  Caused by:
-      0: Invalid component in ".h‌g/hgrc"
-      1: Invalid path component ".hg"": Invalid path component ".hg"
+  abort: error writing files:
+   .h‌g/hgrc: invalid component in ".h‌g/hgrc": invalid path component ".hg"
   [255]
 #endif
 
@@ -730,7 +727,7 @@ verify pathauditor blocks evil filepaths
   > [committemplate]
   > changeset.commit = HI THIS IS NOT STRIPPED
   >     HG: this is customized commit template
-  >     HG: {extramsg}
+  >     HG: Leave message empty to abort commit.
   >     {if(activebookmark,
   >    "HG: bookmark '{activebookmark}' is activated\n",
   >    "HG: no bookmark is activated\n")}
@@ -760,7 +757,7 @@ test that text below the --- >8 --- special string is ignored
   > [committemplate]
   > changeset.commit = first LINE
   >     HG: this is customized commit template
-  >     HG: {extramsg}
+  >     HG: Leave message empty to abort commit.
   >     HG: ------------------------ >8 ------------------------
   >     {diff()}
   > EOF
@@ -790,7 +787,7 @@ a line
   > changeset.commit = first LINE2
   >     another line HG: ------------------------ >8 ------------------------
   >     HG: this is customized commit template
-  >     HG: {extramsg}
+  >     HG: Leave message empty to abort commit.
   >     HG: ------------------------ >8 ------------------------
   >     {diff()}
   > EOF
@@ -820,7 +817,7 @@ at the end
   >     HG: ------------------------ >8 ------------------------foobar
   >     second line
   >     HG: this is customized commit template
-  >     HG: {extramsg}
+  >     HG: Leave message empty to abort commit.
   >     HG: ------------------------ >8 ------------------------
   >     {diff()}
   > EOF
@@ -844,4 +841,3 @@ at the end
   second line
 
   $ cd ..
-

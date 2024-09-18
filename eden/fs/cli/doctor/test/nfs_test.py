@@ -14,7 +14,7 @@ import eden.fs.cli.doctor as doctor
 from eden.fs.cli.config import EdenInstance
 from eden.fs.cli.doctor.test.lib.fake_eden_instance import FakeEdenInstance
 from eden.fs.cli.doctor.test.lib.fake_fs_util import FakeFsUtil
-from eden.fs.cli.doctor.test.lib.fake_kerberos_checker import FakeKerberosChecker
+from eden.fs.cli.doctor.test.lib.fake_network_checker import FakeNetworkChecker
 from eden.fs.cli.doctor.test.lib.fake_vscode_extensions_checker import (
     getFakeVSCodeExtensionsChecker,
 )
@@ -49,8 +49,8 @@ class NfsTest(DoctorTestBase):
             mount_table=instance.mount_table,
             fs_util=FakeFsUtil(),
             proc_utils=self.make_proc_utils(),
-            kerberos_checker=FakeKerberosChecker(),
             vscode_extensions_checker=getFakeVSCodeExtensionsChecker(),
+            network_checker=FakeNetworkChecker(),
             out=out,
         )
         expected = f"""<yellow>- Found problem:<reset>
@@ -61,6 +61,8 @@ The most common cause for this is if your ~/local symlink does not point to loca
 Checking {checkout.path}
 <yellow>- Found problem:<reset>
 The Mercurial data directory for {checkout.path}/.hg/sharedpath is at {instance.default_backing_repo}/.hg which is on a NFS filesystem. Accessing files and directories in this repository will be slow.
+To fix this, move the Mercurial data directory to a non-NFS filesystem.
+
 <yellow>Discovered 2 problems during --dry-run<reset>
 """
         self.assertEqual(expected, out.getvalue())
@@ -106,6 +108,8 @@ Checking {v.client_path}
         out = f"""Checking {v.client_path}
 <yellow>- Found problem:<reset>
 The Mercurial data directory for {v.client_path}/.hg/sharedpath is at {v.shared_path} which is on a NFS filesystem. Accessing files and directories in this repository will be slow.
+To fix this, move the Mercurial data directory to a non-NFS filesystem.
+
 <yellow>Discovered 1 problem during --dry-run<reset>
 """
         self.assertEqual(mock_is_nfs_mounted.call_count, 2)
@@ -131,6 +135,8 @@ The most common cause for this is if your ~/local symlink does not point to loca
 Checking {v.client_path}
 <yellow>- Found problem:<reset>
 The Mercurial data directory for {v.client_path}/.hg/sharedpath is at {v.shared_path} which is on a NFS filesystem. Accessing files and directories in this repository will be slow.
+To fix this, move the Mercurial data directory to a non-NFS filesystem.
+
 <yellow>Discovered 2 problems during --dry-run<reset>
 """
         self.assertEqual(mock_is_nfs_mounted.call_count, 2)
@@ -153,8 +159,8 @@ The Mercurial data directory for {v.client_path}/.hg/sharedpath is at {v.shared_
             mount_table=instance.mount_table,
             fs_util=FakeFsUtil(),
             proc_utils=self.make_proc_utils(),
-            kerberos_checker=FakeKerberosChecker(),
             vscode_extensions_checker=getFakeVSCodeExtensionsChecker(),
+            network_checker=FakeNetworkChecker(),
             out=out,
         )
         return NfsDoctorResult(

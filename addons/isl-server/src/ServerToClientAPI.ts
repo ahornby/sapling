@@ -12,7 +12,7 @@ import type {Logger} from './logger';
 import type {ServerPlatform} from './serverPlatform';
 import type {RepositoryContext} from './serverTypes';
 import type {ExecaError} from 'execa';
-import type {TypeaheadResult} from 'isl/src/CommitInfoView/types';
+import type {TypeaheadResult} from 'isl-components/Types';
 import type {Serializable} from 'isl/src/serialize';
 import type {
   ServerToClientMessage,
@@ -23,7 +23,6 @@ import type {
   RepositoryError,
   PlatformSpecificClientToServerMessages,
   FileABugProgress,
-  ClientToServerMessageWithPayload,
   FetchedCommits,
   FetchedUncommittedChanges,
   LandInfo,
@@ -40,15 +39,15 @@ import {parseExecJson} from './utils';
 import {serializeToString, deserializeFromString} from 'isl/src/serialize';
 import {Readable} from 'node:stream';
 import {revsetForComparison} from 'shared/Comparison';
-import {randomId, nullthrows, notEmpty} from 'shared/utils';
+import {randomId, notEmpty, base64Decode} from 'shared/utils';
 
 export type IncomingMessage = ClientToServerMessage;
-type IncomingMessageWithPayload = ClientToServerMessageWithPayload;
 export type OutgoingMessage = ServerToClientMessage;
 
 type GeneralMessage = IncomingMessage &
   (
     | {type: 'heartbeat'}
+    | {type: 'stress'}
     | {type: 'changeCwd'}
     | {type: 'requestRepoInfo'}
     | {type: 'requestApplicationInfo'}
@@ -56,17 +55,6 @@ type GeneralMessage = IncomingMessage &
     | {type: 'track'}
   );
 type WithRepoMessage = Exclude<IncomingMessage, GeneralMessage>;
-
-/**
- * Return true if a ClientToServerMessage is a ClientToServerMessageWithPayload
- */
-function expectsBinaryPayload(message: unknown): message is ClientToServerMessageWithPayload {
-  return (
-    message != null &&
-    typeof message === 'object' &&
-    (message as ClientToServerMessageWithPayload).hasBinaryPayload === true
-  );
-}
 
 /**
  * Message passing channel built on top of ClientConnection.
@@ -100,34 +88,9 @@ export default class ServerToClientAPI {
     private tracker: ServerSideTracker,
     private logger: Logger,
   ) {
-    // messages with binary payloads are sent as two post calls. We first get the JSON message, then the binary payload,
-    // which we will reconstruct together.
-    let messageExpectingBinaryFollowup: ClientToServerMessageWithPayload | null = null;
-    this.incomingListener = this.connection.onDidReceiveMessage((buf, isBinary) => {
-      if (isBinary) {
-        if (messageExpectingBinaryFollowup == null) {
-          connection.logger?.error('Error: got a binary message when not expecting one');
-          return;
-        }
-        // TODO: we don't handle queueing up messages with payloads...
-        this.handleIncomingMessageWithPayload(messageExpectingBinaryFollowup, buf);
-        messageExpectingBinaryFollowup = null;
-        return;
-      } else if (messageExpectingBinaryFollowup != null) {
-        connection.logger?.error(
-          'Error: didnt get binary payload after a message that requires one',
-        );
-        messageExpectingBinaryFollowup = null;
-        return;
-      }
-
+    this.incomingListener = this.connection.onDidReceiveMessage(buf => {
       const message = buf.toString('utf-8');
       const data = deserializeFromString(message) as IncomingMessage;
-      if (expectsBinaryPayload(data)) {
-        // remember this message, and wait to get the binary payload before handling it
-        messageExpectingBinaryFollowup = data;
-        return;
-      }
 
       // When the client is connected, we want to immediately start listening to messages.
       // However, we can't properly respond to these messages until we have a repository set up.
@@ -233,34 +196,6 @@ export default class ServerToClientAPI {
     this.queuedMessages = [];
   }
 
-  private handleIncomingMessageWithPayload(
-    message: IncomingMessageWithPayload,
-    payload: ArrayBuffer,
-  ) {
-    switch (message.type) {
-      case 'uploadFile': {
-        const {id, filename} = message;
-        const uploadFile = Internal.uploadFile;
-        if (uploadFile == null) {
-          return;
-        }
-        this.tracker
-          .operation('UploadImage', 'UploadImageError', {}, () =>
-            uploadFile(nullthrows(this.connection.logger), {filename, data: payload}),
-          )
-          .then((result: string) => {
-            this.connection.logger?.info('sucessfully uploaded file', filename, result);
-            this.postMessage({type: 'uploadFileResult', id, result: {value: result}});
-          })
-          .catch((error: Error) => {
-            this.connection.logger?.info('error uploading file', filename, error);
-            this.postMessage({type: 'uploadFileResult', id, result: {error}});
-          });
-        break;
-      }
-    }
-  }
-
   private handleIncomingMessage(data: IncomingMessage) {
     this.handleIncomingGeneralMessage(data as GeneralMessage);
     const {currentState} = this;
@@ -304,6 +239,10 @@ export default class ServerToClientAPI {
     switch (data.type) {
       case 'heartbeat': {
         this.postMessage({type: 'heartbeat', id: data.id});
+        break;
+      }
+      case 'stress': {
+        this.postMessage(data);
         break;
       }
       case 'track': {
@@ -583,6 +522,27 @@ export default class ServerToClientAPI {
         repo.setPageFocus(this.pageId, data.state);
         break;
       }
+      case 'uploadFile': {
+        const {id, filename, b64Content} = data;
+        const payload = base64Decode(b64Content);
+        const uploadFile = Internal.uploadFile;
+        if (uploadFile == null) {
+          return;
+        }
+        this.tracker
+          .operation('UploadImage', 'UploadImageError', {}, () =>
+            uploadFile(this.logger, {filename, data: payload}),
+          )
+          .then((result: string) => {
+            this.logger.info('sucessfully uploaded file', filename, result);
+            this.postMessage({type: 'uploadFileResult', id, result: {value: result}});
+          })
+          .catch((error: Error) => {
+            this.logger.info('error uploading file', filename, error);
+            this.postMessage({type: 'uploadFileResult', id, result: {error}});
+          });
+        break;
+      }
       case 'fetchCommitMessageTemplate': {
         this.handleFetchCommitMessageTemplate(repo, ctx);
         break;
@@ -630,7 +590,7 @@ export default class ServerToClientAPI {
                 type: 'fetchedPendingSignificantLinesOfCode',
                 requestId: data.requestId,
                 hash: data.hash,
-                linesOfCode: {value},
+                result: {value: {linesOfCode: value.sloc, strictLinesOfCode: value.strictSloc}},
               });
             })
             .catch(err => {
@@ -638,7 +598,7 @@ export default class ServerToClientAPI {
                 type: 'fetchedPendingSignificantLinesOfCode',
                 hash: data.hash,
                 requestId: data.requestId,
-                linesOfCode: {error: err as Error},
+                result: {error: err as Error},
               });
             });
         }
@@ -651,14 +611,36 @@ export default class ServerToClientAPI {
               this.postMessage({
                 type: 'fetchedSignificantLinesOfCode',
                 hash: data.hash,
-                linesOfCode: {value},
+                result: {value: {linesOfCode: value.sloc, strictLinesOfCode: value.strictSloc}},
               });
             })
             .catch(err => {
               this.postMessage({
                 type: 'fetchedSignificantLinesOfCode',
                 hash: data.hash,
-                linesOfCode: {error: err as Error},
+                result: {error: err as Error},
+              });
+            });
+        }
+        break;
+      case 'fetchPendingAmendSignificantLinesOfCode':
+        {
+          repo
+            .fetchPendingAmendSignificantLinesOfCode(ctx, data.hash, data.includedFiles)
+            .then(value => {
+              this.postMessage({
+                type: 'fetchedPendingAmendSignificantLinesOfCode',
+                requestId: data.requestId,
+                hash: data.hash,
+                result: {value: {linesOfCode: value.sloc, strictLinesOfCode: value.strictSloc}},
+              });
+            })
+            .catch(err => {
+              this.postMessage({
+                type: 'fetchedPendingAmendSignificantLinesOfCode',
+                hash: data.hash,
+                requestId: data.requestId,
+                result: {error: err as Error},
               });
             });
         }
@@ -810,6 +792,9 @@ export default class ServerToClientAPI {
           ?.updateDiffMessage?.(data.diffId, data.title, data.description)
           ?.catch(err => err)
           ?.then((error: string | undefined) => {
+            if (error != null) {
+              this.logger.error('Error updating remote diff message:', error);
+            }
             this.postMessage({type: 'updatedRemoteDiffMessage', diffId: data.diffId, error});
           });
         break;
@@ -956,7 +941,7 @@ export default class ServerToClientAPI {
         const args = ['url', '--rev', data.revset];
         // validate that the path is a valid file in repo
         if (data.path != null && absolutePathForFileInRepo(data.path, repo) != null) {
-          args.push(data.path);
+          args.push(`path:${data.path}`);
         }
         repo
           .runCommand(args, 'RepoUrlCommand', ctx)
@@ -976,7 +961,11 @@ export default class ServerToClientAPI {
         break;
       }
       default: {
-        if (repo.codeReviewProvider?.handleClientToServerMessage?.(data) === true) {
+        if (
+          repo.codeReviewProvider?.handleClientToServerMessage?.(data, message =>
+            this.postMessage(message),
+          ) === true
+        ) {
           break;
         }
         this.platform.handleMessageFromClient(

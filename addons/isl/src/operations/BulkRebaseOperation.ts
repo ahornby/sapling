@@ -6,15 +6,15 @@
  */
 
 import type {Dag} from '../previews';
-import type {ExactRevset, SucceedableRevset} from '../types';
+import type {ExactRevset, OptimisticRevset, SucceedableRevset} from '../types';
 
-import {latestSuccessor} from '../SuccessionTracker';
+import {latestSuccessor} from '../successionUtils';
 import {Operation} from './Operation';
 
 export class BulkRebaseOperation extends Operation {
   constructor(
-    private sources: Array<SucceedableRevset>,
-    private destination: ExactRevset | SucceedableRevset,
+    private sources: Array<SucceedableRevset | ExactRevset | OptimisticRevset>,
+    private destination: SucceedableRevset | ExactRevset | OptimisticRevset,
   ) {
     super('BulkRebaseOperation');
   }

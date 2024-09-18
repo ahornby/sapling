@@ -6,8 +6,9 @@ use std::path::Path;
 use thrift_compiler::Config;
 use thrift_compiler::GenContext;
 const CRATEMAP: &str = "\
-config crate //configerator/structs/scm/mononoke/mysql/replication_lag:replication_lag_config-rust
-rust rust //thrift/annotation:rust-rust
+configerator/structs/scm/mononoke/mysql/replication_lag/config.thrift crate //configerator/structs/scm/mononoke/mysql/replication_lag:replication_lag_config-rust
+thrift/annotation/rust.thrift rust //thrift/annotation:rust-rust
+thrift/annotation/scope.thrift rust->scope //thrift/annotation:scope-rust
 ";
 #[rustfmt::skip]
 fn main() {
@@ -15,21 +16,12 @@ fn main() {
     let out_dir = env::var_os("OUT_DIR").expect("OUT_DIR env not provided");
     let cratemap_path = Path::new(&out_dir).join("cratemap");
     fs::write(cratemap_path, CRATEMAP).expect("Failed to write cratemap");
-    let mut conf = Config::from_env(GenContext::Services)
-        .expect("Failed to instantiate thrift_compiler::Config");
-    let cargo_manifest_dir = env::var_os("CARGO_MANIFEST_DIR")
-        .expect("CARGO_MANIFEST_DIR not provided");
-    let mut base_path = Path::new(&cargo_manifest_dir)
-        .join("../../../../../../..")
-        .canonicalize()
-        .expect("Failed to canonicalize base_path");
-    if cfg!(windows) {
-        base_path = base_path.to_string_lossy().trim_start_matches(r"\\?\").into();
-    }
-    conf.base_path(base_path);
-    conf.types_crate("replication_lag_config__types");
-    conf.clients_crate("replication_lag_config__clients");
-    conf.options("serde");
-    let srcs: &[&str] = &["../config.thrift"];
-    conf.run(srcs).expect("Failed while running thrift compilation");
+    Config::from_env(GenContext::Services)
+        .expect("Failed to instantiate thrift_compiler::Config")
+        .base_path("../../../../../../..")
+        .types_crate("replication_lag_config__types")
+        .clients_crate("replication_lag_config__clients")
+        .options("serde")
+        .run(["../config.thrift"])
+        .expect("Failed while running thrift compilation");
 }

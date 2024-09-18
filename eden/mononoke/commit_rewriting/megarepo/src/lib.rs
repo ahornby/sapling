@@ -14,7 +14,8 @@ use anyhow::Error;
 use blobstore::Loadable;
 use bonsai_hg_mapping::BonsaiHgMappingRef;
 use bookmarks::BookmarksRef;
-use changesets::ChangesetsRef;
+use commit_graph::CommitGraphRef;
+use commit_graph::CommitGraphWriterRef;
 use context::CoreContext;
 use futures::future;
 use futures::Stream;
@@ -30,10 +31,12 @@ use mononoke_types::ChangesetId;
 use mononoke_types::ContentId;
 use mononoke_types::FileChange;
 use mononoke_types::FileType;
+use mononoke_types::GitLfs;
 use movers::Mover;
 use phases::PhasesRef;
 use repo_blobstore::RepoBlobstoreRef;
 use repo_derived_data::RepoDerivedDataRef;
+use repo_identity::RepoIdentityRef;
 use slog::info;
 
 pub mod chunking;
@@ -59,9 +62,11 @@ const REPORTING_INTERVAL_FILES: usize = 10000;
 pub trait Repo = BonsaiHgMappingRef
     + RepoBlobstoreRef
     + RepoDerivedDataRef
-    + ChangesetsRef
+    + CommitGraphRef
+    + CommitGraphWriterRef
     + PhasesRef
     + BookmarksRef
+    + RepoIdentityRef
     + Send
     + Sync
     + Clone;
@@ -218,6 +223,7 @@ where
                     file_move.file_type,
                     file_move.file_size,
                     Some((file_move.old_path, parent_bcs_id)),
+                    GitLfs::FullContent,
                 );
                 file_changes.insert(to, fc);
             }
@@ -251,9 +257,9 @@ mod test {
     use anyhow::Result;
     use bonsai_hg_mapping::BonsaiHgMapping;
     use bookmarks::Bookmarks;
-    use changeset_fetcher::ChangesetFetcher;
-    use changesets::Changesets;
     use cloned::cloned;
+    use commit_graph::CommitGraph;
+    use commit_graph::CommitGraphWriter;
     use fbinit::FacebookInit;
     use filestore::FilestoreConfig;
     use fixtures::Linear;
@@ -261,12 +267,14 @@ mod test {
     use fixtures::TestRepoFixture;
     use futures::FutureExt;
     use mercurial_types::HgChangesetId;
+    use mononoke_macros::mononoke;
     use mononoke_types::BonsaiChangeset;
     use mononoke_types::BonsaiChangesetMut;
     use mononoke_types::DateTime;
     use phases::Phases;
     use repo_blobstore::RepoBlobstore;
     use repo_derived_data::RepoDerivedData;
+    use repo_identity::RepoIdentity;
     use sorted_vector_map::sorted_vector_map;
     use tests_utils::resolve_cs_id;
 
@@ -281,13 +289,15 @@ mod test {
         #[facet]
         repo_derived_data: RepoDerivedData,
         #[facet]
-        changeset_fetcher: dyn ChangesetFetcher,
+        commit_graph: CommitGraph,
         #[facet]
-        changesets: dyn Changesets,
+        commit_graph_writer: dyn CommitGraphWriter,
         #[facet]
         filestore_config: FilestoreConfig,
         #[facet]
         pub phases: dyn Phases,
+        #[facet]
+        repo_identity: RepoIdentity,
     }
 
     use super::*;
@@ -341,7 +351,7 @@ mod test {
         ChangesetId,
         ChangesetArgs,
     ) {
-        let repo: Arc<TestRepo> = Arc::new(ManyFilesDirs::get_custom_test_repo(fb).await);
+        let repo: Arc<TestRepo> = Arc::new(ManyFilesDirs::get_repo(fb).await);
         let ctx = CoreContext::test_mock(fb);
 
         let hg_cs_id = HgChangesetId::from_str("2f866e7e549760934e31bf0420a873f65100ad63").unwrap();
@@ -375,7 +385,7 @@ mod test {
         bcs_id.load(&ctx, repo.repo_blobstore()).await.unwrap()
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_do_not_move_anything(fb: FacebookInit) {
         let (ctx, repo, _hg_cs_id, bcs_id, changeset_args) = prepare(fb).await;
         let newcs = perform_move(
@@ -398,7 +408,7 @@ mod test {
         assert_eq!(file_changes, Default::default());
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_drop_file(fb: FacebookInit) {
         let (ctx, repo, _hg_cs_id, bcs_id, changeset_args) = prepare(fb).await;
         let newcs = perform_move(&ctx, &repo, bcs_id, Arc::new(skip_one), changeset_args)
@@ -420,7 +430,7 @@ mod test {
         );
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_shift_path_by_one(fb: FacebookInit) {
         let (ctx, repo, _hg_cs_id, bcs_id, changeset_args) = prepare(fb).await;
         let newcs = perform_move(&ctx, &repo, bcs_id, Arc::new(shift_one), changeset_args)
@@ -466,7 +476,7 @@ mod test {
             .unwrap()
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_performed_move(fb: FacebookInit) {
         let (ctx, repo, old_hg_cs_id, old_bcs_id, changeset_args) = prepare(fb).await;
         let new_hg_cs_id = perform_move(
@@ -490,9 +500,9 @@ mod test {
         assert_eq!(old_wc, new_wc);
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_stack_move(fb: FacebookInit) -> Result<(), Error> {
-        let repo: Arc<TestRepo> = Arc::new(Linear::get_custom_test_repo(fb).await);
+        let repo: Arc<TestRepo> = Arc::new(Linear::get_repo(fb).await);
         let ctx = CoreContext::test_mock(fb);
 
         let old_bcs_id = resolve_cs_id(&ctx, &repo, "master").await?;

@@ -8,11 +8,9 @@
 import type {CommitMessageFields} from './CommitInfoView/types';
 import type {UseUncommittedSelection} from './partialSelection';
 import type {ChangedFile, ChangedFileType, MergeConflicts, RepoRelativePath} from './types';
-import type {MutableRefObject} from 'react';
 import type {Comparison} from 'shared/Comparison';
 
 import {Avatar} from './Avatar';
-import {Banner, BannerKind} from './Banner';
 import {File} from './ChangedFile';
 import {
   ChangedFileDisplayTypePicker,
@@ -31,19 +29,17 @@ import {
   commitMessageFieldsSchema,
   commitMessageFieldsToString,
 } from './CommitInfoView/CommitMessageFields';
+import {PendingDiffStats} from './CommitInfoView/DiffStats';
 import {temporaryCommitTitle} from './CommitTitle';
 import {OpenComparisonViewButton} from './ComparisonView/OpenComparisonViewButton';
 import {Row} from './ComponentUtils';
-import {ErrorNotice} from './ErrorNotice';
 import {FileTree, FileTreeFolderHeader} from './FileTree';
 import {useGeneratedFileStatuses} from './GeneratedFile';
 import {Internal} from './Internal';
-import {DOCUMENTATION_DELAY, Tooltip} from './Tooltip';
 import {UnsavedFilesCount, confirmUnsavedFiles} from './UnsavedFiles';
 import {tracker} from './analytics';
 import {latestCommitMessageFields} from './codeReview/CodeReviewInfo';
-import {Badge} from './components/Badge';
-import {Button} from './components/Button';
+import GatedComponent from './components/GatedComponent';
 import {islDrawerState} from './drawerState';
 import {externalMergeToolAtom} from './externalMergeTool';
 import {T, t} from './i18n';
@@ -78,11 +74,16 @@ import {selectedCommits} from './selection';
 import {latestHeadCommit, uncommittedChangesFetchError} from './serverAPIState';
 import {GeneratedStatus} from './types';
 import * as stylex from '@stylexjs/stylex';
-import {VSCodeButton, VSCodeTextField} from '@vscode/webview-ui-toolkit/react';
+import {Badge} from 'isl-components/Badge';
+import {Banner, BannerKind} from 'isl-components/Banner';
+import {Button} from 'isl-components/Button';
+import {ErrorNotice} from 'isl-components/ErrorNotice';
+import {HorizontallyGrowingTextField} from 'isl-components/HorizontallyGrowingTextField';
+import {Icon} from 'isl-components/Icon';
+import {DOCUMENTATION_DELAY, Tooltip} from 'isl-components/Tooltip';
 import {useAtom, useAtomValue} from 'jotai';
 import React, {useCallback, useMemo, useEffect, useRef, useState} from 'react';
 import {ComparisonType} from 'shared/Comparison';
-import {Icon} from 'shared/Icon';
 import {useDeepMemo} from 'shared/hooks';
 import {minimalDisambiguousPaths} from 'shared/minimalDisambiguousPaths';
 import {group, notEmpty, partition} from 'shared/utils';
@@ -110,7 +111,7 @@ function processCopiesAndRenames(files: Array<ChangedFile>): Array<UIChangedFile
       .map((file, i) => {
         const minimalName = disambiguousPaths[i];
         let fileLabel = minimalName;
-        let tooltip = file.path;
+        let tooltip = `${nameForStatus(file.status)}: ${file.path}`;
         let copiedFrom;
         let renamedFrom;
         let visualStatus: VisualChangedFileType = file.status;
@@ -167,6 +168,25 @@ const sortKeyForStatus: Record<VisualChangedFileType, number> = {
   U: 7,
   Resolved: 8,
 };
+
+function nameForStatus(status: ChangedFileType): string {
+  switch (status) {
+    case '!':
+      return t('Missing');
+    case '?':
+      return t('Untracked');
+    case 'A':
+      return t('Added');
+    case 'M':
+      return t('Modified');
+    case 'R':
+      return t('Removed');
+    case 'U':
+      return t('Unresolved');
+    case 'Resolved':
+      return t('Resolved');
+  }
+}
 
 type SectionProps = Omit<React.ComponentProps<typeof LinearFileList>, 'files'> & {
   filesByPrefix: Map<string, Array<UIChangedFile>>;
@@ -315,26 +335,26 @@ export function ChangedFiles(props: {
             hasAdditionalPages ? (
               <div className="changed-files-pages-buttons">
                 <Tooltip title={t('See previous page of files')}>
-                  <VSCodeButton
+                  <Button
                     data-testid="changed-files-previous-page"
-                    appearance="icon"
+                    icon
                     disabled={pageNum === 0}
                     onClick={() => {
                       setPageNum(old => old - 1);
                     }}>
                     <Icon icon="arrow-left" />
-                  </VSCodeButton>
+                  </Button>
                 </Tooltip>
                 <Tooltip title={t('See next page of files')}>
-                  <VSCodeButton
+                  <Button
                     data-testid="changed-files-next-page"
-                    appearance="icon"
+                    icon
                     disabled={isLastPage}
                     onClick={() => {
                       setPageNum(old => old + 1);
                     }}>
                     <Icon icon="arrow-right" />
-                  </VSCodeButton>
+                  </Button>
                 </Tooltip>
               </div>
             ) : null
@@ -457,7 +477,7 @@ export function UncommittedChanges({place}: {place: Place}) {
   const conflicts = useAtomValue(optimisticMergeConflicts);
 
   const selection = useUncommittedSelection();
-  const commitTitleRef = useRef<HTMLTextAreaElement | undefined>(null);
+  const commitTitleRef = useRef<HTMLInputElement>(null);
 
   const runOperation = useRunOperation();
 
@@ -502,7 +522,7 @@ export function UncommittedChanges({place}: {place: Place}) {
       return;
     }
 
-    const titleEl = commitTitleRef.current as HTMLInputElement | null;
+    const titleEl = commitTitleRef.current;
     const title = titleEl?.value || template?.Title || temporaryCommitTitle();
     // use the template, unless a specific quick title is given
     const fields: CommitMessageFields = {...template, Title: title};
@@ -539,8 +559,8 @@ export function UncommittedChanges({place}: {place: Place}) {
     <Tooltip
       delayMs={DOCUMENTATION_DELAY}
       title={t('Add all untracked files and remove all missing files.')}>
-      <VSCodeButton
-        appearance="icon"
+      <Button
+        icon
         key="addremove"
         data-testid="addremove-button"
         onClick={() => {
@@ -555,12 +575,12 @@ export function UncommittedChanges({place}: {place: Place}) {
         }}>
         <Icon slot="start" icon="expand-all" />
         <T>Add/Remove</T>
-      </VSCodeButton>
+      </Button>
     </Tooltip>
   ) : null;
 
   const onShelve = () => {
-    const title = (commitTitleRef.current as HTMLInputElement | null)?.value || undefined;
+    const title = commitTitleRef.current?.value || undefined;
     const allFiles = uncommittedChanges.map(file => file.path);
     const operation = getShelveOperation(title, selection.selection, allFiles);
     runOperation(operation);
@@ -603,8 +623,8 @@ export function UncommittedChanges({place}: {place: Place}) {
                     : ComparisonType.UncommittedChanges,
               }}
             />
-            <VSCodeButton
-              appearance="icon"
+            <Button
+              icon
               key="select-all"
               disabled={allFilesSelected}
               onClick={() => {
@@ -612,9 +632,9 @@ export function UncommittedChanges({place}: {place: Place}) {
               }}>
               <Icon slot="start" icon="check-all" />
               <T>Select All</T>
-            </VSCodeButton>
-            <VSCodeButton
-              appearance="icon"
+            </Button>
+            <Button
+              icon
               key="deselect-all"
               data-testid="deselect-all-button"
               disabled={noFilesSelected}
@@ -623,15 +643,15 @@ export function UncommittedChanges({place}: {place: Place}) {
               }}>
               <Icon slot="start" icon="close-all" />
               <T>Deselect All</T>
-            </VSCodeButton>
+            </Button>
             {addremoveButton}
             <Tooltip
               delayMs={DOCUMENTATION_DELAY}
               title={t(
                 'Discard selected uncommitted changes, including untracked files.\n\nNote: Changes will be irreversibly lost.',
               )}>
-              <VSCodeButton
-                appearance="icon"
+              <Button
+                icon
                 disabled={noFilesSelected}
                 data-testid={'discard-all-selected-button'}
                 onClick={() => {
@@ -683,7 +703,7 @@ export function UncommittedChanges({place}: {place: Place}) {
                 }}>
                 <Icon slot="start" icon="trashcan" />
                 <T>Discard</T>
-              </VSCodeButton>
+              </Button>
             </Tooltip>
           </>
         )}
@@ -711,20 +731,25 @@ export function UncommittedChanges({place}: {place: Place}) {
       <UnsavedFilesCount />
       {conflicts != null || place !== 'main' ? null : (
         <div className="button-rows">
+          <GatedComponent featureFlag={Internal.featureFlags?.ShowSplitSuggestion}>
+            <div className="button-row">
+              <PendingDiffStats showWarning={true} />
+            </div>
+          </GatedComponent>
           <div className="button-row">
             <span className="quick-commit-inputs">
-              <VSCodeButton
-                appearance="icon"
+              <Button
+                icon
                 disabled={noFilesSelected}
                 data-testid="quick-commit-button"
                 onClick={onConfirmQuickCommit}>
                 <Icon slot="start" icon="plus" />
                 <T>Commit</T>
-              </VSCodeButton>
-              <VSCodeTextField
+              </Button>
+              <HorizontallyGrowingTextField
                 data-testid="quick-commit-title"
                 placeholder="Title"
-                ref={commitTitleRef as MutableRefObject<null>}
+                ref={commitTitleRef}
                 onKeyPress={e => {
                   if (e.key === 'Enter' && !(e.ctrlKey || e.metaKey || e.altKey || e.shiftKey)) {
                     onConfirmQuickCommit();
@@ -732,33 +757,33 @@ export function UncommittedChanges({place}: {place: Place}) {
                 }}
               />
             </span>
-            <VSCodeButton
-              appearance="icon"
+            <Button
+              icon
               className="show-on-hover"
               onClick={() => {
                 openCommitForm('commit');
               }}>
               <Icon slot="start" icon="edit" />
               <T>Commit as...</T>
-            </VSCodeButton>
+            </Button>
             <Tooltip
               title={t(
                 'Save selected uncommitted changes for later unshelving. Removes these changes from the working copy.',
               )}>
-              <VSCodeButton
+              <Button
                 disabled={noFilesSelected || hasChunkSelection}
-                appearance="icon"
+                icon
                 className="show-on-hover"
                 onClick={onShelve}>
                 <Icon slot="start" icon="archive" />
                 <T>Shelve</T>
-              </VSCodeButton>
+              </Button>
             </Tooltip>
           </div>
           {canAmend && (
             <div className="button-row">
-              <VSCodeButton
-                appearance="icon"
+              <Button
+                icon
                 disabled={noFilesSelected || !headCommit}
                 data-testid="uncommitted-changes-quick-amend-button"
                 onClick={async () => {
@@ -780,16 +805,16 @@ export function UncommittedChanges({place}: {place: Place}) {
                 }}>
                 <Icon slot="start" icon="debug-step-into" />
                 <T>Amend</T>
-              </VSCodeButton>
-              <VSCodeButton
-                appearance="icon"
+              </Button>
+              <Button
+                icon
                 className="show-on-hover"
                 onClick={() => {
                   openCommitForm('amend');
                 }}>
                 <Icon slot="start" icon="edit" />
                 <T>Amend as...</T>
-              </VSCodeButton>
+              </Button>
             </div>
           )}
         </div>

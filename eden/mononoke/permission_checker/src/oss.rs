@@ -82,7 +82,7 @@ impl MononokeIdentitySetExt for MononokeIdentitySet {
         None
     }
 
-    fn main_client_identity(&self) -> String {
+    fn main_client_identity(&self, sandcastle_alias: Option<&str>) -> String {
         String::from("PLACEHOLDER_CLIENT_IDENTITY")
     }
 
@@ -92,40 +92,5 @@ impl MononokeIdentitySetExt for MononokeIdentitySet {
 
     fn identity_type_filtered_concat(&self, _id_type: &str) -> Option<String> {
         None
-    }
-}
-
-pub struct DummyAclProvider;
-
-impl DummyAclProvider {
-    pub fn new(_fb: FacebookInit) -> Arc<dyn AclProvider> {
-        Arc::new(DummyAclProvider)
-    }
-}
-
-#[async_trait]
-impl AclProvider for DummyAclProvider {
-    async fn repo_acl(&self, _name: &str) -> Result<BoxPermissionChecker> {
-        Ok(Box::new(AlwaysAllow))
-    }
-
-    async fn repo_region_acl(&self, _name: &str) -> Result<BoxPermissionChecker> {
-        Ok(Box::new(AlwaysAllow))
-    }
-
-    async fn tier_acl(&self, _name: &str) -> Result<BoxPermissionChecker> {
-        Ok(Box::new(AlwaysAllow))
-    }
-
-    async fn group(&self, _name: &str) -> Result<BoxMembershipChecker> {
-        Ok(Box::new(NeverMember))
-    }
-
-    async fn admin_group(&self) -> Result<BoxMembershipChecker> {
-        Ok(Box::new(NeverMember))
-    }
-
-    async fn reviewers_group(&self) -> Result<BoxMembershipChecker> {
-        Ok(Box::new(AlwaysMember))
     }
 }

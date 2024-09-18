@@ -44,7 +44,7 @@ use mononoke_types::MPathElement;
 use mononoke_types::MPathHash;
 use mononoke_types::ManifestUnodeId;
 use mononoke_types::NonRootMPath;
-use mononoke_types::TrieMap;
+use mononoke_types::SortedVectorTrieMap;
 use sorted_vector_map::SortedVectorMap;
 
 use crate::ErrorKind;
@@ -179,7 +179,7 @@ async fn create_unode_manifest(
         ManifestUnodeId,
         FileUnodeId,
         (),
-        TrieMap<Entry<ManifestUnodeId, FileUnodeId>>,
+        SortedVectorTrieMap<Entry<ManifestUnodeId, FileUnodeId>>,
     >,
 ) -> Result<((), ManifestUnodeId), Error> {
     let mut subentries = SortedVectorMap::new();
@@ -273,12 +273,12 @@ async fn create_unode_file(
     }
 
     let LeafInfo {
-        leaf,
+        change,
         path,
         parents,
     } = leaf_info;
 
-    let leaf_id = if let Some((content_id, file_type)) = leaf {
+    let leaf = if let Some((content_id, file_type)) = change {
         save_unode(
             ctx,
             blobstore,
@@ -350,7 +350,7 @@ async fn create_unode_file(
         }
     };
 
-    Ok(((), leaf_id))
+    Ok(((), leaf))
 }
 
 // reuse_manifest_parent() and reuse_file_parent() are used in unodes v2 in order to avoid
@@ -448,10 +448,9 @@ mod tests {
 
     use anyhow::Result;
     use async_trait::async_trait;
-    use blobrepo::save_bonsai_changesets;
     use blobstore::Storable;
     use bytes::Bytes;
-    use derived_data::BonsaiDerived;
+    use changesets_creation::save_changesets;
     use derived_data_test_utils::bonsai_changeset_from_hg;
     use derived_data_test_utils::iterate_all_manifest_entries;
     use fbinit::FacebookInit;
@@ -465,6 +464,7 @@ mod tests {
     use mercurial_types::blobs::HgBlobManifest;
     use mercurial_types::HgFileNodeId;
     use mercurial_types::HgManifestId;
+    use mononoke_macros::mononoke;
     use mononoke_types::path::MPath;
     use mononoke_types::BlobstoreValue;
     use mononoke_types::BonsaiChangeset;
@@ -472,6 +472,7 @@ mod tests {
     use mononoke_types::DateTime;
     use mononoke_types::FileChange;
     use mononoke_types::FileContents;
+    use mononoke_types::GitLfs;
     use mononoke_types::RepoPath;
     use repo_derived_data::RepoDerivedDataRef;
     use test_repo_factory::TestRepoFactory;
@@ -483,15 +484,17 @@ mod tests {
     use crate::mapping::RootUnodeManifestId;
     use crate::tests::TestRepo;
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn linear_test(fb: FacebookInit) -> Result<(), Error> {
-        let repo: TestRepo = Linear::get_custom_test_repo(fb).await;
+        let repo: TestRepo = Linear::get_repo(fb).await;
         let derivation_ctx = repo.repo_derived_data().manager().derivation_context(None);
         let ctx = CoreContext::test_mock(fb);
 
         // Derive filenodes because they are going to be used in this test
         let master_cs_id = resolve_cs_id(&ctx, &repo, "master").await?;
-        FilenodesOnlyPublic::derive(&ctx, &repo, master_cs_id).await?;
+        repo.repo_derived_data()
+            .derive::<FilenodesOnlyPublic>(&ctx, master_cs_id)
+            .await?;
 
         let parent_unode_id = {
             let parent_hg_cs = "2d7d4ba9ce0a6ffd222de7785b249ead9c51c536";
@@ -566,9 +569,9 @@ mod tests {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_same_content_different_paths(fb: FacebookInit) -> Result<(), Error> {
-        let repo: TestRepo = Linear::get_custom_test_repo(fb).await;
+        let repo: TestRepo = Linear::get_repo(fb).await;
         let ctx = CoreContext::test_mock(fb);
 
         async fn check_unode_uniqeness(
@@ -613,9 +616,9 @@ mod tests {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_same_content_no_change(fb: FacebookInit) -> Result<(), Error> {
-        let repo: TestRepo = Linear::get_custom_test_repo(fb).await;
+        let repo: TestRepo = Linear::get_repo(fb).await;
         let ctx = CoreContext::test_mock(fb);
 
         build_diamond_graph(
@@ -687,7 +690,10 @@ mod tests {
 
         let find_unodes = {
             |ctx: CoreContext, repo: TestRepo| async move {
-                let p1_root_unode_mf_id = RootUnodeManifestId::derive(&ctx, &repo, p1).await?;
+                let p1_root_unode_mf_id = repo
+                    .repo_derived_data
+                    .derive::<RootUnodeManifestId>(&ctx, p1)
+                    .await?;
 
                 let mut p1_unodes: Vec<_> = p1_root_unode_mf_id
                     .manifest_unode_id()
@@ -701,8 +707,10 @@ mod tests {
                     .await?;
                 p1_unodes.sort_by_key(|(path, _)| path.clone());
 
-                let merge_root_unode_mf_id =
-                    RootUnodeManifestId::derive(&ctx, &repo, merge).await?;
+                let merge_root_unode_mf_id = repo
+                    .repo_derived_data()
+                    .derive::<RootUnodeManifestId>(&ctx, merge)
+                    .await?;
 
                 let mut merge_unodes: Vec<_> = merge_root_unode_mf_id
                     .manifest_unode_id()
@@ -726,12 +734,12 @@ mod tests {
         Ok(())
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_diamond_merge_unodes_v2(fb: FacebookInit) -> Result<(), Error> {
         diamond_merge_unodes_v2(fb).await
     }
 
-    #[fbinit::test]
+    #[mononoke::fbinit_test]
     async fn test_parent_order(fb: FacebookInit) -> Result<(), Error> {
         let repo: TestRepo = test_repo_factory::build_empty(fb).await.unwrap();
         let derivation_ctx = repo.repo_derived_data().manager().derivation_context(None);
@@ -936,7 +944,7 @@ mod tests {
         .freeze()
         .unwrap();
 
-        save_bonsai_changesets(vec![bcs.clone()], CoreContext::test_mock(fb), &repo).await?;
+        save_changesets(&CoreContext::test_mock(fb), &repo, vec![bcs.clone()]).await?;
         Ok(bcs)
     }
 
@@ -955,7 +963,13 @@ mod tests {
                     let content =
                         FileContents::Bytes(Bytes::copy_from_slice(content.as_bytes())).into_blob();
                     let content_id = content.store(&ctx, &repo.repo_blobstore).await?;
-                    let file_change = FileChange::tracked(content_id, file_type, size as u64, None);
+                    let file_change = FileChange::tracked(
+                        content_id,
+                        file_type,
+                        size as u64,
+                        None,
+                        GitLfs::FullContent,
+                    );
                     res.insert(path, file_change);
                 }
                 None => {

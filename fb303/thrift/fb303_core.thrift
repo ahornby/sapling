@@ -14,9 +14,12 @@
  * limitations under the License.
  */
 
+package "facebook.com/fb303"
+
+namespace cpp2 "facebook.fb303.cpp2"
+namespace py3 ""
 namespace java com.facebook.fb303.core
 namespace java.swift com.facebook.swift.fb303.core
-namespace cpp facebook.fb303
 namespace py.asyncio fb303_asyncio.fb303_core
 namespace perl fb303
 namespace hack fb303
@@ -46,12 +49,15 @@ service BaseService {
   /**
    * Gets the status of this service
    */
-  fb303_status getStatus() (priority = 'IMPORTANT');
+  fb303_status getStatus() (
+    priority = 'IMPORTANT',
+    cpp.generate_deprecated_header_client_methods,
+  );
 
   /**
    * Returns a descriptive name of the service
    */
-  string getName();
+  string getName() (cpp.generate_deprecated_header_client_methods);
 
   /**
    * Returns the version of the service

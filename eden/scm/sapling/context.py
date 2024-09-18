@@ -173,8 +173,11 @@ class basectx:
             cleanset = set()
         deleted, unknown, ignored = s.deleted, s.unknown, s.ignored
         deletedset = set(deleted)
-        d = mf1.diff(mf2, matcher=match)
-        for fn, value in pycompat.iteritems(d):
+        dmf1, dmf2 = mf1, mf2
+        if mf1.hasgrafts():
+            dmf1, dmf2 = bindings.manifest.treemanifest.applydiffgrafts(mf1, mf2)
+        d = dmf1.diff(dmf2, matcher=match)
+        for fn, value in d.items():
             if listclean:
                 cleanset.discard(fn)
             if fn in deletedset:
@@ -1511,14 +1514,18 @@ class committablectx(basectx):
         self._extra = {}
         if extra:
             self._extra = extra.copy()
-        if "branch" not in self._extra:
-            try:
-                branch = encoding.fromlocal(self._repo.dirstate.branch())
-            except UnicodeDecodeError:
-                raise error.Abort(_("branch name not in UTF-8!"))
-            self._extra["branch"] = branch
-        if self._extra["branch"] == "":
+
+        if repo.ui.configbool("experimental", "no-branch", True):
             self._extra["branch"] = "default"
+        else:
+            if "branch" not in self._extra:
+                try:
+                    branch = encoding.fromlocal(self._repo.dirstate.branch())
+                except UnicodeDecodeError:
+                    raise error.Abort(_("branch name not in UTF-8!"))
+                self._extra["branch"] = branch
+            if self._extra["branch"] == "":
+                self._extra["branch"] = "default"
 
     def __bytes__(self):
         return encodeutf8(str(self))
@@ -1601,6 +1608,110 @@ class committablectx(basectx):
 
     def manifestnode(self):
         return None
+
+    def write_manifest_and_compute_files(self, tr):
+        """write manifest and compute files, returns (manifestnode, files) pair.
+
+        This is used in `repo.commitctx()` when committing the context. Subclasses
+        may override this function to reuse existing manifest.
+        """
+        if not self.files():
+            # reuse parent manifest in commitctx if no files have changed
+            return self.p1().manifestnode(), []
+
+        repo = self._repo
+        ui = repo.ui
+        isgit = git.isgitformat(repo)
+
+        p1, p2 = self.p1(), self.p2()
+
+        m1ctx = p1.manifestctx()
+        m2ctx = p2.manifestctx()
+        mctx = m1ctx.copy()
+
+        m1 = m1ctx.read()
+        m2 = m2ctx.read()
+        m = mctx.read()
+
+        # check in files
+        added = []
+        changed = []
+
+        removed = []
+        drop = []
+
+        def handleremove(f):
+            if f in m1 or f in m2:
+                removed.append(f)
+                if f in m:
+                    del m[f]
+                    drop.append(f)
+
+        for f in self.removed():
+            handleremove(f)
+        for f in sorted(self.modified() + self.added()):
+            if self[f] is None:
+                # in memctx this means removal
+                handleremove(f)
+            else:
+                added.append(f)
+
+        linkrev = len(repo)
+        ui.note(_("committing files:\n"))
+
+        if not isgit:
+            # Prefetch rename data, since _filecommit will look for it.
+            # (git does not need this step)
+            if hasattr(repo.fileslog, "metadatastore"):
+                keys = []
+                for f in added:
+                    fctx = self[f]
+                    if fctx.filenode() is not None:
+                        keys.append((fctx.path(), fctx.filenode()))
+                repo.fileslog.metadatastore.prefetch(keys)
+        for f in progress.each(ui, added, _("committing"), _("files")):
+            ui.note(f + "\n")
+            try:
+                fctx = self[f]
+                if isgit:
+                    filenode = repo._filecommitgit(fctx)
+                else:
+                    filenode = repo._filecommit(fctx, m1, m2, linkrev, tr, changed)
+                assert filenode != nullid, "manifest should not have nullid"
+                m.set(f, filenode, fctx.flags())
+            except OSError:
+                ui.warn(_("trouble committing %s!\n") % f)
+                raise
+            except IOError as inst:
+                errcode = getattr(inst, "errno", errno.ENOENT)
+                if error or errcode and errcode != errno.ENOENT:
+                    ui.warn(_("trouble committing %s!\n") % f)
+                raise
+
+        # update manifest
+        ui.note(_("committing manifest\n"))
+        removed = sorted(removed)
+        drop = sorted(drop)
+        if added or drop:
+            if isgit:
+                mn = mctx.writegit()
+            else:
+                mn = (
+                    mctx.write(
+                        tr,
+                        linkrev,
+                        p1.manifestnode(),
+                        p2.manifestnode(),
+                        added,
+                        drop,
+                    )
+                    or p1.manifestnode()
+                )
+        else:
+            mn = p1.manifestnode()
+        files = changed + removed
+
+        return mn, files
 
     def user(self):
         return self._user or self._repo.ui.username()
@@ -2271,6 +2382,9 @@ class overlayworkingctx(committablectx):
     def __init__(self, repo):
         super(overlayworkingctx, self).__init__(repo)
         self._repo = repo
+        self._reuse_filenode = repo.ui.configbool(
+            "experimental", "reuse-filenodes", True
+        )
         self.clean()
 
     def setbase(self, wrappedctx):
@@ -2301,11 +2415,9 @@ class overlayworkingctx(committablectx):
 
         flag = self._flagfunc
         for path in self.added():
-            man[path] = addednodeid
-            man.setflag(path, flag(path))
+            man.set(path, addednodeid, flag(path))
         for path in self.modified():
-            man[path] = modifiednodeid
-            man.setflag(path, flag(path))
+            man.set(path, modifiednodeid, flag(path))
         for path in self.removed():
             del man[path]
         return man
@@ -2549,7 +2661,7 @@ class overlayworkingctx(committablectx):
         copied=None,
     ):
         filenode = None
-        if isinstance(data, basefilectx):
+        if self._reuse_filenode and isinstance(data, basefilectx):
             filenode = data.filenode()
 
         self._cache[path] = {
@@ -3237,6 +3349,10 @@ class metadataonlyctx(committablectx):
     def manifestnode(self):
         return self._manifestnode
 
+    def write_manifest_and_compute_files(self, tr):
+        # reuse the existing manifest revision
+        return self.manifestnode(), self.files()
+
     @property
     def _manifestctx(self):
         return self._repo.manifestlog[self._manifestnode]
@@ -3275,6 +3391,91 @@ class metadataonlyctx(committablectx):
                 removed.append(f)
 
         return scmutil.status(modified, added, removed, [], [], [], [])
+
+
+class subtreecopyctx(committablectx):
+
+    def __new__(cls, repo, to_mctx, *args, **kwargs):
+        return super(subtreecopyctx, cls).__new__(cls, repo)
+
+    def __init__(
+        self,
+        repo,
+        from_ctx,
+        to_ctx,
+        from_paths,
+        to_paths,
+        text=None,
+        user=None,
+        date=None,
+        extra=None,
+        editor=False,
+        loginfo=None,
+        mutinfo=None,
+    ):
+        super(subtreecopyctx, self).__init__(
+            repo, text, user, date, extra, loginfo=loginfo, mutinfo=mutinfo
+        )
+        self._from_ctx = from_ctx
+        self._to_ctx = to_ctx
+        self._to_mctx = to_ctx.manifestctx().copy()
+        self._to_mf = self._to_mctx.read()
+        self._manifest = self._to_mf
+
+        self._from_paths = from_paths
+        self._to_paths = to_paths
+        self._parents = [to_ctx]
+
+        if editor:
+            self._text = editor(self._repo, self)
+            self._repo.savecommitmessage(self._text)
+
+    def write_manifest_and_compute_files(self, tr):
+        from_mf = self._from_ctx.manifest()
+        to_mf = self._to_mf
+
+        for from_path, to_path in zip(self._from_paths, self._to_paths):
+            to_mf.graft(to_path, from_mf, from_path)
+
+        # todo: handle git repo
+
+        linkrev = len(self._repo)
+        mn = self._to_mctx.write(
+            tr,
+            linkrev,
+            self.p1().manifestnode(),
+            nullid,
+            added=[],
+            removed=[],
+        )
+
+        return mn, self.files()
+
+    def filectx(self, path, filelog=None):
+        # todo: handle the case when the `path` is file one of `self._to_paths`
+        # currently, this is only used to read dirsync configs
+        return self._to_ctx.filectx(path, filelog=filelog)
+
+    def files(self):
+        return []
+
+    def commit(self):
+        """commit context to the repo"""
+        return self._repo.commitctx(self)
+
+    @propertycache
+    def _status(self):
+        # todo: may need to handle `subtree copy + modification` here
+        # set status files to empty to avoid files scan
+        return scmutil.status(
+            modified=[],
+            added=[],
+            removed=[],
+            deleted=[],
+            unknown=[],
+            ignored=[],
+            clean=[],
+        )
 
 
 class arbitraryfilectx:

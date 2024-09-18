@@ -17,6 +17,8 @@ use anyhow::Context;
 use anyhow::Error;
 use async_trait::async_trait;
 use clap::Parser;
+use clap::ValueEnum;
+use client::AsyncRequestsQueue;
 use cloned::cloned;
 use cmdlib_logging::ScribeLoggingArgs;
 use connection_security_checker::ConnectionSecurityChecker;
@@ -26,6 +28,7 @@ use environment::BookmarkCacheOptions;
 use executor_lib::args::ShardedExecutorArgs;
 use executor_lib::RepoShardedProcess;
 use executor_lib::RepoShardedProcessExecutor;
+use factory_group::FactoryGroup;
 use fb303_core_services::make_BaseService_server;
 use fbinit::FacebookInit;
 use megarepo_api::MegarepoApi;
@@ -36,12 +39,13 @@ use mononoke_app::args::HooksAppExtension;
 use mononoke_app::args::RepoFilterAppExtension;
 use mononoke_app::args::ShutdownTimeoutArgs;
 use mononoke_app::args::WarmBookmarksCacheExtension;
+use mononoke_app::MononokeApp;
 use mononoke_app::MononokeAppBuilder;
 use mononoke_app::MononokeReposManager;
 use panichandler::Fate;
-use permission_checker::DefaultAclProvider;
 use sharding_ext::RepoShard;
 use slog::info;
+use slog::Logger;
 use source_control_services::make_SourceControlService_server;
 use srserver::service_framework::BuildModule;
 use srserver::service_framework::ContextPropModule;
@@ -49,9 +53,18 @@ use srserver::service_framework::Fb303Module;
 use srserver::service_framework::ProfileModule;
 use srserver::service_framework::ServiceFramework;
 use srserver::service_framework::ThriftStatsModule;
+use srserver::ThriftExecutor;
 use srserver::ThriftServer;
 use srserver::ThriftServerBuilder;
+use srserver::ThriftStreamExecutor;
+use thrift_factory::ThriftFactoryBuilder;
 use tokio::task;
+use tracing::Level;
+use tracing_glog::Glog;
+use tracing_glog::GlogFields;
+use tracing_subscriber::filter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::Layer;
 
 mod commit_id;
 mod errors;
@@ -62,7 +75,6 @@ mod into_response;
 mod metadata;
 mod methods;
 mod monitoring;
-mod scuba_common;
 mod scuba_params;
 mod scuba_response;
 mod source_control_impl;
@@ -70,6 +82,7 @@ mod specifiers;
 
 const SERVICE_NAME: &str = "mononoke_scs_server";
 const SM_CLEANUP_TIMEOUT_SECS: u64 = 60;
+const NUM_PRIORITY_QUEUES: usize = 2;
 
 /// Mononoke Source Control Service Server
 #[derive(Parser)]
@@ -78,6 +91,9 @@ struct ScsServerArgs {
     shutdown_timeout_args: ShutdownTimeoutArgs,
     #[clap(flatten)]
     scribe_logging_args: ScribeLoggingArgs,
+    /// Enable trace logging of dependencies
+    #[clap(long, default_value = "false")]
+    trace: bool,
     /// Thrift host
     #[clap(long, short = 'H', default_value = "::")]
     host: String,
@@ -92,6 +108,31 @@ struct ScsServerArgs {
     /// Max memory to use for the thrift server
     #[clap(long)]
     max_memory: Option<usize>,
+    /// Thrift server mode;
+    #[clap(long, value_enum, default_value_t = ThriftServerMode::Default)]
+    thift_server_mode: ThriftServerMode,
+    /// Thrift queue size
+    #[clap(long, default_value = "0")]
+    thrift_queue_size: usize,
+    /// Number of Thrift workers
+    #[clap(long, default_value = "1000")]
+    thrift_workers_num: usize,
+    /// Number of Thrift workers for fast methods
+    #[clap(long, default_value = "1000")]
+    thrift_workers_num_fast: usize,
+    /// Number of Thrift workers for slow methods
+    #[clap(long, default_value = "5")]
+    thrift_workers_num_slow: usize,
+    /// Some long-running requests are processed asynchronously by default. This flag disables that behavior; requests will fail.
+    #[clap(long, default_value = "false")]
+    disable_async_requests: bool,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum ThriftServerMode {
+    Default,
+    ThriftFactory,
+    FactoryGroup,
 }
 
 /// Struct representing the Source Control Service process when sharding by
@@ -202,23 +243,28 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
 
     let args: ScsServerArgs = app.args()?;
 
-    let logger = app.logger().clone();
+    let logger = setup_logging(&app, &args)?;
     let runtime = app.runtime();
-
-    let exec = runtime.clone();
     let env = app.environment();
 
     let scuba_builder = env.scuba_sample_builder.clone();
     // Service name is used for shallow or deep sharding. If sharding itself is disabled, provide
     // service name as None while opening repos.
-    let service_name = args
-        .sharded_executor_args
-        .sharded_service_name
-        .as_ref()
-        .map(|_| ShardedService::SourceControlService);
+    let service_name = if args.sharded_executor_args.sharded_service_name.is_some()
+        || justknobs::eval(
+            "scm/mononoke:scs_unsharded_load_only_shallow_sharded",
+            None,
+            None,
+        )
+        .unwrap_or(false)
+    {
+        Some(ShardedService::SourceControlService)
+    } else {
+        None
+    };
     let repos_mgr = runtime.block_on(app.open_managed_repos(service_name))?;
     let mononoke = Arc::new(repos_mgr.make_mononoke_api()?);
-    let megarepo_api = Arc::new(runtime.block_on(MegarepoApi::new(&app, mononoke.clone()))?);
+    let megarepo_api = Arc::new(MegarepoApi::new(&app, mononoke.clone())?);
 
     let will_exit = Arc::new(AtomicBool::new(false));
 
@@ -226,55 +272,77 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
         memory::set_max_memory(max_memory);
     }
 
-    // Initialize the FB303 Thrift stack.
-
-    let fb303_base = {
-        cloned!(will_exit);
-        move |proto| {
-            make_BaseService_server(proto, facebook::BaseServiceImpl::new(will_exit.clone()))
-        }
-    };
-    let acl_provider = DefaultAclProvider::new(fb);
     let security_checker = runtime.block_on(ConnectionSecurityChecker::new(
-        acl_provider.as_ref(),
+        app.environment().acl_provider.as_ref(),
         &app.repo_configs().common,
     ))?;
-    let source_control_server = source_control_impl::SourceControlServiceImpl::new(
-        fb,
-        mononoke.clone(),
-        megarepo_api,
-        logger.clone(),
-        scuba_builder,
-        args.scribe_logging_args.get_scribe(fb)?,
-        security_checker,
-        app.configs(),
-        &app.repo_configs().common,
-    );
-    let service = {
-        move |proto| {
-            make_SourceControlService_server(
-                proto,
-                source_control_server.thrift_server(),
-                fb303_base.clone(),
-            )
-        }
+
+    let async_requests_queue_client = if args.disable_async_requests {
+        None
+    } else {
+        let queue_client = runtime.block_on(AsyncRequestsQueue::new(fb, &app, None))?;
+        Some(Arc::new(queue_client))
     };
+
+    let source_control_server = {
+        let maybe_factory_group = if let ThriftServerMode::FactoryGroup = args.thift_server_mode {
+            let worker_counts: [usize; NUM_PRIORITY_QUEUES] =
+                vec![args.thrift_workers_num_fast, args.thrift_workers_num_slow]
+                    .try_into()
+                    .unwrap();
+            Some(Arc::new(runtime.block_on(FactoryGroup::<
+                { NUM_PRIORITY_QUEUES },
+            >::new(
+                fb,
+                "requests-pri-queues",
+                worker_counts,
+                None,
+            ))?))
+        } else {
+            None
+        };
+        runtime.block_on(source_control_impl::SourceControlServiceImpl::new(
+            fb,
+            &app,
+            mononoke.clone(),
+            megarepo_api,
+            logger.clone(),
+            scuba_builder,
+            args.scribe_logging_args.get_scribe(fb)?,
+            security_checker,
+            app.configs(),
+            &app.repo_configs().common,
+            maybe_factory_group,
+            async_requests_queue_client,
+        ))?
+    };
+
     let monitoring_forever = {
         let monitoring_ctx = CoreContext::new_with_logger(fb, logger.clone());
         monitoring::monitoring_stats_submitter(monitoring_ctx, mononoke)
     };
     runtime.spawn(monitoring_forever);
 
-    let thrift: ThriftServer = ThriftServerBuilder::new(fb)
-        .with_name(SERVICE_NAME)
-        .expect("failed to set name")
-        .with_address(&args.host, args.port, false)?
-        .with_tls()
-        .expect("failed to enable TLS")
-        .with_cancel_if_client_disconnected()
-        .with_metadata(metadata::create_metadata())
-        .with_factory(exec, move || service)
-        .build();
+    let thrift = match args.thift_server_mode {
+        ThriftServerMode::Default => setup_thrift_server(
+            fb,
+            &args,
+            &will_exit,
+            source_control_server,
+            runtime.clone(),
+        ),
+        _ => {
+            let (factory, _processing_handle) = runtime.block_on(async move {
+                ThriftFactoryBuilder::new(fb, "main-thrift-incoming", args.thrift_workers_num)
+                    .with_queueing_limit(args.thrift_queue_size)
+                    .build()
+                    .await
+                    .expect("Failed to build thrift factory")
+            });
+            setup_thrift_server(fb, &args, &will_exit, source_control_server, factory)
+        }
+    }
+    .context("Failed to set up Thrift server")?;
 
     let mut service_framework = ServiceFramework::from_server(SERVICE_NAME, thrift)
         .context("Failed to create service framework server")?;
@@ -342,4 +410,70 @@ fn main(fb: FacebookInit) -> Result<(), Error> {
 
     info!(logger, "Exiting...");
     Ok(())
+}
+
+fn setup_logging(app: &MononokeApp, args: &ScsServerArgs) -> anyhow::Result<Logger> {
+    if args.trace {
+        let default_filter = filter::Targets::new()
+            .with_default(Level::TRACE)
+            // Make sure noisy dependencies don't pollute the logs
+            .with_target("fb303_core::server", Level::WARN)
+            .with_target("overload_protection::capacity", Level::WARN)
+            .with_target("runtime", Level::WARN)
+            .with_target("tokio", Level::WARN);
+
+        let event_format = Glog::default()
+            .with_timer(tracing_glog::LocalTime::default())
+            .with_target(true);
+
+        // Create and register Glog (stderr) and Scuba logging layers
+        let log_layer = tracing_subscriber::fmt::layer()
+            .event_format(event_format)
+            .fmt_fields(GlogFields::default())
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .with_filter(default_filter.clone());
+
+        let subscriber = tracing_subscriber::registry().with(log_layer);
+
+        // Register tracing subscriber and default
+        tracing::subscriber::set_global_default(subscriber)?;
+    }
+
+    Ok(app.logger().clone())
+}
+
+fn setup_thrift_server(
+    fb: FacebookInit,
+    args: &ScsServerArgs,
+    will_exit: &Arc<AtomicBool>,
+    source_control_server: source_control_impl::SourceControlServiceImpl,
+    exec: impl 'static + Clone + ThriftExecutor + ThriftStreamExecutor,
+) -> anyhow::Result<ThriftServer> {
+    let fb303_base = {
+        cloned!(will_exit);
+        move |proto| {
+            make_BaseService_server(proto, facebook::BaseServiceImpl::new(will_exit.clone()))
+        }
+    };
+
+    let service = {
+        move |proto| {
+            make_SourceControlService_server(
+                proto,
+                source_control_server.thrift_server(),
+                fb303_base.clone(),
+            )
+        }
+    };
+
+    Ok(ThriftServerBuilder::new(fb)
+        .with_name(SERVICE_NAME)
+        .expect("failed to set name")
+        .with_address(&args.host, args.port, false)?
+        .with_tls()
+        .expect("failed to enable TLS")
+        .with_cancel_if_client_disconnected()
+        .add_factory(exec, move || service, Some(metadata::create_metadata()))
+        .build())
 }

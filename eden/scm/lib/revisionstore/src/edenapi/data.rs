@@ -212,13 +212,12 @@ mod tests {
     use std::collections::BTreeMap;
     use std::str::FromStr;
 
-    use edenapi_types::Blake3;
     use edenapi_types::Sha1;
     use maplit::hashmap;
     use tempfile::TempDir;
     use types::fetch_mode::FetchMode;
     use types::testutil::*;
-    use types::Sha256;
+    use types::Blake3;
 
     use super::*;
     use crate::edenapi::File;
@@ -228,6 +227,7 @@ mod tests {
     use crate::indexedlogdatastore::IndexedLogHgIdDataStoreConfig;
     use crate::indexedlogutil::StoreType;
     use crate::localstore::ExtStoredPolicy;
+    use crate::scmstore::tree::types::TreeAttributes;
     use crate::scmstore::FileAttributes;
     use crate::scmstore::FileAuxData;
     use crate::scmstore::FileStore;
@@ -258,7 +258,7 @@ mod tests {
             &tmp,
             ExtStoredPolicy::Ignore,
             &config,
-            StoreType::Shared,
+            StoreType::Rotated,
         )?);
         store.indexedlog_cache = Some(cache.clone());
         store.edenapi = Some(remote_files);
@@ -305,7 +305,7 @@ mod tests {
             &tmp,
             ExtStoredPolicy::Ignore,
             &config,
-            StoreType::Shared,
+            StoreType::Rotated,
         )?);
         store.indexedlog_cache = Some(cache.clone());
         store.edenapi = Some(remote_files);
@@ -352,14 +352,18 @@ mod tests {
             &tmp,
             ExtStoredPolicy::Ignore,
             &config,
-            StoreType::Shared,
+            StoreType::Rotated,
         )?);
         store.indexedlog_cache = Some(cache.clone());
         store.edenapi = Some(remote_trees);
 
         // Attempt fetch.
         let mut fetched = store
-            .fetch_batch(std::iter::once(k.clone()), FetchMode::AllowRemote)
+            .fetch_batch(
+                std::iter::once(k.clone()),
+                TreeAttributes::CONTENT,
+                FetchMode::AllowRemote,
+            )
             .single()?
             .expect("key not found");
         assert_eq!(
@@ -398,14 +402,18 @@ mod tests {
             &tmp,
             ExtStoredPolicy::Ignore,
             &config,
-            StoreType::Shared,
+            StoreType::Rotated,
         )?);
         store.indexedlog_cache = Some(cache.clone());
         store.edenapi = Some(remote_trees);
 
         // Attempt fetch.
         let mut fetched = store
-            .fetch_batch(std::iter::once(k.clone()), FetchMode::RemoteOnly)
+            .fetch_batch(
+                std::iter::once(k.clone()),
+                TreeAttributes::CONTENT,
+                FetchMode::RemoteOnly,
+            )
             .single()?
             .expect("key not found");
         assert_eq!(
@@ -432,7 +440,11 @@ mod tests {
         let k = key("a", "def6f29d7b61f9cb70b2f14f79cd5c43c38e21b2");
 
         // Attempt fetch.
-        let fetched = store.fetch_batch(std::iter::once(k.clone()), FetchMode::AllowRemote);
+        let fetched = store.fetch_batch(
+            std::iter::once(k.clone()),
+            TreeAttributes::CONTENT,
+            FetchMode::AllowRemote,
+        );
         let (found, missing, _errors) = fetched.consume();
         assert_eq!(found.len(), 0);
         assert_eq!(missing.into_keys().collect::<Vec<_>>(), vec![k]);
@@ -456,7 +468,7 @@ mod tests {
 
         // Empty aux cache
         let tmp = TempDir::new()?;
-        let aux_cache = Arc::new(AuxStore::new(&tmp, &empty_config(), StoreType::Shared)?);
+        let aux_cache = Arc::new(AuxStore::new(&tmp, &empty_config(), StoreType::Rotated)?);
         store.aux_cache = Some(aux_cache);
 
         // Empty content cache
@@ -471,7 +483,7 @@ mod tests {
             &tmp,
             ExtStoredPolicy::Ignore,
             &config,
-            StoreType::Shared,
+            StoreType::Rotated,
         )?);
         store.indexedlog_cache = Some(cache.clone());
 
@@ -481,6 +493,7 @@ mod tests {
             blake3: Blake3::from_str(
                 "2078b4229b5353de0268efc7f64b68f3c99fb8829e9c052117b4e1e090b2603a",
             )?,
+            file_header_metadata: None,
         };
 
         // Test that we can read aux data from SaplingRemoteApi

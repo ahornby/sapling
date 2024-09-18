@@ -20,12 +20,11 @@
   ...     return list(tuple(line.split()) for line in sheval(cmd).splitlines())
 
   $ setconfig experimental.allowfilepeer=True
-  $ setconfig format.use-segmented-changelog=true
   $ setconfig devel.segmented-changelog-rev-compat=true
   $ . "$TESTDIR/library.sh"
 
   $ configure dummyssh
-  $ enable treemanifest remotenames remotefilelog pushrebase
+  $ enable remotenames pushrebase
 
 # Check manifest behavior with empty commit
 
@@ -87,10 +86,7 @@
   $ cat >> .hg/hgrc << 'EOF'
   > [extensions]
   > pushrebase=
-  > treemanifest=$TESTDIR/../sapling/ext/treemanifestserver.py
   > [remotefilelog]
-  > server=True
-  > [treemanifest]
   > server=True
   > EOF
   $ hg clone 'ssh://user@dummy/serverpushrebasemerge' $TESTTMP/tempclient -q
@@ -114,11 +110,6 @@
 
   $ hg clone 'ssh://user@dummy/serverpushrebasemerge' $TESTTMP/clientpushrebasemerge -q
   $ cd $TESTTMP/clientpushrebasemerge
-  $ cat >> .hg/hgrc << 'EOF'
-  > [treemanifest]
-  > sendtrees=True
-  > treeonly=True
-  > EOF
   $ drawdag << 'EOS'
   >  # drawdag.defaultfiles=false
   > F   # F/y/c=f  # crash with rustmanifest if y/c=c

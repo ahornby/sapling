@@ -111,14 +111,11 @@ impl MononokeApp {
         extension_args: HashMap<TypeId, Box<dyn BoxedAppExtensionArgs>>,
     ) -> Result<Self> {
         let env = Arc::new(env);
-        let config_path = ConfigArgs::from_arg_matches(&args)?.config_path();
-        let config_store = &env.as_ref().config_store;
-        let configs = Arc::new(MononokeConfigs::new(
-            config_path,
-            config_store,
+        let configs = ConfigArgs::from_arg_matches(&args)?.create_mononoke_configs(
             runtime.handle().clone(),
             env.logger.clone(),
-        )?);
+            &env.as_ref().config_store,
+        )?;
 
         let repo_factory = Arc::new(RepoFactory::new(env.clone()));
 
@@ -495,6 +492,24 @@ impl MononokeApp {
         Ok(repo)
     }
 
+    /// Open a named repository.
+    /// FIXME should pass a String but I need to figure out how get the repo config
+    pub async fn open_named_repo<Repo>(&self, repo_id: RepositoryId) -> Result<Repo>
+    where
+        Repo: for<'builder> AsyncBuildable<'builder, RepoFactoryBuilder<'builder>>,
+    {
+        let repo_configs = self.repo_configs();
+        let (repo_name, repo_config) = repo_configs
+            .get_repo_config(repo_id)
+            .ok_or_else(|| anyhow!("unknown repoid: {:?}", repo_id))?;
+        let common_config = self.repo_configs().common.clone();
+        let repo = self
+            .repo_factory
+            .build(repo_name.clone(), repo_config.clone(), common_config)
+            .await?;
+        Ok(repo)
+    }
+
     /// Open a repository based on user-provided arguments while modifying the repo_factory as
     /// needed
     pub async fn open_repo_with_factory_customization<Repo>(
@@ -508,6 +523,29 @@ impl MononokeApp {
         let repo_arg = repo_args.as_repo_arg();
         let (repo_name, repo_config) = self.repo_config(repo_arg)?;
         let common_config = self.repo_configs().common.clone();
+        let mut repo_factory = self.repo_factory.clone();
+        let repo_factory = Arc::make_mut(&mut repo_factory);
+        customize_repo_factory(repo_factory);
+        let repo = repo_factory
+            .build(repo_name, repo_config, common_config)
+            .await?;
+        Ok(repo)
+    }
+
+    /// Open a repository based on user-provided arguments while modifying the repo_factory as
+    /// needed. Make sure that the opened repo has redaction DISABLED
+    pub async fn open_repo_unredacted_with_factory_customization<Repo>(
+        &self,
+        repo_args: &impl AsRepoArg,
+        customize_repo_factory: impl Fn(&mut RepoFactory) -> &mut RepoFactory,
+    ) -> Result<Repo>
+    where
+        Repo: for<'builder> AsyncBuildable<'builder, RepoFactoryBuilder<'builder>>,
+    {
+        let repo_arg = repo_args.as_repo_arg();
+        let (repo_name, mut repo_config) = self.repo_config(repo_arg)?;
+        let common_config = self.repo_configs().common.clone();
+        repo_config.redaction = Redaction::Disabled;
         let mut repo_factory = self.repo_factory.clone();
         let repo_factory = Arc::make_mut(&mut repo_factory);
         customize_repo_factory(repo_factory);

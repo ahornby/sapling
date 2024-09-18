@@ -6,12 +6,10 @@
  */
 
 mod ancestors_difference;
-mod backfill;
-mod backfill_one;
-mod checkpoints;
 mod children;
 mod common_base;
 mod descendants;
+mod is_ancestor;
 mod range_stream;
 mod segments;
 mod slice_ancestors;
@@ -19,20 +17,18 @@ mod update_preloaded;
 
 use ancestors_difference::AncestorsDifferenceArgs;
 use anyhow::Result;
-use backfill::BackfillArgs;
-use backfill_one::BackfillOneArgs;
 use bonsai_git_mapping::BonsaiGitMapping;
 use bonsai_globalrev_mapping::BonsaiGlobalrevMapping;
 use bonsai_hg_mapping::BonsaiHgMapping;
 use bonsai_svnrev_mapping::BonsaiSvnrevMapping;
-use changeset_fetcher::ChangesetFetcher;
-use changesets::Changesets;
 use children::ChildrenArgs;
 use clap::Parser;
 use clap::Subcommand;
 use commit_graph::CommitGraph;
+use commit_graph::CommitGraphWriter;
 use common_base::CommonBaseArgs;
 use descendants::DescendantsArgs;
+use is_ancestor::IsAncestorArgs;
 use metaconfig_types::RepoConfig;
 use mononoke_app::args::RepoArgs;
 use mononoke_app::MononokeApp;
@@ -55,10 +51,6 @@ pub struct CommandArgs {
 
 #[derive(Subcommand)]
 pub enum CommitGraphSubcommand {
-    /// Backfill commit graph entries
-    Backfill(BackfillArgs),
-    /// Backfill a commit and all of its missing ancestors.
-    BackfillOne(BackfillOneArgs),
     /// Display ids of all commits that are ancestors of one set of commits (heads),
     /// excluding ancestors of another set of commits (common) in reverse topological order.
     AncestorsDifference(AncestorsDifferenceArgs),
@@ -78,18 +70,17 @@ pub enum CommitGraphSubcommand {
     /// Display segments representing ancestors of one set of commits (heads), excluding
     /// ancestors of another set of commits (common) in reverse topological order.
     Segments(SegmentsArgs),
+    /// Check if a commit is an ancestor of another commit.
+    IsAncestor(IsAncestorArgs),
 }
 
 #[facet::container]
 pub struct Repo {
     #[facet]
-    changesets: dyn Changesets,
-
-    #[facet]
-    changeset_fetcher: dyn ChangesetFetcher,
-
-    #[facet]
     commit_graph: CommitGraph,
+
+    #[facet]
+    commit_graph_writer: dyn CommitGraphWriter,
 
     #[facet]
     config: RepoConfig,
@@ -118,10 +109,6 @@ pub async fn run(app: MononokeApp, args: CommandArgs) -> Result<()> {
     let repo: Repo = app.open_repo(&args.repo).await?;
 
     match args.subcommand {
-        CommitGraphSubcommand::Backfill(args) => backfill::backfill(&ctx, &app, &repo, args).await,
-        CommitGraphSubcommand::BackfillOne(args) => {
-            backfill_one::backfill_one(&ctx, &repo, args).await
-        }
         CommitGraphSubcommand::AncestorsDifference(args) => {
             ancestors_difference::ancestors_difference(&ctx, &repo, args).await
         }
@@ -142,5 +129,8 @@ pub async fn run(app: MononokeApp, args: CommandArgs) -> Result<()> {
             descendants::descendants(&ctx, &repo, args).await
         }
         CommitGraphSubcommand::Segments(args) => segments::segments(&ctx, &repo, args).await,
+        CommitGraphSubcommand::IsAncestor(args) => {
+            is_ancestor::is_ancestor(&ctx, &repo, args).await
+        }
     }
 }

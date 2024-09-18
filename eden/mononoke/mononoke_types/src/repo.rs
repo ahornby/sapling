@@ -11,7 +11,9 @@ use std::str::FromStr;
 use abomonation_derive::Abomonation;
 use anyhow::Error;
 use lazy_static::lazy_static;
+use quickcheck_arbitrary_derive::Arbitrary;
 use regex::Regex;
+use serde_derive::Deserialize;
 use serde_derive::Serialize;
 use sql::mysql;
 
@@ -44,8 +46,9 @@ lazy_static! {
 }
 
 /// Represents a repository. This ID is used throughout storage.
-#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Debug, Hash, Abomonation)]
-#[derive(Serialize, mysql::OptTryFromRowField)]
+#[derive(Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Debug, Hash)]
+#[derive(Abomonation, Arbitrary)]
+#[derive(Serialize, Deserialize, mysql::OptTryFromRowField)]
 pub struct RepositoryId(i32);
 
 impl RepositoryId {
@@ -93,9 +96,11 @@ impl FromStr for RepositoryId {
 
 #[cfg(test)]
 mod test {
+    use mononoke_macros::mononoke;
+
     use super::*;
 
-    #[test]
+    #[mononoke::test]
     fn prefix_generation() {
         assert_eq!(RepositoryId::new(0).prefix().as_str(), "repo0000.");
         assert_eq!(RepositoryId::new(1).prefix().as_str(), "repo0001.");
@@ -105,7 +110,7 @@ mod test {
         assert_eq!(RepositoryId::new(12000).prefix().as_str(), "repo12000.");
     }
 
-    #[test]
+    #[mononoke::test]
     fn prefix_match() {
         // Check generated prefixes match the expected form
         assert!(REPO_PREFIX_REGEX.is_match(RepositoryId::new(0).prefix().as_str()));
@@ -116,7 +121,7 @@ mod test {
         assert!(REPO_PREFIX_REGEX.is_match(RepositoryId::new(12000).prefix().as_str()));
     }
 
-    #[test]
+    #[mononoke::test]
     fn prefix_not_match() {
         // Check we dont match unexpected forms
         assert!(!REPO_PREFIX_REGEX.is_match(""));

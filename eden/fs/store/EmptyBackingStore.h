@@ -52,12 +52,19 @@ class EmptyBackingStore final : public BijectiveBackingStore {
   folly::SemiFuture<GetTreeResult> getTree(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) override;
+  folly::SemiFuture<GetTreeMetaResult> getTreeMetadata(
+      const ObjectId& /*id*/,
+      const ObjectFetchContextPtr& /*context*/) override;
   folly::SemiFuture<GetBlobResult> getBlob(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) override;
   folly::SemiFuture<GetBlobMetaResult> getBlobMetadata(
       const ObjectId& /*id*/,
       const ObjectFetchContextPtr& /*context*/) override;
+
+  ImmediateFuture<GetGlobFilesResult> getGlobFiles(
+      const RootId& id,
+      const std::vector<std::string>& globs) override;
 
   LocalStoreCachingPolicy localStoreCachingPolicy_ =
       LocalStoreCachingPolicy::NoCaching;

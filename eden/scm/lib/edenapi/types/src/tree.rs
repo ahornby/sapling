@@ -5,7 +5,7 @@
  * GNU General Public License version 2.
  */
 
-use bytes::Bytes;
+use minibytes::Bytes;
 #[cfg(any(test, feature = "for-tests"))]
 use quickcheck::Arbitrary;
 #[cfg(any(test, feature = "for-tests"))]
@@ -15,14 +15,23 @@ use serde_derive::Serialize;
 use thiserror::Error;
 use type_macros::auto_wire;
 use types::hgid::HgId;
+use types::hgid::NULL_ID;
 use types::key::Key;
 use types::parents::Parents;
+use types::AugmentedTree;
+use types::AugmentedTreeEntry;
+use types::AugmentedTreeWithDigest;
 
+use crate::Blake3;
 use crate::DirectoryMetadata;
+use crate::FileAuxData;
 use crate::FileMetadata;
 use crate::InvalidHgId;
 use crate::SaplingRemoteApiServerError;
+use crate::Sha1;
 use crate::UploadToken;
+
+pub type TreeAuxData = DirectoryMetadata;
 
 #[derive(Debug, Error)]
 pub enum TreeError {
@@ -38,6 +47,9 @@ pub enum TreeError {
 
     #[error("TreeEntry missing field '{0}'")]
     MissingField(&'static str),
+
+    #[error("TreeEntry failed to convert from AugmentedTree: '{0}'")]
+    AugmentedTreeConversionError(String),
 }
 
 impl TreeError {
@@ -62,6 +74,7 @@ pub struct TreeEntry {
     pub data: Option<Bytes>,
     pub parents: Option<Parents>,
     pub children: Option<Vec<Result<TreeChildEntry, SaplingRemoteApiServerError>>>,
+    pub tree_aux_data: Option<TreeAuxData>,
 }
 
 impl TreeEntry {
@@ -87,6 +100,11 @@ impl TreeEntry {
         children: Option<Vec<Result<TreeChildEntry, SaplingRemoteApiServerError>>>,
     ) -> &'a mut Self {
         self.children = children;
+        self
+    }
+
+    pub fn with_tree_aux_data<'a>(&'a mut self, tree_aux_data: TreeAuxData) -> &'a mut Self {
+        self.tree_aux_data = Some(tree_aux_data);
         self
     }
 
@@ -139,6 +157,10 @@ impl TreeEntry {
     pub fn data_unchecked(&self) -> Option<Bytes> {
         self.data.clone()
     }
+
+    pub fn tree_aux_data(&self) -> Option<&TreeAuxData> {
+        self.tree_aux_data.as_ref()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -159,7 +181,7 @@ pub struct TreeChildFileEntry {
 #[cfg_attr(any(test, feature = "for-tests"), derive(Arbitrary))]
 pub struct TreeChildDirectoryEntry {
     pub key: Key,
-    pub directory_metadata: Option<DirectoryMetadata>,
+    pub tree_aux_data: Option<TreeAuxData>,
 }
 
 impl TreeChildEntry {
@@ -170,11 +192,87 @@ impl TreeChildEntry {
         })
     }
 
-    pub fn new_directory_entry(key: Key, metadata: DirectoryMetadata) -> Self {
+    pub fn new_directory_entry(key: Key, aux_data: TreeAuxData) -> Self {
         TreeChildEntry::Directory(TreeChildDirectoryEntry {
             key,
-            directory_metadata: Some(metadata),
+            tree_aux_data: Some(aux_data),
         })
+    }
+}
+
+impl TryFrom<AugmentedTree> for TreeEntry {
+    type Error = TreeError;
+    fn try_from(aug_tree: AugmentedTree) -> Result<Self, Self::Error> {
+        let mut entry: TreeEntry = TreeEntry::new(Key {
+            hgid: aug_tree.hg_node_id,
+            ..Default::default()
+        });
+        let mut buf: Vec<u8> = Vec::with_capacity(aug_tree.sapling_tree_blob_size());
+        aug_tree
+            .write_sapling_tree_blob(&mut buf)
+            .map_err(|e| TreeError::AugmentedTreeConversionError(e.to_string()))?;
+        entry.with_data(Some(buf.into()));
+        entry.with_parents(Some(Parents::new(
+            aug_tree.p1.unwrap_or(NULL_ID),
+            aug_tree.p2.unwrap_or(NULL_ID),
+        )));
+        entry.with_children(Some(
+            aug_tree
+                .entries
+                .into_iter()
+                .map(|(path, augmented_entry)| match augmented_entry {
+                    AugmentedTreeEntry::FileNode(file) => Ok(TreeChildEntry::new_file_entry(
+                        Key {
+                            hgid: file.filenode,
+                            path,
+                        },
+                        FileAuxData {
+                            blake3: Blake3::from_another(file.content_blake3),
+                            sha1: Sha1::from_another(file.content_sha1),
+                            total_size: file.total_size,
+                            // in FileAuxData None would mean file_header_metadata is not fetched/not known if it is present
+                            file_header_metadata: Some(
+                                file.file_header_metadata.unwrap_or_default(),
+                            ),
+                        }
+                        .into(),
+                    )),
+                    AugmentedTreeEntry::DirectoryNode(tree) => {
+                        Ok(TreeChildEntry::new_directory_entry(
+                            Key {
+                                hgid: tree.treenode,
+                                path,
+                            },
+                            DirectoryMetadata {
+                                augmented_manifest_id: Blake3::from_another(
+                                    tree.augmented_manifest_id,
+                                ),
+                                augmented_manifest_size: tree.augmented_manifest_size,
+                            },
+                        ))
+                    }
+                })
+                .collect::<Result<Vec<_>, TreeError>>()?
+                .into_iter()
+                .map(Ok)
+                .collect(),
+        ));
+        Ok(entry)
+    }
+}
+
+impl TryFrom<AugmentedTreeWithDigest> for TreeEntry {
+    type Error = TreeError;
+    fn try_from(aug_tree_with_digest: AugmentedTreeWithDigest) -> Result<Self, Self::Error> {
+        let mut entry: TreeEntry = TreeEntry::try_from(aug_tree_with_digest.augmented_tree)?;
+        let dir_meta = DirectoryMetadata {
+            augmented_manifest_id: Blake3::from_byte_array(
+                aug_tree_with_digest.augmented_manifest_id.into_byte_array(),
+            ),
+            augmented_manifest_size: aug_tree_with_digest.augmented_manifest_size,
+        };
+        entry.with_tree_aux_data(dir_meta);
+        Ok(entry)
     }
 }
 
@@ -188,6 +286,7 @@ impl Arbitrary for TreeEntry {
             parents: Arbitrary::arbitrary(g),
             // Recursive TreeEntry in children causes stack overflow in QuickCheck
             children: None,
+            tree_aux_data: None,
         }
     }
 }

@@ -10,20 +10,18 @@ import type {CommitInfo, SuccessorInfo} from './types';
 import type {ReactNode} from 'react';
 import type {ContextMenuItem} from 'shared/ContextMenu';
 
-import {Bookmarks} from './Bookmark';
+import {spacing} from '../../components/theme/tokens.stylex';
+import {AllBookmarksTruncated, createBookmarkAtCommit} from './Bookmark';
 import {openBrowseUrlForHash, supportsBrowseUrlForHash} from './BrowseRepo';
 import {hasUnsavedEditedCommitMessage} from './CommitInfoView/CommitInfoState';
-import {currentComparisonMode} from './ComparisonView/atoms';
+import {showComparison} from './ComparisonView/atoms';
 import {Row} from './ComponentUtils';
 import {DragToRebase} from './DragToRebase';
 import {EducationInfoTip} from './Education';
 import {HighlightCommitsWhileHovering} from './HighlightedCommits';
 import {Internal} from './Internal';
 import {SubmitSelectionButton} from './SubmitSelectionButton';
-import {Subtle} from './Subtle';
-import {latestSuccessorUnlessExplicitlyObsolete} from './SuccessionTracker';
 import {getSuggestedRebaseOperation, suggestedRebaseDestinations} from './SuggestedRebase';
-import {Tooltip} from './Tooltip';
 import {UncommitButton} from './UncommitButton';
 import {UncommittedChanges} from './UncommittedChanges';
 import {tracker} from './analytics';
@@ -39,6 +37,7 @@ import {FoldButton, useRunFoldPreview} from './fold';
 import {findPublicBaseAncestor} from './getCommitTree';
 import {t, T} from './i18n';
 import {IconStack} from './icons/IconStack';
+import {IrrelevantCwdIcon} from './icons/IrrelevantCwdIcon';
 import {atomFamilyWeak, readAtom, writeAtom} from './jotaiUtils';
 import {CONFLICT_SIDE_LABELS} from './mergeConflicts/state';
 import {getAmendToOperation, isAmendToAllowedForCommit} from './operationUtils';
@@ -53,23 +52,26 @@ import {
 import platform from './platform';
 import {CommitPreview, dagWithPreviews, uncommittedChangesWithPreviews} from './previews';
 import {RelativeDate, relativeDate} from './relativeDate';
+import {repoRelativeCwd, useIsIrrelevantToCwd} from './repositoryData';
 import {isNarrowCommitTree} from './responsive';
 import {selectedCommits, useCommitCallbacks} from './selection';
 import {inMergeConflicts, mergeConflicts} from './serverAPIState';
 import {useConfirmUnsavedEditsBeforeSplit} from './stackEdit/ui/ConfirmUnsavedEditsBeforeSplit';
 import {SplitButton} from './stackEdit/ui/SplitButton';
 import {editingStackIntentionHashes} from './stackEdit/ui/stackEditState';
+import {latestSuccessorUnlessExplicitlyObsolete} from './successionUtils';
 import {copyAndShowToast} from './toast';
 import {succeedableRevset} from './types';
 import {short} from './utils';
 import * as stylex from '@stylexjs/stylex';
-import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
+import {Button} from 'isl-components/Button';
+import {Icon} from 'isl-components/Icon';
+import {Subtle} from 'isl-components/Subtle';
+import {Tooltip} from 'isl-components/Tooltip';
 import {atom, useAtomValue, useSetAtom} from 'jotai';
-import {useAtomCallback} from 'jotai/utils';
 import React, {memo} from 'react';
 import {ComparisonType} from 'shared/Comparison';
 import {useContextMenu} from 'shared/ContextMenu';
-import {Icon} from 'shared/Icon';
 import {MS_PER_DAY} from 'shared/constants';
 import {useAutofocusRef} from 'shared/hooks';
 import {notEmpty} from 'shared/utils';
@@ -121,6 +123,8 @@ export const Commit = memo(
     const isPublic = commit.phase === 'public';
     const isObsoleted = commit.successorInfo != null;
 
+    const isIrrelevantToCwd = useIsIrrelevantToCwd(commit);
+
     const handlePreviewedOperation = useRunPreviewedOperation();
     const runOperation = useRunOperation();
     const setEditStackIntentionHashes = useSetAtom(editingStackIntentionHashes);
@@ -140,13 +144,6 @@ export const Commit = memo(
 
     const clipboardCopy = (text: string, url?: string) =>
       copyAndShowToast(text, url == null ? undefined : clipboardLinkHtml(text, url));
-
-    const viewChangesCallback = useAtomCallback((_get, set) => {
-      set(currentComparisonMode, {
-        comparison: {type: ComparisonType.Committed, hash: commit.hash},
-        visible: true,
-      });
-    });
 
     const confirmUnsavedEditsBeforeSplit = useConfirmUnsavedEditsBeforeSplit();
     async function handleSplit() {
@@ -193,7 +190,7 @@ export const Commit = memo(
       if (!isPublic) {
         items.push({
           label: <T>View Changes in Commit</T>,
-          onClick: viewChangesCallback,
+          onClick: () => showComparison({type: ComparisonType.Committed, hash: commit.hash}),
         });
       }
       if (!isPublic && syncStatus != null && syncStatus !== SyncStatus.InSync) {
@@ -202,12 +199,23 @@ export const Commit = memo(
           items.push({
             label: <T replace={{$provider: provider?.label ?? 'remote'}}>Compare with $provider</T>,
             onClick: () => {
-              writeAtom(currentComparisonMode, {
-                comparison: {type: ComparisonType.SinceLastCodeReviewSubmit, hash: commit.hash},
-                visible: true,
-              });
+              showComparison({type: ComparisonType.SinceLastCodeReviewSubmit, hash: commit.hash});
             },
           });
+        }
+      }
+      if (!isPublic && commit.diffId != null) {
+        const provider = readAtom(codeReviewProvider);
+        const summary = readAtom(diffSummary(commit.diffId));
+        if (summary.value) {
+          const actions = provider?.getUpdateDiffActions(summary.value);
+          if (actions != null && actions.length > 0) {
+            items.push({
+              label: <T replace={{$number: commit.diffId}}>Update Diff $number</T>,
+              type: 'submenu',
+              children: actions,
+            });
+          }
         }
       }
       if (!isPublic && !actionsPrevented && !inConflicts) {
@@ -217,7 +225,7 @@ export const Commit = memo(
           type: 'submenu',
           children:
             suggestedRebases?.map(([dest, name]) => ({
-              label: <T>{name}</T>,
+              label: name,
               onClick: () => {
                 const operation = getSuggestedRebaseOperation(
                   dest,
@@ -249,6 +257,12 @@ export const Commit = memo(
           });
         }
         items.push({
+          label: <T>Create Bookmark...</T>,
+          onClick: () => {
+            createBookmarkAtCommit(commit);
+          },
+        });
+        items.push({
           label: hasChildren ? <T>Hide Commit and Descendants</T> : <T>Hide Commit</T>,
           onClick: () =>
             writeAtom(
@@ -267,13 +281,11 @@ export const Commit = memo(
     if (previewType === CommitPreview.REBASE_ROOT) {
       commitActions.push(
         <React.Fragment key="rebase">
-          <VSCodeButton
-            appearance="secondary"
-            onClick={() => handlePreviewedOperation(/* cancel */ true)}>
+          <Button onClick={() => handlePreviewedOperation(/* cancel */ true)}>
             <T>Cancel</T>
-          </VSCodeButton>
-          <VSCodeButton
-            appearance="primary"
+          </Button>
+          <Button
+            primary
             onClick={() => {
               handlePreviewedOperation(/* cancel */ false);
 
@@ -289,17 +301,15 @@ export const Commit = memo(
               }
             }}>
             <T>Run Rebase</T>
-          </VSCodeButton>
+          </Button>
         </React.Fragment>,
       );
     } else if (previewType === CommitPreview.HIDDEN_ROOT) {
       commitActions.push(
         <React.Fragment key="hide">
-          <VSCodeButton
-            appearance="secondary"
-            onClick={() => handlePreviewedOperation(/* cancel */ true)}>
+          <Button onClick={() => handlePreviewedOperation(/* cancel */ true)}>
             <T>Cancel</T>
-          </VSCodeButton>
+          </Button>
           <ConfirmHideButton onClick={() => handlePreviewedOperation(/* cancel */ false)} />
         </React.Fragment>,
       );
@@ -322,9 +332,9 @@ export const Commit = memo(
               'Update files in the working copy to match this commit. Mark this commit as the "current commit".',
             )}
             delayMs={250}>
-            <VSCodeButton
-              appearance="secondary"
+            <Button
               aria-label={t('Go to commit "$title"', {replace: {$title: commit.title}})}
+              xstyle={styles.gotoButton}
               onClick={async event => {
                 event.stopPropagation(); // don't toggle selection by letting click propagate onto selection target.
 
@@ -344,8 +354,9 @@ export const Commit = memo(
                 // (since the head commit is the default thing shown in the sidebar)
                 writeAtom(selectedCommits, new Set());
               }}>
-              <T>Goto</T> <Icon icon="newline" />
-            </VSCodeButton>
+              <T>Goto</T>
+              <Icon icon="newline" />
+            </Button>
           </Tooltip>
         </span>,
       );
@@ -383,7 +394,8 @@ export const Commit = memo(
         className={
           'commit' +
           (commit.isDot ? ' head-commit' : '') +
-          (commit.successorInfo != null ? ' obsolete' : '')
+          (commit.successorInfo != null ? ' obsolete' : '') +
+          (isIrrelevantToCwd ? ' irrelevant' : '')
         }
         onContextMenu={contextMenu}
         data-testid={`commit-${commit.hash}`}>
@@ -394,6 +406,21 @@ export const Commit = memo(
             }
             commit={commit}
             previewType={previewType}>
+            {!isPublic && isIrrelevantToCwd && (
+              <Tooltip
+                title={
+                  <T
+                    replace={{
+                      $prefix: <pre>{commit.maxCommonPathPrefix}</pre>,
+                      $cwd: <pre>{readAtom(repoRelativeCwd)}</pre>,
+                    }}>
+                    This commit only contains files within: $prefix These are irrelevant to your
+                    current working directory: $cwd
+                  </T>
+                }>
+                <IrrelevantCwdIcon />
+              </Tooltip>
+            )}
             {isPublic ? null : (
               <span className="commit-title">
                 {commitLabel && <CommitLabel>{commitLabel}</CommitLabel>}
@@ -402,11 +429,11 @@ export const Commit = memo(
               </span>
             )}
             <UnsavedEditedMessageIndicator commit={commit} />
-            <Bookmarks bookmarks={commit.bookmarks} kind="local" />
-            <Bookmarks bookmarks={commit.remoteBookmarks} kind="remote" />
-            {commit?.stableCommitMetadata != null ? (
-              <Bookmarks bookmarks={commit.stableCommitMetadata} kind="stable" />
-            ) : null}
+            <AllBookmarksTruncated
+              local={commit.bookmarks}
+              remote={commit.remoteBookmarks}
+              stable={commit?.stableCommitMetadata ?? []}
+            />
             {isPublic ? <CommitDate date={commit.date} /> : null}
             {isNarrow ? commitActions : null}
           </DragToRebase>
@@ -445,6 +472,9 @@ const styles = stylex.create({
     fontWeight: 'bold',
     fontSize: '90%',
   },
+  gotoButton: {
+    gap: spacing.half,
+  },
 });
 
 function CommitLabel({children}: {children?: ReactNode}) {
@@ -468,8 +498,8 @@ function OpenCommitInfoButton({
 }) {
   return (
     <Tooltip title={t("Open commit's details in sidebar")} delayMs={250}>
-      <VSCodeButton
-        appearance="icon"
+      <Button
+        icon
         onClick={e => {
           revealCommit();
           e.stopPropagation();
@@ -479,7 +509,7 @@ function OpenCommitInfoButton({
         aria-label={t('Open commit "$title"', {replace: {$title: commit.title}})}
         data-testid="open-commit-info-button">
         <Icon icon="chevron-right" />
-      </VSCodeButton>
+      </Button>
     </Tooltip>
   );
 }
@@ -487,9 +517,9 @@ function OpenCommitInfoButton({
 function ConfirmHideButton({onClick}: {onClick: () => unknown}) {
   const ref = useAutofocusRef() as React.MutableRefObject<null>;
   return (
-    <VSCodeButton ref={ref} appearance="primary" onClick={onClick}>
+    <Button ref={ref} primary onClick={onClick}>
       <T>Hide</T>
-    </VSCodeButton>
+    </Button>
   );
 }
 
@@ -499,12 +529,12 @@ function ConfirmCombineButtons() {
 
   return (
     <>
-      <VSCodeButton appearance="secondary" onClick={cancel}>
+      <Button onClick={cancel}>
         <T>Cancel</T>
-      </VSCodeButton>
-      <VSCodeButton ref={ref} appearance="primary" onClick={run}>
+      </Button>
+      <Button ref={ref} primary onClick={run}>
         <T>Run Combine</T>
-      </VSCodeButton>
+      </Button>
     </>
   );
 }

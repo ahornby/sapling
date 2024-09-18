@@ -12,6 +12,7 @@ import type {
 import type {
   CommandArg,
   ExactRevset,
+  OptimisticRevset,
   RepoRelativePath,
   SucceedableRevset,
   UncommittedChanges,
@@ -24,7 +25,7 @@ export class RevertOperation extends Operation {
 
   constructor(
     private files: Array<RepoRelativePath>,
-    private revset?: SucceedableRevset | ExactRevset,
+    private revset?: SucceedableRevset | ExactRevset | OptimisticRevset,
   ) {
     super('RevertOperation');
   }
@@ -34,15 +35,13 @@ export class RevertOperation extends Operation {
     if (this.revset != null) {
       args.push('--rev', this.revset);
     }
-    args.push(
-      ...this.files.map(file =>
-        // tag file arguments specialy so the remote repo can convert them to the proper cwd-relative format.
-        ({
-          type: 'repo-relative-file' as const,
-          path: file,
-        }),
-      ),
-    );
+    if (this.files.length > 0) {
+      // Tag file arguments specialy so the remote repo can convert them to the proper cwd-relative format.
+      args.push({
+        type: 'repo-relative-file-list' as const,
+        paths: this.files,
+      });
+    }
     return args;
   }
 

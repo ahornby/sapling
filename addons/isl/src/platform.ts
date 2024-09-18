@@ -44,13 +44,15 @@ export interface Platform {
    */
   getPersistedState<T extends Json>(key: string): T | null;
   /** see getPersistedState  */
-  setPersistedState<T extends Json>(key: string, value: T): void;
+  setPersistedState<T extends Json>(key: string, value: T | undefined): void;
   /** see getPersistedState  */
   clearPersistedState(): void;
   /** see getPersistedState  */
   getAllPersistedState(): Json | undefined;
 
   handleServerMessage?: (message: ServerToClientMessage) => void;
+
+  openDedicatedComparison?: (comparison: Comparison) => Promise<boolean>;
 
   /**
    * Component representing additional buttons/info in the help menu.
@@ -64,10 +66,16 @@ export interface Platform {
    * may import any files without worrying about the platform being set up yet or not.
    */
   GettingStartedContent?: LazyExoticComponent<({dismiss}: {dismiss: () => void}) => JSX.Element>;
-  /** Content to show as a tooltip on the bug button after going through the getting started experience */
-  GettingStartedBugNuxContent?: LazyExoticComponent<
-    ({dismiss}: {dismiss: () => void}) => JSX.Element
-  >;
+  /**
+   * Component representing additional buttons/info in the cwd menu,
+   * used to show a button or hint about how to add more cwds.
+   * Note: This should be lazy-loaded via `React.lazy()` so that implementations
+   * may import any files without worrying about the platform being set up yet or not.
+   */
+  AddMoreCwdsHint?: LazyExoticComponent<() => JSX.Element>;
+
+  /** Platform-specific settings, such as how ISL panels work */
+  Settings?: LazyExoticComponent<() => JSX.Element>;
 
   theme?: {
     getTheme(): ThemeColor;

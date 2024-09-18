@@ -12,12 +12,7 @@ import type {ParsedDiff} from 'shared/patch/parse';
 
 import serverAPI from '../ClientToServerAPI';
 import {EmptyState} from '../EmptyState';
-import {ErrorBoundary, ErrorNotice} from '../ErrorNotice';
 import {useGeneratedFileStatuses} from '../GeneratedFile';
-import {Subtle} from '../Subtle';
-import {Tooltip} from '../Tooltip';
-import {Dropdown} from '../components/Dropdown';
-import {RadioGroup} from '../components/Radio';
 import {T, t} from '../i18n';
 import {atomFamilyWeak, atomLoadableWithRefresh, localStorageBackedAtom} from '../jotaiUtils';
 import platform from '../platform';
@@ -25,7 +20,14 @@ import {latestHeadCommit} from '../serverAPIState';
 import {GeneratedStatus} from '../types';
 import {SplitDiffView} from './SplitDiffView';
 import {currentComparisonMode} from './atoms';
-import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
+import {parsePatchAndFilter, sortFilesByType} from './utils';
+import {Button} from 'isl-components/Button';
+import {Dropdown} from 'isl-components/Dropdown';
+import {ErrorBoundary, ErrorNotice} from 'isl-components/ErrorNotice';
+import {Icon} from 'isl-components/Icon';
+import {RadioGroup} from 'isl-components/Radio';
+import {Subtle} from 'isl-components/Subtle';
+import {Tooltip} from 'isl-components/Tooltip';
 import {useAtom, useAtomValue, useSetAtom} from 'jotai';
 import {useEffect, useMemo, useState} from 'react';
 import {
@@ -34,8 +36,6 @@ import {
   ComparisonType,
   comparisonStringKey,
 } from 'shared/Comparison';
-import {Icon} from 'shared/Icon';
-import {parsePatch} from 'shared/patch/parse';
 import {group, notEmpty} from 'shared/utils';
 
 import './ComparisonView.css';
@@ -46,14 +46,6 @@ import './ComparisonView.css';
  */
 function mapResult<T, U>(result: Result<T>, fn: (t: T) => U): Result<U> {
   return result.error == null ? {value: fn(result.value)} : result;
-}
-
-function parsePatchAndFilter(patch: string): ReturnType<typeof parsePatch> {
-  const result = parsePatch(patch);
-  return result.filter(
-    // empty patches and other weird situations can cause invalid files to get parsed, ignore these entirely
-    diff => diff.hunks.length > 0 || diff.newFileName != null || diff.oldFileName != null,
-  );
 }
 
 const currentComparisonData = atomFamilyWeak((comparison: Comparison) =>
@@ -115,7 +107,13 @@ const comparisonDisplayMode = localStorageBackedAtom<ComparisonDisplayMode | 're
   'responsive',
 );
 
-export default function ComparisonView({comparison}: {comparison: Comparison}) {
+export default function ComparisonView({
+  comparison,
+  dismiss,
+}: {
+  comparison: Comparison;
+  dismiss?: () => void;
+}) {
   const compared = useAtomValue(currentComparisonData(comparison));
 
   const displayMode = useComparisonDisplayMode();
@@ -155,6 +153,7 @@ export default function ComparisonView({comparison}: {comparison: Comparison}) {
       );
   } else {
     const files = data.value ?? [];
+    sortFilesByType(files);
     const fileGroups = group(files, file => generatedStatuses[file.newFileName ?? '']);
     content = (
       <>
@@ -207,6 +206,7 @@ export default function ComparisonView({comparison}: {comparison: Comparison}) {
         comparison={comparison}
         collapsedFiles={collapsedFiles}
         setCollapsedFile={setCollapsedFile}
+        dismiss={dismiss}
       />
       <div className="comparison-view-details">{content}</div>
     </div>
@@ -222,10 +222,12 @@ function ComparisonViewHeader({
   comparison,
   collapsedFiles,
   setCollapsedFile,
+  dismiss,
 }: {
   comparison: Comparison;
   collapsedFiles: Map<string, boolean>;
   setCollapsedFile: (path: string, collapsed: boolean) => unknown;
+  dismiss?: () => void;
 }) {
   const setComparisonMode = useSetAtom(currentComparisonMode);
   const [compared, reloadComparison] = useAtom(currentComparisonData(comparison));
@@ -249,15 +251,23 @@ function ComparisonViewHeader({
           <Dropdown
             data-testid="comparison-view-picker"
             value={comparison.type}
-            onChange={event =>
+            onChange={event => {
+              const newComparison = {
+                type: (event as React.FormEvent<HTMLSelectElement>).currentTarget
+                  .value as (typeof defaultComparisons)[0],
+              };
               setComparisonMode(previous => ({
                 ...previous,
-                comparison: {
-                  type: (event as React.FormEvent<HTMLSelectElement>).currentTarget
-                    .value as (typeof defaultComparisons)[0],
-                },
-              }))
-            }
+                comparison: newComparison,
+              }));
+              // When viewed in a dedicated viewer, change the title as the comparison changes
+              if (window.islAppMode != null && window.islAppMode.mode != 'isl') {
+                serverAPI.postMessage({
+                  type: 'platform/changeTitle',
+                  title: labelForComparison(newComparison),
+                });
+              }
+            }}
             options={[
               ...defaultComparisons.map(comparison => ({
                 value: comparison,
@@ -272,11 +282,11 @@ function ComparisonViewHeader({
           <Tooltip
             delayMs={1000}
             title={t('Reload this comparison. Comparisons do not refresh automatically.')}>
-            <VSCodeButton appearance="secondary" onClick={reloadComparison}>
+            <Button onClick={reloadComparison}>
               <Icon icon="refresh" data-testid="comparison-refresh-button" />
-            </VSCodeButton>
+            </Button>
           </Tooltip>
-          <VSCodeButton
+          <Button
             onClick={() => {
               for (const file of data?.value ?? []) {
                 if (file.newFileName) {
@@ -285,11 +295,11 @@ function ComparisonViewHeader({
               }
             }}
             disabled={isLoading || allFilesExpanded}
-            appearance="icon">
+            icon>
             <Icon icon="unfold" slot="start" />
             <T>Expand all files</T>
-          </VSCodeButton>
-          <VSCodeButton
+          </Button>
+          <Button
             onClick={() => {
               for (const file of data?.value ?? []) {
                 if (file.newFileName) {
@@ -297,24 +307,23 @@ function ComparisonViewHeader({
                 }
               }
             }}
-            appearance="icon"
+            icon
             disabled={isLoading || noFilesExpanded}>
             <Icon icon="fold" slot="start" />
             <T>Collapse all files</T>
-          </VSCodeButton>
+          </Button>
           <Tooltip trigger="click" component={() => <ComparisonSettingsDropdown />}>
-            <VSCodeButton appearance="icon">
+            <Button icon>
               <Icon icon="ellipsis" />
-            </VSCodeButton>
+            </Button>
           </Tooltip>
           {isLoading ? <Icon icon="loading" data-testid="comparison-loading" /> : null}
         </span>
-        <VSCodeButton
-          data-testid="close-comparison-view-button"
-          appearance="icon"
-          onClick={() => setComparisonMode(previous => ({...previous, visible: false}))}>
-          <Icon icon="x" />
-        </VSCodeButton>
+        {dismiss == null ? null : (
+          <Button data-testid="close-comparison-view-button" icon onClick={dismiss}>
+            <Icon icon="x" />
+          </Button>
+        )}
       </div>
     </>
   );

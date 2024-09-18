@@ -50,11 +50,11 @@ use crate::scuba::SaplingRemoteApiScubaHandler;
 
 pub type SaplingRemoteApi = MononokeHttpHandler<Router>;
 
-pub fn build(
+pub fn build<R: Send + Sync + Clone + 'static>(
     fb: FacebookInit,
     logger: Logger,
     scuba: MononokeScubaSampleBuilder,
-    mononoke: Arc<Mononoke>,
+    mononoke: Arc<Mononoke<R>>,
     will_exit: Arc<AtomicBool>,
     test_friendly_loging: bool,
     tls_session_data_log_path: Option<&Path>,
@@ -62,6 +62,7 @@ pub fn build(
     configs: Arc<MononokeConfigs>,
     common_config: &CommonConfig,
     readonly: bool,
+    mtls_disabled: bool,
 ) -> Result<SaplingRemoteApi, Error> {
     let ctx = ServerContext::new(mononoke, will_exit);
 
@@ -85,6 +86,7 @@ pub fn build(
             logger.clone(),
             common_config.internal_identity.clone(),
             ClientEntryPoint::SaplingRemoteApi,
+            mtls_disabled,
         ))
         .add(ServerIdentityMiddleware::new(HeaderValue::from_static(
             "edenapi_server",

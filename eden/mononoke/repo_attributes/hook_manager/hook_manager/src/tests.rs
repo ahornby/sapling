@@ -8,6 +8,7 @@
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use anyhow::Error;
 use async_trait::async_trait;
@@ -20,18 +21,21 @@ use futures::stream::TryStreamExt;
 use maplit::hashmap;
 use maplit::hashset;
 use metaconfig_types::HookManagerParams;
+use mononoke_macros::mononoke;
 use mononoke_types::BasicFileChange;
 use mononoke_types::BonsaiChangeset;
 use mononoke_types::BonsaiChangesetMut;
 use mononoke_types::DateTime;
 use mononoke_types::FileChange;
 use mononoke_types::FileType;
+use mononoke_types::GitLfs;
 use mononoke_types::NonRootMPath;
 use mononoke_types_mocks::contentid::ONES_CTID;
 use mononoke_types_mocks::contentid::THREES_CTID;
 use mononoke_types_mocks::contentid::TWOS_CTID;
 use permission_checker::InternalAclProvider;
 use regex::Regex;
+use repo_permission_checker::NeverAllowRepoPermissionChecker;
 use scuba_ext::MononokeScubaSampleBuilder;
 use sorted_vector_map::sorted_vector_map;
 
@@ -39,10 +43,10 @@ use crate::ChangesetHook;
 use crate::CrossRepoPushSource;
 use crate::FileHook;
 use crate::HookExecution;
-use crate::HookFileContentProvider;
 use crate::HookManager;
 use crate::HookRejectionInfo;
-use crate::InMemoryHookFileContentProvider;
+use crate::HookStateProvider;
+use crate::InMemoryHookStateProvider;
 use crate::PushAuthoredBy;
 
 #[derive(Clone, Debug)]
@@ -63,7 +67,7 @@ impl ChangesetHook for FnChangesetHook {
         _ctx: &'ctx CoreContext,
         _bookmark: &BookmarkKey,
         _changeset: &'cs BonsaiChangeset,
-        _content_manager: &'fetcher dyn HookFileContentProvider,
+        _content_manager: &'fetcher dyn HookStateProvider,
         _cross_repo_push_source: CrossRepoPushSource,
         _push_authored_by: PushAuthoredBy,
     ) -> Result<HookExecution, Error> {
@@ -93,7 +97,7 @@ impl ChangesetHook for FileContentMatchingChangesetHook {
         ctx: &'ctx CoreContext,
         _bookmark: &BookmarkKey,
         changeset: &'cs BonsaiChangeset,
-        content_manager: &'fetcher dyn HookFileContentProvider,
+        content_manager: &'fetcher dyn HookStateProvider,
         _cross_repo_push_source: CrossRepoPushSource,
         _push_authored_by: PushAuthoredBy,
     ) -> Result<HookExecution, Error> {
@@ -165,7 +169,7 @@ impl ChangesetHook for LengthMatchingChangesetHook {
         ctx: &'ctx CoreContext,
         _bookmark: &BookmarkKey,
         changeset: &'cs BonsaiChangeset,
-        content_manager: &'fetcher dyn HookFileContentProvider,
+        content_manager: &'fetcher dyn HookStateProvider,
         _cross_repo_push_source: CrossRepoPushSource,
         _push_authored_by: PushAuthoredBy,
     ) -> Result<HookExecution, Error> {
@@ -177,8 +181,9 @@ impl ChangesetHook for LengthMatchingChangesetHook {
                 Some(change) => {
                     let fut = async move {
                         let size = content_manager
-                            .get_file_size(ctx, change.content_id())
-                            .await?;
+                            .get_file_metadata(ctx, change.content_id())
+                            .await?
+                            .total_size;
 
                         Ok(expected_length == Some(size).as_ref())
                     };
@@ -225,7 +230,7 @@ impl FileHook for FnFileHook {
     async fn run<'this: 'change, 'ctx: 'this, 'change, 'fetcher: 'change, 'path: 'change>(
         &'this self,
         _ctx: &'ctx CoreContext,
-        _content_manager: &'fetcher dyn HookFileContentProvider,
+        _content_manager: &'fetcher dyn HookStateProvider,
         _change: Option<&'change BasicFileChange>,
         _path: &'path NonRootMPath,
         _cross_repo_push_source: CrossRepoPushSource,
@@ -255,7 +260,7 @@ impl FileHook for PathMatchingFileHook {
     async fn run<'this: 'change, 'ctx: 'this, 'change, 'fetcher: 'change, 'path: 'change>(
         &'this self,
         _ctx: &'ctx CoreContext,
-        _content_manager: &'fetcher dyn HookFileContentProvider,
+        _content_manager: &'fetcher dyn HookStateProvider,
         _change: Option<&'change BasicFileChange>,
         path: &'path NonRootMPath,
         _cross_repo_push_source: CrossRepoPushSource,
@@ -283,7 +288,7 @@ impl FileHook for FileContentMatchingFileHook {
     async fn run<'this: 'change, 'ctx: 'this, 'change, 'fetcher: 'change, 'path: 'change>(
         &'this self,
         ctx: &'ctx CoreContext,
-        content_manager: &'fetcher dyn HookFileContentProvider,
+        content_manager: &'fetcher dyn HookStateProvider,
         change: Option<&'change BasicFileChange>,
         _path: &'path NonRootMPath,
         _cross_repo_push_source: CrossRepoPushSource,
@@ -327,7 +332,7 @@ impl FileHook for IsSymLinkMatchingFileHook {
     async fn run<'this: 'change, 'ctx: 'this, 'change, 'fetcher: 'change, 'path: 'change>(
         &'this self,
         _ctx: &'ctx CoreContext,
-        _content_manager: &'fetcher dyn HookFileContentProvider,
+        _content_manager: &'fetcher dyn HookStateProvider,
         change: Option<&'change BasicFileChange>,
         _path: &'path NonRootMPath,
         _cross_repo_push_source: CrossRepoPushSource,
@@ -359,7 +364,7 @@ impl FileHook for LengthMatchingFileHook {
     async fn run<'this: 'change, 'ctx: 'this, 'change, 'fetcher: 'change, 'path: 'change>(
         &'this self,
         ctx: &'ctx CoreContext,
-        content_manager: &'fetcher dyn HookFileContentProvider,
+        content_manager: &'fetcher dyn HookStateProvider,
         change: Option<&'change BasicFileChange>,
         _path: &'path NonRootMPath,
         _cross_repo_push_source: CrossRepoPushSource,
@@ -368,8 +373,9 @@ impl FileHook for LengthMatchingFileHook {
         let length = match change {
             Some(change) => {
                 content_manager
-                    .get_file_size(ctx, change.content_id())
+                    .get_file_metadata(ctx, change.content_id())
                     .await?
+                    .total_size
             }
             None => return Ok(HookExecution::Accepted),
         };
@@ -387,7 +393,7 @@ fn length_matching_file_hook(length: u64) -> Box<dyn FileHook> {
 async fn hook_manager_inmem(fb: FacebookInit) -> HookManager {
     let ctx = CoreContext::test_mock(fb);
 
-    let mut content_manager = InMemoryHookFileContentProvider::new();
+    let mut content_manager = InMemoryHookStateProvider::new();
     content_manager.insert(ONES_CTID, "elephants");
     content_manager.insert(TWOS_CTID, "hippopatami");
     content_manager.insert(THREES_CTID, "eels");
@@ -400,6 +406,7 @@ async fn hook_manager_inmem(fb: FacebookInit) -> HookManager {
             disable_acl_checker: true,
             ..Default::default()
         },
+        Arc::new(NeverAllowRepoPermissionChecker {}),
         MononokeScubaSampleBuilder::with_discard(),
         "zoo".to_string(),
     )
@@ -443,9 +450,9 @@ fn default_changeset() -> BonsaiChangeset {
         git_extra_headers: None,
         git_tree_hash: None,
         file_changes: sorted_vector_map!{
-            to_mpath("dir1/subdir1/subsubdir1/file_1") => FileChange::tracked(ONES_CTID, FileType::Symlink, 15, None),
-            to_mpath("dir1/subdir1/subsubdir2/file_1") => FileChange::tracked(TWOS_CTID, FileType::Regular, 17, None),
-            to_mpath("dir1/subdir1/subsubdir2/file_2") => FileChange::tracked(THREES_CTID, FileType::Regular, 2, None),
+            to_mpath("dir1/subdir1/subsubdir1/file_1") => FileChange::tracked(ONES_CTID, FileType::Symlink, 15, None, GitLfs::FullContent),
+            to_mpath("dir1/subdir1/subsubdir2/file_1") => FileChange::tracked(TWOS_CTID, FileType::Regular, 17, None, GitLfs::FullContent),
+            to_mpath("dir1/subdir1/subsubdir2/file_2") => FileChange::tracked(THREES_CTID, FileType::Regular, 2, None, GitLfs::FullContent),
         },
         is_snapshot: false,
         git_annotated_tag: None,
@@ -467,7 +474,7 @@ async fn run_changeset_hooks(
 
     let changeset = default_changeset();
     let res = hook_manager
-        .run_hooks_for_bookmark(
+        .run_changesets_hooks_for_bookmark(
             &ctx,
             vec![changeset].iter(),
             &BookmarkKey::new(bookmark_name).unwrap(),
@@ -498,7 +505,7 @@ async fn run_file_hooks(
         hook_manager.register_file_hook(&hook_name, hook, Default::default());
     }
     let res = hook_manager
-        .run_hooks_for_bookmark(
+        .run_changesets_hooks_for_bookmark(
             &ctx,
             vec![cs].iter(),
             &BookmarkKey::new(bookmark_name).unwrap(),
@@ -520,7 +527,7 @@ async fn run_file_hooks(
     assert_eq!(expected, map);
 }
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_changeset_hook_accepted(fb: FacebookInit) {
     let ctx = CoreContext::test_mock(fb);
     let hooks: HashMap<String, Box<dyn ChangesetHook>> = hashmap! {
@@ -536,7 +543,7 @@ async fn test_changeset_hook_accepted(fb: FacebookInit) {
     run_changeset_hooks(ctx, "bm1", hooks, bookmarks, regexes, expected).await;
 }
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_changeset_hook_rejected(fb: FacebookInit) {
     let ctx = CoreContext::test_mock(fb);
     let hooks: HashMap<String, Box<dyn ChangesetHook>> = hashmap! {
@@ -552,7 +559,7 @@ async fn test_changeset_hook_rejected(fb: FacebookInit) {
     run_changeset_hooks(ctx, "bm1", hooks, bookmarks, regexes, expected).await;
 }
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_changeset_hook_mix(fb: FacebookInit) {
     let ctx = CoreContext::test_mock(fb);
     let hooks: HashMap<String, Box<dyn ChangesetHook>> = hashmap! {
@@ -574,7 +581,7 @@ async fn test_changeset_hook_mix(fb: FacebookInit) {
     run_changeset_hooks(ctx, "bm1", hooks, bookmarks, regexes, expected).await;
 }
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_changeset_hook_file_text(fb: FacebookInit) {
     let ctx = CoreContext::test_mock(fb);
     let hook1_map = hashmap![
@@ -611,7 +618,7 @@ async fn test_changeset_hook_file_text(fb: FacebookInit) {
     run_changeset_hooks(ctx, "bm1", hooks, bookmarks, regexes, expected).await;
 }
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_changeset_hook_lengths(fb: FacebookInit) {
     let ctx = CoreContext::test_mock(fb);
     let hook1_map = hashmap![
@@ -648,7 +655,7 @@ async fn test_changeset_hook_lengths(fb: FacebookInit) {
     run_changeset_hooks(ctx, "bm1", hooks, bookmarks, regexes, expected).await;
 }
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_file_hook_accepted(fb: FacebookInit) {
     let ctx = CoreContext::test_mock(fb);
     let hooks: HashMap<String, Box<dyn FileHook>> = hashmap! {
@@ -668,7 +675,7 @@ async fn test_file_hook_accepted(fb: FacebookInit) {
     run_file_hooks(ctx, "bm1", hooks, bookmarks, regexes, expected).await;
 }
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_file_hook_rejected(fb: FacebookInit) {
     let ctx = CoreContext::test_mock(fb);
     let hooks: HashMap<String, Box<dyn FileHook>> = hashmap! {
@@ -688,7 +695,7 @@ async fn test_file_hook_rejected(fb: FacebookInit) {
     run_file_hooks(ctx, "bm1", hooks, bookmarks, regexes, expected).await;
 }
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_file_hook_mix(fb: FacebookInit) {
     let ctx = CoreContext::test_mock(fb);
     let hooks: HashMap<String, Box<dyn FileHook>> = hashmap! {
@@ -716,7 +723,7 @@ async fn test_file_hook_mix(fb: FacebookInit) {
     run_file_hooks(ctx, "bm1", hooks, bookmarks, regexes, expected).await;
 }
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_file_hooks_paths(fb: FacebookInit) {
     let ctx = CoreContext::test_mock(fb);
     let matching_paths = hashset![
@@ -740,7 +747,7 @@ async fn test_file_hooks_paths(fb: FacebookInit) {
     run_file_hooks(ctx, "bm1", hooks, bookmarks, regexes, expected).await;
 }
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_file_hooks_paths_mix(fb: FacebookInit) {
     let ctx = CoreContext::test_mock(fb);
     let matching_paths1 = hashset![
@@ -773,7 +780,7 @@ async fn test_file_hooks_paths_mix(fb: FacebookInit) {
     run_file_hooks(ctx, "bm1", hooks, bookmarks, regexes, expected).await;
 }
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_file_hook_file_text(fb: FacebookInit) {
     let ctx = CoreContext::test_mock(fb);
     let hooks: HashMap<String, Box<dyn FileHook>> = hashmap! {
@@ -807,7 +814,7 @@ async fn test_file_hook_file_text(fb: FacebookInit) {
     run_file_hooks(ctx, "bm1", hooks, bookmarks, regexes, expected).await;
 }
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_file_hook_is_symlink(fb: FacebookInit) {
     let ctx = CoreContext::test_mock(fb);
     let hooks: HashMap<String, Box<dyn FileHook>> = hashmap! {
@@ -835,7 +842,7 @@ async fn test_file_hook_is_symlink(fb: FacebookInit) {
     run_file_hooks(ctx, "bm1", hooks, bookmarks, regexes, expected).await;
 }
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_file_hook_length(fb: FacebookInit) {
     let ctx = CoreContext::test_mock(fb);
     let hooks: HashMap<String, Box<dyn FileHook>> = hashmap! {

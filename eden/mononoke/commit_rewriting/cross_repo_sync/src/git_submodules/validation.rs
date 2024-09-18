@@ -11,7 +11,6 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::anyhow;
-use anyhow::ensure;
 use anyhow::Context;
 use anyhow::Result;
 use async_recursion::async_recursion;
@@ -25,6 +24,7 @@ use fsnodes::RootFsnodeId;
 use futures::stream;
 use futures::stream::TryStreamExt;
 use futures::StreamExt;
+use futures_stats::TimedFutureExt;
 use itertools::Itertools;
 use manifest::Entry;
 use manifest::ManifestOps;
@@ -39,6 +39,7 @@ use mononoke_types::FsnodeId;
 use mononoke_types::MPathElement;
 use mononoke_types::NonRootMPath;
 use movers::Mover;
+use scuba_ext::FutureStatsScubaExt;
 
 use crate::git_submodules::expand::SubmoduleExpansionData;
 use crate::git_submodules::expand::SubmodulePath;
@@ -51,60 +52,91 @@ use crate::git_submodules::utils::list_non_submodule_files_under;
 use crate::git_submodules::utils::root_fsnode_id_from_submodule_git_commit;
 use crate::git_submodules::utils::x_repo_submodule_metadata_file_basename;
 use crate::reporting::log_debug;
-use crate::reporting::run_and_log_stats_to_scuba;
+use crate::reporting::log_error;
+use crate::reporting::log_trace;
 use crate::types::Repo;
 
-/// Validate that a given bonsai **from the large repo** keeps all submodule
-/// expansions valid.
-pub async fn validate_all_submodule_expansions<'a, R: Repo>(
-    ctx: &'a CoreContext,
-    sm_exp_data: SubmoduleExpansionData<'a, R>,
-    // Bonsai from the large repo that should have all submodule expansions
-    // validated
-    bonsai: BonsaiChangeset,
-    // TODO(T179533620): fetch mover from commit sync config, instead of
-    // requiring it to be provided by callers.
-    mover: Mover,
-) -> Result<BonsaiChangeset> {
-    // For every submodule dependency, get all changes in their directories.
+/// A wrapper over BonsaiChangeset that can only be created by running submodule
+/// expansion validation on a bonsai.
+/// This type will be used as input of any functions that require a bonsai
+/// to have all its submodule expansions already validated (e.g. backsyncing).
+///
+/// A token is also generated that can be passed to downstream calls that mutate
+/// the bonsai but also want to ensure that it was previously validated.
+pub struct ValidSubmoduleExpansionBonsai(BonsaiChangeset, SubmoduleExpansionValidationToken);
+/// A type that can only be constructed in this module due to the private field
+#[derive(Debug, Clone, Copy)]
+pub struct SubmoduleExpansionValidationToken(());
 
-    // Iterate over the submodule dependency paths.
-    // Create a map grouping the file changes per submodule dependency.
+impl ValidSubmoduleExpansionBonsai {
+    /// Validate that a given bonsai **from the large repo** keeps all submodule
+    /// expansions valid.
+    pub async fn validate_all_submodule_expansions<'a, R: Repo>(
+        ctx: &'a CoreContext,
+        sm_exp_data: SubmoduleExpansionData<'a, R>,
+        // Bonsai from the large repo that should have all submodule expansions
+        // validated
+        bonsai: BonsaiChangeset,
+        // TODO(T179533620): fetch mover from commit sync config, instead of
+        // requiring it to be provided by callers.
+        mover: Mover,
+    ) -> Result<ValidSubmoduleExpansionBonsai> {
+        // For every submodule dependency, get all changes in their directories.
 
-    let bonsai: BonsaiChangeset = stream::iter(sm_exp_data.submodule_deps.iter().map(anyhow::Ok))
-        .try_fold(bonsai, |bonsai, (submodule_path, submodule_repo)| {
-            cloned!(mover, sm_exp_data);
-            async move {
-                run_and_log_stats_to_scuba(
-                    ctx,
-                    "Validating submodule expansion",
-                    format!("Submodule path: {submodule_path}"),
-                    validate_submodule_expansion(
-                        ctx,
-                        sm_exp_data,
-                        bonsai,
-                        submodule_path,
-                        submodule_repo.as_ref(),
-                        mover,
-                    ),
-                )
-                .await
-            }
+        // Iterate over the submodule dependency paths.
+        // Create a map grouping the file changes per submodule dependency.
+
+        let bonsai_res: Result<BonsaiChangeset> =
+            stream::iter(sm_exp_data.submodule_deps.iter().map(anyhow::Ok))
+                .try_fold(bonsai, |bonsai, (submodule_path, submodule_repo)| {
+                    cloned!(mover, sm_exp_data);
+                    async move {
+                        validate_submodule_expansion(
+                            ctx,
+                            sm_exp_data,
+                            bonsai,
+                            submodule_path,
+                            submodule_repo.as_ref(),
+                            mover,
+                        )
+                        .timed()
+                        .await
+                        .log_future_stats(
+                            ctx.scuba().clone(),
+                            "Validating submodule expansion",
+                            format!("Submodule path: {submodule_path}"),
+                        )
+                        .with_context(|| format!("Validation of submodule {submodule_path} failed"))
+                    }
+                })
+                .await;
+
+        if let Err(err) = &bonsai_res {
+            log_error(ctx, format!("Submodule validation failed: {err:#?}"));
+        }
+
+        bonsai_res.map(|bonsai| {
+            ValidSubmoduleExpansionBonsai(bonsai, SubmoduleExpansionValidationToken(()))
         })
-        .await?;
+    }
 
-    Ok(bonsai)
+    pub fn into_inner(self) -> BonsaiChangeset {
+        self.0
+    }
+    pub fn into_inner_with_token(self) -> (BonsaiChangeset, SubmoduleExpansionValidationToken) {
+        (self.0, self.1)
+    }
 }
 
 /// Validate that a bonsai in the large repo is valid for a given submodule repo
 /// repo.
 /// Among other things, it will assert that
 /// 1. If the submodule expansion is changed, the submodule metadata file (i.e.
-/// pointer) is updated as well.
+///    pointer) is updated as well.
 /// 2. The submoldule metadata file exists, contains a valid git commit hash
-/// and that commit exists in the submodule repo.
+///    and that commit exists in the submodule repo.
 /// 3. The working copy of the commit in the submodule repo is exactly the same
-/// as its expansion in the large repo.
+///    as its expansion in the large repo.
 ///
 /// NOTE: this function will derive fsnodes for the provided bonsais, so it
 /// requires access to the large repo's blobstore and that the parent commits
@@ -174,6 +206,7 @@ async fn validate_submodule_expansion<'a, R: Repo>(
                 // the large repo bonsai
                 return Ok(bonsai);
             }
+
             // Check if the submodule metadata file existed in any of the
             // parents. If it did, it means that a submodule expansion is
             // being modified without properly updating the metadata file.
@@ -238,34 +271,46 @@ async fn validate_submodule_expansion<'a, R: Repo>(
     // This is the root fsnode from the submodule at the commit the submodule
     // metadata file points to.
 
-    let submodule_fsnode_id = run_and_log_stats_to_scuba(
+    let submodule_fsnode_id = root_fsnode_id_from_submodule_git_commit(
         ctx,
+        submodule_repo,
+        git_hash,
+        &sm_exp_data.dangling_submodule_pointers,
+    )
+    .timed()
+    .await
+    .log_future_stats(
+        ctx.scuba().clone(),
         "Getting root fsnode id from submodule git commit",
         format!("Submodule repo: {}", &submodule_repo.repo_identity().name()),
-        root_fsnode_id_from_submodule_git_commit(
-            ctx,
-            submodule_repo,
-            git_hash,
-            &sm_exp_data.dangling_submodule_pointers,
-        ),
-    )
-    .await?;
+    )?;
 
     // ------------------------------------------------------------------------
     // STEP 3: Get the fsnode from the expansion of the submodule in the large
     // repo and compare it with the fsnode from the submodule commit.
 
-    let expansion_fsnode_id = run_and_log_stats_to_scuba(
+    let expansion_fsnode_id = get_submodule_expansion_fsnode_id(
         ctx,
+        sm_exp_data.clone(),
+        &bonsai,
+        &synced_submodule_path,
+    )
+    .timed()
+    .await
+    .log_future_stats(
+        ctx.scuba().clone(),
         "Get submodule expansion fsnode id",
         format!("Synced submodule path: {}", &synced_submodule_path),
-        get_submodule_expansion_fsnode_id(ctx, sm_exp_data.clone(), &bonsai, synced_submodule_path),
     )
-    .await?;
+    .context("Failed to get submodule expansion fsnode id")?;
 
     if submodule_fsnode_id == expansion_fsnode_id {
         // If fsnodes are an exact match, there are no recursive submodules and the
         // working copy is the same.
+        log_trace(
+            ctx,
+            "Root submodule expansion fsnode is the same as submodule repo's fsnode",
+        );
         return Ok(bonsai);
     };
 
@@ -277,23 +322,24 @@ async fn validate_submodule_expansion<'a, R: Repo>(
 
     // The submodule roots fsnode and the fsnode from its expansion in the large
     // repo should be exactly the same.
-    run_and_log_stats_to_scuba(
+    validate_working_copy_of_expansion_with_recursive_submodules(
         ctx,
+        sm_exp_data,
+        adjusted_submodule_deps,
+        submodule_repo,
+        expansion_fsnode_id,
+        submodule_fsnode_id,
+    )
+    .timed()
+    .await
+    .log_future_stats(
+        ctx.scuba().clone(),
         "Validate working copy of submodule expansion with recursive submodules",
         format!(
             "Recursive submodule: {}",
             submodule_repo.repo_identity().name()
         ),
-        validate_working_copy_of_expansion_with_recursive_submodules(
-            ctx,
-            sm_exp_data,
-            adjusted_submodule_deps,
-            submodule_repo,
-            expansion_fsnode_id,
-            submodule_fsnode_id,
-        ),
-    )
-    .await?;
+    )?;
 
     Ok(bonsai)
 }
@@ -305,9 +351,9 @@ async fn validate_submodule_expansion<'a, R: Repo>(
 ///
 /// The submodule expansion can be deleted in two ways:
 /// 1. Manually deleting the entire directory, in which case there must be
-/// `FileChange::Deletion` for all the files in the expansion.
+///    `FileChange::Deletion` for all the files in the expansion.
 /// 2. Implicitly deleted by adding a file in the path of the expansion
-/// directory.
+///    directory.
 async fn _ensure_submodule_expansion_deletion<'a, R: Repo>(
     ctx: &'a CoreContext,
     sm_exp_data: SubmoduleExpansionData<'a, R>,
@@ -389,7 +435,7 @@ async fn get_submodule_expansion_fsnode_id<'a, R: Repo>(
     sm_exp_data: SubmoduleExpansionData<'a, R>,
     // Bonsai from the large repo
     bonsai: &'a BonsaiChangeset,
-    synced_submodule_path: NonRootMPath,
+    synced_submodule_path: &NonRootMPath,
 ) -> Result<FsnodeId> {
     let large_repo = sm_exp_data.large_repo.clone();
 
@@ -398,34 +444,36 @@ async fn get_submodule_expansion_fsnode_id<'a, R: Repo>(
 
     // Get the root fsnodes from the parent commits, so the one from this commit
     // can be derived.
-    let parent_root_fsnodes = run_and_log_stats_to_scuba(
-        ctx,
-        "Deriving large repo bonsai parent's fsnode ids",
-        format!("Synced submodule path: {}", &synced_submodule_path),
-        stream::iter(bonsai.parents())
-            .then(|cs_id| large_repo_derived_data.derive::<RootFsnodeId>(ctx, cs_id))
-            .boxed()
-            .try_collect::<Vec<_>>(),
-    )
-    .await
-    .context("Failed to derive parent fsnodes in large repo")?;
+    let parent_root_fsnodes = stream::iter(bonsai.parents())
+        .then(|cs_id| large_repo_derived_data.derive::<RootFsnodeId>(ctx, cs_id))
+        .boxed()
+        .try_collect::<Vec<_>>()
+        .timed()
+        .await
+        .log_future_stats(
+            ctx.scuba().clone(),
+            "Deriving large repo bonsai parent's fsnode ids",
+            format!("Synced submodule path: {}", synced_submodule_path),
+        )
+        .context("Failed to derive parent fsnodes in large repo")?;
 
     let large_derived_data_ctx = large_repo_derived_data.manager().derivation_context(None);
 
-    let new_root_fsnode_id = run_and_log_stats_to_scuba(
+    let new_root_fsnode_id = RootFsnodeId::derive_single(
         ctx,
-        "Deriving large repo bonsai root fsnode id",
-        format!("Synced submodule path: {}", &synced_submodule_path),
-        RootFsnodeId::derive_single(
-            ctx,
-            &large_derived_data_ctx,
-            // NOTE: deriving directly from the bonsai requires an owned type, so
-            // the bonsai needs to be cloned.
-            bonsai.clone(),
-            parent_root_fsnodes,
-        ),
+        &large_derived_data_ctx,
+        // NOTE: deriving directly from the bonsai requires an owned type, so
+        // the bonsai needs to be cloned.
+        bonsai.clone(),
+        parent_root_fsnodes,
     )
+    .timed()
     .await
+    .log_future_stats(
+        ctx.scuba().clone(),
+        "Deriving large repo bonsai root fsnode id",
+        format!("Synced submodule path: {}", synced_submodule_path),
+    )
     .context("Deriving root fsnode for new bonsai")?
     .into_fsnode_id();
 
@@ -433,7 +481,7 @@ async fn get_submodule_expansion_fsnode_id<'a, R: Repo>(
         .find_entry(
             ctx.clone(),
             large_repo_blobstore.clone(),
-            synced_submodule_path.into(),
+            synced_submodule_path.clone().into(),
         )
         .await
         .context("Getting fsnode entry for submodule expansion in target repo")?;
@@ -485,8 +533,14 @@ where
     let large_repo_blobstore = large_repo.repo_blobstore_arc();
     let submodule_blobstore = submodule_repo.repo_blobstore_arc();
 
-    let submodule_fsnode: Fsnode = submodule_fsnode_id.load(ctx, &submodule_blobstore).await?;
-    let expansion_fsnode: Fsnode = expansion_fsnode_id.load(ctx, &large_repo_blobstore).await?;
+    let submodule_fsnode: Fsnode = submodule_fsnode_id
+        .load(ctx, &submodule_blobstore)
+        .await
+        .context("Failed to load fsnode")?;
+    let expansion_fsnode: Fsnode = expansion_fsnode_id
+        .load(ctx, &large_repo_blobstore)
+        .await
+        .context("Failed to load fsnode")?;
 
     // STEP 1: get all the entries in each fsnode.
     let all_expansion_entries: HashSet<(MPathElement, FsnodeEntry)> =
@@ -542,15 +596,26 @@ where
 
     // The paths that are NOT in the submodule's manifest CAN ONLY BE submodule
     // metadata files.
-    let expected_metadata_files = should_be_metadata_files
-        .into_iter()
-        .map(|(path, entry)| match entry {
-            FsnodeEntry::File(fsnode_file) => Ok((path, fsnode_file)),
-            FsnodeEntry::Directory(_) => Err(anyhow!(
-                "Paths in expansion and not in submodules should be metadata files"
-            )),
-        })
-        .collect::<Result<HashMap<_, _>>>()?;
+    let (expected_metadata_files, unexpected_paths): (HashMap<_, _>, Vec<_>) =
+        should_be_metadata_files
+            .into_iter()
+            .map(|(path, entry)| match entry {
+                FsnodeEntry::File(fsnode_file) => Ok((path, fsnode_file)),
+                FsnodeEntry::Directory(_) => Err(path),
+            })
+            .partition_result();
+
+    if !unexpected_paths.is_empty() {
+        log_error(
+            ctx,
+            format!(
+                "Unexpected files in the expansion that are not in the submodule: {unexpected_paths:#?}",
+            ),
+        );
+        return Err(anyhow!(
+            "Found files in the expansion that are not in the submodule",
+        ));
+    }
 
     // The paths are are present in both, but their content doesn't match can be
     // either a submodule expansion or a directory that contains an expansion.
@@ -601,48 +666,102 @@ where
                 borrowed!(submodule_repo);
 
                 async move {
-                    run_and_log_stats_to_scuba(
+                    validate_expansion_directory_against_submodule_manifest_entry(
                         ctx,
+                        sm_exp_data,
+                        submodule_repo,
+                        adjusted_submodule_deps,
+                        iteration_data,
+                        exp_path.clone(),
+                        exp_directory,
+                    )
+                    .timed()
+                    .await
+                    .log_future_stats(
+                        ctx.scuba().clone(),
                         "Validate expansion directory against submodule manifest entry",
                         format!(
                             "submodule_repo: {} / exp_path: {}",
                             submodule_repo.repo_identity().name(),
                             exp_path
                         ),
-                        validate_expansion_directory_against_submodule_manifest_entry(
-                            ctx,
-                            sm_exp_data,
-                            submodule_repo,
-                            adjusted_submodule_deps,
-                            iteration_data,
-                            exp_path,
-                            exp_directory,
-                        ),
                     )
-                    .await
+                    .context(
+                        "Failed to validate expansion directory against submodule manifest entry",
+                    )
                 }
             },
         )
         .await?;
 
+    log_trace(
+        ctx,
+        format!(
+            "Remaining directories in submodule's manifest: {:#?}",
+            final_submodule_dirs
+        ),
+    );
+    log_trace(
+        ctx,
+        format!(
+            "Remaining files in submodule's manifest: {:#?}",
+            final_submodule_files
+        ),
+    );
+    log_trace(
+        ctx,
+        format!(
+            "Remaining files in expansion's manifest: {:#?}",
+            final_expansion_only_files
+        ),
+    );
+
+    /// Helper to assert that there are no unexpected files/directories in
+    /// the submodule manifest or expansion manifests, and log/display these
+    /// entries if they're there.
+    fn check_for_unexpected_entries<T>(
+        ctx: &CoreContext,
+        entries: HashMap<MPathElement, T>,
+        entry_kind: &str,
+        location: &str,
+    ) -> Result<()>
+    where
+        T: std::fmt::Debug,
+    {
+        if entries.is_empty() {
+            // No unexpected entries
+            return Ok(());
+        }
+
+        let unexpected_entries = entries.keys().sorted().collect::<Vec<_>>();
+        log_error(
+            ctx,
+            format!(
+                "{entry_kind} unaccounted for in {location}: {:#?}",
+                unexpected_entries
+            ),
+        );
+
+        Err(anyhow!(
+            "{entry_kind} present in {location} are unaccounted for"
+        ))
+    }
+
     // STEP 5: ensure that all the paths in the submodule manifest were accounted
     // for.
-    ensure!(
-        final_submodule_dirs.is_empty(),
-        "Some directories present in submodule manifest are unaccounted for"
-    );
-    ensure!(
-        final_submodule_files.is_empty(),
-        "Some files present in submodule manifest are unaccounted for"
-    );
+    check_for_unexpected_entries(
+        ctx,
+        final_submodule_dirs,
+        "Directories",
+        "submodule manifest",
+    )?;
+
+    check_for_unexpected_entries(ctx, final_submodule_files, "Files", "submodule manifest")?;
 
     // Do the same for all the files in the expansion that don't exist in
     // the submodule manifest, because they should be metadata files that were
     // fetched to expand their submodule.
-    ensure!(
-        final_expansion_only_files.is_empty(),
-        "Files present in the expansion are unaccounted for"
-    );
+    check_for_unexpected_entries(ctx, final_expansion_only_files, "Files", "expansion")?;
 
     // STEP 6: actually perform the recursive validation calls
     stream::iter(entries_to_validate)

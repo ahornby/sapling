@@ -18,15 +18,16 @@ use blobstore::Loadable;
 use bookmarks::BookmarkKey;
 use bookmarks::BookmarksRef;
 use context::CoreContext;
+use cross_repo_sync::CandidateSelectionHint;
+use cross_repo_sync::CommitSyncContext;
 use fbinit::FacebookInit;
-use git_types::MappedGitCommitId;
 use maplit::btreemap;
+use mononoke_macros::mononoke;
 use mononoke_types::hash::GitSha1;
 use mononoke_types::ChangesetId;
 use mononoke_types::FileType;
 use mononoke_types::NonRootMPath;
 use repo_blobstore::RepoBlobstoreRef;
-use repo_derived_data::RepoDerivedDataRef;
 use repo_identity::RepoIdentityRef;
 use tests_utils::CreateCommitContext;
 
@@ -46,13 +47,13 @@ const REPO_B_SUBMODULE_PATH: &str = "submodules/repo_b";
 /// Tests the basic setup of expanding a submodule.
 /// Also test that adding and deleting files in the submodule repo will generate
 /// the proper change in its expansion.
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_submodule_expansion_basic(fb: FacebookInit) -> Result<()> {
     let ctx = CoreContext::test_mock(fb.clone());
     let (repo_b, repo_b_cs_map) = build_repo_b(fb).await?;
 
     let SubmoduleSyncTestData {
-        repo_a_info: (repo_a, repo_a_cs_map),
+        small_repo_info: (small_repo, small_repo_cs_map),
         large_repo_info: (large_repo, _large_repo_master),
         commit_syncer,
         ..
@@ -67,8 +68,8 @@ async fn test_submodule_expansion_basic(fb: FacebookInit) -> Result<()> {
     check_mapping(
         ctx.clone(),
         &commit_syncer,
-        *repo_a_cs_map.get("A_A").unwrap(),
-        ChangesetId::from_str("28b30c7f04abbba1c636e7cc36d9181685a45a35a903b69074631d135c873869")
+        *small_repo_cs_map.get("A_A").unwrap(),
+        ChangesetId::from_str("8e4c86fbb8af564753141502a96ae89f808b8ff3880b9d8fb82aa33ac055b7d8")
             .ok(),
     )
     .await;
@@ -76,8 +77,8 @@ async fn test_submodule_expansion_basic(fb: FacebookInit) -> Result<()> {
     check_mapping(
         ctx.clone(),
         &commit_syncer,
-        *repo_a_cs_map.get("A_B").unwrap(),
-        ChangesetId::from_str("beeb0fbae2b578f4db9c2413da2d3e9c925abb6cce7ffb7aaee16b26b685100f")
+        *small_repo_cs_map.get("A_B").unwrap(),
+        ChangesetId::from_str("ff1c511380d99c88b484fa2b0cb742be44f6dca66e85a1c620fcf08454cd6ab6")
             .ok(),
     )
     .await;
@@ -85,13 +86,13 @@ async fn test_submodule_expansion_basic(fb: FacebookInit) -> Result<()> {
     check_mapping(
         ctx.clone(),
         &commit_syncer,
-        *repo_a_cs_map.get("A_C").unwrap(),
-        ChangesetId::from_str("dd3b9ad41f6984993899d4d7dee27bae1cc01bbbd3f481646cf7f6a67638e369")
+        small_repo_cs_map["A_C"],
+        ChangesetId::from_str("8d60517a2c3491ac2cbee5e254153037e9d7c6b83a5ab58a615b841421661bdc")
             .ok(),
     )
     .await;
 
-    // Modify repo_b, update submodule pointer in repo_a, sync this commit
+    // Modify repo_b, update submodule pointer in small_repo, sync this commit
     // to large repo and check that submodule expansion was updated properly
 
     let repo_b_cs_id =
@@ -102,16 +103,12 @@ async fn test_submodule_expansion_basic(fb: FacebookInit) -> Result<()> {
             .commit()
             .await?;
 
-    let repo_b_mapped_git_commit = repo_b
-        .repo_derived_data()
-        .derive::<MappedGitCommitId>(&ctx, repo_b_cs_id)
-        .await?;
-    let repo_b_git_commit_hash = *repo_b_mapped_git_commit.oid();
+    let repo_b_git_commit_hash = git_sha1_from_changeset(&ctx, &repo_b, repo_b_cs_id).await?;
 
     const MESSAGE: &str = "Update submodule after adding and deleting a file";
 
-    let repo_a_cs_id =
-        CreateCommitContext::new(&ctx, &repo_a, vec![*repo_a_cs_map.get("A_C").unwrap()])
+    let small_repo_cs_id =
+        CreateCommitContext::new(&ctx, &small_repo, vec![small_repo_cs_map["A_C"]])
             .set_message(MESSAGE)
             .add_file_with_type(
                 REPO_B_SUBMODULE_PATH,
@@ -121,47 +118,45 @@ async fn test_submodule_expansion_basic(fb: FacebookInit) -> Result<()> {
             .commit()
             .await?;
 
-    let _large_repo_cs_id = sync_to_master(ctx.clone(), &commit_syncer, repo_a_cs_id)
-        .await?
-        .ok_or(anyhow!("Failed to sync commit"))?;
-
-    let large_repo_changesets = get_all_changeset_data_from_repo(&ctx, &large_repo).await?;
-
-    derive_all_data_types_for_repo(&ctx, &large_repo, &large_repo_changesets).await?;
-
-    let expected_cs_id =
-        ChangesetId::from_str("eb139e09af89e542b3d0d272857e7400ba721e814e3a06d94c85dfcea8e0c124")
-            .unwrap();
+    let (large_repo_cs_id, large_repo_changesets) = sync_changeset_and_derive_all_types(
+        ctx.clone(),
+        small_repo_cs_id,
+        &large_repo,
+        &commit_syncer,
+    )
+    .await?;
 
     check_mapping(
         ctx.clone(),
         &commit_syncer,
-        repo_a_cs_id,
-        Some(expected_cs_id),
+        small_repo_cs_id,
+        Some(large_repo_cs_id),
     )
     .await;
 
     compare_expected_changesets_from_basic_setup(
         &large_repo_changesets,
-        &[ExpectedChangeset::new_by_file_change(
-            MESSAGE,
-            // File changes only contain exact delta and change to submodule
-            // metadata file
-            vec![
-                // Submodule metadata file is updated
-                "repo_a/submodules/.x-repo-submodule-repo_b",
-                "repo_a/submodules/repo_b/new_dir/new_file",
-            ],
-            // File was deleted
-            vec!["repo_a/submodules/repo_b/B_B"],
-        )],
+        &[ExpectedChangeset::new(MESSAGE)
+            .with_regular_changes(
+                // File changes only contain exact delta and change to submodule
+                // metadata file
+                vec![
+                    // Submodule metadata file is updated
+                    "small_repo/submodules/.x-repo-submodule-repo_b",
+                    "small_repo/submodules/repo_b/new_dir/new_file",
+                ],
+            )
+            .with_deletions(
+                // File was deleted
+                vec!["small_repo/submodules/repo_b/B_B"],
+            )],
     )?;
 
     check_submodule_metadata_file_in_large_repo(
         &ctx,
         &large_repo,
-        expected_cs_id,
-        NonRootMPath::new("repo_a/submodules/.x-repo-submodule-repo_b")?,
+        large_repo_cs_id,
+        NonRootMPath::new("small_repo/submodules/.x-repo-submodule-repo_b")?,
         &repo_b_git_commit_hash,
     )
     .await?;
@@ -170,15 +165,11 @@ async fn test_submodule_expansion_basic(fb: FacebookInit) -> Result<()> {
 }
 
 /// Tests the basic setup of expanding submodules that contain other submodules.
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_recursive_submodule_expansion_basic(fb: FacebookInit) -> Result<()> {
     let ctx = CoreContext::test_mock(fb.clone());
     let (repo_c, repo_c_cs_map) = build_repo_c(fb).await?;
-    let c_master_mapped_git_commit = repo_c
-        .repo_derived_data()
-        .derive::<MappedGitCommitId>(&ctx, repo_c_cs_map["C_B"])
-        .await?;
-    let c_master_git_sha1 = *c_master_mapped_git_commit.oid();
+    let c_master_git_sha1 = git_sha1_from_changeset(&ctx, &repo_c, repo_c_cs_map["C_B"]).await?;
 
     let repo_c_submodule_path_in_repo_b = NonRootMPath::new("submodules/repo_c")?;
     let (repo_b, repo_b_cs_map) =
@@ -188,7 +179,7 @@ async fn test_recursive_submodule_expansion_basic(fb: FacebookInit) -> Result<()
     let repo_c_submodule_path =
         NonRootMPath::new(REPO_B_SUBMODULE_PATH)?.join(&repo_c_submodule_path_in_repo_b);
     let SubmoduleSyncTestData {
-        repo_a_info: (repo_a, repo_a_cs_map),
+        small_repo_info: (small_repo, small_repo_cs_map),
         large_repo_info: (large_repo, _large_repo_master),
         commit_syncer,
         ..
@@ -217,20 +208,20 @@ async fn test_recursive_submodule_expansion_basic(fb: FacebookInit) -> Result<()
         master_before_change,
         vec![
             "large_repo_root",
-            "repo_a/A_A",
-            "repo_a/A_B",
-            "repo_a/A_C",
-            "repo_a/submodules/.x-repo-submodule-repo_b",
-            "repo_a/submodules/repo_b/B_A",
-            "repo_a/submodules/repo_b/B_B",
-            "repo_a/submodules/repo_b/submodules/.x-repo-submodule-repo_c",
-            "repo_a/submodules/repo_b/submodules/repo_c/C_A",
-            "repo_a/submodules/repo_b/submodules/repo_c/C_B",
+            "small_repo/A_A",
+            "small_repo/A_B",
+            "small_repo/A_C",
+            "small_repo/submodules/.x-repo-submodule-repo_b",
+            "small_repo/submodules/repo_b/B_A",
+            "small_repo/submodules/repo_b/B_B",
+            "small_repo/submodules/repo_b/submodules/.x-repo-submodule-repo_c",
+            "small_repo/submodules/repo_b/submodules/repo_c/C_A",
+            "small_repo/submodules/repo_b/submodules/repo_c/C_B",
         ],
     )
     .await?;
 
-    // Modify repo_b, update submodule pointer in repo_a, sync this commit
+    // Modify repo_b, update submodule pointer in small_repo, sync this commit
     // to large repo and check that submodule expansion was updated properly
     let repo_b_cs_id =
         CreateCommitContext::new(&ctx, &repo_b, vec![*repo_b_cs_map.get("B_B").unwrap()])
@@ -240,42 +231,34 @@ async fn test_recursive_submodule_expansion_basic(fb: FacebookInit) -> Result<()
             .commit()
             .await?;
 
-    let repo_b_mapped_git_commit = repo_b
-        .repo_derived_data()
-        .derive::<MappedGitCommitId>(&ctx, repo_b_cs_id)
-        .await?;
-    let repo_b_git_commit_hash = *repo_b_mapped_git_commit.oid();
+    let repo_b_git_commit_hash = git_sha1_from_changeset(&ctx, &repo_b, repo_b_cs_id).await?;
 
     const MESSAGE: &str = "Update submodule after adding and deleting a file";
 
-    let repo_a_cs_id = CreateCommitContext::new(&ctx, &repo_a, vec![repo_a_cs_map["A_C"]])
-        .set_message(MESSAGE)
-        .add_file_with_type(
-            REPO_B_SUBMODULE_PATH,
-            repo_b_git_commit_hash.into_inner(),
-            FileType::GitSubmodule,
-        )
-        .commit()
-        .await?;
+    let small_repo_cs_id =
+        CreateCommitContext::new(&ctx, &small_repo, vec![small_repo_cs_map["A_C"]])
+            .set_message(MESSAGE)
+            .add_file_with_type(
+                REPO_B_SUBMODULE_PATH,
+                repo_b_git_commit_hash.into_inner(),
+                FileType::GitSubmodule,
+            )
+            .commit()
+            .await?;
 
-    let large_repo_cs_id = sync_to_master(ctx.clone(), &commit_syncer, repo_a_cs_id)
-        .await?
-        .ok_or(anyhow!("Failed to sync commit"))?;
-
-    let large_repo_changesets = get_all_changeset_data_from_repo(&ctx, &large_repo).await?;
-    println!("large_repo_changesets: {:#?}\n\n", &large_repo_changesets);
-
-    derive_all_data_types_for_repo(&ctx, &large_repo, &large_repo_changesets).await?;
-
-    let expected_cs_id =
-        ChangesetId::from_str("7b95de313bd54b4654e3aae74d5f444cd6db44504f6808cb7f138f42fc61f6e7")
-            .unwrap();
+    let (large_repo_cs_id, _large_repo_changesets) = sync_changeset_and_derive_all_types(
+        ctx.clone(),
+        small_repo_cs_id,
+        &large_repo,
+        &commit_syncer,
+    )
+    .await?;
 
     check_submodule_metadata_file_in_large_repo(
         &ctx,
         &large_repo,
-        expected_cs_id,
-        NonRootMPath::new("repo_a/submodules/.x-repo-submodule-repo_b")?,
+        large_repo_cs_id,
+        NonRootMPath::new("small_repo/submodules/.x-repo-submodule-repo_b")?,
         &repo_b_git_commit_hash,
     )
     .await?;
@@ -283,8 +266,8 @@ async fn test_recursive_submodule_expansion_basic(fb: FacebookInit) -> Result<()
     check_submodule_metadata_file_in_large_repo(
         &ctx,
         &large_repo,
-        expected_cs_id,
-        NonRootMPath::new("repo_a/submodules/repo_b/submodules/.x-repo-submodule-repo_c")?,
+        large_repo_cs_id,
+        NonRootMPath::new("small_repo/submodules/repo_b/submodules/.x-repo-submodule-repo_c")?,
         &c_master_git_sha1,
     )
     .await?;
@@ -295,15 +278,15 @@ async fn test_recursive_submodule_expansion_basic(fb: FacebookInit) -> Result<()
         large_repo_cs_id,
         vec![
             "large_repo_root",
-            "repo_a/A_A",
-            "repo_a/A_B",
-            "repo_a/A_C",
-            "repo_a/submodules/.x-repo-submodule-repo_b",
-            "repo_a/submodules/repo_b/B_A",
-            "repo_a/submodules/repo_b/submodules/.x-repo-submodule-repo_c",
-            "repo_a/submodules/repo_b/new_dir/new_file",
-            "repo_a/submodules/repo_b/submodules/repo_c/C_A",
-            "repo_a/submodules/repo_b/submodules/repo_c/C_B",
+            "small_repo/A_A",
+            "small_repo/A_B",
+            "small_repo/A_C",
+            "small_repo/submodules/.x-repo-submodule-repo_b",
+            "small_repo/submodules/repo_b/B_A",
+            "small_repo/submodules/repo_b/submodules/.x-repo-submodule-repo_c",
+            "small_repo/submodules/repo_b/new_dir/new_file",
+            "small_repo/submodules/repo_b/submodules/repo_c/C_A",
+            "small_repo/submodules/repo_b/submodules/repo_c/C_B",
         ],
     )
     .await?;
@@ -311,8 +294,8 @@ async fn test_recursive_submodule_expansion_basic(fb: FacebookInit) -> Result<()
     check_mapping(
         ctx.clone(),
         &commit_syncer,
-        repo_a_cs_id,
-        Some(expected_cs_id),
+        small_repo_cs_id,
+        Some(large_repo_cs_id),
     )
     .await;
 
@@ -321,15 +304,15 @@ async fn test_recursive_submodule_expansion_basic(fb: FacebookInit) -> Result<()
 
 // ------------------------- Deletions ----------------------------
 
-/// Deleting an entire submodule in the small repo (i.e. repo_a) should delete
-/// its expansion and its metadata file in repo_a folder in the large repo.
-#[fbinit::test]
+/// Deleting an entire submodule in the small repo (i.e. small_repo) should delete
+/// its expansion and its metadata file in small_repo folder in the large repo.
+#[mononoke::fbinit_test]
 async fn test_submodule_deletion(fb: FacebookInit) -> Result<()> {
     let ctx = CoreContext::test_mock(fb.clone());
     let (repo_b, _repo_b_cs_map) = build_repo_b(fb).await?;
 
     let SubmoduleSyncTestData {
-        repo_a_info: (repo_a, repo_a_cs_map),
+        small_repo_info: (small_repo, small_repo_cs_map),
         large_repo_info: (large_repo, _large_repo_master),
         commit_syncer,
         ..
@@ -340,60 +323,40 @@ async fn test_submodule_deletion(fb: FacebookInit) -> Result<()> {
     )
     .await?;
 
-    const MESSAGE: &str = "Delete repo_b submodule in repo_a";
-    let cs_id = CreateCommitContext::new(&ctx, &repo_a, vec![*repo_a_cs_map.get("A_C").unwrap()])
+    const MESSAGE: &str = "Delete repo_b submodule in small_repo";
+    let cs_id = CreateCommitContext::new(&ctx, &small_repo, vec![small_repo_cs_map["A_C"]])
         .set_message(MESSAGE)
         .delete_file(REPO_B_SUBMODULE_PATH)
         .commit()
         .await?;
 
-    let large_repo_cs_id = sync_to_master(ctx.clone(), &commit_syncer, cs_id)
-        .await?
-        .ok_or(anyhow!("Failed to sync commit deleting submodule B"))?;
+    let (large_repo_cs_id, large_repo_changesets) =
+        sync_changeset_and_derive_all_types(ctx.clone(), cs_id, &large_repo, &commit_syncer)
+            .await?;
 
-    println!("large_repo_cs_id: {}", large_repo_cs_id);
-
-    let large_repo_changesets = get_all_changeset_data_from_repo(&ctx, &large_repo).await?;
-
-    derive_all_data_types_for_repo(&ctx, &large_repo, &large_repo_changesets).await?;
-
-    check_mapping(
-        ctx.clone(),
-        &commit_syncer,
-        cs_id,
-        ChangesetId::from_str("04fc8faa78bf6eb8e3f75fa34ba823577c8b78cb4428e881b0d7b7db956630b5")
-            .ok(),
-    )
-    .await;
+    check_mapping(ctx.clone(), &commit_syncer, cs_id, Some(large_repo_cs_id)).await;
 
     compare_expected_changesets_from_basic_setup(
         &large_repo_changesets,
-        &[ExpectedChangeset::new_by_file_change(
-            MESSAGE,
-            // No regular file changes
-            vec![],
+        &[ExpectedChangeset::new(MESSAGE)
             // Files being deleted
-            vec![
-                "repo_a/submodules/.x-repo-submodule-repo_b",
-                "repo_a/submodules/repo_b/B_A",
-                "repo_a/submodules/repo_b/B_B",
-            ],
-        )],
+            .with_deletions(vec![
+                "small_repo/submodules/.x-repo-submodule-repo_b",
+                "small_repo/submodules/repo_b/B_A",
+                "small_repo/submodules/repo_b/B_B",
+            ])],
     )?;
 
     Ok(())
 }
 
 /// Test that deleting a recursive submodule also deletes its metadata file.
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_recursive_submodule_deletion(fb: FacebookInit) -> Result<()> {
     let ctx = CoreContext::test_mock(fb.clone());
     let (repo_c, repo_c_cs_map) = build_repo_c(fb).await?;
-    let c_master_mapped_git_commit = repo_c
-        .repo_derived_data()
-        .derive::<MappedGitCommitId>(&ctx, repo_c_cs_map["C_B"])
-        .await?;
-    let c_master_git_sha1 = *c_master_mapped_git_commit.oid();
+
+    let c_master_git_sha1 = git_sha1_from_changeset(&ctx, &repo_c, repo_c_cs_map["C_B"]).await?;
 
     let repo_c_submodule_path_in_repo_b = NonRootMPath::new("submodules/repo_c")?;
     let (repo_b, repo_b_cs_map) =
@@ -403,7 +366,7 @@ async fn test_recursive_submodule_deletion(fb: FacebookInit) -> Result<()> {
     let repo_c_submodule_path =
         NonRootMPath::new(REPO_B_SUBMODULE_PATH)?.join(&repo_c_submodule_path_in_repo_b);
     let SubmoduleSyncTestData {
-        repo_a_info: (repo_a, repo_a_cs_map),
+        small_repo_info: (small_repo, small_repo_cs_map),
         large_repo_info: (large_repo, _large_repo_master),
         commit_syncer,
         ..
@@ -425,46 +388,133 @@ async fn test_recursive_submodule_deletion(fb: FacebookInit) -> Result<()> {
             .commit()
             .await?;
 
-    let repo_b_mapped_git_commit = repo_b
-        .repo_derived_data()
-        .derive::<MappedGitCommitId>(&ctx, repo_b_cs_id)
-        .await?;
-    let repo_b_git_commit_hash = *repo_b_mapped_git_commit.oid();
+    let repo_b_git_commit_hash = git_sha1_from_changeset(&ctx, &repo_b, repo_b_cs_id).await?;
 
     const MESSAGE: &str = "Update submodule after deleting repo_c submodule in repo_b";
 
-    let repo_a_cs_id = CreateCommitContext::new(&ctx, &repo_a, vec![repo_a_cs_map["A_C"]])
-        .set_message(MESSAGE)
-        .add_file_with_type(
-            REPO_B_SUBMODULE_PATH,
-            repo_b_git_commit_hash.into_inner(),
-            FileType::GitSubmodule,
-        )
-        .commit()
-        .await?;
+    let small_repo_cs_id =
+        CreateCommitContext::new(&ctx, &small_repo, vec![small_repo_cs_map["A_C"]])
+            .set_message(MESSAGE)
+            .add_file_with_type(
+                REPO_B_SUBMODULE_PATH,
+                repo_b_git_commit_hash.into_inner(),
+                FileType::GitSubmodule,
+            )
+            .commit()
+            .await?;
 
-    let large_repo_cs_id = sync_to_master(ctx.clone(), &commit_syncer, repo_a_cs_id)
-        .await
-        .context("sync_to_master failed")
-        .and_then(|res| res.ok_or(anyhow!("No commit was synced")))?;
-
-    let large_repo_changesets = get_all_changeset_data_from_repo(&ctx, &large_repo).await?;
-    println!("large_repo_changesets: {:#?}\n\n", &large_repo_changesets);
-
-    derive_all_data_types_for_repo(&ctx, &large_repo, &large_repo_changesets).await?;
+    let (large_repo_cs_id, large_repo_changesets) = sync_changeset_and_derive_all_types(
+        ctx.clone(),
+        small_repo_cs_id,
+        &large_repo,
+        &commit_syncer,
+    )
+    .await?;
 
     compare_expected_changesets(
         large_repo_changesets.last_chunk::<1>().unwrap(),
-        &[ExpectedChangeset::new_by_file_change(
-            MESSAGE,
-            // repo_b submodule metadata file is updated
-            vec!["repo_a/submodules/.x-repo-submodule-repo_b"],
+        &[ExpectedChangeset::new(MESSAGE)
+            .with_regular_changes(
+                // repo_b submodule metadata file is updated
+                vec!["small_repo/submodules/.x-repo-submodule-repo_b"],
+            )
+            .with_deletions(
+                // Files being deleted
+                vec![
+                    // NOTE: repo_c submodule metadata file has to be deleted too
+                    "small_repo/submodules/repo_b/submodules/.x-repo-submodule-repo_c",
+                    "small_repo/submodules/repo_b/submodules/repo_c/C_A",
+                    "small_repo/submodules/repo_b/submodules/repo_c/C_B",
+                ],
+            )],
+    )?;
+
+    assert_working_copy_matches_expected(
+        &ctx,
+        &large_repo,
+        large_repo_cs_id,
+        vec![
+            "large_repo_root",
+            "small_repo/A_A",
+            "small_repo/A_B",
+            "small_repo/A_C",
+            "small_repo/submodules/.x-repo-submodule-repo_b",
+            "small_repo/submodules/repo_b/B_A",
+            "small_repo/submodules/repo_b/B_B",
+        ],
+    )
+    .await?;
+
+    check_mapping(
+        ctx.clone(),
+        &commit_syncer,
+        small_repo_cs_id,
+        Some(large_repo_cs_id),
+    )
+    .await;
+
+    Ok(())
+}
+
+/// Test that deleting a submodule with a recursive submodule properly deletes
+/// both and their metadata files.
+#[mononoke::fbinit_test]
+async fn test_submodule_with_recursive_submodule_deletion(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb.clone());
+    let (repo_c, repo_c_cs_map) = build_repo_c(fb).await?;
+    let c_master_git_sha1 = git_sha1_from_changeset(&ctx, &repo_c, repo_c_cs_map["C_B"]).await?;
+
+    let repo_c_submodule_path_in_repo_b = NonRootMPath::new("submodules/repo_c")?;
+    let (repo_b, _repo_b_cs_map) =
+        build_repo_b_with_c_submodule(fb, c_master_git_sha1, &repo_c_submodule_path_in_repo_b)
+            .await?;
+
+    let repo_c_submodule_path =
+        NonRootMPath::new(REPO_B_SUBMODULE_PATH)?.join(&repo_c_submodule_path_in_repo_b);
+    let SubmoduleSyncTestData {
+        small_repo_info: (small_repo, small_repo_cs_map),
+        large_repo_info: (large_repo, _large_repo_master),
+        commit_syncer,
+        ..
+    } = build_submodule_sync_test_data(
+        fb,
+        &repo_b,
+        vec![
+            (NonRootMPath::new(REPO_B_SUBMODULE_PATH)?, repo_b.clone()),
+            (repo_c_submodule_path, repo_c.clone()),
+        ],
+    )
+    .await?;
+
+    const MESSAGE: &str = "Delete repo_b submodule";
+
+    let small_repo_cs_id =
+        CreateCommitContext::new(&ctx, &small_repo, vec![small_repo_cs_map["A_C"]])
+            .set_message(MESSAGE)
+            .delete_file(REPO_B_SUBMODULE_PATH)
+            .commit()
+            .await?;
+
+    let (large_repo_cs_id, large_repo_changesets) = sync_changeset_and_derive_all_types(
+        ctx.clone(),
+        small_repo_cs_id,
+        &large_repo,
+        &commit_syncer,
+    )
+    .await?;
+
+    compare_expected_changesets(
+        large_repo_changesets.last_chunk::<1>().unwrap(),
+        &[ExpectedChangeset::new(MESSAGE).with_deletions(
             // Files being deleted
             vec![
+                "small_repo/submodules/.x-repo-submodule-repo_b",
+                "small_repo/submodules/repo_b/B_A",
+                "small_repo/submodules/repo_b/B_B",
                 // NOTE: repo_c submodule metadata file has to be deleted too
-                "repo_a/submodules/repo_b/submodules/.x-repo-submodule-repo_c",
-                "repo_a/submodules/repo_b/submodules/repo_c/C_A",
-                "repo_a/submodules/repo_b/submodules/repo_c/C_B",
+                "small_repo/submodules/repo_b/submodules/.x-repo-submodule-repo_c",
+                "small_repo/submodules/repo_b/submodules/repo_c/C_A",
+                "small_repo/submodules/repo_b/submodules/repo_c/C_B",
             ],
         )],
     )?;
@@ -475,25 +525,18 @@ async fn test_recursive_submodule_deletion(fb: FacebookInit) -> Result<()> {
         large_repo_cs_id,
         vec![
             "large_repo_root",
-            "repo_a/A_A",
-            "repo_a/A_B",
-            "repo_a/A_C",
-            "repo_a/submodules/.x-repo-submodule-repo_b",
-            "repo_a/submodules/repo_b/B_A",
-            "repo_a/submodules/repo_b/B_B",
+            "small_repo/A_A",
+            "small_repo/A_B",
+            "small_repo/A_C",
         ],
     )
     .await?;
 
-    let expected_cs_id =
-        ChangesetId::from_str("7f8fbaec6112ac5e14bb4385d744fa1fea6c64c800f30c59c9c0ffca509c4e4c")
-            .unwrap();
-
     check_mapping(
         ctx.clone(),
         &commit_syncer,
-        repo_a_cs_id,
-        Some(expected_cs_id),
+        small_repo_cs_id,
+        Some(large_repo_cs_id),
     )
     .await;
 
@@ -509,13 +552,13 @@ async fn test_recursive_submodule_deletion(fb: FacebookInit) -> Result<()> {
 /// This also tests that **later modifying this static copy** also passes
 /// validation, even if the path is still in the small repo config as one
 /// of its submodule deps.
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_deleting_submodule_but_keeping_directory(fb: FacebookInit) -> Result<()> {
     let ctx = CoreContext::test_mock(fb.clone());
     let (repo_b, _repo_b_cs_map) = build_repo_b(fb).await?;
 
     let SubmoduleSyncTestData {
-        repo_a_info: (repo_a, repo_a_cs_map),
+        small_repo_info: (small_repo, small_repo_cs_map),
         large_repo_info: (large_repo, _large_repo_master),
         commit_syncer,
         ..
@@ -528,25 +571,28 @@ async fn test_deleting_submodule_but_keeping_directory(fb: FacebookInit) -> Resu
 
     const DELETE_METADATA_FILE_MSG: &str = "Delete repo_b submodule and keept its static copy";
 
-    let del_md_file_cs_id = CreateCommitContext::new(&ctx, &repo_a, vec![repo_a_cs_map["A_C"]])
-        .set_message(DELETE_METADATA_FILE_MSG)
-        .delete_file(REPO_B_SUBMODULE_PATH)
-        // Delete the submodule file change, but keep the contents in the same path
-        .add_file(
-            format!("{}/B_A", REPO_B_SUBMODULE_PATH).as_str(),
-            "first commit in submodule B",
-        )
-        .add_file(
-            format!("{}/B_B", REPO_B_SUBMODULE_PATH).as_str(),
-            "second commit in submodule B",
-        )
-        .commit()
-        .await?;
+    let del_md_file_cs_id =
+        CreateCommitContext::new(&ctx, &small_repo, vec![small_repo_cs_map["A_C"]])
+            .set_message(DELETE_METADATA_FILE_MSG)
+            .delete_file(REPO_B_SUBMODULE_PATH)
+            // Delete the submodule file change, but keep the contents in the same path
+            .add_file(
+                format!("{}/B_A", REPO_B_SUBMODULE_PATH).as_str(),
+                "first commit in submodule B",
+            )
+            .add_file(
+                format!("{}/B_B", REPO_B_SUBMODULE_PATH).as_str(),
+                "second commit in submodule B",
+            )
+            .commit()
+            .await?;
 
     let large_repo_cs_id = sync_to_master(ctx.clone(), &commit_syncer, del_md_file_cs_id)
         .await
         .context("sync_to_master failed")
         .and_then(|res| res.ok_or(anyhow!("No commit was synced")))?;
+
+    let first_expected_cs_id = large_repo_cs_id;
 
     println!("large_repo_cs_id: {0:#?}", large_repo_cs_id);
 
@@ -556,19 +602,19 @@ async fn test_deleting_submodule_but_keeping_directory(fb: FacebookInit) -> Resu
         large_repo_cs_id,
         vec![
             "large_repo_root",
-            "repo_a/A_A",
-            "repo_a/A_B",
-            "repo_a/A_C",
+            "small_repo/A_A",
+            "small_repo/A_B",
+            "small_repo/A_C",
             // Files from the submodule are now regular files in the small repo
-            "repo_a/submodules/repo_b/B_A",
-            "repo_a/submodules/repo_b/B_B",
+            "small_repo/submodules/repo_b/B_A",
+            "small_repo/submodules/repo_b/B_B",
         ],
     )
     .await?;
 
     const CHANGE_SUBMODULE_PATH_MSG: &str = "Change static copy of repo_b";
 
-    let chg_sm_path_cs_id = CreateCommitContext::new(&ctx, &repo_a, vec![del_md_file_cs_id])
+    let chg_sm_path_cs_id = CreateCommitContext::new(&ctx, &small_repo, vec![del_md_file_cs_id])
         .set_message(CHANGE_SUBMODULE_PATH_MSG)
         // Modify files in the submodule path, because they're now regular files
         // in the small repo
@@ -584,41 +630,44 @@ async fn test_deleting_submodule_but_keeping_directory(fb: FacebookInit) -> Resu
         .commit()
         .await?;
 
-    let large_repo_cs_id = sync_to_master(ctx.clone(), &commit_syncer, chg_sm_path_cs_id)
-        .await
-        .context("sync_to_master failed")
-        .and_then(|res| res.ok_or(anyhow!("No commit was synced")))?;
+    let (large_repo_cs_id, large_repo_changesets) = sync_changeset_and_derive_all_types(
+        ctx.clone(),
+        chg_sm_path_cs_id,
+        &large_repo,
+        &commit_syncer,
+    )
+    .await?;
 
-    println!("large_repo_cs_id: {0:#?}", large_repo_cs_id);
-
-    let large_repo_changesets = get_all_changeset_data_from_repo(&ctx, &large_repo).await?;
-    derive_all_data_types_for_repo(&ctx, &large_repo, &large_repo_changesets).await?;
     compare_expected_changesets_from_basic_setup(
         &large_repo_changesets,
         &[
             // Changeset that deletes the submodule metadata file
-            ExpectedChangeset::new_by_file_change(
-                DELETE_METADATA_FILE_MSG,
-                // The submodule files are treated as regular file changes
-                vec![
-                    "repo_a/submodules/repo_b/B_A",
-                    "repo_a/submodules/repo_b/B_B",
-                ],
-                // Only submodule metadata file is deleted
-                vec!["repo_a/submodules/.x-repo-submodule-repo_b"],
-            ),
+            ExpectedChangeset::new(DELETE_METADATA_FILE_MSG)
+                .with_regular_changes(
+                    // The submodule files are treated as regular file changes
+                    vec![
+                        "small_repo/submodules/repo_b/B_A",
+                        "small_repo/submodules/repo_b/B_B",
+                    ],
+                )
+                .with_deletions(
+                    // Only submodule metadata file is deleted
+                    vec!["small_repo/submodules/.x-repo-submodule-repo_b"],
+                ),
             // Changeset that modifies files in the submodule path, which is
             // now a static copy of the submodule
-            ExpectedChangeset::new_by_file_change(
-                CHANGE_SUBMODULE_PATH_MSG,
-                // The submodule files are treated as regular file changes
-                vec![
-                    "repo_a/submodules/repo_b/B_B",
-                    "repo_a/submodules/repo_b/B_C",
-                ],
-                // Only submodule metadata file is deleted
-                vec!["repo_a/submodules/repo_b/B_A"],
-            ),
+            ExpectedChangeset::new(CHANGE_SUBMODULE_PATH_MSG)
+                .with_regular_changes(
+                    // The submodule files are treated as regular file changes
+                    vec![
+                        "small_repo/submodules/repo_b/B_B",
+                        "small_repo/submodules/repo_b/B_C",
+                    ],
+                )
+                .with_deletions(
+                    // Only submodule metadata file is deleted
+                    vec!["small_repo/submodules/repo_b/B_A"],
+                ),
         ],
     )?;
 
@@ -628,12 +677,12 @@ async fn test_deleting_submodule_but_keeping_directory(fb: FacebookInit) -> Resu
         large_repo_cs_id,
         vec![
             "large_repo_root",
-            "repo_a/A_A",
-            "repo_a/A_B",
-            "repo_a/A_C",
+            "small_repo/A_A",
+            "small_repo/A_B",
+            "small_repo/A_C",
             // Files from the submodule are now regular files in the small repo
-            "repo_a/submodules/repo_b/B_B",
-            "repo_a/submodules/repo_b/B_C",
+            "small_repo/submodules/repo_b/B_B",
+            "small_repo/submodules/repo_b/B_C",
         ],
     )
     .await?;
@@ -643,24 +692,14 @@ async fn test_deleting_submodule_but_keeping_directory(fb: FacebookInit) -> Resu
         ctx.clone(),
         &commit_syncer,
         del_md_file_cs_id,
-        Some(
-            ChangesetId::from_str(
-                "6176e1966404d7da39e62f814ddc49181cb7a31f63a40504f76feada0a47bcf4",
-            )
-            .unwrap(),
-        ),
+        Some(first_expected_cs_id),
     )
     .await;
     check_mapping(
         ctx.clone(),
         &commit_syncer,
         chg_sm_path_cs_id,
-        Some(
-            ChangesetId::from_str(
-                "d988d913f6b9f1e91d1fdc41d317cf2d6bed335774c2d5415e33eaa46d086442",
-            )
-            .unwrap(),
-        ),
+        Some(large_repo_cs_id),
     )
     .await;
 
@@ -669,16 +708,12 @@ async fn test_deleting_submodule_but_keeping_directory(fb: FacebookInit) -> Resu
 
 /// Same scenario as `test_deleting_submodule_but_keeping_directory`, but with
 /// a recursive submodule.
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_deleting_recursive_submodule_but_keeping_directory(fb: FacebookInit) -> Result<()> {
     let ctx = CoreContext::test_mock(fb.clone());
 
     let (repo_c, repo_c_cs_map) = build_repo_c(fb).await?;
-    let c_master_mapped_git_commit = repo_c
-        .repo_derived_data()
-        .derive::<MappedGitCommitId>(&ctx, repo_c_cs_map["C_B"])
-        .await?;
-    let c_master_git_sha1 = *c_master_mapped_git_commit.oid();
+    let c_master_git_sha1 = git_sha1_from_changeset(&ctx, &repo_c, repo_c_cs_map["C_B"]).await?;
 
     let repo_c_submodule_path_in_repo_b = NonRootMPath::new("submodules/repo_c")?;
     let (repo_b, repo_b_cs_map) =
@@ -689,7 +724,7 @@ async fn test_deleting_recursive_submodule_but_keeping_directory(fb: FacebookIni
         NonRootMPath::new(REPO_B_SUBMODULE_PATH)?.join(&repo_c_submodule_path_in_repo_b);
 
     let SubmoduleSyncTestData {
-        repo_a_info: (repo_a, repo_a_cs_map),
+        small_repo_info: (small_repo, small_repo_cs_map),
         large_repo_info: (large_repo, _large_repo_master),
         commit_syncer,
         ..
@@ -725,28 +760,26 @@ async fn test_deleting_recursive_submodule_but_keeping_directory(fb: FacebookIni
             .commit()
             .await?;
 
-    let repo_b_mapped_git_commit = repo_b
-        .repo_derived_data()
-        .derive::<MappedGitCommitId>(&ctx, del_repo_c_md_file_cs_id)
-        .await?;
-    let repo_b_git_commit_hash = *repo_b_mapped_git_commit.oid();
+    let repo_b_git_commit_hash =
+        git_sha1_from_changeset(&ctx, &repo_b, del_repo_c_md_file_cs_id).await?;
 
-    let del_md_file_cs_id = CreateCommitContext::new(&ctx, &repo_a, vec![repo_a_cs_map["A_C"]])
-        .set_message(DELETE_METADATA_FILE_MSG)
-        .add_file_with_type(
-            REPO_B_SUBMODULE_PATH,
-            repo_b_git_commit_hash.into_inner(),
-            FileType::GitSubmodule,
-        )
-        .commit()
-        .await?;
+    let del_md_file_cs_id =
+        CreateCommitContext::new(&ctx, &small_repo, vec![small_repo_cs_map["A_C"]])
+            .set_message(DELETE_METADATA_FILE_MSG)
+            .add_file_with_type(
+                REPO_B_SUBMODULE_PATH,
+                repo_b_git_commit_hash.into_inner(),
+                FileType::GitSubmodule,
+            )
+            .commit()
+            .await?;
 
     let large_repo_cs_id = sync_to_master(ctx.clone(), &commit_syncer, del_md_file_cs_id)
         .await
         .context("Failed to sync del_md_file_cs_id")
         .and_then(|res| res.ok_or(anyhow!("No commit was synced")))?;
 
-    println!("large_repo_cs_id: {0:#?}", large_repo_cs_id);
+    let first_expected_cs_id = large_repo_cs_id;
 
     assert_working_copy_matches_expected(
         &ctx,
@@ -754,15 +787,15 @@ async fn test_deleting_recursive_submodule_but_keeping_directory(fb: FacebookIni
         large_repo_cs_id,
         vec![
             "large_repo_root",
-            "repo_a/A_A",
-            "repo_a/A_B",
-            "repo_a/A_C",
+            "small_repo/A_A",
+            "small_repo/A_B",
+            "small_repo/A_C",
             // Files from the submodule are now regular files in the small repo
-            "repo_a/submodules/.x-repo-submodule-repo_b",
-            "repo_a/submodules/repo_b/B_A",
-            "repo_a/submodules/repo_b/B_B",
-            "repo_a/submodules/repo_b/submodules/repo_c/C_A",
-            "repo_a/submodules/repo_b/submodules/repo_c/C_B",
+            "small_repo/submodules/.x-repo-submodule-repo_b",
+            "small_repo/submodules/repo_b/B_A",
+            "small_repo/submodules/repo_b/B_B",
+            "small_repo/submodules/repo_b/submodules/repo_c/C_A",
+            "small_repo/submodules/repo_b/submodules/repo_c/C_B",
         ],
     )
     .await?;
@@ -792,13 +825,10 @@ async fn test_deleting_recursive_submodule_but_keeping_directory(fb: FacebookIni
             .commit()
             .await?;
 
-    let repo_b_mapped_git_commit = repo_b
-        .repo_derived_data()
-        .derive::<MappedGitCommitId>(&ctx, chg_repo_c_copy_cs_id)
-        .await?;
-    let repo_b_git_commit_hash = *repo_b_mapped_git_commit.oid();
+    let repo_b_git_commit_hash =
+        git_sha1_from_changeset(&ctx, &repo_b, chg_repo_c_copy_cs_id).await?;
 
-    let chg_sm_path_cs_id = CreateCommitContext::new(&ctx, &repo_a, vec![del_md_file_cs_id])
+    let chg_sm_path_cs_id = CreateCommitContext::new(&ctx, &small_repo, vec![del_md_file_cs_id])
         .set_message(CHANGE_SUBMODULE_PATH_MSG)
         .add_file_with_type(
             REPO_B_SUBMODULE_PATH,
@@ -808,46 +838,48 @@ async fn test_deleting_recursive_submodule_but_keeping_directory(fb: FacebookIni
         .commit()
         .await?;
 
-    let large_repo_cs_id = sync_to_master(ctx.clone(), &commit_syncer, chg_sm_path_cs_id)
-        .await
-        .context("Failed to sync chg_sm_path_cs_id")
-        .and_then(|res| res.ok_or(anyhow!("No commit was synced")))?;
-
-    println!("large_repo_cs_id: {0:#?}", large_repo_cs_id);
-
-    let large_repo_changesets = get_all_changeset_data_from_repo(&ctx, &large_repo).await?;
-    derive_all_data_types_for_repo(&ctx, &large_repo, &large_repo_changesets).await?;
+    let (large_repo_cs_id, large_repo_changesets) = sync_changeset_and_derive_all_types(
+        ctx.clone(),
+        chg_sm_path_cs_id,
+        &large_repo,
+        &commit_syncer,
+    )
+    .await?;
 
     compare_expected_changesets(
         large_repo_changesets.last_chunk::<2>().unwrap(),
         &[
             // Changeset that deletes the submodule metadata file
-            ExpectedChangeset::new_by_file_change(
-                DELETE_METADATA_FILE_MSG,
-                // The submodule files are treated as regular file changes
-                vec![
-                    // repo_b submodule metadata file is updated
-                    "repo_a/submodules/.x-repo-submodule-repo_b",
-                    "repo_a/submodules/repo_b/submodules/repo_c/C_A",
-                    "repo_a/submodules/repo_b/submodules/repo_c/C_B",
-                ],
-                // Only submodule metadata file is deleted
-                vec!["repo_a/submodules/repo_b/submodules/.x-repo-submodule-repo_c"],
-            ),
+            ExpectedChangeset::new(DELETE_METADATA_FILE_MSG)
+                .with_regular_changes(
+                    // The submodule files are treated as regular file changes
+                    vec![
+                        // repo_b submodule metadata file is updated
+                        "small_repo/submodules/.x-repo-submodule-repo_b",
+                        "small_repo/submodules/repo_b/submodules/repo_c/C_A",
+                        "small_repo/submodules/repo_b/submodules/repo_c/C_B",
+                    ],
+                )
+                .with_deletions(
+                    // Only submodule metadata file is deleted
+                    vec!["small_repo/submodules/repo_b/submodules/.x-repo-submodule-repo_c"],
+                ),
             // Changeset that modifies files in the submodule path, which is
             // now a static copy of the submodule
-            ExpectedChangeset::new_by_file_change(
-                CHANGE_SUBMODULE_PATH_MSG,
-                // The submodule files are treated as regular file changes
-                vec![
-                    // repo_b submodule metadata file is updated
-                    "repo_a/submodules/.x-repo-submodule-repo_b",
-                    "repo_a/submodules/repo_b/submodules/repo_c/C_B",
-                    "repo_a/submodules/repo_b/submodules/repo_c/C_C",
-                ],
-                // Only submodule metadata file is deleted
-                vec!["repo_a/submodules/repo_b/submodules/repo_c/C_A"],
-            ),
+            ExpectedChangeset::new(CHANGE_SUBMODULE_PATH_MSG)
+                .with_regular_changes(
+                    // The submodule files are treated as regular file changes
+                    vec![
+                        // repo_b submodule metadata file is updated
+                        "small_repo/submodules/.x-repo-submodule-repo_b",
+                        "small_repo/submodules/repo_b/submodules/repo_c/C_B",
+                        "small_repo/submodules/repo_b/submodules/repo_c/C_C",
+                    ],
+                )
+                .with_deletions(
+                    // Only submodule metadata file is deleted
+                    vec!["small_repo/submodules/repo_b/submodules/repo_c/C_A"],
+                ),
         ],
     )?;
 
@@ -857,15 +889,15 @@ async fn test_deleting_recursive_submodule_but_keeping_directory(fb: FacebookIni
         large_repo_cs_id,
         vec![
             "large_repo_root",
-            "repo_a/A_A",
-            "repo_a/A_B",
-            "repo_a/A_C",
+            "small_repo/A_A",
+            "small_repo/A_B",
+            "small_repo/A_C",
             // Files from the submodule are now regular files in the small repo
-            "repo_a/submodules/.x-repo-submodule-repo_b",
-            "repo_a/submodules/repo_b/B_A",
-            "repo_a/submodules/repo_b/B_B",
-            "repo_a/submodules/repo_b/submodules/repo_c/C_B",
-            "repo_a/submodules/repo_b/submodules/repo_c/C_C",
+            "small_repo/submodules/.x-repo-submodule-repo_b",
+            "small_repo/submodules/repo_b/B_A",
+            "small_repo/submodules/repo_b/B_B",
+            "small_repo/submodules/repo_b/submodules/repo_c/C_B",
+            "small_repo/submodules/repo_b/submodules/repo_c/C_C",
         ],
     )
     .await?;
@@ -875,24 +907,14 @@ async fn test_deleting_recursive_submodule_but_keeping_directory(fb: FacebookIni
         ctx.clone(),
         &commit_syncer,
         del_md_file_cs_id,
-        Some(
-            ChangesetId::from_str(
-                "727dc8e42f7886bfb3bd919d58724cff6c4b7d5ea42410184b4c0027e53d8c54",
-            )
-            .unwrap(),
-        ),
+        Some(first_expected_cs_id),
     )
     .await;
     check_mapping(
         ctx.clone(),
         &commit_syncer,
         chg_sm_path_cs_id,
-        Some(
-            ChangesetId::from_str(
-                "3b28131208374b55997843bdcacef567aa8b1bb09212d2d3168c30ef056dcd60",
-            )
-            .unwrap(),
-        ),
+        Some(large_repo_cs_id),
     )
     .await;
 
@@ -914,13 +936,13 @@ async fn test_deleting_recursive_submodule_but_keeping_directory(fb: FacebookIni
 /// Implicitly deleting a submodule in the source repo (i.e. by adding a file
 /// with the same path) should delete the **entire submodule expansion and its
 /// metadata file**, like when the submodule itself is manually deleted.
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_implicitly_deleting_submodule(fb: FacebookInit) -> Result<()> {
     let ctx = CoreContext::test_mock(fb.clone());
     let (repo_b, _repo_b_cs_map) = build_repo_b(fb).await?;
 
     let SubmoduleSyncTestData {
-        repo_a_info: (repo_a, repo_a_cs_map),
+        small_repo_info: (small_repo, small_repo_cs_map),
         large_repo_info: (large_repo, _large_repo_master),
         commit_syncer,
         ..
@@ -931,39 +953,36 @@ async fn test_implicitly_deleting_submodule(fb: FacebookInit) -> Result<()> {
     )
     .await?;
 
-    const MESSAGE: &str = "Implicitly delete repo_b submodule in repo_a";
+    const MESSAGE: &str = "Implicitly delete repo_b submodule in small_repo";
 
-    let cs_id = CreateCommitContext::new(&ctx, &repo_a, vec![*repo_a_cs_map.get("A_C").unwrap()])
+    let cs_id = CreateCommitContext::new(&ctx, &small_repo, vec![small_repo_cs_map["A_C"]])
         .set_message(MESSAGE)
         .add_file(REPO_B_SUBMODULE_PATH, "File implicitly deleting submodule")
         .commit()
         .await?;
 
-    let large_repo_cs_id = sync_to_master(ctx.clone(), &commit_syncer, cs_id)
-        .await?
-        .ok_or(anyhow!("Commit wasn't synced"))?;
-
-    println!("large_repo_cs_id: {}", large_repo_cs_id);
-
-    let large_repo_changesets = get_all_changeset_data_from_repo(&ctx, &large_repo).await?;
-    derive_all_data_types_for_repo(&ctx, &large_repo, &large_repo_changesets).await?;
+    let (large_repo_cs_id, large_repo_changesets) =
+        sync_changeset_and_derive_all_types(ctx.clone(), cs_id, &large_repo, &commit_syncer)
+            .await?;
 
     compare_expected_changesets_from_basic_setup(
         &large_repo_changesets,
-        &[ExpectedChangeset::new_by_file_change(
-            MESSAGE,
-            // Add a regular file in the same path as the submodule expansion
-            vec!["repo_a/submodules/repo_b"],
-            // Files being deleted
-            vec![
-                // The submodule metadata file should also be deleted
-                "repo_a/submodules/.x-repo-submodule-repo_b",
-                // NOTE: no need to have explicit deletions for these files, because
-                // they're being deleted implicitly.
-                // "repo_a/submodules/repo_b/B_A",
-                // "repo_a/submodules/repo_b/B_B",
-            ],
-        )],
+        &[ExpectedChangeset::new(MESSAGE)
+            .with_regular_changes(
+                // Add a regular file in the same path as the submodule expansion
+                vec!["small_repo/submodules/repo_b"],
+            )
+            .with_deletions(
+                // Files being deleted
+                vec![
+                    // The submodule metadata file should also be deleted
+                    "small_repo/submodules/.x-repo-submodule-repo_b",
+                    // NOTE: no need to have explicit deletions for these files, because
+                    // they're being deleted implicitly.
+                    // "small_repo/submodules/repo_b/B_A",
+                    // "small_repo/submodules/repo_b/B_B",
+                ],
+            )],
     )?;
 
     // Assert that the submodule expansion was actually deleted implicitly
@@ -973,31 +992,27 @@ async fn test_implicitly_deleting_submodule(fb: FacebookInit) -> Result<()> {
         large_repo_cs_id,
         vec![
             "large_repo_root",
-            "repo_a/A_A",
-            "repo_a/A_B",
-            "repo_a/A_C",
-            "repo_a/submodules/repo_b",
+            "small_repo/A_A",
+            "small_repo/A_B",
+            "small_repo/A_C",
+            "small_repo/submodules/repo_b",
         ],
     )
     .await?;
 
-    let expected_cs_id =
-        ChangesetId::from_str("723b5fd70f5a429c35fef028b7165f63c7f94821493db9188d83f6a2603b91a5")
-            .unwrap();
-
-    check_mapping(ctx.clone(), &commit_syncer, cs_id, Some(expected_cs_id)).await;
+    check_mapping(ctx.clone(), &commit_syncer, cs_id, Some(large_repo_cs_id)).await;
     Ok(())
 }
 
 /// Implicitly deleting files in the submodule repo (repo_b) should generate the
 /// proper deletions in its expansion.
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_implicit_deletions_inside_submodule_repo(fb: FacebookInit) -> Result<()> {
     let ctx = CoreContext::test_mock(fb.clone());
     let (repo_b, repo_b_cs_map) = build_repo_b(fb).await?;
 
     let SubmoduleSyncTestData {
-        repo_a_info: (repo_a, repo_a_cs_map),
+        small_repo_info: (small_repo, small_repo_cs_map),
         large_repo_info: (large_repo, _large_repo_master),
         commit_syncer,
         ..
@@ -1023,17 +1038,12 @@ async fn test_implicit_deletions_inside_submodule_repo(fb: FacebookInit) -> Resu
         .commit()
         .await?;
 
-    let repo_b_mapped_git_commit = repo_b
-        .repo_derived_data()
-        .derive::<MappedGitCommitId>(&ctx, repo_b_cs_id)
-        .await?;
-
-    let repo_b_git_commit_hash = *repo_b_mapped_git_commit.oid();
+    let repo_b_git_commit_hash = git_sha1_from_changeset(&ctx, &repo_b, repo_b_cs_id).await?;
 
     // Update repo B submodule pointer in repo A to point to the last commit
     // with the implicit deletions.
     const MESSAGE: &str = "Update submodule after implicit deletions";
-    let cs_id = CreateCommitContext::new(&ctx, &repo_a, vec![*repo_a_cs_map.get("A_C").unwrap()])
+    let cs_id = CreateCommitContext::new(&ctx, &small_repo, vec![small_repo_cs_map["A_C"]])
         .set_message(MESSAGE)
         .add_file_with_type(
             REPO_B_SUBMODULE_PATH,
@@ -1043,42 +1053,34 @@ async fn test_implicit_deletions_inside_submodule_repo(fb: FacebookInit) -> Resu
         .commit()
         .await?;
 
-    let large_repo_master = sync_to_master(ctx.clone(), &commit_syncer, cs_id)
-        .await?
-        .ok_or(anyhow!("Failed to sync commit"))?;
+    let (large_repo_cs_id, large_repo_changesets) =
+        sync_changeset_and_derive_all_types(ctx.clone(), cs_id, &large_repo, &commit_syncer)
+            .await?;
 
-    let large_repo_changesets = get_all_changeset_data_from_repo(&ctx, &large_repo).await?;
-    derive_all_data_types_for_repo(&ctx, &large_repo, &large_repo_changesets).await?;
-
-    let expected_cs_id =
-        ChangesetId::from_str("7fc76cfa1906ccc74f86322cf529c5508867b5cfef8b80fb65a425e835f4b92b")
-            .unwrap();
-
-    check_mapping(ctx.clone(), &commit_syncer, cs_id, Some(expected_cs_id)).await;
+    check_mapping(ctx.clone(), &commit_syncer, cs_id, Some(large_repo_cs_id)).await;
 
     compare_expected_changesets_from_basic_setup(
         &large_repo_changesets,
-        &[ExpectedChangeset::new_by_file_change(
-            MESSAGE,
-            // Submodule metadata file is updated
-            vec![
-                "repo_a/submodules/.x-repo-submodule-repo_b",
-                "repo_a/submodules/repo_b/some_dir",
-            ],
+        &[
+            ExpectedChangeset::new(MESSAGE).with_regular_changes(
+                // Submodule metadata file is updated
+                vec![
+                    "small_repo/submodules/.x-repo-submodule-repo_b",
+                    "small_repo/submodules/repo_b/some_dir",
+                ],
+            ),
             // NOTE: no need to have explicit deletions for these files, because
-            // they're being deleted implicitly.
-            vec![
-                // "repo_a/submodules/repo_b/some_dir/file_x",
-                // "repo_a/submodules/repo_b/some_dir/file_y"
-            ],
-        )],
+            // they're being deleted implicitly:
+            // "small_repo/submodules/repo_b/some_dir/file_x",
+            // "small_repo/submodules/repo_b/some_dir/file_y"
+        ],
     )?;
 
     check_submodule_metadata_file_in_large_repo(
         &ctx,
         &large_repo,
-        expected_cs_id,
-        NonRootMPath::new("repo_a/submodules/.x-repo-submodule-repo_b")?,
+        large_repo_cs_id,
+        NonRootMPath::new("small_repo/submodules/.x-repo-submodule-repo_b")?,
         &repo_b_git_commit_hash,
     )
     .await?;
@@ -1088,16 +1090,16 @@ async fn test_implicit_deletions_inside_submodule_repo(fb: FacebookInit) -> Resu
     assert_working_copy_matches_expected(
         &ctx,
         &large_repo,
-        large_repo_master,
+        large_repo_cs_id,
         vec![
             "large_repo_root",
-            "repo_a/A_A",
-            "repo_a/A_B",
-            "repo_a/A_C",
-            "repo_a/submodules/.x-repo-submodule-repo_b",
-            "repo_a/submodules/repo_b/B_A",
-            "repo_a/submodules/repo_b/B_B",
-            "repo_a/submodules/repo_b/some_dir",
+            "small_repo/A_A",
+            "small_repo/A_B",
+            "small_repo/A_C",
+            "small_repo/submodules/.x-repo-submodule-repo_b",
+            "small_repo/submodules/repo_b/B_A",
+            "small_repo/submodules/repo_b/B_B",
+            "small_repo/submodules/repo_b/some_dir",
         ],
     )
     .await?;
@@ -1108,7 +1110,7 @@ async fn test_implicit_deletions_inside_submodule_repo(fb: FacebookInit) -> Resu
 /// Test adding a submodule dependency in the source repo in the path of an existing
 /// file. This should generate a deletion of the file in the large repo, along
 /// with the expansion of the submodule.
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_implicitly_deleting_file_with_submodule(fb: FacebookInit) -> Result<()> {
     let ctx = CoreContext::test_mock(fb.clone());
     let (repo_b, _repo_b_cs_map) = build_repo_b(fb).await?;
@@ -1117,9 +1119,8 @@ async fn test_implicitly_deleting_file_with_submodule(fb: FacebookInit) -> Resul
     let (repo_c, repo_c_cs_map) = build_repo_c(fb).await?;
 
     let SubmoduleSyncTestData {
-        repo_a_info: (repo_a, repo_a_cs_map),
+        small_repo_info: (small_repo, small_repo_cs_map),
         large_repo_info: (large_repo, _large_repo_master),
-        mapping,
         live_commit_sync_config,
         test_sync_config_source,
         ..
@@ -1138,28 +1139,23 @@ async fn test_implicitly_deleting_file_with_submodule(fb: FacebookInit) -> Resul
     // submodule deps.
     let commit_syncer = add_new_commit_sync_config_version_with_submodule_deps(
         &ctx,
-        &repo_a,
+        &small_repo,
         &large_repo,
-        "repo_a",
+        "small_repo",
         vec![
             (NonRootMPath::new(REPO_B_SUBMODULE_PATH)?, repo_b.clone()),
             // Add it as a submdule in the path of the existing `A_A` file.
             (NonRootMPath::new("A_A").unwrap(), repo_c.clone()),
         ],
-        mapping,
         live_commit_sync_config,
         test_sync_config_source,
     )?;
 
-    let repo_c_mapped_git_commit = repo_c
-        .repo_derived_data()
-        .derive::<MappedGitCommitId>(&ctx, repo_c_cs_map["C_B"])
-        .await?;
-
-    let repo_c_git_commit_hash = *repo_c_mapped_git_commit.oid();
+    let repo_c_git_commit_hash =
+        git_sha1_from_changeset(&ctx, &repo_c, repo_c_cs_map["C_B"]).await?;
 
     const MESSAGE: &str = "Add submodule on path of existing file";
-    let cs_id = CreateCommitContext::new(&ctx, &repo_a, vec![repo_a_cs_map["A_C"]])
+    let cs_id = CreateCommitContext::new(&ctx, &small_repo, vec![small_repo_cs_map["A_C"]])
         .set_message(MESSAGE)
         .add_file_with_type(
             "A_A",
@@ -1169,39 +1165,31 @@ async fn test_implicitly_deleting_file_with_submodule(fb: FacebookInit) -> Resul
         .commit()
         .await?;
 
-    let _large_repo_cs_id = sync_to_master(ctx.clone(), &commit_syncer, cs_id).await?;
+    let (large_repo_cs_id, large_repo_changesets) =
+        sync_changeset_and_derive_all_types(ctx.clone(), cs_id, &large_repo, &commit_syncer)
+            .await?;
 
-    let large_repo_changesets = get_all_changeset_data_from_repo(&ctx, &large_repo).await?;
-
-    derive_all_data_types_for_repo(&ctx, &large_repo, large_repo_changesets.as_slice()).await?;
-
-    let expected_cs_id =
-        ChangesetId::from_str("a586b2e4b85ef2ab37aa37a78711d82a10733098975c2ea352f3d80729d5cd6f")
-            .unwrap();
-
-    check_mapping(ctx.clone(), &commit_syncer, cs_id, Some(expected_cs_id)).await;
+    check_mapping(ctx.clone(), &commit_syncer, cs_id, Some(large_repo_cs_id)).await;
 
     compare_expected_changesets_from_basic_setup(
         &large_repo_changesets,
-        &[ExpectedChangeset::new_by_file_change(
-            MESSAGE,
-            vec![
-                "repo_a/.x-repo-submodule-A_A",
-                "repo_a/A_A/C_A",
-                "repo_a/A_A/C_B",
-            ],
-            vec![
+        &[ExpectedChangeset::new(MESSAGE)
+            .with_regular_changes(vec![
+                "small_repo/.x-repo-submodule-A_A",
+                "small_repo/A_A/C_A",
+                "small_repo/A_A/C_B",
+            ])
+            .with_deletions(vec![
                 // The original file is deleted because of the submodule expansion
-                "repo_a/A_A",
-            ],
-        )],
+                "small_repo/A_A",
+            ])],
     )?;
 
     check_submodule_metadata_file_in_large_repo(
         &ctx,
         &large_repo,
-        expected_cs_id,
-        NonRootMPath::new("repo_a/.x-repo-submodule-A_A")?,
+        large_repo_cs_id,
+        NonRootMPath::new("small_repo/.x-repo-submodule-A_A")?,
         &repo_c_git_commit_hash,
     )
     .await?;
@@ -1212,7 +1200,7 @@ async fn test_implicitly_deleting_file_with_submodule(fb: FacebookInit) -> Resul
 /// Test adding a submodule dependency in the source repo in the path of an
 /// existing **directory**. This should generate a deletion for all the files
 /// in the directory, along with the expansion of the submodule.
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_adding_submodule_on_existing_directory(fb: FacebookInit) -> Result<()> {
     let ctx = CoreContext::test_mock(fb.clone());
     let (repo_b, _repo_b_cs_map) = build_repo_b(fb).await?;
@@ -1223,10 +1211,9 @@ async fn test_adding_submodule_on_existing_directory(fb: FacebookInit) -> Result
     let dir_path = NonRootMPath::new("some_dir/subdir")?;
 
     let SubmoduleSyncTestData {
-        repo_a_info: (repo_a, repo_a_cs_map),
+        small_repo_info: (small_repo, small_repo_cs_map),
         large_repo_info: (large_repo, _large_repo_master),
         commit_syncer,
-        mapping,
         live_commit_sync_config,
         test_sync_config_source,
         ..
@@ -1239,7 +1226,7 @@ async fn test_adding_submodule_on_existing_directory(fb: FacebookInit) -> Result
     .await?;
 
     const ADD_DIR_MSG: &str = "Create directory with a few files";
-    let add_dir_cs_id = CreateCommitContext::new(&ctx, &repo_a, vec![repo_a_cs_map["A_C"]])
+    let add_dir_cs_id = CreateCommitContext::new(&ctx, &small_repo, vec![small_repo_cs_map["A_C"]])
         .set_message(ADD_DIR_MSG)
         .add_files(btreemap! {
             dir_path.join(&NonRootMPath::new("file_x")?) => "File X",
@@ -1262,28 +1249,23 @@ async fn test_adding_submodule_on_existing_directory(fb: FacebookInit) -> Result
     // path of an existing directory.
     let commit_syncer = add_new_commit_sync_config_version_with_submodule_deps(
         &ctx,
-        &repo_a,
+        &small_repo,
         &large_repo,
-        "repo_a",
+        "small_repo",
         vec![
             (NonRootMPath::new(REPO_B_SUBMODULE_PATH)?, repo_b.clone()),
             // Add the submodule path to the config
             (dir_path.clone(), repo_c.clone()),
         ],
-        mapping,
         live_commit_sync_config,
         test_sync_config_source,
     )?;
 
-    let repo_c_mapped_git_commit = repo_c
-        .repo_derived_data()
-        .derive::<MappedGitCommitId>(&ctx, repo_c_cs_map["C_B"])
-        .await?;
-
-    let repo_c_git_commit_hash = *repo_c_mapped_git_commit.oid();
+    let repo_c_git_commit_hash =
+        git_sha1_from_changeset(&ctx, &repo_c, repo_c_cs_map["C_B"]).await?;
 
     const MESSAGE: &str = "Add submodule on path of existing directory";
-    let cs_id = CreateCommitContext::new(&ctx, &repo_a, vec![add_dir_cs_id])
+    let cs_id = CreateCommitContext::new(&ctx, &small_repo, vec![add_dir_cs_id])
         .set_message(MESSAGE)
         .add_file_with_type(
             dir_path,
@@ -1293,63 +1275,49 @@ async fn test_adding_submodule_on_existing_directory(fb: FacebookInit) -> Result
         .commit()
         .await?;
 
-    let _large_repo_cs_id = sync_to_master(ctx.clone(), &commit_syncer, cs_id)
-        .await
-        .context("Failed to sync commit replacing existing directory with submodule expansion")?;
-
-    let large_repo_changesets = get_all_changeset_data_from_repo(&ctx, &large_repo).await?;
-
-    derive_all_data_types_for_repo(&ctx, &large_repo, large_repo_changesets.as_slice()).await?;
-
-    let expected_cs_id =
-        ChangesetId::from_str("349e55c3d49f9c4841e218c49fb3bee3e6ea29fa8a95774df22f7cd307a109ad")
-            .unwrap();
+    let (large_repo_cs_id, large_repo_changesets) =
+        sync_changeset_and_derive_all_types(ctx.clone(), cs_id, &large_repo, &commit_syncer)
+            .await?;
 
     compare_expected_changesets_from_basic_setup(
         &large_repo_changesets,
         &[
-            ExpectedChangeset::new_by_file_change(
-                ADD_DIR_MSG,
-                vec![
-                    "repo_a/some_dir/subdir/file_x",
-                    "repo_a/some_dir/subdir/file_y",
-                    "repo_a/some_dir/subdir/file_z",
-                    "repo_a/some_dir/subdir/C_A",
-                ],
-                vec![],
-            ),
-            ExpectedChangeset::new_by_file_change(
-                MESSAGE,
-                vec![
-                    "repo_a/some_dir/.x-repo-submodule-subdir",
-                    "repo_a/some_dir/subdir/C_A",
-                    "repo_a/some_dir/subdir/C_B",
-                ],
-                vec![
+            ExpectedChangeset::new(ADD_DIR_MSG).with_regular_changes(vec![
+                "small_repo/some_dir/subdir/file_x",
+                "small_repo/some_dir/subdir/file_y",
+                "small_repo/some_dir/subdir/file_z",
+                "small_repo/some_dir/subdir/C_A",
+            ]),
+            ExpectedChangeset::new(MESSAGE)
+                .with_regular_changes(vec![
+                    "small_repo/some_dir/.x-repo-submodule-subdir",
+                    "small_repo/some_dir/subdir/C_A",
+                    "small_repo/some_dir/subdir/C_B",
+                ])
+                .with_deletions(vec![
                     // All files from the directory should be deleted with
                     // the addition of a submodule expansion on the same path
-                    "repo_a/some_dir/subdir/file_x",
-                    "repo_a/some_dir/subdir/file_y",
-                    "repo_a/some_dir/subdir/file_z",
+                    "small_repo/some_dir/subdir/file_x",
+                    "small_repo/some_dir/subdir/file_y",
+                    "small_repo/some_dir/subdir/file_z",
                     // NOTE: We DON'T actually want a deletion for C_A, because
                     // the submodule expansion has the file with the same path.
                     // I'm leaving this commented out to convey this clearly.
-                    // "repo_a/some_dir/subdir/C_A",
-                ],
-            ),
+                    // "small_repo/some_dir/subdir/C_A",
+                ]),
         ],
     )?;
 
     check_submodule_metadata_file_in_large_repo(
         &ctx,
         &large_repo,
-        expected_cs_id,
-        NonRootMPath::new("repo_a/some_dir/.x-repo-submodule-subdir")?,
+        large_repo_cs_id,
+        NonRootMPath::new("small_repo/some_dir/.x-repo-submodule-subdir")?,
         &repo_c_git_commit_hash,
     )
     .await?;
 
-    check_mapping(ctx.clone(), &commit_syncer, cs_id, Some(expected_cs_id)).await;
+    check_mapping(ctx.clone(), &commit_syncer, cs_id, Some(large_repo_cs_id)).await;
 
     Ok(())
 }
@@ -1357,7 +1325,7 @@ async fn test_adding_submodule_on_existing_directory(fb: FacebookInit) -> Result
 // ------------------ Unexpected state / Error handling ------------------
 
 /// Test that sync fails if submodule dependency repo is not available.
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_submodule_expansion_crashes_when_dep_not_available(fb: FacebookInit) -> Result<()> {
     let ctx = CoreContext::test_mock(fb.clone());
     let (repo_b, _repo_b_cs_map) = build_repo_b(fb).await?;
@@ -1366,7 +1334,7 @@ async fn test_submodule_expansion_crashes_when_dep_not_available(fb: FacebookIni
     let (repo_c, repo_c_cs_map) = build_repo_c(fb).await?;
 
     let SubmoduleSyncTestData {
-        repo_a_info: (repo_a, repo_a_cs_map),
+        small_repo_info: (small_repo, small_repo_cs_map),
         large_repo_info: (large_repo, _large_repo_master),
         commit_syncer,
         ..
@@ -1379,16 +1347,12 @@ async fn test_submodule_expansion_crashes_when_dep_not_available(fb: FacebookIni
     .await?;
 
     // Get a git commit from repo C
-    let repo_c_mapped_git_commit = repo_c
-        .repo_derived_data()
-        .derive::<MappedGitCommitId>(&ctx, repo_c_cs_map["C_B"])
-        .await?;
-
-    let repo_c_git_commit_hash = *repo_c_mapped_git_commit.oid();
+    let repo_c_git_commit_hash =
+        git_sha1_from_changeset(&ctx, &repo_c, repo_c_cs_map["C_B"]).await?;
 
     // Create a commit in repo A that adds repo C as a submodule.
     const MESSAGE: &str = "Add submodule on path of existing file";
-    let cs_id = CreateCommitContext::new(&ctx, &repo_a, vec![repo_a_cs_map["A_C"]])
+    let cs_id = CreateCommitContext::new(&ctx, &small_repo, vec![small_repo_cs_map["A_C"]])
         .set_message(MESSAGE)
         .add_file_with_type(
             "submodules/repo_c",
@@ -1413,7 +1377,7 @@ async fn test_submodule_expansion_crashes_when_dep_not_available(fb: FacebookIni
     // Get all the changesets in the large repo
     let large_repo_changesets = get_all_changeset_data_from_repo(&ctx, &large_repo).await?;
 
-    derive_all_data_types_for_repo(&ctx, &large_repo, large_repo_changesets.as_slice()).await?;
+    derive_all_enabled_types_for_repo(&ctx, &large_repo, large_repo_changesets.as_slice()).await?;
 
     // And confirm that nothing was synced, i.e. all changesets are from the basic
     // setup.
@@ -1428,7 +1392,7 @@ async fn test_submodule_expansion_crashes_when_dep_not_available(fb: FacebookIni
 /// It's an unlikely scenario, but we want to be certain of what would happen,
 /// because users might, for example, manually copy directories from the large
 /// repo to the git repo.
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_submodule_validation_fails_with_file_on_metadata_file_path_in_small_repo(
     fb: FacebookInit,
 ) -> Result<()> {
@@ -1436,7 +1400,7 @@ async fn test_submodule_validation_fails_with_file_on_metadata_file_path_in_smal
     let (repo_b, repo_b_cs_map) = build_repo_b(fb).await?;
 
     let SubmoduleSyncTestData {
-        repo_a_info: (repo_a, repo_a_cs_map),
+        small_repo_info: (small_repo, small_repo_cs_map),
         large_repo_info: (large_repo, _large_repo_master),
         commit_syncer,
         ..
@@ -1450,18 +1414,19 @@ async fn test_submodule_validation_fails_with_file_on_metadata_file_path_in_smal
     const MESSAGE_CS_1: &str =
         "Add file with same path as a submodule metadata file with random content";
 
-    let repo_a_cs_id = CreateCommitContext::new(&ctx, &repo_a, vec![repo_a_cs_map["A_C"]])
-        .set_message(MESSAGE_CS_1)
-        .add_file(
-            "submodules/.x-repo-submodule-repo_b",
-            "File that should only exist in the large repo",
-        )
-        .commit()
-        .await?;
+    let small_repo_cs_id =
+        CreateCommitContext::new(&ctx, &small_repo, vec![small_repo_cs_map["A_C"]])
+            .set_message(MESSAGE_CS_1)
+            .add_file(
+                "submodules/.x-repo-submodule-repo_b",
+                "File that should only exist in the large repo",
+            )
+            .commit()
+            .await?;
 
     println!("Trying to sync changeset #1!");
 
-    let sync_result = sync_to_master(ctx.clone(), &commit_syncer, repo_a_cs_id)
+    let sync_result = sync_to_master(ctx.clone(), &commit_syncer, small_repo_cs_id)
         .await
         .context("sync_to_master failed")
         .and_then(|res| res.ok_or(anyhow!("No commit was synced")));
@@ -1482,7 +1447,7 @@ async fn test_submodule_validation_fails_with_file_on_metadata_file_path_in_smal
     println!("large_repo_changesets: {:#?}\n\n", &large_repo_changesets);
 
     // When this is fixed, the commit sync should fail, instead of validation.
-    // check_mapping(ctx.clone(), &commit_syncer, repo_a_cs_id, None).await;
+    // check_mapping(ctx.clone(), &commit_syncer, small_repo_cs_id, None).await;
 
     // Do the same thing, but adding a valid git commit has in the file
     // To see what happens if a user tries updating a submodule in a weird
@@ -1490,25 +1455,22 @@ async fn test_submodule_validation_fails_with_file_on_metadata_file_path_in_smal
     const MESSAGE_CS_2: &str =
         "Add file with same path as a submodule metadata file with valid git commit hash";
 
-    let repo_b_mapped_git_commit = repo_b
-        .repo_derived_data()
-        .derive::<MappedGitCommitId>(&ctx, repo_b_cs_map["B_A"])
-        .await?;
+    let repo_b_git_commit_hash =
+        git_sha1_from_changeset(&ctx, &repo_b, repo_b_cs_map["B_A"]).await?;
 
-    let repo_b_git_commit_hash = *repo_b_mapped_git_commit.oid();
-
-    let repo_a_cs_id = CreateCommitContext::new(&ctx, &repo_a, vec![repo_a_cs_map["A_C"]])
-        .set_message(MESSAGE_CS_2)
-        .add_file_with_type(
-            REPO_B_SUBMODULE_PATH,
-            repo_b_git_commit_hash.into_inner(),
-            FileType::GitSubmodule,
-        )
-        .commit()
-        .await?;
+    let small_repo_cs_id =
+        CreateCommitContext::new(&ctx, &small_repo, vec![small_repo_cs_map["A_C"]])
+            .set_message(MESSAGE_CS_2)
+            .add_file_with_type(
+                REPO_B_SUBMODULE_PATH,
+                repo_b_git_commit_hash.into_inner(),
+                FileType::GitSubmodule,
+            )
+            .commit()
+            .await?;
 
     println!("Trying to sync changeset #2!");
-    let sync_result = sync_to_master(ctx.clone(), &commit_syncer, repo_a_cs_id)
+    let sync_result = sync_to_master(ctx.clone(), &commit_syncer, small_repo_cs_id)
         .await
         .context("sync_to_master failed")
         .and_then(|res| res.ok_or(anyhow!("No commit was synced")));
@@ -1524,24 +1486,21 @@ async fn test_submodule_validation_fails_with_file_on_metadata_file_path_in_smal
     // }));
 
     // When this is fixed, the commit sync should fail, instead of validation.
-    // check_mapping(ctx.clone(), &commit_syncer, repo_a_cs_id, None).await;
+    // check_mapping(ctx.clone(), &commit_syncer, small_repo_cs_id, None).await;
 
     Ok(())
 }
 
 /// Similar to the test above, but adding a file that maps to a submodule
 /// metadata file path of a recursive submodule.
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_submodule_validation_fails_with_file_on_metadata_file_path_in_recursive_submodule(
     fb: FacebookInit,
 ) -> Result<()> {
     let ctx = CoreContext::test_mock(fb.clone());
     let (repo_c, repo_c_cs_map) = build_repo_c(fb).await?;
-    let c_master_mapped_git_commit = repo_c
-        .repo_derived_data()
-        .derive::<MappedGitCommitId>(&ctx, repo_c_cs_map["C_B"])
-        .await?;
-    let c_master_git_sha1 = *c_master_mapped_git_commit.oid();
+
+    let c_master_git_sha1 = git_sha1_from_changeset(&ctx, &repo_c, repo_c_cs_map["C_B"]).await?;
 
     let repo_c_submodule_path_in_repo_b = NonRootMPath::new("submodules/repo_c")?;
     let (repo_b, repo_b_cs_map) =
@@ -1551,7 +1510,7 @@ async fn test_submodule_validation_fails_with_file_on_metadata_file_path_in_recu
     let repo_c_submodule_path =
         NonRootMPath::new(REPO_B_SUBMODULE_PATH)?.join(&repo_c_submodule_path_in_repo_b);
     let SubmoduleSyncTestData {
-        repo_a_info: (repo_a, repo_a_cs_map),
+        small_repo_info: (small_repo, small_repo_cs_map),
         large_repo_info: (_large_repo, _large_repo_master),
         commit_syncer,
         ..
@@ -1576,26 +1535,23 @@ async fn test_submodule_validation_fails_with_file_on_metadata_file_path_in_recu
         .commit()
         .await?;
 
-    let repo_b_mapped_git_commit = repo_b
-        .repo_derived_data()
-        .derive::<MappedGitCommitId>(&ctx, repo_b_cs_id)
-        .await?;
-    let repo_b_git_commit_hash = *repo_b_mapped_git_commit.oid();
+    let repo_b_git_commit_hash = git_sha1_from_changeset(&ctx, &repo_b, repo_b_cs_id).await?;
 
     const MESSAGE: &str =
         "Update repo_b submodule after adding a file in the same place as a metadata file";
 
-    let repo_a_cs_id = CreateCommitContext::new(&ctx, &repo_a, vec![repo_a_cs_map["A_C"]])
-        .set_message(MESSAGE)
-        .add_file_with_type(
-            REPO_B_SUBMODULE_PATH,
-            repo_b_git_commit_hash.into_inner(),
-            FileType::GitSubmodule,
-        )
-        .commit()
-        .await?;
+    let small_repo_cs_id =
+        CreateCommitContext::new(&ctx, &small_repo, vec![small_repo_cs_map["A_C"]])
+            .set_message(MESSAGE)
+            .add_file_with_type(
+                REPO_B_SUBMODULE_PATH,
+                repo_b_git_commit_hash.into_inner(),
+                FileType::GitSubmodule,
+            )
+            .commit()
+            .await?;
 
-    let sync_result = sync_to_master(ctx.clone(), &commit_syncer, repo_a_cs_id)
+    let sync_result = sync_to_master(ctx.clone(), &commit_syncer, small_repo_cs_id)
         .await
         .context("sync_to_master failed")
         .and_then(|res| res.ok_or(anyhow!("No commit was synced")));
@@ -1613,7 +1569,7 @@ async fn test_submodule_validation_fails_with_file_on_metadata_file_path_in_recu
     // }));
 
     // When this is fixed, the commit sync should fail, instead of validation.
-    // check_mapping(ctx.clone(), &commit_syncer, repo_a_cs_id, None).await;
+    // check_mapping(ctx.clone(), &commit_syncer, small_repo_cs_id, None).await;
 
     Ok(())
 }
@@ -1623,16 +1579,12 @@ async fn test_submodule_validation_fails_with_file_on_metadata_file_path_in_recu
 /// the pointer didn't exist in the submodule.
 /// The list of known dangling submodule pointers can be set in the small repo's
 /// sync config.
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_expanding_known_dangling_submodule_pointers(fb: FacebookInit) -> Result<()> {
     let ctx = CoreContext::test_mock(fb.clone());
 
     let (repo_c, repo_c_cs_map) = build_repo_c(fb).await?;
-    let c_master_mapped_git_commit = repo_c
-        .repo_derived_data()
-        .derive::<MappedGitCommitId>(&ctx, repo_c_cs_map["C_B"])
-        .await?;
-    let c_master_git_sha1 = *c_master_mapped_git_commit.oid();
+    let c_master_git_sha1 = git_sha1_from_changeset(&ctx, &repo_c, repo_c_cs_map["C_B"]).await?;
 
     let repo_c_submodule_path_in_repo_b = NonRootMPath::new("submodules/repo_c")?;
     let (repo_b, repo_b_cs_map) =
@@ -1642,7 +1594,7 @@ async fn test_expanding_known_dangling_submodule_pointers(fb: FacebookInit) -> R
         NonRootMPath::new(REPO_B_SUBMODULE_PATH)?.join(&repo_c_submodule_path_in_repo_b);
 
     let SubmoduleSyncTestData {
-        repo_a_info: (repo_a, repo_a_cs_map),
+        small_repo_info: (small_repo, small_repo_cs_map),
         large_repo_info: (large_repo, _large_repo_master),
         commit_syncer,
         ..
@@ -1662,8 +1614,8 @@ async fn test_expanding_known_dangling_submodule_pointers(fb: FacebookInit) -> R
     // Test expanding a known dangling submodule pointer
     let repo_b_dangling_pointer = GitSha1::from_str(REPO_B_DANGLING_GIT_COMMIT_HASH)?;
 
-    let repo_a_cs_id =
-        CreateCommitContext::new(&ctx, &repo_a, vec![*repo_a_cs_map.get("A_C").unwrap()])
+    let small_repo_cs_id =
+        CreateCommitContext::new(&ctx, &small_repo, vec![small_repo_cs_map["A_C"]])
             .set_message(COMMIT_MSG_1)
             .add_file_with_type(
                 REPO_B_SUBMODULE_PATH,
@@ -1673,7 +1625,7 @@ async fn test_expanding_known_dangling_submodule_pointers(fb: FacebookInit) -> R
             .commit()
             .await?;
 
-    let large_repo_cs_id = sync_to_master(ctx.clone(), &commit_syncer, repo_a_cs_id)
+    let large_repo_cs_id = sync_to_master(ctx.clone(), &commit_syncer, small_repo_cs_id)
         .await?
         .ok_or(anyhow!("Failed to sync commit"))?;
 
@@ -1684,7 +1636,9 @@ async fn test_expanding_known_dangling_submodule_pointers(fb: FacebookInit) -> R
         .context("Failed to load bonsai in large repo")?;
     let readme_file_change = bonsai
         .file_changes_map()
-        .get(&NonRootMPath::new("repo_a/submodules/repo_b/README.TXT")?)
+        .get(&NonRootMPath::new(
+            "small_repo/submodules/repo_b/README.TXT",
+        )?)
         .ok_or(anyhow!(
             "No file change for README file about dangling submodule pointer"
         ))?;
@@ -1706,7 +1660,7 @@ async fn test_expanding_known_dangling_submodule_pointers(fb: FacebookInit) -> R
         &ctx,
         &large_repo,
         large_repo_cs_id,
-        NonRootMPath::new("repo_a/submodules/.x-repo-submodule-repo_b")?,
+        NonRootMPath::new("small_repo/submodules/.x-repo-submodule-repo_b")?,
         &repo_b_dangling_pointer,
     )
     .await?;
@@ -1714,7 +1668,7 @@ async fn test_expanding_known_dangling_submodule_pointers(fb: FacebookInit) -> R
     check_mapping(
         ctx.clone(),
         &commit_syncer,
-        repo_a_cs_id,
+        small_repo_cs_id,
         Some(large_repo_cs_id),
     )
     .await;
@@ -1730,13 +1684,9 @@ async fn test_expanding_known_dangling_submodule_pointers(fb: FacebookInit) -> R
             .commit()
             .await?;
 
-    let repo_b_mapped_git_commit = repo_b
-        .repo_derived_data()
-        .derive::<MappedGitCommitId>(&ctx, repo_b_cs_id)
-        .await?;
-    let repo_b_git_commit_hash = *repo_b_mapped_git_commit.oid();
+    let repo_b_git_commit_hash = git_sha1_from_changeset(&ctx, &repo_b, repo_b_cs_id).await?;
 
-    let repo_a_cs_id = CreateCommitContext::new(&ctx, &repo_a, vec![repo_a_cs_id])
+    let small_repo_cs_id = CreateCommitContext::new(&ctx, &small_repo, vec![small_repo_cs_id])
         .set_message(COMMIT_MSG_2)
         .add_file_with_type(
             REPO_B_SUBMODULE_PATH,
@@ -1746,7 +1696,7 @@ async fn test_expanding_known_dangling_submodule_pointers(fb: FacebookInit) -> R
         .commit()
         .await?;
 
-    let large_repo_cs_id = sync_to_master(ctx.clone(), &commit_syncer, repo_a_cs_id)
+    let large_repo_cs_id = sync_to_master(ctx.clone(), &commit_syncer, small_repo_cs_id)
         .await?
         .ok_or(anyhow!("Failed to sync commit"))?;
 
@@ -1754,7 +1704,7 @@ async fn test_expanding_known_dangling_submodule_pointers(fb: FacebookInit) -> R
         &ctx,
         &large_repo,
         large_repo_cs_id,
-        NonRootMPath::new("repo_a/submodules/.x-repo-submodule-repo_b")?,
+        NonRootMPath::new("small_repo/submodules/.x-repo-submodule-repo_b")?,
         &repo_b_git_commit_hash,
     )
     .await?;
@@ -1762,7 +1712,7 @@ async fn test_expanding_known_dangling_submodule_pointers(fb: FacebookInit) -> R
     check_mapping(
         ctx.clone(),
         &commit_syncer,
-        repo_a_cs_id,
+        small_repo_cs_id,
         Some(large_repo_cs_id),
     )
     .await;
@@ -1784,13 +1734,9 @@ async fn test_expanding_known_dangling_submodule_pointers(fb: FacebookInit) -> R
         .commit()
         .await?;
 
-    let repo_b_mapped_git_commit = repo_b
-        .repo_derived_data()
-        .derive::<MappedGitCommitId>(&ctx, repo_b_cs_id)
-        .await?;
-    let repo_b_git_commit_hash = *repo_b_mapped_git_commit.oid();
+    let repo_b_git_commit_hash = git_sha1_from_changeset(&ctx, &repo_b, repo_b_cs_id).await?;
 
-    let repo_a_cs_id = CreateCommitContext::new(&ctx, &repo_a, vec![repo_a_cs_id])
+    let small_repo_cs_id = CreateCommitContext::new(&ctx, &small_repo, vec![small_repo_cs_id])
         .set_message(COMMIT_MSG_3)
         .add_file_with_type(
             REPO_B_SUBMODULE_PATH,
@@ -1800,7 +1746,7 @@ async fn test_expanding_known_dangling_submodule_pointers(fb: FacebookInit) -> R
         .commit()
         .await?;
 
-    let large_repo_cs_id = sync_to_master(ctx.clone(), &commit_syncer, repo_a_cs_id)
+    let large_repo_cs_id = sync_to_master(ctx.clone(), &commit_syncer, small_repo_cs_id)
         .await?
         .ok_or(anyhow!("Failed to sync commit"))?;
 
@@ -1808,7 +1754,7 @@ async fn test_expanding_known_dangling_submodule_pointers(fb: FacebookInit) -> R
         &ctx,
         &large_repo,
         large_repo_cs_id,
-        NonRootMPath::new("repo_a/submodules/.x-repo-submodule-repo_b")?,
+        NonRootMPath::new("small_repo/submodules/.x-repo-submodule-repo_b")?,
         &repo_b_git_commit_hash,
     )
     .await?;
@@ -1816,7 +1762,7 @@ async fn test_expanding_known_dangling_submodule_pointers(fb: FacebookInit) -> R
     check_mapping(
         ctx.clone(),
         &commit_syncer,
-        repo_a_cs_id,
+        small_repo_cs_id,
         Some(large_repo_cs_id),
     )
     .await;
@@ -1834,13 +1780,9 @@ async fn test_expanding_known_dangling_submodule_pointers(fb: FacebookInit) -> R
         .commit()
         .await?;
 
-    let repo_b_mapped_git_commit = repo_b
-        .repo_derived_data()
-        .derive::<MappedGitCommitId>(&ctx, repo_b_cs_id)
-        .await?;
-    let repo_b_git_commit_hash = *repo_b_mapped_git_commit.oid();
+    let repo_b_git_commit_hash = git_sha1_from_changeset(&ctx, &repo_b, repo_b_cs_id).await?;
 
-    let repo_a_cs_id = CreateCommitContext::new(&ctx, &repo_a, vec![repo_a_cs_id])
+    let small_repo_cs_id = CreateCommitContext::new(&ctx, &small_repo, vec![small_repo_cs_id])
         .set_message(COMMIT_MSG_4)
         .add_file_with_type(
             REPO_B_SUBMODULE_PATH,
@@ -1850,7 +1792,7 @@ async fn test_expanding_known_dangling_submodule_pointers(fb: FacebookInit) -> R
         .commit()
         .await?;
 
-    let large_repo_cs_id = sync_to_master(ctx.clone(), &commit_syncer, repo_a_cs_id)
+    let large_repo_cs_id = sync_to_master(ctx.clone(), &commit_syncer, small_repo_cs_id)
         .await?
         .ok_or(anyhow!("Failed to sync commit"))?;
 
@@ -1858,7 +1800,7 @@ async fn test_expanding_known_dangling_submodule_pointers(fb: FacebookInit) -> R
         &ctx,
         &large_repo,
         large_repo_cs_id,
-        NonRootMPath::new("repo_a/submodules/.x-repo-submodule-repo_b")?,
+        NonRootMPath::new("small_repo/submodules/.x-repo-submodule-repo_b")?,
         &repo_b_git_commit_hash,
     )
     .await?;
@@ -1867,7 +1809,7 @@ async fn test_expanding_known_dangling_submodule_pointers(fb: FacebookInit) -> R
         &ctx,
         &large_repo,
         large_repo_cs_id,
-        NonRootMPath::new("repo_a/submodules/repo_b/submodules/.x-repo-submodule-repo_c")?,
+        NonRootMPath::new("small_repo/submodules/repo_b/submodules/.x-repo-submodule-repo_c")?,
         &c_master_git_sha1,
     )
     .await?;
@@ -1875,7 +1817,7 @@ async fn test_expanding_known_dangling_submodule_pointers(fb: FacebookInit) -> R
     check_mapping(
         ctx.clone(),
         &commit_syncer,
-        repo_a_cs_id,
+        small_repo_cs_id,
         Some(large_repo_cs_id),
     )
     .await;
@@ -1886,83 +1828,202 @@ async fn test_expanding_known_dangling_submodule_pointers(fb: FacebookInit) -> R
     let large_repo_changesets = get_all_changeset_data_from_repo(&ctx, &large_repo).await?;
 
     // Ensure everything can be derived successfully
-    derive_all_data_types_for_repo(&ctx, &large_repo, &large_repo_changesets).await?;
+    derive_all_enabled_types_for_repo(&ctx, &large_repo, &large_repo_changesets).await?;
 
     compare_expected_changesets(
         large_repo_changesets.last_chunk::<4>().unwrap(),
         &[
             // COMMIT 1: Expansion of known dangling pointer
-            ExpectedChangeset::new_by_file_change(
-                COMMIT_MSG_1,
-                vec![
+            ExpectedChangeset::new(COMMIT_MSG_1)
+                .with_regular_changes(vec![
                     // Submodule metadata file is updated
-                    "repo_a/submodules/.x-repo-submodule-repo_b",
+                    "small_repo/submodules/.x-repo-submodule-repo_b",
                     // README file is added with a message informing that this
                     // submodule pointer was dangling.
-                    "repo_a/submodules/repo_b/README.TXT",
-                ],
-                // Should delete everything from previous expansion
-                vec![
-                    "repo_a/submodules/repo_b/B_A",
-                    "repo_a/submodules/repo_b/B_B",
-                    "repo_a/submodules/repo_b/submodules/.x-repo-submodule-repo_c",
-                    "repo_a/submodules/repo_b/submodules/repo_c/C_A",
-                    "repo_a/submodules/repo_b/submodules/repo_c/C_B",
-                ],
-            ),
+                    "small_repo/submodules/repo_b/README.TXT",
+                ])
+                .with_deletions(
+                    // Should delete everything from previous expansion
+                    vec![
+                        "small_repo/submodules/repo_b/B_A",
+                        "small_repo/submodules/repo_b/B_B",
+                        "small_repo/submodules/repo_b/submodules/.x-repo-submodule-repo_c",
+                        "small_repo/submodules/repo_b/submodules/repo_c/C_A",
+                        "small_repo/submodules/repo_b/submodules/repo_c/C_B",
+                    ],
+                ),
             // COMMIT 2: Fix the dangling pointer
-            ExpectedChangeset::new_by_file_change(
-                COMMIT_MSG_2,
-                vec![
+            ExpectedChangeset::new(COMMIT_MSG_2)
+                .with_regular_changes(vec![
                     // Submodule metadata file is updated
-                    "repo_a/submodules/.x-repo-submodule-repo_b",
+                    "small_repo/submodules/.x-repo-submodule-repo_b",
                     // Add back files from previous submodule pointer
-                    "repo_a/submodules/repo_b/B_A",
-                    "repo_a/submodules/repo_b/B_B",
-                    "repo_a/submodules/repo_b/submodules/.x-repo-submodule-repo_c",
-                    "repo_a/submodules/repo_b/submodules/repo_c/C_A",
-                    "repo_a/submodules/repo_b/submodules/repo_c/C_B",
+                    "small_repo/submodules/repo_b/B_A",
+                    "small_repo/submodules/repo_b/B_B",
+                    "small_repo/submodules/repo_b/submodules/.x-repo-submodule-repo_c",
+                    "small_repo/submodules/repo_b/submodules/repo_c/C_A",
+                    "small_repo/submodules/repo_b/submodules/repo_c/C_B",
                     // Plus the new file added in the new valid pointer
-                    "repo_a/submodules/repo_b/B_C",
-                ],
-                vec![
+                    "small_repo/submodules/repo_b/B_C",
+                ])
+                .with_deletions(vec![
                     // Delete README file from dangling pointer expansion
-                    "repo_a/submodules/repo_b/README.TXT",
-                ],
-            ),
+                    "small_repo/submodules/repo_b/README.TXT",
+                ]),
             // COMMIT 3: Set dangling pointer in repo_c recursive submodule
-            ExpectedChangeset::new_by_file_change(
-                COMMIT_MSG_3,
-                vec![
+            ExpectedChangeset::new(COMMIT_MSG_3)
+                .with_regular_changes(vec![
                     // Submodule metadata files are updated
-                    "repo_a/submodules/.x-repo-submodule-repo_b",
-                    "repo_a/submodules/repo_b/submodules/.x-repo-submodule-repo_c",
+                    "small_repo/submodules/.x-repo-submodule-repo_b",
+                    "small_repo/submodules/repo_b/submodules/.x-repo-submodule-repo_c",
                     // README file is added with a message informing that this
                     // submodule pointer was dangling.
-                    "repo_a/submodules/repo_b/submodules/repo_c/README.TXT",
-                ],
-                // Should delete everything from previous expansion
-                vec![
-                    "repo_a/submodules/repo_b/submodules/repo_c/C_A",
-                    "repo_a/submodules/repo_b/submodules/repo_c/C_B",
-                ],
-            ),
+                    "small_repo/submodules/repo_b/submodules/repo_c/README.TXT",
+                ])
+                .with_deletions(
+                    // Should delete everything from previous expansion
+                    vec![
+                        "small_repo/submodules/repo_b/submodules/repo_c/C_A",
+                        "small_repo/submodules/repo_b/submodules/repo_c/C_B",
+                    ],
+                ),
             // COMMIT 4: Fix dangling pointer in repo_c recursive submodule
-            ExpectedChangeset::new_by_file_change(
-                COMMIT_MSG_4,
-                vec![
+            ExpectedChangeset::new(COMMIT_MSG_4)
+                .with_regular_changes(vec![
                     // Submodule metadata files are updated
-                    "repo_a/submodules/.x-repo-submodule-repo_b",
-                    "repo_a/submodules/repo_b/submodules/.x-repo-submodule-repo_c",
+                    "small_repo/submodules/.x-repo-submodule-repo_b",
+                    "small_repo/submodules/repo_b/submodules/.x-repo-submodule-repo_c",
                     // Add back files from expansion of commit C_B
-                    "repo_a/submodules/repo_b/submodules/repo_c/C_A",
-                    "repo_a/submodules/repo_b/submodules/repo_c/C_B",
-                ],
-                vec![
+                    "small_repo/submodules/repo_b/submodules/repo_c/C_A",
+                    "small_repo/submodules/repo_b/submodules/repo_c/C_B",
+                ])
+                .with_deletions(vec![
                     // Delete README file from dangling pointer expansion
-                    "repo_a/submodules/repo_b/submodules/repo_c/README.TXT",
-                ],
-            ),
+                    "small_repo/submodules/repo_b/submodules/repo_c/README.TXT",
+                ]),
+        ],
+    )?;
+
+    Ok(())
+}
+
+/// Test that submodule expansion updates and deletions will work for merge
+/// commits.
+#[mononoke::fbinit_test]
+async fn test_submodule_expansion_and_deletion_on_merge_commits(fb: FacebookInit) -> Result<()> {
+    let ctx = CoreContext::test_mock(fb.clone());
+    let (repo_b, repo_b_cs_map) = build_repo_b(fb).await?;
+
+    let SubmoduleSyncTestData {
+        small_repo_info: (small_repo, small_repo_cs_map),
+        large_repo_info: (large_repo, _large_repo_master),
+        commit_syncer,
+        ..
+    } = build_submodule_sync_test_data(
+        fb,
+        &repo_b,
+        vec![(NonRootMPath::new(REPO_B_SUBMODULE_PATH)?, repo_b.clone())],
+    )
+    .await?;
+
+    // Standalone commit with no parent, because we don't support syncing diamond merges
+    // through forward syncer.
+    let p1_cs_id = CreateCommitContext::new(&ctx, &small_repo, Vec::<ChangesetId>::new())
+        .set_message("Parent commit P1")
+        .add_file("file_from_p1", "file_from_p1")
+        .commit()
+        .await?;
+
+    // Another commit to be used as a parent
+    let p2_cs_id = CreateCommitContext::new(&ctx, &small_repo, Vec::<ChangesetId>::new())
+        .set_message("Parent commit P2")
+        .add_file("file_from_p2", "file_from_p2")
+        .commit()
+        .await?;
+
+    // Sync both standalone commits, because we can't sync any commits without
+    // first syncing all of their parents.
+    let _large_p1_cs_id = commit_syncer
+        .unsafe_sync_commit(
+            &ctx,
+            p1_cs_id,
+            CandidateSelectionHint::Only,
+            CommitSyncContext::XRepoSyncJob,
+            Some(base_commit_sync_version_name()),
+        )
+        .await
+        .context("Failed to sync standalone parent commit")?;
+
+    let _large_p2_cs_id = commit_syncer
+        .unsafe_sync_commit(
+            &ctx,
+            p2_cs_id,
+            CandidateSelectionHint::Only,
+            CommitSyncContext::XRepoSyncJob,
+            Some(base_commit_sync_version_name()),
+        )
+        .await
+        .context("Failed to sync standalone parent commit")?;
+
+    // COMMIT 1: MERGE commit updating the repo_b submodule pointer
+    let repo_b_git_commit_hash =
+        git_sha1_from_changeset(&ctx, &repo_b, repo_b_cs_map["B_A"]).await?;
+
+    const MESSAGE_1: &str = "Change repo_b submodule with two parent commits";
+    let cs_id_1 =
+        CreateCommitContext::new(&ctx, &small_repo, vec![small_repo_cs_map["A_C"], p1_cs_id])
+            .set_message(MESSAGE_1)
+            .add_file_with_type(
+                REPO_B_SUBMODULE_PATH,
+                repo_b_git_commit_hash.into_inner(),
+                FileType::GitSubmodule,
+            )
+            .commit()
+            .await?;
+
+    let large_repo_cs_id_1 = sync_to_master(ctx.clone(), &commit_syncer, cs_id_1)
+        .await
+        .context("Failed to sync del_md_file_cs_id")
+        .and_then(|res| res.ok_or(anyhow!("No commit was synced")))?;
+
+    check_mapping(
+        ctx.clone(),
+        &commit_syncer,
+        cs_id_1,
+        Some(large_repo_cs_id_1),
+    )
+    .await;
+
+    // COMMIT 2: MERGE commit deleting the repo_b submodule
+    const MESSAGE_2: &str = "Delete repo_b submodule with two parent commits";
+    let cs_id_2 = CreateCommitContext::new(&ctx, &small_repo, vec![cs_id_1, p2_cs_id])
+        .set_message(MESSAGE_2)
+        .delete_file(REPO_B_SUBMODULE_PATH)
+        .commit()
+        .await?;
+
+    let (large_repo_cs_id_2, large_repo_changesets) =
+        sync_changeset_and_derive_all_types(ctx.clone(), cs_id_2, &large_repo, &commit_syncer)
+            .await?;
+
+    check_mapping(
+        ctx.clone(),
+        &commit_syncer,
+        cs_id_2,
+        Some(large_repo_cs_id_2),
+    )
+    .await;
+
+    compare_expected_changesets(
+        large_repo_changesets.last_chunk::<2>().unwrap(),
+        &[
+            ExpectedChangeset::new(MESSAGE_1)
+                .with_regular_changes(vec!["small_repo/submodules/.x-repo-submodule-repo_b"])
+                .with_deletions(vec!["small_repo/submodules/repo_b/B_B"]),
+            ExpectedChangeset::new(MESSAGE_2).with_deletions(vec![
+                "small_repo/submodules/.x-repo-submodule-repo_b",
+                "small_repo/submodules/repo_b/B_A",
+            ]),
         ],
     )?;
 

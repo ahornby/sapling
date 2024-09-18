@@ -5,9 +5,11 @@
 # directory of this source tree.
 
   $ . "${TEST_FIXTURES}/library.sh"
+  $ . "${TEST_FIXTURES}/library-push-redirector.sh"
+
   $ setup_common_config
   $ GIT_REPO="${TESTTMP}/repo-git"
-  $ HG_REPO="${TESTTMP}/repo-hg"
+  $ HG_REPO="${TESTTMP}/repo"
   $ BLOB_TYPE="blob_files" default_setup
   hg repo
   o  C [draft;rev=2;26805aba1e60]
@@ -20,16 +22,7 @@
   starting Mononoke
   cloning repo in hg client 'repo2'
   $ SKIP_CROSS_REPO_CONFIG=1 setup_configerator_configs
-  $ cat > "$PUSHREDIRECT_CONF/enable" <<EOF
-  > {
-  > "per_repo": {
-  >   "0": {
-  >      "draft_push": false,
-  >      "public_push": true
-  >    }
-  >   }
-  > }
-  > EOF
+  $ enable_pushredirect 0
 
 # Setup git repository
   $ mkdir "$GIT_REPO"
@@ -78,16 +71,7 @@
   Error: Execution failed
   [1]
 
-  $ cat > "$PUSHREDIRECT_CONF/enable" <<EOF
-  > {
-  > "per_repo": {
-  >   "0": {
-  >      "draft_push": false,
-  >      "public_push": false
-  >    }
-  >   }
-  > }
-  > EOF
+  $ enable_pushredirect 0 false false
 
   $ repo_import \
   > check-additional-setup-steps \
@@ -99,21 +83,7 @@
   * The destination bookmark name is: master_bookmark. * (glob)
   * There is no additional setup step needed! (glob)
 
-# run segmented changelog tailer on master bookmark
-  $ cat >> "$TESTTMP/mononoke-config/repos/repo/server.toml" <<CONFIG
-  > [segmented_changelog_config]
-  > heads_to_include = [
-  >    { bookmark = "master_bookmark" },
-  > ]
-  > CONFIG
-  $ segmented_changelog_tailer_reseed --repo repo  2>&1 | grep -e successfully -e segmented_changelog_tailer
-  * repo name 'repo' translates to id 0 (glob)
-  * SegmentedChangelogTailer initialized, repo_id: 0 (glob)
-  * successfully seeded segmented changelog, repo_id: 0 (glob)
-  * SegmentedChangelogTailer is done, repo_id: 0 (glob)
-
 # Import the repo
-# Segmented changelog should be rebuild for newly imported commits along the way.
   $ repo_import \
   > import \
   > "$GIT_REPO" \
@@ -130,10 +100,6 @@
   > --recovery-file-path "$GIT_REPO/recovery_file.json"
   * using repo "repo" repoid RepositoryId(0) (glob)
   * Started importing git commits to Mononoke (glob)
-  * GitRepo:$TESTTMP/repo-git commit 1 of 5 - Oid:ce435b03 => Bid:071d73e6 (glob)
-  * GitRepo:$TESTTMP/repo-git commit 2 of 5 - Oid:2c01e4a5 => Bid:4dbc9506 (glob)
-  * GitRepo:$TESTTMP/repo-git commit 3 of 5 - Oid:38f71f7e => Bid:d805ae48 (glob)
-  * GitRepo:$TESTTMP/repo-git commit 4 of 5 - Oid:13aef6ec => Bid:260f78ba (glob)
   * GitRepo:$TESTTMP/repo-git commit 5 of 5 - Oid:6783febd => Bid:8d76deb1 (glob)
   * Added commits to Mononoke (glob)
   * Commit 1/5: Remapped ChangesetId(Blake2(071d73e6b97823ffbde324c6147a785013f479157ade3f83c9b016c8f40c09de)) => ChangesetId(Blake2(4f830791a5ae7a2981d6c252d2be0bd7ebd3b1090080074b4b4bae6deb250b4a)) (glob)
@@ -145,19 +111,6 @@
   * Saved shifted bonsai changesets (glob)
   * Start deriving data types (glob)
   * Finished deriving data types (glob)
-  * Start tailing segmented changelog (glob)
-  * Using the following segmented changelog heads: [* "master_bookmark" *] (glob)
-  * SegmentedChangelogTailer initialized (glob)
-  * starting incremental update to segmented changelog (glob)
-  * iddag initialized, it covers 3 ids (glob)
-  * starting the actual update (glob)
-  * Adding hints for idmap_version 1 (glob)
-  * idmap_version 1 has a full set of hints * (glob)
-  * IdMap updated, IdDag updated (glob)
-  * segmented changelog version saved, idmap_version: 1, iddag_version: * (glob)
-  * successful incremental update to segmented changelog (glob)
-  * SegmentedChangelogTailer is done (glob)
-  * Finished tailing segmented changelog (glob)
   * Start moving the bookmark (glob)
   * Created bookmark * "repo_import_new_repo" * pointing to 4f830791a5ae7a2981d6c252d2be0bd7ebd3b1090080074b4b4bae6deb250b4a (glob)
   * Set bookmark * "repo_import_new_repo" * to point to ChangesetId(Blake2(6b49fda25c209960aad992721e872237737671564a6ce0f0347f04f4c0fee177)) (glob)
@@ -237,32 +190,30 @@
     "x_repo_check_disabled": false
   }
 
-  $ hgclone_treemanifest ssh://user@dummy/repo-hg repo1 --noupdate -q
+  $ hg clone -q mono:repo repo1 --noupdate
   $ cd repo1
-  $ hgmn pull
-  pulling from mononoke://$LOCALIP:$LOCAL_PORT/repo
+  $ hg pull
+  pulling from mono:repo
   searching for changes
+  no changes found
   adding changesets
   adding manifests
   adding file changes
-  updating bookmark master_bookmark
-  adding remote bookmark repo_import_new_repo
-  $ hgmn up master_bookmark
+  $ hg up master_bookmark
   6 files updated, 0 files merged, 0 files removed, 0 files unresolved
-  (activating bookmark master_bookmark)
 
   $ log -r "ancestors(master_bookmark)"
-  @    merging [draft;rev=5;dd88c051bcb0]
+  @    merging [public;rev=5;dd88c051bcb0] default/master_bookmark default/repo_import_new_repo
   ├─╮
-  │ o  Add file3 [draft;rev=4;fe8342d2de1a]
+  │ o  Add file3 [public;rev=4;fe8342d2de1a]
   │ │
-  │ o  Add file1 and file2 [draft;rev=3;4ad443ff73f0]
+  │ o  Add file1 and file2 [public;rev=3;4ad443ff73f0]
   │
-  o  C [draft;rev=2;26805aba1e60]
+  o  C [public;rev=2;26805aba1e60]
   │
-  o  B [draft;rev=1;112478962961]
+  o  B [public;rev=1;112478962961]
   │
-  o  A [draft;rev=0;426bada5c675]
+  o  A [public;rev=0;426bada5c675]
   $
 
   $ ls

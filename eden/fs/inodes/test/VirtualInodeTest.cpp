@@ -531,6 +531,7 @@ void verifyTreeState(
                                             << expected.getContents() << "\"";
       }
 
+      // TODO(cuev): This is no longer true. We should test directories as well.
       // Blake3 is only computed for files
       if ((verify_flags & VERIFY_BLAKE3) &&
           virtualInode.getDtype() == dtype_t::Regular) {
@@ -550,25 +551,34 @@ void verifyTreeState(
 
       if ((verify_flags & VERIFY_BLOB_METADATA) &&
           virtualInode.getDtype() == dtype_t::Regular) {
-        auto metadataFut = virtualInode
-                               .getEntryAttributes(
-                                   ENTRY_ATTRIBUTE_SIZE | ENTRY_ATTRIBUTE_SHA1 |
-                                       ENTRY_ATTRIBUTE_SOURCE_CONTROL_TYPE |
-                                       ENTRY_ATTRIBUTE_BLAKE3,
-                                   expected.path,
-                                   mount.getEdenMount()->getObjectStore(),
-                                   ObjectFetchContext::getNullContext())
-                               .semi()
-                               .via(mount.getServerExecutor().get());
+        auto metadataFut =
+            virtualInode
+                .getEntryAttributes(
+                    ENTRY_ATTRIBUTE_SIZE | ENTRY_ATTRIBUTE_SHA1 |
+                        ENTRY_ATTRIBUTE_SOURCE_CONTROL_TYPE |
+                        ENTRY_ATTRIBUTE_BLAKE3 | ENTRY_ATTRIBUTE_DIGEST_SIZE,
+                    expected.path,
+                    mount.getEdenMount()->getObjectStore(),
+                    ObjectFetchContext::getNullContext(),
+                    /*shouldFetchTreeMetadata=*/true)
+                .semi()
+                .via(mount.getServerExecutor().get());
         mount.drainServerExecutor();
         auto metadata = std::move(metadataFut).get(0ms);
         EXPECT_EQ(metadata.sha1.value().value(), expected.getSHA1()) << dbgMsg;
         EXPECT_EQ(
             metadata.blake3.value().value(), expected.getBlake3(blake3Key))
             << dbgMsg;
+        // The digest size and file size of regular files are the same.
         EXPECT_EQ(metadata.size.value().value(), expected.getContents().size())
             << dbgMsg;
+        EXPECT_EQ(
+            metadata.digestSize.value().value(), expected.getContents().size())
+            << dbgMsg;
         EXPECT_EQ(metadata.type.value().value(), expected.getTreeEntryType())
+            << dbgMsg;
+        EXPECT_EQ(
+            metadata.digestSize.value().value(), expected.getContents().size())
             << dbgMsg;
       }
 
@@ -742,9 +752,10 @@ TEST(VirtualInodeTest, getChildrenAttributes) {
   VERIFY_TREE(flags);
   std::vector<EntryAttributeFlags> attribute_requests{
       ENTRY_ATTRIBUTE_SIZE | ENTRY_ATTRIBUTE_SHA1 |
-          ENTRY_ATTRIBUTE_SOURCE_CONTROL_TYPE,
+          ENTRY_ATTRIBUTE_SOURCE_CONTROL_TYPE | ENTRY_ATTRIBUTE_DIGEST_SIZE,
       ENTRY_ATTRIBUTE_SHA1,
-      ENTRY_ATTRIBUTE_SOURCE_CONTROL_TYPE | ENTRY_ATTRIBUTE_SIZE,
+      ENTRY_ATTRIBUTE_SOURCE_CONTROL_TYPE | ENTRY_ATTRIBUTE_SIZE |
+          ENTRY_ATTRIBUTE_DIGEST_SIZE,
       ENTRY_ATTRIBUTE_OBJECT_ID,
       EntryAttributeFlags{0}};
 
@@ -759,7 +770,8 @@ TEST(VirtualInodeTest, getChildrenAttributes) {
                               attribute_request,
                               info->path,
                               mount.getEdenMount()->getObjectStore(),
-                              ObjectFetchContext::getNullContext())
+                              ObjectFetchContext::getNullContext(),
+                              /*shouldFetchTreeMetadata=*/true)
                           .get();
 
         for (auto child : files.getChildren(RelativePathPiece{info->path})) {
@@ -774,7 +786,8 @@ TEST(VirtualInodeTest, getChildrenAttributes) {
                           attribute_request,
                           child->path,
                           mount.getEdenMount()->getObjectStore(),
-                          ObjectFetchContext::getNullContext())
+                          ObjectFetchContext::getNullContext(),
+                          /*shouldFetchTreeMetadata=*/true)
                       .getTry())));
         }
       }
@@ -823,10 +836,12 @@ TEST(VirtualInodeTest, fileOpsOnCorrectObjectsOnly) {
     auto metadataTry = virtualInode
                            .getEntryAttributes(
                                ENTRY_ATTRIBUTE_SIZE | ENTRY_ATTRIBUTE_SHA1 |
-                                   ENTRY_ATTRIBUTE_SOURCE_CONTROL_TYPE,
+                                   ENTRY_ATTRIBUTE_SOURCE_CONTROL_TYPE |
+                                   ENTRY_ATTRIBUTE_DIGEST_SIZE,
                                info.path,
                                mount.getEdenMount()->getObjectStore(),
-                               ObjectFetchContext::getNullContext())
+                               ObjectFetchContext::getNullContext(),
+                               /*shouldFetchTreeMetadata=*/true)
                            .getTry();
     if (info.isRegularFile()) {
       EXPECT_EQ(true, metadataTry.hasValue())
@@ -837,6 +852,9 @@ TEST(VirtualInodeTest, fileOpsOnCorrectObjectsOnly) {
             << " on path " << info.getLogPath();
         EXPECT_EQ(metadata.size.value().value(), info.getContents().size())
             << " on path " << info.getLogPath();
+        EXPECT_EQ(
+            metadata.digestSize.value().value(), info.getContents().size())
+            << " on path " << info.getLogPath();
         EXPECT_EQ(metadata.type.value().value(), info.getTreeEntryType())
             << " on path " << info.getLogPath();
       }
@@ -845,8 +863,16 @@ TEST(VirtualInodeTest, fileOpsOnCorrectObjectsOnly) {
           << " on path " << info.getLogPath();
       if (metadataTry.hasValue()) {
         auto& metadata = metadataTry.value();
+        // We can't calculate the sha1/file-size of directories
         EXPECT_TRUE(metadata.sha1.value().hasException());
         EXPECT_TRUE(metadata.size.value().hasException());
+        if (info.isMaterialized()) {
+          // We can't get the digest-size/blake3 of materialized directories
+          EXPECT_FALSE(metadata.digestSize.has_value());
+        } else {
+          // We require a remote lookup to get the size/blake3 of directories
+          EXPECT_TRUE(metadata.digestSize.value().hasException());
+        }
         EXPECT_EQ(metadata.type.value().value(), info.getTreeEntryType())
             << " on path " << info.getLogPath();
       }
@@ -855,10 +881,12 @@ TEST(VirtualInodeTest, fileOpsOnCorrectObjectsOnly) {
     metadataTry =
         virtualInode
             .getEntryAttributes(
-                ENTRY_ATTRIBUTE_SIZE | ENTRY_ATTRIBUTE_SOURCE_CONTROL_TYPE,
+                ENTRY_ATTRIBUTE_SIZE | ENTRY_ATTRIBUTE_SOURCE_CONTROL_TYPE |
+                    ENTRY_ATTRIBUTE_DIGEST_SIZE,
                 info.path,
                 mount.getEdenMount()->getObjectStore(),
-                ObjectFetchContext::getNullContext())
+                ObjectFetchContext::getNullContext(),
+                /*shouldFetchTreeMetadata=*/true)
             .getTry();
     if (info.isRegularFile()) {
       EXPECT_EQ(true, metadataTry.hasValue())
@@ -869,6 +897,9 @@ TEST(VirtualInodeTest, fileOpsOnCorrectObjectsOnly) {
             << " on path " << info.getLogPath();
         EXPECT_EQ(metadata.size.value().value(), info.getContents().size())
             << " on path " << info.getLogPath();
+        EXPECT_EQ(
+            metadata.digestSize.value().value(), info.getContents().size())
+            << " on path " << info.getLogPath();
         EXPECT_EQ(metadata.type.value().value(), info.getTreeEntryType())
             << " on path " << info.getLogPath();
       }
@@ -877,8 +908,16 @@ TEST(VirtualInodeTest, fileOpsOnCorrectObjectsOnly) {
           << " on path " << info.getLogPath();
       if (metadataTry.hasValue()) {
         auto& metadata = metadataTry.value();
+        // We can't calculate the sha1/file-size of directories
         EXPECT_FALSE(metadata.sha1.has_value());
         EXPECT_TRUE(metadata.size.value().hasException());
+        if (info.isMaterialized()) {
+          // We can't get the digest-size/blake3 of materialized directories
+          EXPECT_FALSE(metadata.digestSize.has_value());
+        } else {
+          // We require a remote lookup to get the size/blake3 of directories
+          EXPECT_TRUE(metadata.digestSize.value().hasException());
+        }
         EXPECT_EQ(metadata.type.value().value(), info.getTreeEntryType())
             << " on path " << info.getLogPath();
       }
@@ -912,10 +951,11 @@ TEST(VirtualInodeTest, getEntryAttributesAttributeError) {
 
   auto attributesFuture = virtualInode.getEntryAttributes(
       ENTRY_ATTRIBUTE_SIZE | ENTRY_ATTRIBUTE_SHA1 |
-          ENTRY_ATTRIBUTE_SOURCE_CONTROL_TYPE,
+          ENTRY_ATTRIBUTE_SOURCE_CONTROL_TYPE | ENTRY_ATTRIBUTE_DIGEST_SIZE,
       RelativePathPiece{"root_dirA"},
       mount.getEdenMount()->getObjectStore(),
-      ObjectFetchContext::getNullContext());
+      ObjectFetchContext::getNullContext(),
+      /*shouldFetchTreeMetadata=*/true);
 
   builder.triggerError(
       "root_dirA/child1_fileA1", std::domain_error("fake error for testing"));
@@ -923,6 +963,7 @@ TEST(VirtualInodeTest, getEntryAttributesAttributeError) {
   auto attributes = std::move(attributesFuture).get();
   EXPECT_TRUE(attributes.sha1.value().hasException());
   EXPECT_TRUE(attributes.size.value().hasException());
+  EXPECT_TRUE(attributes.digestSize.value().hasException());
   EXPECT_FALSE(attributes.type.value().hasException());
 }
 

@@ -152,10 +152,10 @@ def _flattenresponse(response: Sized, sort: bool = False):
         ("f", "input-file", [], _("input file in Python literal format")),
         ("", "sort", False, _("sort list to stabilize output")),
     ],
-    _(""),
+    _("[SERVER]"),
     optionalrepo=True,
 )
-def debugapi(ui, repo=None, **opts) -> None:
+def debugapi(ui, repo, serverpath=None, **opts) -> None:
     """send an SaplingRemoteAPI request and print its output
 
     The endpoint name is the method name defined on the edenapi object.
@@ -176,7 +176,11 @@ def debugapi(ui, repo=None, **opts) -> None:
     # [str] -> [obj]
     params = [ast.literal_eval(s) for s in inputs]
 
-    client = repo and repo.edenapi or edenapi.getclient(ui)
+    if repo and not serverpath:
+        client = repo.edenapi
+    else:
+        client = edenapi.getclient(ui, serverpath)
+
     func = getattr(client, endpoint)
     try:
         response = func(*params)
@@ -430,7 +434,6 @@ def debugbuilddag(
      - "*p" is a fork at parent p, which is a backref
      - "*p1/p2" is a merge of parents p1 and p2, which are backrefs
      - "/p2" is a merge of the preceding node and p2
-     - "@branch" sets the named branch for subsequent nodes
      - "#...\\n" is a comment up to the end of the line
 
     Whitespace between the above elements is ignored.
@@ -472,7 +475,6 @@ def debugbuilddag(
         tr = repo.transaction("builddag")
 
         at = -1
-        atbranch = "default"
         nodeids = []
         id = 0
 
@@ -556,7 +558,6 @@ def debugbuilddag(
                         fctxfn,
                         date=(id, 0),
                         user="debugbuilddag",
-                        extra={"branch": atbranch},
                     )
                     nodeid = repo.commitctx(cx)
                     nodeids.append(nodeid)
@@ -567,9 +568,6 @@ def debugbuilddag(
                     bookmarks.addbookmarks(
                         repo, tr, [name], rev=hex(tonode(id)), force=True, inactive=True
                     )
-                elif type == "a":
-                    ui.note(_x("branch %s\n" % data))
-                    atbranch = data
                 prog.value = id
         tr.close()
     finally:
@@ -705,7 +703,7 @@ def debugcapabilities(ui, path, **opts) -> None:
     b2caps = bundle2.bundle2caps(peer)
     if b2caps:
         ui.write(_x("Bundle2 capabilities:\n"))
-        for key, values in sorted(pycompat.iteritems(b2caps)):
+        for key, values in sorted(b2caps.items()):
             ui.write(_x("  %s\n") % key)
             for v in values:
                 ui.write(_x("    %s\n") % v)
@@ -1175,7 +1173,7 @@ def debugstate(ui, repo, **opts) -> Optional[int]:
     # pyre-fixme[6]: For 2nd param expected `None` but got
     #  `Optional[typing.Callable[[Named(x, typing.Any)], Tuple[typing.Any,
     #  typing.Any]]]`.
-    for path, ent in sorted(pycompat.iteritems(dmap), key=keyfunc):
+    for path, ent in sorted(dmap.items(), key=keyfunc):
         if ent[3] == -1:
             timestr = "unset               "
         elif nodates:
@@ -2304,7 +2302,7 @@ def debugnamecomplete(ui, repo, *args, **opts) -> None:
     names = set()
     # since we previously only listed open branches, we will handle that
     # specially (after this for loop)
-    for name, ns in pycompat.iteritems(repo.names):
+    for name, ns in repo.names.items():
         # arc uses debugnamecomplete for doing some really wacky things, but
         # luckily it does so by setting HGPLAIN=1, hence the ui.plain()
         # check below
@@ -2730,7 +2728,7 @@ def debugpushkey(ui, repopath, namespace, *keyinfo, **opts) -> Optional[bool]:
         ui.status(str(r) + "\n")
         return not r
     else:
-        for k, v in sorted(pycompat.iteritems(target.listkeys(namespace))):
+        for k, v in sorted(target.listkeys(namespace).items()):
             ui.write("%s\t%s\n" % (util.escapestr(k), util.escapestr(v)))
 
 
@@ -2837,12 +2835,6 @@ def debugrebuilddirstate(ui, repo, rev, **opts) -> None:
             changedfiles = manifestonly | dsnotadded
 
         dirstate.rebuild(ctx.node(), ctx.manifest(), changedfiles)
-
-
-@command("debugrebuildfncache", [], "")
-def debugrebuildfncache(ui, repo: Sized) -> None:
-    """rebuild the fncache file"""
-    repair.rebuildfncache(ui, repo)
 
 
 @command(
@@ -3321,7 +3313,7 @@ def debugwalk(ui, repo, *pats, **opts) -> None:
 def debugwireargs(ui, repopath, *vals, **opts) -> None:
     repo = hg.peer(ui, opts, repopath)
     args = {}
-    for k, v in pycompat.iteritems(opts):
+    for k, v in opts.items():
         if v:
             args[k] = v
     args = args
@@ -3342,7 +3334,7 @@ def debugwireargs(ui, repopath, *vals, **opts) -> None:
         ("", "write-env", "", _("write NAME=HEX per line to a given file (ADVANCED)")),
     ],
 )
-def debugdrawdag(ui, repo, **opts) -> None:
+def debugdrawdag(ui, repo, *args, **opts) -> None:
     r"""read an ASCII graph from stdin and create changesets
 
     Create commits to match the graph described using the drawdag language.
@@ -3351,7 +3343,11 @@ def debugdrawdag(ui, repo, **opts) -> None:
     This command can execute Python logic from input. Therefore, never feed
     it with untrusted input!
     """
-    text = decodeutf8(ui.fin.read())
+    if args:
+        data = b"".join(open(path, "rb").read() for path in args)
+    else:
+        data = ui.fin.read()
+    text = decodeutf8(data)
     return drawdag.drawdag(repo, text, **opts)
 
 
@@ -3536,7 +3532,7 @@ def debugexistingcasecollisions(ui, repo, *basepaths, **opts) -> None:
             dirlistmap = {}
             for entry in dirlist:
                 dirlistmap.setdefault(entry.lower(), []).append(entry)
-            for _lowername, entries in sorted(pycompat.iteritems(dirlistmap)):
+            for _lowername, entries in sorted(dirlistmap.items()):
                 if len(entries) > 1:
                     ui.write(
                         _("%s contains collisions: %s\n")
@@ -3612,7 +3608,7 @@ def debugreadauthforuri(ui, _repo, uri, user=None) -> None:
     auth = httpconnection.readauthforuri(ui, uri, user)
     if auth is not None:
         auth, items = auth
-        for k, v in sorted(pycompat.iteritems(items)):
+        for k, v in sorted(items.items()):
             ui.write(_x("auth.%s.%s=%s\n") % (auth, k, v))
     else:
         ui.warn(_("no match found\n"))
@@ -3866,6 +3862,7 @@ def debugruntest(ui, *paths, **opts) -> int:
     [
         ("l", "line", 1, _("line number (starts with 1)")),
         ("c", "case", "", _("test case")),
+        ("", "record-if-needed", False, _("record test state if not already present")),
     ],
     _("TEST_FILE"),
     norepo=True,
@@ -3880,10 +3877,20 @@ def debugrestoretest(ui, test_file, **opts):
 
     metalog = record.try_locate_metalog(filename, testcase, loc)
     if metalog is None:
-        raise error.Abort(
-            _("no recording found for test"),
-            hint=_("use '@prog@ .t --record' to record a test run"),
-        )
+        if opts.get("record_if_needed"):
+            ui.status_err(_("recording test state\n"))
+            ui.pushbuffer()
+            debugruntest(ui, test_file, record=True)
+            output = ui.popbuffer(errors="backslashreplace")
+            metalog = record.try_locate_metalog(filename, testcase, loc)
+            if metalog is None:
+                ui.status_err(_("output from recording: %s\n") % output)
+                raise error.Abort(_("still no recording"))
+        else:
+            raise error.Abort(
+                _("no recording found for test"),
+                hint=_("use '@prog@ .t --record' to record a test run"),
+            )
     script_path = record.restore_state_script(metalog)
     if ui.formatted:
         ui.status_err(("Run or source the script to enter the testing environment:\n"))
@@ -3976,7 +3983,6 @@ def debugcommitmessage(ui, repo, *args):
     ctx = context.workingcommitctx(repo, status, text, user, date, extra)
 
     editform = form or "commit.normal.normal"
-    extramsg = _("Leave message empty to abort commit.")
 
     forms = [e for e in editform.split(".") if e]
     forms.insert(0, "changeset")
@@ -3984,11 +3990,11 @@ def debugcommitmessage(ui, repo, *args):
         ref = ".".join(forms)
         tmpl = repo.ui.config("committemplate", ref)
         if tmpl:
-            committext = cmdutil.buildcommittemplate(repo, ctx, extramsg, ref)
+            committext = cmdutil.buildcommittemplate(repo, ctx, ref)
             break
         forms.pop()
     else:
-        committext = cmdutil.buildcommittext(repo, ctx, extramsg)
+        committext = cmdutil.buildcommittext(repo, ctx)
 
     ui.status(committext)
 

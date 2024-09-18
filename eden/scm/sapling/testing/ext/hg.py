@@ -141,6 +141,10 @@ def testsetup(t: TestTmp):
 
     if use_watchman:
         watchman_sock = os.getenv("WATCHMAN_SOCK")
+        t.requireexe(
+            "watchman",
+            fullpath=t.path.parents[2] / "install" / "bin" / "watchmanscript",
+        )
         if watchman_sock:
             environ["WATCHMAN_SOCK"] = watchman_sock
             environ["HGFSMONITOR_TESTS"] = "1"
@@ -267,6 +271,7 @@ def hg(stdin: BinaryIO, stdout: BinaryIO, stderr: BinaryIO, env: Env) -> int:
             pycompat.sysargv = env.args
             util._reloadenv()
             exitcode = bindings.commands.run(env.args, stdin, stdout, stderr)
+            bindings.atexit.drop_queued()
             return exitcode
     finally:
         # See above. This avoids leaking file descriptions that prevents

@@ -34,6 +34,7 @@ use cmdlib_caching::CachelibArgs;
 use cmdlib_caching::CachelibSettings;
 use cmdlib_logging::LoggingArgs;
 use cmdlib_logging::ScubaLoggingArgs;
+use commit_graph_types::environment::CommitGraphArgs;
 use derived_data_remote::RemoteDerivationArgs;
 use environment::BookmarkCacheOptions;
 use environment::MononokeEnvironment;
@@ -60,6 +61,7 @@ use crate::app::MononokeApp;
 use crate::args::parse_config_spec_to_path;
 use crate::args::AclArgs;
 use crate::args::ConfigArgs;
+use crate::args::GFlagsArgs;
 use crate::args::JustKnobsArgs;
 use crate::args::MysqlArgs;
 use crate::args::RuntimeArgs;
@@ -119,6 +121,12 @@ pub struct EnvironmentArgs {
 
     #[clap(flatten, next_help_heading = "MEGAREPO OPTIONS")]
     megarepo_configs_args: MegarepoConfigsArgs,
+
+    #[clap(flatten, next_help_heading = "GFLAGS")]
+    gflags_args: GFlagsArgs,
+
+    #[clap(flatten, next_help_heading = "COMMIT GRAPH OPTIONS")]
+    commit_graph_args: CommitGraphArgs,
 }
 
 impl MononokeAppBuilder {
@@ -281,7 +289,11 @@ impl MononokeAppBuilder {
             remote_derivation_args,
             rendezvous_args,
             just_knobs_args,
+            gflags_args,
+            commit_graph_args,
         } = env_args;
+
+        gflags_args.propagate(self.fb)?;
 
         let log_level = logging_args.create_log_level();
         #[cfg(fbcode_build)]
@@ -290,12 +302,9 @@ impl MononokeAppBuilder {
             .create_root_log_drain(self.fb, log_level)
             .context("Failed to create root log drain")?;
 
-        let config_store = create_config_store(
-            self.fb,
-            &config_args,
-            Logger::root(root_log_drain.clone(), o![]),
-        )
-        .context("Failed to create config store")?;
+        let config_store = config_args
+            .create_config_store(self.fb, Logger::root(root_log_drain.clone(), o![]))
+            .context("Failed to create config store")?;
 
         let observability_context = logging_args
             .create_observability_context(&config_store, log_level)
@@ -350,6 +359,8 @@ impl MononokeAppBuilder {
         let acl_provider =
             create_acl_provider(self.fb, &acl_args).context("Failed to create ACL provider")?;
 
+        let commit_graph_options = commit_graph_args.into();
+
         init_just_knobs_worker(
             &just_knobs_args,
             &config_store,
@@ -376,45 +387,8 @@ impl MononokeAppBuilder {
             disabled_hooks: HashMap::new(),
             bookmark_cache_options: self.bookmark_cache_options.clone(),
             filter_repos: None,
+            commit_graph_options,
         })
-    }
-}
-
-fn create_config_store(
-    fb: FacebookInit,
-    config_args: &ConfigArgs,
-    logger: Logger,
-) -> Result<ConfigStore> {
-    const CRYPTO_PROJECT: &str = "SCM";
-    const CONFIGERATOR_POLL_INTERVAL: Duration = Duration::from_secs(1);
-    const CONFIGERATOR_REFRESH_TIMEOUT: Duration = Duration::from_secs(1);
-
-    if let Some(path) = &config_args.local_configerator_path {
-        Ok(ConfigStore::file(
-            logger,
-            path.clone(),
-            String::new(),
-            CONFIGERATOR_POLL_INTERVAL,
-        ))
-    } else {
-        let crypto_regex_paths = match &config_args.crypto_path_regex {
-            Some(paths) => paths.clone(),
-            None => vec![
-                "scm/mononoke/repos/.*".to_string(),
-                "scm/mononoke/redaction/.*".to_string(),
-            ],
-        };
-        let crypto_regex = crypto_regex_paths
-            .into_iter()
-            .map(|path| (path, CRYPTO_PROJECT.to_string()))
-            .collect();
-        ConfigStore::regex_signed_configerator(
-            fb,
-            logger,
-            crypto_regex,
-            CONFIGERATOR_POLL_INTERVAL,
-            CONFIGERATOR_REFRESH_TIMEOUT,
-        )
     }
 }
 

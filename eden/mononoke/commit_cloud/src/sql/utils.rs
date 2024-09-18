@@ -41,11 +41,21 @@ pub fn list_as_bytes(
     Ok(res)
 }
 
+pub fn prepare_prefix(input: &str) -> String {
+    let mut escaped = input.to_string();
+    escaped = escaped.replace('\\', "\\\\");
+    escaped = escaped.replace('_', "\\_");
+    escaped = escaped.replace('%', "\\%");
+    escaped.push('%');
+    escaped
+}
+
 #[cfg(test)]
 mod test {
     use std::str::FromStr;
 
     use mercurial_types::HgChangesetId;
+    use mononoke_macros::mononoke;
     use once_cell::sync::Lazy;
 
     use crate::sql::utils::changeset_as_bytes;
@@ -62,19 +72,19 @@ mod test {
             .expect("Failed encoding test changeset id")
     });
 
-    #[test]
+    #[mononoke::test]
     fn test_decode_changeset() {
         assert_eq!(changeset_from_bytes(HEX_ENCODED, true).unwrap(), *CS_ID);
         assert_eq!(changeset_from_bytes(&BYTES, false).unwrap(), *CS_ID);
     }
 
-    #[test]
+    #[mononoke::test]
     fn test_encode_changeset() {
         assert_eq!(changeset_as_bytes(&CS_ID, true).unwrap(), HEX_ENCODED);
         assert_eq!(changeset_as_bytes(&CS_ID, false).unwrap(), BYTES);
     }
 
-    #[test]
+    #[mononoke::test]
     fn test_non_decodable() {
         assert!(changeset_from_bytes(HEX_ENCODED, false).is_err());
         assert!(changeset_from_bytes(&BYTES, true).is_err());

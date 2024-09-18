@@ -15,8 +15,8 @@ setup configuration
 
 setup hg server repo
 
-  $ hginit_treemanifest repo-hg
-  $ cd repo-hg
+  $ hginit_treemanifest repo
+  $ cd repo
   $ drawdag <<EOF
   > C
   > |
@@ -64,35 +64,68 @@ setup hg server repo
      pre_deletion_commit       0069ba24938a
 
   $ cd .. 
-  $ blobimport repo-hg/.hg repo
+  $ blobimport repo/.hg repo
   $ megarepo_tool gradual-merge \
   > stash \
   > "gradual merge" \
   > --pre-deletion-commit pre_deletion_commit \
   > --last-deletion-commit last_deletion_commit \
   > --bookmark head_bookmark \
-  > --limit 1 2>&1 | grep 'merging'
+  > --limit 1
+  * using repo "repo" repoid RepositoryId(0) (glob)
+  * changeset resolved as: ChangesetId(Blake2(9b65f1881b4fac85aa2f82ea599274472d58938ad1520e9306aa98942b5b2db3)) (glob)
+  * changeset resolved as: ChangesetId(Blake2(0f74833ca121d604c4a32d9df3826d1b5d5b8d6191c6f4cd5ed0b323b2d3c288)) (glob)
+  * Finding all commits to merge... (glob)
+  * 3 total commits to merge (glob)
+  * Finding commits that haven't been merged yet... (glob)
+  * changeset resolved as: ChangesetId(Blake2(c3384961b16276f2db77df9d7c874bbe981cf0525bd6f84a502f919044f2dabd)) (glob)
   * merging 1 commits (glob)
+  * Preparing to merge 9b65f1881b4fac85aa2f82ea599274472d58938ad1520e9306aa98942b5b2db3 (glob)
+  * changeset resolved as: ChangesetId(Blake2(c3384961b16276f2db77df9d7c874bbe981cf0525bd6f84a502f919044f2dabd)) (glob)
+  * Created merge changeset * (glob)
+  * Generated hg changeset * (glob)
+  * Now running pushrebase... (glob)
+  * Pushrebased to * (glob)
 
   $ megarepo_tool gradual-merge \
   > stash \
   > "gradual merge" \
   > --pre-deletion-commit pre_deletion_commit \
   > --last-deletion-commit last_deletion_commit \
-  > --bookmark head_bookmark 2>&1 | grep 'merging'
+  > --bookmark head_bookmark
+  * using repo "repo" repoid RepositoryId(0) (glob)
+  * changeset resolved as: ChangesetId(Blake2(9b65f1881b4fac85aa2f82ea599274472d58938ad1520e9306aa98942b5b2db3)) (glob)
+  * changeset resolved as: ChangesetId(Blake2(0f74833ca121d604c4a32d9df3826d1b5d5b8d6191c6f4cd5ed0b323b2d3c288)) (glob)
+  * Finding all commits to merge... (glob)
+  * 3 total commits to merge (glob)
+  * Finding commits that haven't been merged yet... (glob)
+  * changeset resolved as: ChangesetId(Blake2(*)) (glob)
   * merging 2 commits (glob)
+  * Preparing to merge afd03e5c132921683e0e7023556448c4dddd6dcf8d639d0743c638c5410413d2 (glob)
+  * changeset resolved as: ChangesetId(Blake2(*)) (glob)
+  * Created merge changeset * (glob)
+  * Generated hg changeset * (glob)
+  * Now running pushrebase... (glob)
+  * Pushrebased to * (glob)
+  * Preparing to merge 0f74833ca121d604c4a32d9df3826d1b5d5b8d6191c6f4cd5ed0b323b2d3c288 (glob)
+  * changeset resolved as: ChangesetId(Blake2(*)) (glob)
+  * Created merge changeset * (glob)
+  * Generated hg changeset * (glob)
+  * Now running pushrebase... (glob)
+  * Pushrebased to * (glob)
+
+  $ cd "$TESTTMP"
+  $ hg clone -q mono:repo client --noupdate
+  $ cd client
 
   $ start_and_wait_for_mononoke_server
-  $ cd "$TESTTMP"
-  $ hgclone_treemanifest ssh://user@dummy/repo-hg repo --noupdate
-  $ cd repo
-  $ hgmn pull
-  pulling from mononoke://$LOCALIP:$LOCAL_PORT/repo
+
+  $ hg pull
+  pulling from mono:repo
   searching for changes
   adding changesets
   adding manifests
   adding file changes
-  updating bookmark head_bookmark
   $ hg log -G -T '{node|short} {desc|firstline}\n'
   o    * [MEGAREPO GRADUAL MERGE] gradual merge (2) (glob)
   ├─╮
@@ -116,9 +149,8 @@ setup hg server repo
       │
       o  426bada5c675 A
   
-  $ hgmn up head_bookmark
+  $ hg up head_bookmark
   6 files updated, 0 files merged, 0 files removed, 0 files unresolved
-  (activating bookmark head_bookmark)
   $ ls
   A
   B

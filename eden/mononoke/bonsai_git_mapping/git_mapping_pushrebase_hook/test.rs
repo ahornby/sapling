@@ -13,13 +13,13 @@ use bonsai_git_mapping::BonsaiGitMappingRef;
 use bonsai_hg_mapping::BonsaiHgMapping;
 use bookmarks::Bookmarks;
 use borrowed::borrowed;
-use changeset_fetcher::ChangesetFetcher;
-use changesets::Changesets;
 use commit_graph::CommitGraph;
+use commit_graph::CommitGraphWriter;
 use context::CoreContext;
 use fbinit::FacebookInit;
 use filestore::FilestoreConfig;
 use maplit::hashset;
+use mononoke_macros::mononoke;
 use mononoke_types::RepositoryId;
 use mononoke_types_mocks::hash::*;
 use pushrebase::do_pushrebase_bonsai;
@@ -46,13 +46,10 @@ struct Repo {
     bookmarks: dyn Bookmarks,
 
     #[facet]
-    changeset_fetcher: dyn ChangesetFetcher,
-
-    #[facet]
-    changesets: dyn Changesets,
-
-    #[facet]
     commit_graph: CommitGraph,
+
+    #[facet]
+    commit_graph_writer: dyn CommitGraphWriter,
 
     #[facet]
     filestore_config: FilestoreConfig,
@@ -67,7 +64,7 @@ struct Repo {
     repo_identity: RepoIdentity,
 }
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn pushrebase_populates_git_mapping(fb: FacebookInit) -> Result<(), Error> {
     let ctx = CoreContext::test_mock(fb);
     let repo: Repo = TestRepoFactory::new(fb)?

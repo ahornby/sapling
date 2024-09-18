@@ -10,10 +10,10 @@ import type {KindOfChange, PollKind} from './WatchForChanges';
 import type {TrackEventName} from './analytics/eventNames';
 import type {ConfigLevel, ResolveCommandConflictOutput} from './commands';
 import type {RepositoryContext} from './serverTypes';
+import type {ExecaError} from 'execa';
 import type {
   CommitInfo,
   Disposable,
-  CommandArg,
   UncommittedChanges,
   ChangedFile,
   RepoInfo,
@@ -236,18 +236,19 @@ export class Repository {
         operation: RunnableOperation,
         handleCommandProgress,
         signal: AbortSignal,
-      ): Promise<void> => {
+      ): Promise<unknown> => {
         const {cwd} = ctx;
         if (operation.runner === CommandRunner.Sapling) {
           return this.runOperation(ctx, operation, handleCommandProgress, signal);
         } else if (operation.runner === CommandRunner.CodeReviewProvider) {
-          const normalizedArgs = this.normalizeOperationArgs(cwd, operation.args);
+          const {args: normalizedArgs} = this.normalizeOperationArgs(cwd, operation);
           if (this.codeReviewProvider?.runExternalCommand == null) {
             return Promise.reject(
               Error('CodeReviewProvider does not support running external commands'),
             );
           }
 
+          // TODO: support stdin
           return (
             this.codeReviewProvider?.runExternalCommand(
               cwd,
@@ -257,15 +258,13 @@ export class Repository {
             ) ?? Promise.resolve()
           );
         } else if (operation.runner === CommandRunner.InternalArcanist) {
-          const normalizedArgs = this.normalizeOperationArgs(cwd, operation.args);
-          return (
-            void Internal.runArcanistCommand?.(
-              cwd,
-              normalizedArgs,
-              handleCommandProgress,
-              signal,
-            ) ?? Promise.resolve()
-          );
+          // TODO: support stdin
+          const {args: normalizedArgs} = this.normalizeOperationArgs(cwd, operation);
+          if (Internal.runArcanistCommand == null) {
+            return Promise.reject(Error('InternalArcanist runner is not supported'));
+          }
+          ctx.logger.info('running arcanist command:', normalizedArgs);
+          return Internal.runArcanistCommand(cwd, normalizedArgs, handleCommandProgress, signal);
         }
         return Promise.resolve();
       },
@@ -496,6 +495,10 @@ export class Repository {
       };
     }
     if (repoRoot == null || dotdir == null) {
+      // A seemingly invalid repo may just be from EdenFS not running properly
+      if (await isUnhealthyEdenFs(cwd)) {
+        return {type: 'edenFsUnhealthy', cwd};
+      }
       return {type: 'cwdNotARepository', cwd};
     }
 
@@ -596,34 +599,58 @@ export class Repository {
     return this.operationQueue.getRunningOperation();
   }
 
-  private normalizeOperationArgs(cwd: string, args: Array<CommandArg>): Array<string> {
+  private normalizeOperationArgs(
+    cwd: string,
+    operation: RunnableOperation,
+  ): {args: Array<string>; stdin?: string | undefined} {
     const repoRoot = nullthrows(this.info.repoRoot);
     const illegalArgs = new Set(['--cwd', '--config', '--insecure', '--repository', '-R']);
-    return args.flatMap(arg => {
+    let stdin = operation.stdin;
+    const args = [];
+    for (const arg of operation.args) {
       if (typeof arg === 'object') {
         switch (arg.type) {
           case 'config':
             if (!(settableConfigNames as ReadonlyArray<string>).includes(arg.key)) {
               throw new Error(`config ${arg.key} not allowed`);
             }
-            return ['--config', `${arg.key}=${arg.value}`];
+            args.push('--config', `${arg.key}=${arg.value}`);
+            continue;
           case 'repo-relative-file':
-            return [path.normalize(path.relative(cwd, path.join(repoRoot, arg.path)))];
+            args.push(path.normalize(path.relative(cwd, path.join(repoRoot, arg.path))));
+            continue;
+          case 'repo-relative-file-list':
+            // pass long lists of files as stdin via fileset patterns
+            // this is passed as an arg instead of directly in stdin so that we can do path normalization
+            args.push('listfile0:-');
+            if (stdin != null) {
+              throw new Error('stdin already set when using repo-relative-file-list');
+            }
+            stdin = arg.paths
+              .map(p => path.normalize(path.relative(cwd, path.join(repoRoot, p))))
+              .join('\0');
+            continue;
           case 'exact-revset':
             if (arg.revset.startsWith('-')) {
               // don't allow revsets to be used as flags
               throw new Error('invalid revset');
             }
-            return [arg.revset];
+            args.push(arg.revset);
+            continue;
           case 'succeedable-revset':
-            return [`max(successors(${arg.revset}))`];
+            args.push(`max(successors(${arg.revset}))`);
+            continue;
+          case 'optimistic-revset':
+            args.push(`max(successors(${arg.revset}))`);
+            continue;
         }
       }
       if (illegalArgs.has(arg)) {
         throw new Error(`argument '${arg}' is not allowed`);
       }
-      return arg;
-    });
+      args.push(arg);
+    }
+    return {args, stdin};
   }
 
   /**
@@ -636,8 +663,12 @@ export class Repository {
     signal: AbortSignal,
   ): Promise<void> {
     const {cwd} = ctx;
-    const cwdRelativeArgs = this.normalizeOperationArgs(cwd, operation.args);
-    const {stdin} = operation;
+    const {args: cwdRelativeArgs, stdin} = this.normalizeOperationArgs(cwd, operation);
+
+    const env = await Promise.all([
+      Internal.additionalEnvForCommand?.(operation),
+      this.getMergeToolEnvVars(ctx),
+    ]);
 
     const {command, args, options} = getExecParams(
       this.info.command,
@@ -645,8 +676,8 @@ export class Repository {
       cwd,
       stdin ? {input: stdin} : undefined,
       {
-        ...Internal.additionalEnvForCommand?.(operation),
-        ...(await this.getMergeToolEnvVars(ctx)),
+        ...env[0],
+        ...env[1],
       },
     );
 
@@ -668,14 +699,17 @@ export class Repository {
     execution.stderr?.on('data', data => {
       onProgress('stderr', data.toString());
     });
-    execution.on('exit', exitCode => {
-      onProgress('exit', exitCode || 0);
-    });
     signal.addEventListener('abort', () => {
       ctx.logger.log('kill operation: ', command, cwdRelativeArgs.join(' '));
     });
     handleAbortSignalOnProcess(execution, signal);
-    await execution;
+    try {
+      const result = await execution;
+      onProgress('exit', result.exitCode || 0);
+    } catch (err) {
+      onProgress('exit', isExecaError(err) ? err.exitCode : -1);
+      throw err;
+    }
   }
 
   /**
@@ -753,20 +787,26 @@ export class Repository {
       };
       this.uncommittedChangesEmitter.emit('change', this.uncommittedChanges);
     } catch (err) {
-      this.initialConnectionContext.logger.error('Error fetching files: ', err);
-      if (isExecaError(err)) {
-        if (err.stderr.includes('checkout is currently in progress')) {
+      let error = err;
+      if (isExecaError(error)) {
+        if (error.stderr.includes('checkout is currently in progress')) {
           this.initialConnectionContext.logger.info(
             'Ignoring `sl status` error caused by in-progress checkout',
           );
           return;
         }
       }
+
+      this.initialConnectionContext.logger.error('Error fetching files: ', error);
+      if (isExecaError(error)) {
+        error = simplifyExecaError(error);
+      }
+
       // emit an error, but don't save it to this.uncommittedChanges
       this.uncommittedChangesEmitter.emit('change', {
         fetchStartTimestamp,
         fetchCompletedTimestamp: Date.now(),
-        files: {error: err instanceof Error ? err : new Error(err as string)},
+        files: {error: error instanceof Error ? error : new Error(error as string)},
       });
     }
   });
@@ -857,7 +897,12 @@ export class Repository {
       if (isExecaError(error) && error.stderr.includes('Please check your internet connection')) {
         error = Error('Network request failed. Please check your internet connection.');
       }
+
       this.initialConnectionContext.logger.error('Error fetching commits: ', error);
+      if (isExecaError(error)) {
+        error = simplifyExecaError(error);
+      }
+
       this.smartlogCommitsChangesEmitter.emit('change', {
         fetchStartTimestamp,
         fetchCompletedTimestamp: Date.now(),
@@ -1090,7 +1135,7 @@ export class Repository {
     ctx: RepositoryContext,
     hash: Hash,
     excludedFiles: string[],
-  ): Promise<number> {
+  ): Promise<{sloc: number; strictSloc: number}> {
     const exclusions = excludedFiles.flatMap(file => [
       '-X',
       absolutePathForFileInRepo(file, this) ?? file,
@@ -1105,18 +1150,62 @@ export class Repository {
     ).stdout;
 
     const sloc = this.parseSlocFrom(output);
+    const strictSloc = this.parseStrictSlocFrom(output);
 
-    ctx.logger.info('Fetched SLOC for commit:', hash, output, `SLOC: ${sloc}`);
-    return sloc;
+    ctx.logger.info(
+      'Fetched SLOC for commit:',
+      hash,
+      output,
+      `SLOC: ${sloc} Strict SLOC: ${strictSloc}`,
+    );
+    return {sloc, strictSloc};
+  }
+
+  public async fetchPendingAmendSignificantLinesOfCode(
+    ctx: RepositoryContext,
+    hash: Hash,
+    includedFiles: string[],
+  ): Promise<{sloc: number; strictSloc: number}> {
+    if (includedFiles.length === 0) {
+      return {sloc: 0, strictSloc: 0}; // don't bother running sl diff if there are no files to include
+    }
+    const inclusions = includedFiles.flatMap(file => [
+      '-I',
+      absolutePathForFileInRepo(file, this) ?? file,
+    ]);
+
+    const output = (
+      await this.runCommand(
+        ['diff', '--stat', '-B', '-X', '**__generated__**', ...inclusions, '-r', '.^'],
+        'PendingSlocCommand',
+        ctx,
+      )
+    ).stdout;
+
+    if (output.trim() === '') {
+      return {sloc: 0, strictSloc: 0};
+    }
+
+    const sloc = this.parseSlocFrom(output);
+    const strictSloc = this.parseStrictSlocFrom(output);
+
+    ctx.logger.info(
+      'Fetched Pending AMEND SLOC for commit:',
+      hash,
+      output,
+      `SLOC: ${sloc} Strict SLOC: ${strictSloc}`,
+    );
+
+    return {sloc, strictSloc};
   }
 
   public async fetchPendingSignificantLinesOfCode(
     ctx: RepositoryContext,
     hash: Hash,
     includedFiles: string[],
-  ): Promise<number> {
+  ): Promise<{sloc: number; strictSloc: number}> {
     if (includedFiles.length === 0) {
-      return 0; // don't bother running sl diff if there are no files to include
+      return {sloc: 0, strictSloc: 0}; // don't bother running sl diff if there are no files to include
     }
     const inclusions = includedFiles.flatMap(file => [
       '-I',
@@ -1130,11 +1219,19 @@ export class Repository {
         ctx,
       )
     ).stdout;
-    const sloc = this.parseSlocFrom(output);
 
-    ctx.logger.info('Fetched Pending SLOC for commit:', hash, output, `SLOC: ${sloc}`);
-    return sloc;
+    const sloc = this.parseSlocFrom(output);
+    const strictSloc = this.parseStrictSlocFrom(output);
+
+    ctx.logger.info(
+      'Fetched Pending SLOC for commit:',
+      hash,
+      output,
+      `SLOC: ${sloc} Strict SLOC: ${strictSloc}`,
+    );
+    return {sloc, strictSloc};
   }
+
   private parseSlocFrom(output: string) {
     const lines = output.trim().split('\n');
     const changes = lines[lines.length - 1];
@@ -1143,6 +1240,25 @@ export class Repository {
     const insertions = parseInt(diffStatMatch?.[1] ?? '0', 10);
     const deletions = parseInt(diffStatMatch?.[2] ?? '0', 10);
     const sloc = insertions + deletions;
+    return sloc;
+  }
+
+  private parseStrictSlocFrom(output: string) {
+    let sloc = 0;
+    const lines = output.trim().split('\n');
+
+    for (let i = 0; i < lines.length - 1; i++) {
+      const fileChange = lines[i];
+      const [path, lineChange] = fileChange.split('|');
+      const trimmedPath = path.trim();
+
+      if (!trimmedPath.includes('/__tests__/') && !trimmedPath.endsWith('.md')) {
+        const lineChangeMatch = lineChange.match(/\d+/);
+        const lineChangeCount = lineChangeMatch ? parseInt(lineChangeMatch[0]) : 0;
+        sloc += lineChangeCount;
+      }
+    }
+
     return sloc;
   }
 
@@ -1268,13 +1384,16 @@ export class Repository {
         extras: eventName == null ? {args} : undefined,
         operationId: `isl:${id}`,
       },
-      () =>
+      async () =>
         runCommand(
           ctx,
           args,
           {
             ...options,
-            env: {...options?.env, ...Internal.additionalEnvForCommand?.(id)} as NodeJS.ProcessEnv,
+            env: {
+              ...options?.env,
+              ...((await Internal.additionalEnvForCommand?.(id)) ?? {}),
+            } as NodeJS.ProcessEnv,
           },
           timeout ?? READ_COMMAND_TIMEOUT_MS,
         ),
@@ -1381,4 +1500,15 @@ export function absolutePathForFileInRepo(
   } else {
     return null;
   }
+}
+
+function isUnhealthyEdenFs(cwd: string): Promise<boolean> {
+  return exists(path.join(cwd, 'README_EDEN.txt'));
+}
+
+/**
+ * Extract the actually useful stderr part of the Execa Error, to avoid the long command args being printed first.
+ * */
+function simplifyExecaError(error: ExecaError): Error {
+  return new Error(error.stderr.trim() || error.message);
 }

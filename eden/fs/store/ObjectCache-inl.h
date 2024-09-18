@@ -104,18 +104,31 @@ typename std::enable_if_t<
 ObjectCache<ObjectType, Flavor, ObjectCacheStats>::getInterestHandle(
     const ObjectId& hash,
     Interest interest) {
-  XLOG(DBG6) << "BlobCache::getInterestHandle " << hash;
+  XLOG(DBG6) << "ObjectCache::getInterestHandle " << hash;
   // Acquires ObjectCache's lock upon destruction by calling dropInterestHandle,
   // so ensure that, if an exception is thrown below, the ~ObjectInterestHandle
   // runs after the lock is released.
-  ObjectInterestHandle<ObjectType, ObjectCacheStats> interestHandle;
 
   if (interest == Interest::None) {
     return GetResult{};
   }
-
   auto state = state_.lock();
+  return getInterestHandleCore(state, hash, interest);
+}
 
+template <
+    typename ObjectType,
+    ObjectCacheFlavor Flavor,
+    typename ObjectCacheStats>
+template <ObjectCacheFlavor F>
+typename std::enable_if_t<
+    F == ObjectCacheFlavor::InterestHandle,
+    typename ObjectCache<ObjectType, Flavor, ObjectCacheStats>::GetResult>
+ObjectCache<ObjectType, Flavor, ObjectCacheStats>::getInterestHandleCore(
+    LockedState& state,
+    const ObjectId& hash,
+    Interest interest) noexcept {
+  ObjectInterestHandle<ObjectType, ObjectCacheStats> interestHandle;
   auto item = getImpl(hash, *state);
   if (!item) {
     return GetResult{};
@@ -144,7 +157,6 @@ ObjectCache<ObjectType, Flavor, ObjectCacheStats>::getInterestHandle(
     case Interest::None:
       break;
   }
-
   return GetResult{item->object, std::move(interestHandle)};
 }
 
@@ -158,7 +170,7 @@ typename std::enable_if_t<
     typename ObjectCache<ObjectType, Flavor, ObjectCacheStats>::ObjectPtr>
 ObjectCache<ObjectType, Flavor, ObjectCacheStats>::getSimple(
     const ObjectId& hash) {
-  XLOG(DBG6) << "BlobCache::getSimple " << hash;
+  XLOG(DBG6) << "ObjectCache::getSimple " << hash;
   auto state = state_.lock();
 
   if (auto item = getImpl(hash, *state)) {
@@ -180,7 +192,6 @@ ObjectCache<ObjectType, Flavor, ObjectCacheStats>::getImpl(
   if (!item) {
     XLOG(DBG6) << "ObjectCache::getImpl missed";
     state.stats->increment(&ObjectCacheStats::getMiss);
-    ++state.missCount;
 
   } else {
     XLOG(DBG6) << "ObjectCache::getImpl hit";
@@ -192,7 +203,6 @@ ObjectCache<ObjectType, Flavor, ObjectCacheStats>::getImpl(
         state.evictionQueue,
         state.evictionQueue.iterator_to(*item));
     state.stats->increment(&ObjectCacheStats::getHit);
-    ++state.hitCount;
   }
 
   return item;
@@ -214,25 +224,70 @@ ObjectCache<ObjectType, Flavor, ObjectCacheStats>::insertInterestHandle(
   // Acquires ObjectCache's lock upon destruction by calling dropInterestHandle,
   // so ensure that, if an exception is thrown below, the ~ObjectInterestHandle
   // runs after the lock is released.
-  ObjectInterestHandle<ObjectType, ObjectCacheStats> interestHandle{};
+  auto preProcessRes = preProcessInterestHandle<F>(id, object, interest);
 
+  if (interest == Interest::None) {
+    return std::move(preProcessRes.interestHandle);
+  }
+
+  XLOG(DBG6) << " creating entry with generation="
+             << preProcessRes.cacheItemGeneration;
+
+  auto state = state_.lock();
+  return insertInterestHandleCore(
+      std::move(id),
+      std::move(object),
+      interest,
+      state,
+      preProcessRes.cacheItemGeneration,
+      std::move(preProcessRes.interestHandle));
+}
+
+template <
+    typename ObjectType,
+    ObjectCacheFlavor Flavor,
+    typename ObjectCacheStats>
+template <ObjectCacheFlavor F>
+typename std::enable_if_t<
+    F == ObjectCacheFlavor::InterestHandle,
+    typename ObjectCache<ObjectType, Flavor, ObjectCacheStats>::
+        PreProcessInterestHandleResult>
+ObjectCache<ObjectType, Flavor, ObjectCacheStats>::preProcessInterestHandle(
+    ObjectId id,
+    ObjectPtr object,
+    Interest interest) {
+  ObjectInterestHandle<ObjectType, ObjectCacheStats> interestHandle{};
   auto cacheItemGeneration = generateUniqueID();
 
   if (interest == Interest::WantHandle) {
     // This can throw, so do it before inserting into items.
     interestHandle = ObjectInterestHandle<ObjectType, ObjectCacheStats>{
-        this->shared_from_this(), id, object, cacheItemGeneration};
+        this->shared_from_this(),
+        std::move(id),
+        std::move(object),
+        cacheItemGeneration};
   } else {
-    interestHandle.object_ = object;
+    interestHandle.object_ = std::move(object);
   }
 
-  if (interest == Interest::None) {
-    return interestHandle;
-  }
+  return {std::move(interestHandle), cacheItemGeneration};
+}
 
-  XLOG(DBG6) << "  creating entry with generation=" << cacheItemGeneration;
-
-  auto state = state_.lock();
+template <
+    typename ObjectType,
+    ObjectCacheFlavor Flavor,
+    typename ObjectCacheStats>
+template <ObjectCacheFlavor F>
+typename std::enable_if_t<
+    F == ObjectCacheFlavor::InterestHandle,
+    ObjectInterestHandle<ObjectType, ObjectCacheStats>>
+ObjectCache<ObjectType, Flavor, ObjectCacheStats>::insertInterestHandleCore(
+    ObjectId id,
+    ObjectPtr object,
+    Interest interest,
+    LockedState& state,
+    uint64_t cacheItemGeneration,
+    ObjectInterestHandle<ObjectType, ObjectCacheStats> interestHandle) {
   auto [item, inserted] = insertImpl(std::move(id), std::move(object), *state);
   switch (interest) {
     case Interest::UnlikelyNeededAgain:
@@ -357,15 +412,32 @@ template <
     ObjectCacheFlavor Flavor,
     typename ObjectCacheStats>
 typename ObjectCache<ObjectType, Flavor, ObjectCacheStats>::Stats
-ObjectCache<ObjectType, Flavor, ObjectCacheStats>::getStats() const {
+ObjectCache<ObjectType, Flavor, ObjectCacheStats>::getStats(
+    const std::map<std::string, int64_t>& counters) const {
   auto state = state_.lock();
   Stats stats;
+  // Explicitly don't call getTotalSizeBytes or getObjectCount helpers here to
+  // avoid double-locking state_
   stats.objectCount = state->items.size();
   stats.totalSizeInBytes = state->totalSize;
-  stats.hitCount = state->hitCount;
-  stats.missCount = state->missCount;
-  stats.evictionCount = state->evictionCount;
-  stats.dropCount = state->dropCount;
+  auto getCounterValue = [&counters](const std::string_view& name) -> int64_t {
+    std::string_view kStatsCountSuffix{".count"};
+    auto it = counters.find(fmt::format("{}{}", name, kStatsCountSuffix));
+    if (it != counters.end()) {
+      return it->second;
+    } else {
+      return 0;
+    }
+  };
+
+  stats.hitCount =
+      getCounterValue(state->stats->getName(&ObjectCacheStats::getHit));
+  stats.missCount =
+      getCounterValue(state->stats->getName(&ObjectCacheStats::getMiss));
+  stats.evictionCount =
+      getCounterValue(state->stats->getName(&ObjectCacheStats::insertEviction));
+  stats.dropCount =
+      getCounterValue(state->stats->getName(&ObjectCacheStats::objectDrop));
   return stats;
 }
 
@@ -401,7 +473,6 @@ void ObjectCache<ObjectType, Flavor, ObjectCacheStats>::dropInterestHandle(
   if (--item->referenceCount == 0) {
     state->evictionQueue.erase(state->evictionQueue.iterator_to(*item));
     state->stats->increment(&ObjectCacheStats::objectDrop);
-    ++state->dropCount;
     evictItem(*state, *item);
   }
 }
@@ -432,7 +503,6 @@ void ObjectCache<ObjectType, Flavor, ObjectCacheStats>::evictOne(
   const auto& front = state.evictionQueue.front();
   state.evictionQueue.pop_front();
   state.stats->increment(&ObjectCacheStats::insertEviction);
-  ++state.evictionCount;
   evictItem(state, front);
 }
 
@@ -454,4 +524,19 @@ void ObjectCache<ObjectType, Flavor, ObjectCacheStats>::evictItem(
   state.items.erase(item.id);
   state.totalSize -= size;
 }
+
+template <
+    typename ObjectType,
+    ObjectCacheFlavor Flavor,
+    typename ObjectCacheStats>
+void ObjectCache<ObjectType, Flavor, ObjectCacheStats>::invalidate(
+    const ObjectId& id) noexcept {
+  XLOG(DBG6) << "ObjectCache::invalidate " << id;
+  auto state = state_.lock();
+
+  if (auto item = getImpl(id, *state)) {
+    state->evictionQueue.erase(state->evictionQueue.iterator_to(*item));
+    evictItem(*state, *item);
+  }
+};
 } // namespace facebook::eden

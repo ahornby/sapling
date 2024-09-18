@@ -32,7 +32,7 @@
   gap: var(--pad);
   align-items: center;
   margin-top: var(--halfpad);
-  margin-bottom: var(--pad);
+  margin-bottom: calc(2 * var(--pad));
   margin-left: var(--halfpad);
 }
 
@@ -97,6 +97,10 @@
 }
 
 .commit.obsolete .commit-title {
+  opacity: 0.5;
+}
+
+.commit.irrelevant .commit-title {
   opacity: 0.5;
 }
 
@@ -235,10 +239,6 @@
   .commit-inline-operation-progress {
     animation: delayFadeIn 1s ease-in-out;
   }
-}
-
-.goto-button .codicon {
-  margin-left: var(--halfpad);
 }
 
 .goto-button,

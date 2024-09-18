@@ -45,29 +45,18 @@ pub(crate) type Entry = FileAuxData;
 ///       (v0) also contained content_id hash and blake3 hash was optional,
 ///       also, size field was close to the end, just before the blake3
 pub(crate) fn serialize(this: &FileAuxData, hgid: HgId) -> Result<Bytes> {
-    // Write an original format for the migration period.
-    // version 0
-    let mut buf = Vec::new();
-    buf.write_all(hgid.as_ref())?;
-    buf.write_u8(0)?; // write version
-    buf.write_all(edenapi_types::ContentId::default().as_ref())?;
-    buf.write_all(this.sha1.as_ref())?;
-    buf.write_all(edenapi_types::Sha256::default().as_ref())?;
-    buf.write_vlq(this.total_size)?;
-    buf.write_u8(1)?; // A value of 1 indicates the blake3 hash is present
-    buf.write_all(this.blake3.as_ref())?;
-    Ok(buf.into())
-
-    // TODO(liubovd): finish roll out of the new format after 05-22-2024
-    /* New format (tested)
     let mut buf = Vec::new();
     buf.write_all(hgid.as_ref())?;
     buf.write_u8(2)?; // write version
     buf.write_vlq(this.total_size)?;
     buf.write_all(this.sha1.as_ref())?;
     buf.write_all(this.blake3.as_ref())?;
+    if let Some(ref file_header_metadata) = this.file_header_metadata {
+        buf.write_u8(1)?; // write flag that it is present
+        buf.write_vlq(file_header_metadata.len())?; // write size of file_header_metadata blob
+        buf.write_all(file_header_metadata.as_ref())?;
+    }
     Ok(buf.into())
-    */
 }
 
 fn deserialize(bytes: Bytes) -> Result<Option<(HgId, FileAuxData)>> {
@@ -109,6 +98,8 @@ fn deserialize(bytes: Bytes) -> Result<Option<(HgId, FileAuxData)>> {
                 total_size,
                 sha1: sha1.into(),
                 blake3,
+                // TODO(liubovd) support serialization and deserialization of the new field
+                file_header_metadata: None,
             },
         )))
     } else {
@@ -125,12 +116,28 @@ fn deserialize(bytes: Bytes) -> Result<Option<(HgId, FileAuxData)>> {
 
         let mut blake3 = [0u8; 32];
         cur.read_exact(&mut blake3)?;
+
+        let mut file_header_metadata = None;
+        let remaining = cur.position() < bytes.len() as u64;
+        if remaining && cur.read_u8()? == 1 {
+            // read size
+            let size: u64 = cur.read_vlq()?;
+            // read file header metadata blob
+            if cur.position() + size <= bytes.len() as u64 {
+                let mut buf = vec![0u8; size as usize];
+                cur.read_exact(&mut buf)?;
+                file_header_metadata = Some(buf.into());
+            } else {
+                bail!("auxstore entry is truncated/corrupted");
+            };
+        }
         Ok(Some((
             hgid,
             FileAuxData {
                 total_size,
                 sha1: sha1.into(),
                 blake3: blake3.into(),
+                file_header_metadata,
             },
         )))
     }
@@ -144,8 +151,8 @@ impl AuxStore {
         let open_options = AuxStore::open_options(config)?;
 
         let log = match store_type {
-            StoreType::Local => open_options.local(&path),
-            StoreType::Shared => open_options.shared(&path),
+            StoreType::Permanent => open_options.permanent(&path),
+            StoreType::Rotated => open_options.rotated(&path),
         }?;
 
         Ok(AuxStore(log))
@@ -231,7 +238,6 @@ mod tests {
     use std::str::FromStr;
     use std::sync::Arc;
 
-    use edenapi_types::Blake3;
     use edenapi_types::ContentId;
     use edenapi_types::Sha1;
     use edenapi_types::Sha256;
@@ -239,6 +245,7 @@ mod tests {
     use tempfile::TempDir;
     use types::fetch_mode::FetchMode;
     use types::testutil::*;
+    use types::Blake3;
 
     use super::*;
     use crate::indexedlogdatastore::IndexedLogHgIdDataStore;
@@ -258,7 +265,7 @@ mod tests {
     #[test]
     fn test_empty() -> Result<()> {
         let tempdir = TempDir::new()?;
-        let store = AuxStore::new(&tempdir, &empty_config(), StoreType::Shared)?;
+        let store = AuxStore::new(&tempdir, &empty_config(), StoreType::Rotated)?;
         store.flush()?;
         Ok(())
     }
@@ -266,7 +273,7 @@ mod tests {
     #[test]
     fn test_add_get() -> Result<()> {
         let tempdir = TempDir::new().unwrap();
-        let store = AuxStore::new(&tempdir, &empty_config(), StoreType::Shared)?;
+        let store = AuxStore::new(&tempdir, &empty_config(), StoreType::Rotated)?;
 
         let entry = Entry {
             total_size: 1,
@@ -287,7 +294,7 @@ mod tests {
     #[test]
     fn test_lookup_failure() -> Result<()> {
         let tempdir = TempDir::new().unwrap();
-        let store = AuxStore::new(&tempdir, &empty_config(), StoreType::Shared)?;
+        let store = AuxStore::new(&tempdir, &empty_config(), StoreType::Rotated)?;
 
         let entry = Entry {
             total_size: 1,
@@ -310,7 +317,7 @@ mod tests {
     #[test]
     fn test_corrupted() -> Result<()> {
         let tempdir = TempDir::new()?;
-        let store = AuxStore::new(&tempdir, &empty_config(), StoreType::Shared)?;
+        let store = AuxStore::new(&tempdir, &empty_config(), StoreType::Rotated)?;
 
         let k = key("a", "2");
         let entry = Entry {
@@ -329,7 +336,7 @@ mod tests {
         rotate_log_path.push("log");
         remove_file(rotate_log_path)?;
 
-        let store = AuxStore::new(&tempdir, &empty_config(), StoreType::Shared)?;
+        let store = AuxStore::new(&tempdir, &empty_config(), StoreType::Rotated)?;
 
         let k = key("a", "3");
         let entry = Entry {
@@ -349,7 +356,7 @@ mod tests {
     #[test]
     fn test_scmstore_read() -> Result<()> {
         let tmp = TempDir::new()?;
-        let aux = Arc::new(AuxStore::new(&tmp, &empty_config(), StoreType::Shared)?);
+        let aux = Arc::new(AuxStore::new(&tmp, &empty_config(), StoreType::Rotated)?);
 
         let entry = Entry {
             total_size: 1,
@@ -397,14 +404,14 @@ mod tests {
             &tmp,
             ExtStoredPolicy::Ignore,
             &config,
-            StoreType::Shared,
+            StoreType::Rotated,
         )?);
 
         content.add(&d, &meta).unwrap();
         content.flush().unwrap();
 
         let tmp = TempDir::new()?;
-        let aux = Arc::new(AuxStore::new(&tmp, &empty_config(), StoreType::Shared)?);
+        let aux = Arc::new(AuxStore::new(&tmp, &empty_config(), StoreType::Rotated)?);
 
         // Set up local-only FileStore
         let mut store = FileStore::empty();
@@ -418,6 +425,7 @@ mod tests {
             blake3: Blake3::from_str(
                 "2078b4229b5353de0268efc7f64b68f3c99fb8829e9c052117b4e1e090b2603a",
             )?,
+            file_header_metadata: None,
         };
         // Attempt fetch.
         let fetched = store
@@ -537,7 +545,8 @@ mod tests {
 
     #[test]
     /// Test that we can deserialize correctly the v2 format
-    fn test_deserialize_old_entry_v2() -> Result<()> {
+    /// This test also covers the case where the file header metadata wasn't written at all (so adding it is forward and backward compatible)
+    fn test_deserialize_entry_v2() -> Result<()> {
         let mut buf = Vec::new();
         buf.write_all(
             key("a", "def6f29d7b61f9cb70b2f14f79cd5c43c38e21b2")
@@ -551,13 +560,49 @@ mod tests {
             Blake3::from_str("2078b4229b5353de0268efc7f64b68f3c99fb8829e9c052117b4e1e090b2603a")?
                 .as_ref(),
         )?;
-
         assert!(
             deserialize(buf.into())
-                .expect("Failed to deserialize old format entry")
+                .expect("Failed to deserialize entry")
                 .is_some(),
         );
+        Ok(())
+    }
 
+    #[test]
+    /// Test that we can deserialize and store values with file header metadata
+    fn test_deserialize_with_file_header_metadata() -> Result<()> {
+        let hg_id = HgId::from_hex(b"def6f29d7b61f9cb70b2f14f79cd5c43c38e21b2")?;
+        let test_entry = Entry {
+            total_size: 4,
+            sha1: Sha1::from_str("7110eda4d09e062aa5e4a390b0a572ac0d2c0220")?,
+            blake3: Blake3::from_str(
+                "2078b4229b5353de0268efc7f64b68f3c99fb8829e9c052117b4e1e090b2603a",
+            )?,
+            file_header_metadata: Some("\x01\ncopy: aaa/bbb/ccc/ddd/test_file.php\ncopyrev: 79c2d9e37f2f90e2ee3cb05762224eea0b864e12\n\x01\n".into()),
+        };
+        let bytes = serialize(&test_entry, hg_id)?;
+        let (hg_id1, test_entry1) = deserialize(bytes)?.expect("Failed to deserialize entry");
+        assert_eq!(hg_id, hg_id1);
+        assert_eq!(test_entry, test_entry1);
+        Ok(())
+    }
+
+    #[test]
+    /// Test that we can deserialize and store values with empty file header metadata
+    fn test_deserialize_with_empty_file_header_metadata() -> Result<()> {
+        let hg_id = HgId::from_hex(b"def6f29d7b61f9cb70b2f14f79cd5c43c38e21b2")?;
+        let test_entry = Entry {
+            total_size: 4,
+            sha1: Sha1::from_str("7110eda4d09e062aa5e4a390b0a572ac0d2c0220")?,
+            blake3: Blake3::from_str(
+                "2078b4229b5353de0268efc7f64b68f3c99fb8829e9c052117b4e1e090b2603a",
+            )?,
+            file_header_metadata: None,
+        };
+        let bytes = serialize(&test_entry, hg_id)?;
+        let (hg_id1, test_entry1) = deserialize(bytes)?.expect("Failed to deserialize entry");
+        assert_eq!(hg_id, hg_id1);
+        assert_eq!(test_entry, test_entry1);
         Ok(())
     }
 }

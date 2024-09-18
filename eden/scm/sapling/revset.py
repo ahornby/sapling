@@ -765,7 +765,7 @@ def bookmark(repo, subset, x):
             bms.add(repo[bmrev].rev())
         else:
             matchrevs = set()
-            for name, bmrev in pycompat.iteritems(repo._bookmarks):
+            for name, bmrev in repo._bookmarks.items():
                 if matcher(name):
                     matchrevs.add(bmrev)
             if not matchrevs:
@@ -914,7 +914,7 @@ def children(repo, subset, x):
 
     # rust changelog alternative path
     cl = repo.changelog
-    nodes = repo.dageval(lambda dag: dag.children(cl.tonodes(s)) & (draft() + public()))
+    nodes = repo.dageval(lambda dag: dag.children(cl.tonodes(s)) & (draft() | public()))
     return subset & cl.torevset(nodes)
 
 
@@ -1300,7 +1300,7 @@ def getall(repo, subset, x):
 
     # rust changelog alternative path
     cl = repo.changelog
-    return subset & cl.torevset(repo.dageval(lambda: public() + draft()), reverse=True)
+    return subset & cl.torevset(repo.dageval(lambda: public() | draft()), reverse=True)
 
 
 @predicate("_all()", safe=True)
@@ -1592,7 +1592,7 @@ def named(repo, subset, x):
             raise error.RepoLookupError(_("namespace '%s' does not exist") % ns)
         namespaces.add(repo.names[pattern])
     else:
-        for name, ns in pycompat.iteritems(repo.names):
+        for name, ns in repo.names.items():
             if matcher(name):
                 namespaces.add(ns)
         if not namespaces:

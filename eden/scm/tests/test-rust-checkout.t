@@ -25,6 +25,20 @@ Unknown file w/ different content - conflict:
   (commit, shelve, goto --clean to discard all your changes, or goto --merge to merge them)
   [255]
 
+Checking out to diff without file where file removed locally
+  $ newclientrepo
+  $ drawdag <<EOS
+  > B  # B/file = foo
+  > |
+  > A
+  > EOS
+  $ hg go $B -qC
+  $ hg rm file
+  $ hg go $A
+  abort: 1 conflicting file changes:
+   file
+  (commit, shelve, goto --clean to discard all your changes, or goto --merge to merge them)
+  [255]
 
 Respect merge marker file:
   $ newclientrepo
@@ -41,16 +55,14 @@ Respect merge marker file:
   [1]
 
   $ hg go $B
-  abort: goto --merge in progress
-  (use 'hg goto --continue' to continue or
-       'hg goto --clean' to abort - WARNING: will destroy uncommitted changes)
+  abort: outstanding merge conflicts
+  (use 'hg resolve --list' to list, 'hg resolve --mark FILE' to mark resolved)
   [255]
 
 Run it again to make sure we didn't clear out state file:
   $ hg go $B
-  abort: goto --merge in progress
-  (use 'hg goto --continue' to continue or
-       'hg goto --clean' to abort - WARNING: will destroy uncommitted changes)
+  abort: outstanding merge conflicts
+  (use 'hg resolve --list' to list, 'hg resolve --mark FILE' to mark resolved)
   [255]
 
   $ hg go --continue
@@ -77,7 +89,8 @@ Can continue interrupted checkout:
 
   $ hg go -q null
   $ FAILPOINTS=checkout-post-progress=return hg go $A
-  abort: checkout error: Error set by checkout-post-progress FAILPOINTS
+  abort: checkout errors:
+   Error set by checkout-post-progress FAILPOINTS
   [255]
 
   $ hg whereami
@@ -115,7 +128,7 @@ Don't fail with open files that can't be deleted:
     with open("unlink_fail/foo"), open("unlink_fail/bar"):
 
       $ hg go $B
-      update failed to remove foo: Can't remove file "*foo": The process cannot access the file because it is being used by another process. (os error 32)! (glob) (windows !) (no-eden !)
+      update failed to remove foo: can't remove file "*foo": The process cannot access the file because it is being used by another process. (os error 32)! (glob) (windows !) (no-eden !)
       2 files updated, 0 files merged, 1 files removed, 0 files unresolved
 
 
@@ -171,11 +184,14 @@ Various invalid arg combos:
   [255]
 
   $ echo untracked > bar
+  $ hg rm B
   $ hg st
   M foo
+  R B
   ? bar
   $ hg go $A
-  abort: 2 conflicting file changes:
+  abort: * conflicting file changes: (glob)
+   B
    bar
    foo
   (commit, shelve, goto --clean to discard all your changes, or goto --merge to merge them)
@@ -187,6 +203,9 @@ Various invalid arg combos:
   foo (no-eol)
   $ cat bar
   bar (no-eol)
+  $ cat B
+  cat: B: $ENOENT$
+  [1]
 
 --clean gets you out of merge state:
   $ newclientrepo
@@ -476,3 +495,46 @@ Test update_distance logging:
    INFO update_size: update_distance=1
   $ LOG=update_size=trace hg go -q null
    INFO update_size: update_distance=2
+
+#if unix-permissions no-eden
+# Test output when there are lots of filesystem errors:
+
+  $ newclientrepo
+  $ mkdir dir
+  $ for i in `seq 10`; do touch dir/file_$i; done
+  $ hg commit -Aqm foo
+  $ hg go -q null
+  $ mkdir dir
+  $ chmod 444 dir
+  $ hg go tip
+  abort: error writing files:
+   dir/file_1: can't clear conflicts after handling error "Permission denied (os error 13)": can't lstat "$TESTTMP/*/dir/file_1": Permission denied (os error 13) (glob)
+   dir/file_10: can't clear conflicts after handling error "Permission denied (os error 13)": can't lstat "$TESTTMP/*/dir/file_10": Permission denied (os error 13) (glob)
+   dir/file_2: can't clear conflicts after handling error "Permission denied (os error 13)": can't lstat "$TESTTMP/*/dir/file_2": Permission denied (os error 13) (glob)
+   dir/file_3: can't clear conflicts after handling error "Permission denied (os error 13)": can't lstat "$TESTTMP/*/dir/file_3": Permission denied (os error 13) (glob)
+   dir/file_4: can't clear conflicts after handling error "Permission denied (os error 13)": can't lstat "$TESTTMP/*/dir/file_4": Permission denied (os error 13) (glob)
+   ...and 5 more
+  [255]
+#endif
+
+# Test output when there are lots of edenapi errors:
+#if no-eden
+
+  $ newclientrepo broken_client test:broken_server
+  $ cd ~/broken_server
+  $ for i in `seq 10`; do touch file_$i; done
+  $ hg commit -Aqm foo
+  $ hg book master
+  $ cd ~/broken_client
+  $ hg pull -q
+  $ FAILPOINTS=eagerepo::api::files_attrs=return hg go master
+  abort: error fetching files:
+   b80de5d138758541c5f05265ad144ab9fa86d1db file_1: Network Error: server responded 500 Internal Server Error for eager://$TESTTMP/broken_server/files_attrs: failpoint. Headers: {}
+   b80de5d138758541c5f05265ad144ab9fa86d1db file_10: Network Error: server responded 500 Internal Server Error for eager://$TESTTMP/broken_server/files_attrs: failpoint. Headers: {}
+   b80de5d138758541c5f05265ad144ab9fa86d1db file_2: Network Error: server responded 500 Internal Server Error for eager://$TESTTMP/broken_server/files_attrs: failpoint. Headers: {}
+   b80de5d138758541c5f05265ad144ab9fa86d1db file_3: Network Error: server responded 500 Internal Server Error for eager://$TESTTMP/broken_server/files_attrs: failpoint. Headers: {}
+   b80de5d138758541c5f05265ad144ab9fa86d1db file_4: Network Error: server responded 500 Internal Server Error for eager://$TESTTMP/broken_server/files_attrs: failpoint. Headers: {}
+   ...and 5 more
+  [255]
+
+#endif

@@ -9,8 +9,6 @@ use std::collections::HashSet;
 use std::io::Write;
 
 use anyhow::Result;
-use chrono::naive::NaiveDateTime;
-use chrono::DateTime;
 use scs_client_raw::thrift;
 
 use crate::args::commit_id::resolve_commit_ids;
@@ -23,6 +21,7 @@ use crate::library::commit::render_commit_info;
 use crate::library::commit::render_commit_summary;
 use crate::library::commit::CommitInfo as CommitInfoOutput;
 use crate::render::Render;
+use crate::util::convert_to_ts;
 use crate::ScscApp;
 
 #[derive(Copy, Clone)]
@@ -86,6 +85,14 @@ pub(super) struct CommandArgs {
     #[clap(long)]
     /// Follow mutable overrides to the history that make it more user friendly and 'correct'
     follow_mutable_history: bool,
+    /// Show only the linear history of the commit, ignoring merge commits.
+    #[clap(
+        long,
+        conflicts_with = "after",
+        conflicts_with = "before",
+        conflicts_with = "path"
+    )]
+    linear: bool,
 }
 
 struct LogOutput {
@@ -114,28 +121,6 @@ impl Render for LogOutput {
     fn render_json(&self, _args: &Self::Args, w: &mut dyn Write) -> Result<()> {
         Ok(serde_json::to_writer(w, &self.history)?)
     }
-}
-
-fn convert_to_ts(date_str: Option<&str>) -> Result<Option<i64>> {
-    if let Some(date_str) = date_str {
-        let ts = if let Ok(date) = DateTime::parse_from_str(date_str, "%Y-%m-%d %H:%M:%S %:z") {
-            date.timestamp()
-        } else if let Ok(naive) = NaiveDateTime::parse_from_str(date_str, "%Y-%m-%d %H:%M:%S") {
-            naive.timestamp()
-        } else {
-            date_str.parse::<i64>()?
-        };
-
-        if ts > 0 {
-            return Ok(Some(ts));
-        }
-        anyhow::bail!(
-            "The given date or timestamp must be after 1970-01-01 00:00:00 UTC: {:?}",
-            date_str
-        )
-    }
-
-    Ok(None)
 }
 
 pub(super) async fn run(app: ScscApp, args: CommandArgs) -> Result<()> {
@@ -209,18 +194,31 @@ pub(super) async fn run(app: ScscApp, args: CommandArgs) -> Result<()> {
                 .history
         }
         None => {
-            let params = thrift::CommitHistoryParams {
-                format: thrift::HistoryFormat::COMMIT_INFO,
-                limit,
-                skip,
-                before_timestamp,
-                after_timestamp,
-                identity_schemes,
-                descendants_of,
-                exclude_changeset_and_ancestors,
-                ..Default::default()
-            };
-            conn.commit_history(&commit, &params).await?.history
+            if args.linear {
+                let params = thrift::CommitLinearHistoryParams {
+                    format: thrift::HistoryFormat::COMMIT_INFO,
+                    limit,
+                    skip: skip as i64,
+                    identity_schemes,
+                    descendants_of,
+                    exclude_changeset_and_ancestors,
+                    ..Default::default()
+                };
+                conn.commit_linear_history(&commit, &params).await?.history
+            } else {
+                let params = thrift::CommitHistoryParams {
+                    format: thrift::HistoryFormat::COMMIT_INFO,
+                    limit,
+                    skip,
+                    before_timestamp,
+                    after_timestamp,
+                    identity_schemes,
+                    descendants_of,
+                    exclude_changeset_and_ancestors,
+                    ..Default::default()
+                };
+                conn.commit_history(&commit, &params).await?.history
+            }
         }
     };
 

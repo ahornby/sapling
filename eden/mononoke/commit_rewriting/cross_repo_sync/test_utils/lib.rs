@@ -14,19 +14,16 @@ use anyhow::format_err;
 use anyhow::Context;
 use anyhow::Error;
 use ascii::AsciiString;
-use blobrepo::AsBlobRepo;
-use blobrepo::BlobRepo;
 use blobstore::Loadable;
 use bonsai_git_mapping::BonsaiGitMapping;
 use bonsai_globalrev_mapping::BonsaiGlobalrevMapping;
 use bonsai_hg_mapping::BonsaiHgMapping;
-use bonsai_hg_mapping::BonsaiHgMappingRef;
 use bookmarks::BookmarkKey;
 use bookmarks::BookmarkUpdateLog;
 use bookmarks::BookmarkUpdateReason;
 use bookmarks::Bookmarks;
-use changesets::Changesets;
 use commit_graph::CommitGraph;
+use commit_graph::CommitGraphWriter;
 use commit_transformation::upload_commits;
 use context::CoreContext;
 use cross_repo_sync::rewrite_commit;
@@ -36,7 +33,6 @@ use cross_repo_sync::CommitSyncContext;
 use cross_repo_sync::CommitSyncRepos;
 use cross_repo_sync::CommitSyncer;
 use cross_repo_sync::InMemoryRepo;
-use cross_repo_sync::Large;
 use cross_repo_sync::Repo;
 use cross_repo_sync::SubmoduleDeps;
 use cross_repo_sync::SubmoduleExpansionData;
@@ -68,48 +64,74 @@ use repo_bookmark_attrs::RepoBookmarkAttrs;
 use repo_cross_repo::RepoCrossRepo;
 use repo_derived_data::RepoDerivedData;
 use repo_identity::RepoIdentity;
-use sql_construct::SqlConstruct;
-use synced_commit_mapping::SqlSyncedCommitMapping;
+use repo_identity::RepoIdentityRef;
+use sql_query_config::SqlQueryConfig;
 use synced_commit_mapping::SyncedCommitMapping;
 use synced_commit_mapping::SyncedCommitMappingEntry;
 use test_repo_factory::TestRepoFactory;
+use test_repo_factory::TestRepoFactoryBuilder;
 use tests_utils::bookmark;
 use tests_utils::CreateCommitContext;
 
 #[facet::container]
 #[derive(Clone)]
 pub struct TestRepo {
-    #[delegate(
-        dyn Bookmarks,
-        dyn BookmarkUpdateLog,
-        dyn BonsaiHgMapping,
-        dyn BonsaiGitMapping,
-        dyn BonsaiGlobalrevMapping,
-        dyn PushrebaseMutationMapping,
-        RepoBookmarkAttrs,
-        dyn Changesets,
-        dyn Filenodes,
-        FilestoreConfig,
-        dyn MutableCounters,
-        dyn Phases,
-        RepoBlobstore,
-        RepoDerivedData,
-        RepoIdentity,
-        CommitGraph,
-    )]
-    pub blob_repo: BlobRepo,
+    #[facet]
+    bookmarks: dyn Bookmarks,
 
     #[facet]
-    pub repo_cross_repo: RepoCrossRepo,
+    bookmark_update_log: dyn BookmarkUpdateLog,
 
     #[facet]
-    pub repo_config: RepoConfig,
-}
+    bonsai_hg_mapping: dyn BonsaiHgMapping,
 
-impl AsBlobRepo for TestRepo {
-    fn as_blob_repo(&self) -> &BlobRepo {
-        &self.blob_repo
-    }
+    #[facet]
+    bonsai_git_mapping: dyn BonsaiGitMapping,
+
+    #[facet]
+    bonsai_globalrev_mapping: dyn BonsaiGlobalrevMapping,
+
+    #[facet]
+    pushrebase_mutation_mapping: dyn PushrebaseMutationMapping,
+
+    #[facet]
+    repo_bookmark_attrs: RepoBookmarkAttrs,
+
+    #[facet]
+    filenodes: dyn Filenodes,
+
+    #[facet]
+    filestore_config: FilestoreConfig,
+
+    #[facet]
+    mutable_counters: dyn MutableCounters,
+
+    #[facet]
+    phases: dyn Phases,
+
+    #[facet]
+    repo_blobstore: RepoBlobstore,
+
+    #[facet]
+    repo_derived_data: RepoDerivedData,
+
+    #[facet]
+    repo_identity: RepoIdentity,
+
+    #[facet]
+    commit_graph: CommitGraph,
+
+    #[facet]
+    commit_graph_writer: dyn CommitGraphWriter,
+
+    #[facet]
+    repo_cross_repo: RepoCrossRepo,
+
+    #[facet]
+    repo_config: RepoConfig,
+
+    #[facet]
+    sql_query_config: SqlQueryConfig,
 }
 
 pub fn xrepo_mapping_version_with_small_repo() -> CommitSyncConfigVersion {
@@ -118,13 +140,12 @@ pub fn xrepo_mapping_version_with_small_repo() -> CommitSyncConfigVersion {
 
 // Helper function that takes a root commit from source repo and rebases it on master bookmark
 // in target repo
-pub async fn rebase_root_on_master<M, R>(
+pub async fn rebase_root_on_master<R>(
     ctx: CoreContext,
-    commit_syncer: &CommitSyncer<M, R>,
+    commit_syncer: &CommitSyncer<R>,
     source_bcs_id: ChangesetId,
 ) -> Result<ChangesetId, Error>
 where
-    M: SyncedCommitMapping + Clone + 'static,
     R: Repo,
 {
     let bookmark_name =
@@ -155,7 +176,7 @@ where
     let rewrite_res = {
         let map = HashMap::new();
         let version = CommitSyncConfigVersion("TEST_VERSION_NAME".to_string());
-        let mover = commit_syncer.get_mover_by_version(&version).await?;
+        let movers = commit_syncer.get_movers_by_version(&version).await?;
         let (x_repo_submodule_metadata_file_prefix, dangling_submodule_pointers) =
             submodule_metadata_file_prefix_and_dangling_pointers(
                 source_repo.repo_identity().id(),
@@ -164,13 +185,14 @@ where
             )
             .await?;
 
+        let small_repo = commit_syncer.get_small_repo();
+        let small_repo_id = small_repo.repo_identity().id();
         let large_repo = commit_syncer.get_large_repo();
-        let large_repo_id = Large(large_repo.repo_identity().id());
         let fallback_repos = vec![Arc::new(source_repo.clone())]
             .into_iter()
             .chain(submodule_deps.repos())
             .collect::<Vec<_>>();
-        let large_in_memory_repo = InMemoryRepo::from_repo(target_repo, fallback_repos)?;
+        let large_in_memory_repo = InMemoryRepo::from_repo(large_repo, fallback_repos)?;
 
         let submodule_expansion_data = match submodule_deps {
             SubmoduleDeps::ForSync(deps) => Some(SubmoduleExpansionData {
@@ -178,7 +200,7 @@ where
                 submodule_deps: deps,
                 x_repo_submodule_metadata_file_prefix: x_repo_submodule_metadata_file_prefix
                     .as_str(),
-                large_repo_id,
+                small_repo_id,
                 dangling_submodule_pointers,
             }),
             SubmoduleDeps::NotNeeded | SubmoduleDeps::NotAvailable => None,
@@ -188,7 +210,7 @@ where
             &ctx,
             source_bcs_mut,
             &map,
-            mover,
+            movers,
             source_repo,
             Default::default(),
             Default::default(),
@@ -233,28 +255,33 @@ where
     Ok(target_bcs.get_changeset_id())
 }
 
-pub async fn init_small_large_repo(
+pub async fn init_small_large_repo<Repo>(
     ctx: &CoreContext,
 ) -> Result<
     (
-        Syncers<SqlSyncedCommitMapping, TestRepo>,
+        Syncers<Repo>,
         CommitSyncConfig,
         Arc<dyn LiveCommitSyncConfig>,
         TestLiveCommitSyncConfigSource,
     ),
     Error,
-> {
+>
+where
+    Repo: cross_repo_sync::Repo
+        + for<'builder> facet::AsyncBuildable<'builder, TestRepoFactoryBuilder<'builder>>,
+{
     let mut factory = TestRepoFactory::new(ctx.fb)?;
     let (sync_config, source) = TestLiveCommitSyncConfig::new_with_source();
     let sync_config = Arc::new(sync_config);
-    let megarepo: TestRepo = factory
+    let megarepo: Repo = factory
         .with_id(RepositoryId::new(1))
+        .with_name("largerepo")
         .with_live_commit_sync_config(sync_config.clone())
         .build()
         .await?;
-    let mapping = SqlSyncedCommitMapping::from_sql_connections(factory.metadata_db().clone());
-    let smallrepo: TestRepo = factory
+    let smallrepo: Repo = factory
         .with_id(RepositoryId::new(0))
+        .with_name("smallrepo")
         .with_live_commit_sync_config(sync_config.clone())
         .build()
         .await?;
@@ -302,12 +329,8 @@ pub async fn init_small_large_repo(
 
     let live_commit_sync_config = sync_config.clone();
 
-    let small_to_large_commit_syncer = CommitSyncer::new_with_live_commit_sync_config(
-        ctx,
-        mapping.clone(),
-        repos.clone(),
-        live_commit_sync_config.clone(),
-    );
+    let small_to_large_commit_syncer =
+        CommitSyncer::new(ctx, repos.clone(), live_commit_sync_config.clone());
 
     let repos = CommitSyncRepos::LargeToSmall {
         small_repo: smallrepo.clone(),
@@ -315,12 +338,8 @@ pub async fn init_small_large_repo(
         submodule_deps: SubmoduleDeps::ForSync(HashMap::new()),
     };
 
-    let large_to_small_commit_syncer = CommitSyncer::new_with_live_commit_sync_config(
-        ctx,
-        mapping.clone(),
-        repos.clone(),
-        live_commit_sync_config,
-    );
+    let large_to_small_commit_syncer =
+        CommitSyncer::new(ctx, repos.clone(), live_commit_sync_config);
 
     let first_bcs_id = CreateCommitContext::new_root(ctx, &smallrepo)
         .add_file("file", "content")
@@ -365,7 +384,7 @@ pub async fn init_small_large_repo(
     };
     let move_hg_cs = perform_move(
         ctx,
-        &megarepo.blob_repo,
+        &megarepo,
         second_bcs_id,
         Arc::new(prefix_mover),
         move_cs_args,
@@ -435,7 +454,10 @@ pub async fn init_small_large_repo(
     ))
 }
 
-pub fn base_commit_sync_config(large_repo: &TestRepo, small_repo: &TestRepo) -> CommitSyncConfig {
+pub fn base_commit_sync_config(
+    large_repo: &impl RepoIdentityRef,
+    small_repo: &impl RepoIdentityRef,
+) -> CommitSyncConfig {
     let small_repo_sync_config = SmallRepoCommitSyncConfig {
         default_action: DefaultSmallToLargeCommitSyncPathAction::PrependPrefix(
             NonRootMPath::new("prefix").unwrap(),

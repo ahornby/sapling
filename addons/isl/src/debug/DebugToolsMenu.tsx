@@ -9,17 +9,13 @@ import type {Heartbeat} from '../heartbeat';
 import type {ReactNode} from 'react';
 import type {ExclusiveOr} from 'shared/typeUtils';
 
-import {debugLogMessageTraffic} from '../ClientToServerAPI';
+import {colors} from '../../../components/theme/tokens.stylex';
+import serverApi, {debugLogMessageTraffic} from '../ClientToServerAPI';
 import {Column, Row} from '../ComponentUtils';
 import {DropdownField, DropdownFields} from '../DropdownFields';
-import {InlineErrorBadge} from '../ErrorNotice';
 import messageBus from '../MessageBus';
-import {Subtle} from '../Subtle';
-import {Tooltip} from '../Tooltip';
 import {enableReactTools, enableReduxTools} from '../atoms/debugToolAtoms';
 import {holdingCtrlAtom} from '../atoms/keyboardAtoms';
-import {Badge} from '../components/Badge';
-import {Checkbox} from '../components/Checkbox';
 import {DagCommitInfo} from '../dag/dagCommitInfo';
 import {useHeartbeat} from '../heartbeat';
 import {t, T} from '../i18n';
@@ -36,12 +32,18 @@ import {
   repositoryInfo,
 } from '../serverAPIState';
 import {showToast} from '../toast';
-import {colors} from '../tokens.stylex';
 import {isDev} from '../utils';
 import {ComponentExplorerButton} from './ComponentExplorer';
 import {readInterestingAtoms, serializeAtomsState} from './getInterestingAtoms';
 import * as stylex from '@stylexjs/stylex';
-import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
+import {Badge} from 'isl-components/Badge';
+import {Banner, BannerKind} from 'isl-components/Banner';
+import {Button} from 'isl-components/Button';
+import {Checkbox} from 'isl-components/Checkbox';
+import {InlineErrorBadge} from 'isl-components/ErrorNotice';
+import {Icon} from 'isl-components/Icon';
+import {Subtle} from 'isl-components/Subtle';
+import {Tooltip} from 'isl-components/Tooltip';
 import {atom, useAtom, useAtomValue} from 'jotai';
 import {useState, useCallback, useEffect} from 'react';
 
@@ -78,12 +80,105 @@ export default function DebugToolsMenu({dismiss}: {dismiss: () => unknown}) {
             <ForceDisconnectButton />
             <NopOperationButtons />
           </Row>
+          <Row>
+            <StressTestMessages />
+          </Row>
         </Column>
       </DropdownField>
       <DropdownField title={<T>Component Explorer</T>}>
         <ComponentExplorerButton dismiss={dismiss} />
       </DropdownField>
     </DropdownFields>
+  );
+}
+
+function nextTick(): Promise<void> {
+  return new Promise(res => setTimeout(res, 0));
+}
+
+const stressTestAtom = atom<{progressPct: number | null; mismatches: Array<number>}>({
+  progressPct: null,
+  mismatches: [],
+});
+/** Look for out of order message passing by sending thousands of messages and verifying their ordering */
+function StressTestMessages() {
+  const [result, setResult] = useAtom(stressTestAtom);
+
+  const N = 100_000;
+  // how many messages to send before pausing an async tick
+  const tickEvery = 5_000;
+
+  const ONE_KILOBYTE = 1000;
+  // how large of a string payload to add to each message
+  const payloadSize = 1.0 * ONE_KILOBYTE;
+
+  const enableLogging = false;
+
+  return (
+    <>
+      <Button
+        disabled={result.progressPct != null && result.progressPct !== 100}
+        onClick={async () => {
+          const log = enableLogging ? console.log : () => null;
+
+          setResult({
+            progressPct: null,
+            mismatches: [],
+          });
+          await nextTick();
+
+          log(' ------ Begin Stress ------');
+          const payload = 'a'.repeat(payloadSize);
+
+          let lastReceivedId = 0;
+          const dispose = serverApi.onMessageOfType('stress', ({id, time}) => {
+            log(' < ', id, time);
+            if (id !== lastReceivedId + 1) {
+              setResult(last => ({...last, mismatches: [...last.mismatches, id]}));
+            }
+            lastReceivedId = id;
+
+            setResult(last => ({...last, progressPct: (100 * id) / N}));
+            if (id == N) {
+              dispose.dispose();
+              setResult(last => ({...last, progressPct: 100})); // if last message was out of order, we'd get stuck
+              log(' ------ End Stress ------');
+            }
+          });
+
+          for (let id = 1; id <= N; id++) {
+            if (id % tickEvery === 0) {
+              // eslint-disable-next-line no-await-in-loop
+              await nextTick();
+            }
+            serverApi.postMessage({
+              type: 'stress',
+              id,
+              time: new Date().valueOf(),
+              message: payload,
+            });
+            log(' > ', id);
+          }
+        }}>
+        <T>Message Stress Test</T>
+      </Button>
+      {result.progressPct == null ? null : result.progressPct < 100 ? (
+        <Row style={{fontVariant: 'tabular-nums'}}>
+          <Icon icon="loading" /> {Math.round(result.progressPct)}%
+        </Row>
+      ) : (
+        <Tooltip title={t(`Sent ${N} messages, with ${result.mismatches.length} out of order`)}>
+          {result.mismatches.length === 0 ? (
+            <Icon icon="pass" color="green" />
+          ) : (
+            <Icon icon="error" color="red" />
+          )}
+        </Tooltip>
+      )}
+      {result.mismatches.length === 0 ? null : (
+        <Banner kind={BannerKind.error}>{result.mismatches.join(',')}</Banner>
+      )}
+    </>
   );
 }
 
@@ -109,38 +204,36 @@ function InternalState() {
             'Capture a snapshot of selected Jotai atom states, log it to the dev tools console.\n\n' +
               'Hold Ctrl to use serailzied JSON instead of Javascript objects.',
           )}>
-          <VSCodeButton onClick={generate} appearance="secondary">
+          <Button onClick={generate}>
             {needSerialize ? <T>Take Snapshot (JSON)</T> : <T>Take Snapshot (objects)</T>}
-          </VSCodeButton>
+          </Button>
         </Tooltip>
         <Tooltip
           placement="bottom"
           title={t(
             'Log persisted state (localStorage or vscode storage) to the dev tools console.',
           )}>
-          <VSCodeButton
+          <Button
             onClick={() => {
               console.log('persisted state:', platform.getAllPersistedState());
               showToast('logged persisted state to console!');
-            }}
-            appearance="secondary">
+            }}>
             <T>Log Persisted State</T>
-          </VSCodeButton>
+          </Button>
         </Tooltip>
         <Tooltip
           placement="bottom"
           title={t(
             'Clear any persisted state (localStorage or vscode storage). Usually only matters after restarting.',
           )}>
-          <VSCodeButton
+          <Button
             onClick={() => {
               platform.clearPersistedState();
               console.log('--- cleared isl persisted state ---');
               showToast('cleared persisted state');
-            }}
-            appearance="secondary">
+            }}>
             <T>Clear Persisted State</T>
-          </VSCodeButton>
+          </Button>
         </Tooltip>
       </Row>
       {isDev && (
@@ -321,7 +414,7 @@ function ForceDisconnectButton() {
     return null;
   }
   return (
-    <VSCodeButton
+    <Button
       onClick={() => forceDisconnect(duration)}
       onWheel={e => {
         // deltaY is usually -100 +100 per event.
@@ -332,10 +425,9 @@ function ForceDisconnectButton() {
         } else if (dy < 0) {
           setDuration(v => Math.min(v - dy * scale, 300000));
         }
-      }}
-      appearance="secondary">
+      }}>
       <T replace={{$sec: (duration / 1000).toFixed(1)}}>Force disconnect for $sec seconds</T>
-    </VSCodeButton>
+    </Button>
   );
 }
 
@@ -344,12 +436,11 @@ function NopOperationButtons() {
   return (
     <>
       {[2, 5, 10].map(durationSeconds => (
-        <VSCodeButton
+        <Button
           key={durationSeconds}
-          onClick={() => runOperation(new NopOperation(durationSeconds))}
-          appearance="secondary">
+          onClick={() => runOperation(new NopOperation(durationSeconds))}>
           <T replace={{$sec: durationSeconds}}>Nop $sec s</T>
-        </VSCodeButton>
+        </Button>
       ))}
     </>
   );

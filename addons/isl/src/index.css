@@ -5,6 +5,8 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+@stylex stylesheet;
+
 /**
  * We don't assume we're rendered directly into <body>,
  * so we don't put any styles on <body> itself.
@@ -38,7 +40,7 @@
     monospace
   );
 
-  --editor-font-size: var(--vscode-font-size, 13px);
+  --editor-font-size: var(--vscode-editor-font-size, 12px);
 
   height: calc(100vh / var(--zoom, 1));
   max-height: calc(100vh / var(--zoom, 1));

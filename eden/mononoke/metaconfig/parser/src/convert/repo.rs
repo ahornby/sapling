@@ -6,8 +6,6 @@
  */
 
 use std::collections::HashMap;
-use std::str::FromStr;
-use std::time::Duration;
 
 use anyhow::anyhow;
 use anyhow::Context;
@@ -18,6 +16,7 @@ use metaconfig_types::BlameVersion;
 use metaconfig_types::BookmarkOrRegex;
 use metaconfig_types::BookmarkParams;
 use metaconfig_types::CacheWarmupParams;
+use metaconfig_types::CommitCloudConfig;
 use metaconfig_types::CommitGraphConfig;
 use metaconfig_types::CommitIdentityScheme;
 use metaconfig_types::ComparableRegex;
@@ -25,6 +24,8 @@ use metaconfig_types::CrossRepoCommitValidation;
 use metaconfig_types::DerivedDataConfig;
 use metaconfig_types::DerivedDataTypesConfig;
 use metaconfig_types::GitConcurrencyParams;
+use metaconfig_types::GitConfigs;
+use metaconfig_types::GitDeltaManifestV2Config;
 use metaconfig_types::GitDeltaManifestVersion;
 use metaconfig_types::GlobalrevConfig;
 use metaconfig_types::HgSyncConfig;
@@ -37,13 +38,12 @@ use metaconfig_types::InfinitepushParams;
 use metaconfig_types::LfsParams;
 use metaconfig_types::LoggingDestination;
 use metaconfig_types::MetadataLoggerConfig;
+use metaconfig_types::MononokeCasSyncConfig;
 use metaconfig_types::PushParams;
 use metaconfig_types::PushrebaseFlags;
 use metaconfig_types::PushrebaseParams;
 use metaconfig_types::PushrebaseRemoteMode;
 use metaconfig_types::RepoClientKnobs;
-use metaconfig_types::SegmentedChangelogConfig;
-use metaconfig_types::SegmentedChangelogHeadConfig;
 use metaconfig_types::ServiceWriteRestrictions;
 use metaconfig_types::ShardedService;
 use metaconfig_types::ShardingModeConfig;
@@ -55,9 +55,10 @@ use metaconfig_types::UpdateLoggingConfig;
 use metaconfig_types::WalkerConfig;
 use metaconfig_types::WalkerJobParams;
 use metaconfig_types::WalkerJobType;
+use metaconfig_types::XRepoSyncSourceConfig;
+use metaconfig_types::XRepoSyncSourceConfigMapping;
 use metaconfig_types::ZelosConfig;
 use mononoke_types::path::MPath;
-use mononoke_types::ChangesetId;
 use mononoke_types::DerivableType;
 use mononoke_types::NonRootMPath;
 use mononoke_types::PrefixTrie;
@@ -65,12 +66,16 @@ use mononoke_types::RepositoryId;
 use regex::Regex;
 use repos::RawBookmarkConfig;
 use repos::RawCacheWarmupConfig;
+use repos::RawCasSyncConfig;
+use repos::RawCommitCloudConfig;
 use repos::RawCommitGraphConfig;
 use repos::RawCommitIdentityScheme;
 use repos::RawCrossRepoCommitValidationConfig;
 use repos::RawDerivedDataConfig;
 use repos::RawDerivedDataTypesConfig;
 use repos::RawGitConcurrencyParams;
+use repos::RawGitConfigs;
+use repos::RawGitDeltaManifestV2Config;
 use repos::RawHgSyncConfig;
 use repos::RawHookConfig;
 use repos::RawHookManagerParams;
@@ -84,8 +89,6 @@ use repos::RawPushrebaseParams;
 use repos::RawPushrebaseRemoteMode;
 use repos::RawPushrebaseRemoteModeRemote;
 use repos::RawRepoClientKnobs;
-use repos::RawSegmentedChangelogConfig;
-use repos::RawSegmentedChangelogHeadConfig;
 use repos::RawServiceWriteRestrictions;
 use repos::RawShardedService;
 use repos::RawShardingModeConfig;
@@ -96,6 +99,8 @@ use repos::RawUpdateLoggingConfig;
 use repos::RawWalkerConfig;
 use repos::RawWalkerJobParams;
 use repos::RawWalkerJobType;
+use repos::RawXRepoSyncSourceConfig;
+use repos::RawXRepoSyncSourceConfigMapping;
 use repos::RawZelosConfig;
 
 use crate::convert::Convert;
@@ -158,6 +163,7 @@ impl Convert for RawHookConfig {
         let config = HookConfig {
             bypass,
             options: self.config_json,
+            log_only: self.log_only.unwrap_or_default(),
             strings: self.config_strings.unwrap_or_default(),
             ints: self.config_ints.unwrap_or_default(),
             ints_64: self.config_ints_64.unwrap_or_default(),
@@ -329,7 +335,9 @@ impl Convert for RawPushrebaseParams {
                 .map(|bookmark| {
                     anyhow::Ok(GlobalrevConfig {
                         publishing_bookmark: BookmarkKey::new(bookmark)?,
-                        small_repo_id: self.globalrevs_small_repo_id.map(RepositoryId::new),
+                        globalrevs_small_repo_id: self
+                            .globalrevs_small_repo_id
+                            .map(RepositoryId::new),
                     })
                 })
                 .transpose()?,
@@ -356,6 +364,7 @@ impl Convert for RawLfsParams {
             generate_lfs_blob_in_hg_sync_job: self
                 .generate_lfs_blob_in_hg_sync_job
                 .unwrap_or(false),
+            use_upstream_lfs_server: self.use_upstream_lfs_server.unwrap_or(false),
         })
     }
 }
@@ -466,6 +475,12 @@ impl Convert for RawDerivedDataTypesConfig {
             .into_iter()
             .map(|ty| DerivableType::from_name(&ty))
             .collect::<Result<_>>()?;
+        let ephemeral_bubbles_disabled_types = self
+            .ephemeral_bubbles_disabled_types
+            .unwrap_or_default()
+            .into_iter()
+            .map(|ty| DerivableType::from_name(&ty))
+            .collect::<Result<_>>()?;
         let mapping_key_prefixes = self
             .mapping_key_prefixes
             .into_iter()
@@ -486,17 +501,44 @@ impl Convert for RawDerivedDataTypesConfig {
         };
         let git_delta_manifest_version = match self.git_delta_manifest_version {
             None => GitDeltaManifestVersion::default(),
-            Some(1) => GitDeltaManifestVersion::V1,
+            Some(2) => GitDeltaManifestVersion::V2,
             Some(version) => return Err(anyhow!("unknown git delta manifest version {}", version)),
         };
+        let git_delta_manifest_v2_config = self
+            .git_delta_manifest_v2_config
+            .map(|raw| raw.convert())
+            .transpose()?;
+
+        let derivation_batch_sizes = self
+            .derivation_batch_sizes
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(k, v)| Ok((DerivableType::from_name(&k)?, v.try_into()?)))
+            .collect::<Result<_>>()?;
+
         Ok(DerivedDataTypesConfig {
             types,
+            ephemeral_bubbles_disabled_types,
             mapping_key_prefixes,
             unode_version,
             blame_filesize_limit,
             hg_set_committer_extra: self.hg_set_committer_extra.unwrap_or(false),
             blame_version,
             git_delta_manifest_version,
+            git_delta_manifest_v2_config,
+            derivation_batch_sizes,
+        })
+    }
+}
+
+impl Convert for RawGitDeltaManifestV2Config {
+    type Output = GitDeltaManifestV2Config;
+
+    fn convert(self) -> Result<Self::Output> {
+        Ok(GitDeltaManifestV2Config {
+            max_inlined_object_size: self.max_inlined_object_size as usize,
+            max_inlined_delta_size: self.max_inlined_delta_size as u64,
+            delta_chunk_size: self.delta_chunk_size as u64,
         })
     }
 }
@@ -524,86 +566,6 @@ impl Convert for RawRepoClientKnobs {
     fn convert(self) -> Result<Self::Output> {
         Ok(RepoClientKnobs {
             allow_short_getpack_history: self.allow_short_getpack_history,
-        })
-    }
-}
-
-impl Convert for RawSegmentedChangelogHeadConfig {
-    type Output = SegmentedChangelogHeadConfig;
-
-    fn convert(self) -> Result<Self::Output> {
-        let res = match self {
-            Self::all_public_bookmarks_except(exceptions) => {
-                SegmentedChangelogHeadConfig::AllPublicBookmarksExcept(
-                    exceptions
-                        .into_iter()
-                        .map(BookmarkKey::new)
-                        .collect::<Result<Vec<BookmarkKey>>>()?,
-                )
-            }
-            Self::bookmark(bookmark_name) => {
-                SegmentedChangelogHeadConfig::Bookmark(BookmarkKey::new(bookmark_name)?)
-            }
-            Self::bonsai_changeset(changeset_id) => {
-                SegmentedChangelogHeadConfig::Changeset(ChangesetId::from_str(&changeset_id)?)
-            }
-            Self::UnknownField(_) => {
-                return Err(anyhow!(
-                    "Unknown variant of RawSegmentedChangelogHeadConfig!"
-                ));
-            }
-        };
-        Ok(res)
-    }
-}
-
-impl Convert for RawSegmentedChangelogConfig {
-    type Output = SegmentedChangelogConfig;
-
-    fn convert(self) -> Result<Self::Output> {
-        fn maybe_secs_to_duration(
-            maybe_secs: Option<i64>,
-            default: Option<Duration>,
-        ) -> Result<Option<Duration>> {
-            match maybe_secs {
-                Some(0) => Ok(None),
-                Some(secs) => Ok(Some(Duration::from_secs(secs.try_into()?))),
-                None => Ok(default),
-            }
-        }
-
-        let heads_to_include = self
-            .heads_to_include
-            .into_iter()
-            .map(|raw| raw.convert())
-            .collect::<Result<Vec<_>>>()?;
-
-        let extra_heads_to_include_in_background_jobs = self
-            .extra_heads_to_include_in_background_jobs
-            .into_iter()
-            .map(|raw| raw.convert())
-            .collect::<Result<Vec<_>>>()?;
-
-        let default = SegmentedChangelogConfig::default();
-        Ok(SegmentedChangelogConfig {
-            enabled: self.enabled.unwrap_or(default.enabled),
-            tailer_update_period: maybe_secs_to_duration(
-                self.tailer_update_period_secs,
-                default.tailer_update_period,
-            )?,
-            skip_dag_load_at_startup: self
-                .skip_dag_load_at_startup
-                .unwrap_or(default.skip_dag_load_at_startup),
-            reload_dag_save_period: maybe_secs_to_duration(
-                self.reload_dag_save_period_secs,
-                default.reload_dag_save_period,
-            )?,
-            update_to_master_bookmark_period: maybe_secs_to_duration(
-                self.update_to_master_bookmark_period_secs,
-                default.update_to_master_bookmark_period,
-            )?,
-            heads_to_include,
-            extra_heads_to_include_in_background_jobs,
         })
     }
 }
@@ -707,6 +669,17 @@ impl Convert for RawHgSyncConfig {
     }
 }
 
+impl Convert for RawCasSyncConfig {
+    type Output = MononokeCasSyncConfig;
+
+    fn convert(self) -> Result<Self::Output> {
+        Ok(MononokeCasSyncConfig {
+            main_bookmark_to_sync: self.main_bookmark_to_sync,
+            sync_all_bookmarks: self.sync_all_bookmarks,
+        })
+    }
+}
+
 impl Convert for RawLoggingDestination {
     type Output = LoggingDestination;
 
@@ -742,6 +715,8 @@ impl Convert for RawCommitGraphConfig {
         Ok(CommitGraphConfig {
             scuba_table: self.scuba_table,
             preloaded_commit_graph_blobstore_key: self.preloaded_commit_graph_blobstore_key,
+            disable_commit_graph_v2_with_empty_common: self
+                .disable_commit_graph_v2_with_empty_common,
         })
     }
 }
@@ -827,6 +802,59 @@ impl Convert for RawGitConcurrencyParams {
             trees_and_blobs: self.trees_and_blobs.try_into()?,
             commits: self.commits.try_into()?,
             tags: self.tags.try_into()?,
+        })
+    }
+}
+
+impl Convert for RawGitConfigs {
+    type Output = GitConfigs;
+
+    fn convert(self) -> Result<Self::Output> {
+        let git_concurrency = self.git_concurrency.convert()?;
+        let git_lfs_interpret_pointers = self.git_lfs_interpret_pointers.unwrap_or(false);
+
+        let fetch_message = self.fetch_message;
+
+        Ok(GitConfigs {
+            git_concurrency,
+            git_lfs_interpret_pointers,
+            fetch_message,
+        })
+    }
+}
+
+impl Convert for RawXRepoSyncSourceConfig {
+    type Output = XRepoSyncSourceConfig;
+
+    fn convert(self) -> Result<Self::Output> {
+        Ok(XRepoSyncSourceConfig {
+            bookmark_regex: self.bookmark_regex,
+            backsync_enabled: self.backsync_enabled,
+        })
+    }
+}
+
+impl Convert for RawXRepoSyncSourceConfigMapping {
+    type Output = XRepoSyncSourceConfigMapping;
+
+    fn convert(self) -> Result<Self::Output> {
+        let mapping = self
+            .mapping
+            .into_iter()
+            .map(|(repo_name, x_repo_sync_source_config)| {
+                Ok((repo_name, x_repo_sync_source_config.convert()?))
+            })
+            .collect::<Result<_>>()?;
+        Ok(XRepoSyncSourceConfigMapping { mapping })
+    }
+}
+
+impl Convert for RawCommitCloudConfig {
+    type Output = CommitCloudConfig;
+    fn convert(self) -> Result<Self::Output> {
+        Ok(CommitCloudConfig {
+            mocked_employees: self.mocked_employees,
+            disable_interngraph_notification: self.disable_interngraph_notification,
         })
     }
 }

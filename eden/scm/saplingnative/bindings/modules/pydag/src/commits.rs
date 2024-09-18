@@ -144,13 +144,24 @@ py_class!(pub class commits |py| {
             Some(map) => map,
             None => self.inner(py).read().id_map_snapshot().map_pyerr(py)?,
         };
-        Ok(Spans(block_on(id_map.to_id_set(&set.0)).map_pyerr(py)?))
+        let id_set = block_on(id_map.to_id_set(&set.0)).map_pyerr(py)?;
+        Ok(Spans::from_id_set(id_set))
     }
 
+    /// tonodes(set, preserve_order=False)
     /// Convert IdSet to Set. For compatibility with legacy code only.
-    def tonodes(&self, set: Spans) -> PyResult<Names> {
+    def tonodes(&self, set: Spans, preserve_order: bool = false) -> PyResult<Names> {
         let inner = self.inner(py).read();
-        Ok(Names(inner.to_set(&set.0).map_pyerr(py)?))
+        let mut set = set;
+        if !preserve_order {
+            set.drop_order();
+        }
+        let set = if let Some(list) = set.maybe_as_id_list() {
+            inner.id_list_to_set(list)
+        } else {
+            inner.to_set(set.as_id_set())
+        }.map_pyerr(py)?;
+        Ok(Names(set))
     }
 
     /// Obtain the read-only dagalgo object that supports various DAG algorithms.
@@ -230,6 +241,18 @@ py_class!(pub class commits |py| {
         let meta = metalog.metalog_rwlock(py);
         let mut inner = self.inner(py).write();
         inner.update_references_to_match_metalog(&meta.read()).map_pyerr(py)?;
+        Ok(PyNone)
+    }
+
+    /// import_external_reference(metalog, names: List[str])
+    ///
+    /// Import a single external reference to metalog. Optinally build up DAG
+    /// indexes. For Git, `name` is a full reference name, like
+    /// "refs/remotes/origin/foo".
+    def import_external_references(&self, metalog: PyMetaLog, names: Vec<String>) -> PyResult<PyNone> {
+        let meta = metalog.metalog_rwlock(py);
+        let mut inner = self.inner(py).write();
+        inner.import_external_references(&mut meta.write(), &names).map_pyerr(py)?;
         Ok(PyNone)
     }
 

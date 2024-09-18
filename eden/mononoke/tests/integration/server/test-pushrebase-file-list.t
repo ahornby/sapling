@@ -9,7 +9,8 @@
 setup configuration
   $ export PUSHREBASE_REWRITE_DATES=1
 
-  $ BLOB_TYPE="blob_files" default_setup
+  $ setconfig push.edenapi=true
+  $ ENABLE_API_WRITES=1 BLOB_TYPE="blob_files" default_setup
   hg repo
   o  C [draft;rev=2;26805aba1e60]
   │
@@ -29,8 +30,8 @@ Push a directory
   $ echo 3 > dir/3
   $ hg -q addremove
   $ hg ci -m 'create dir'
-  $ hgmn push -r . --to master_bookmark -q
-  $ hgmn up master_bookmark -q
+  $ hg push -r . --to master_bookmark -q
+  $ hg up master_bookmark -q
 
 Now replace directory with a file and push it. Make sure file lists before push
 and after push match
@@ -46,8 +47,8 @@ List of files before the push
   $ hg log -r . -T '{files}'
   dir dir/1 dir/2 dir/3 (no-eol)
 
-  $ hgmn push -r . --to master_bookmark -q
-  $ hgmn up master_bookmark -q
+  $ hg push -r . --to master_bookmark -q
+  $ hg up master_bookmark -q
 
 List of files after the push.
   $ hg log -r . -T '{files}'

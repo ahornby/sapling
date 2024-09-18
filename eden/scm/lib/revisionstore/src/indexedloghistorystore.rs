@@ -35,9 +35,9 @@ use crate::indexedlogutil::Store;
 use crate::indexedlogutil::StoreOpenOptions;
 use crate::indexedlogutil::StoreType;
 use crate::localstore::LocalStore;
-use crate::repack::ToKeys;
 use crate::sliceext::SliceExt;
 use crate::types::StoreKey;
+use crate::ToKeys;
 
 pub struct IndexedLogHgIdHistoryStore {
     log: Store,
@@ -196,8 +196,8 @@ impl IndexedLogHgIdHistoryStore {
     pub fn new(path: impl AsRef<Path>, config: &dyn Config, store_type: StoreType) -> Result<Self> {
         let open_options = Self::open_options(config)?;
         let log = match store_type {
-            StoreType::Local => open_options.local(&path),
-            StoreType::Shared => open_options.shared(&path),
+            StoreType::Permanent => open_options.permanent(&path),
+            StoreType::Rotated => open_options.rotated(&path),
         }?;
         Ok(IndexedLogHgIdHistoryStore { log })
     }
@@ -225,13 +225,20 @@ impl IndexedLogHgIdHistoryStore {
 
     pub fn repair(path: PathBuf, config: &dyn Config, store_type: StoreType) -> Result<String> {
         match store_type {
-            StoreType::Local => {
-                IndexedLogHgIdHistoryStore::open_options(config)?.repair_local(path)
+            StoreType::Permanent => {
+                IndexedLogHgIdHistoryStore::open_options(config)?.repair_permanent(path)
             }
-            StoreType::Shared => {
-                IndexedLogHgIdHistoryStore::open_options(config)?.repair_shared(path)
+            StoreType::Rotated => {
+                IndexedLogHgIdHistoryStore::open_options(config)?.repair_rotated(path)
             }
         }
+    }
+
+    /// Check whether index contains `key`.
+    pub fn contains(&self, key: &Key) -> Result<bool> {
+        let index_key = Entry::key_to_index_key(key);
+        let log = self.log.read();
+        log.contains(0, index_key)
     }
 }
 
@@ -240,9 +247,9 @@ impl LocalStore for IndexedLogHgIdHistoryStore {
         Ok(keys
             .iter()
             .filter(|k| match k {
-                StoreKey::HgId(k) => match Entry::from_log(k, &self.log) {
-                    Ok(None) | Err(_) => true,
-                    Ok(Some(_)) => false,
+                StoreKey::HgId(k) => match self.contains(k) {
+                    Ok(contains) => !contains,
+                    Err(_) => true,
                 },
                 StoreKey::Content(_, _) => true,
             })
@@ -292,6 +299,8 @@ impl ToKeys for IndexedLogHgIdHistoryStore {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use fs_err::remove_file;
     use rand::SeedableRng;
     use rand_chacha::ChaChaRng;
@@ -299,13 +308,12 @@ mod tests {
     use types::testutil::*;
 
     use super::*;
-    use crate::historypack::tests::get_nodes;
     use crate::testutil::empty_config;
 
     #[test]
     fn test_empty() -> Result<()> {
         let tempdir = TempDir::new()?;
-        let log = IndexedLogHgIdHistoryStore::new(&tempdir, &empty_config(), StoreType::Shared)?;
+        let log = IndexedLogHgIdHistoryStore::new(&tempdir, &empty_config(), StoreType::Rotated)?;
         log.flush()?;
         Ok(())
     }
@@ -313,7 +321,7 @@ mod tests {
     #[test]
     fn test_add() -> Result<()> {
         let tempdir = TempDir::new()?;
-        let log = IndexedLogHgIdHistoryStore::new(&tempdir, &empty_config(), StoreType::Shared)?;
+        let log = IndexedLogHgIdHistoryStore::new(&tempdir, &empty_config(), StoreType::Rotated)?;
         let k = key("a", "1");
         let nodeinfo = NodeInfo {
             parents: [key("a", "2"), null_key("a")],
@@ -328,7 +336,7 @@ mod tests {
     #[test]
     fn test_add_get_node_info() -> Result<()> {
         let tempdir = TempDir::new()?;
-        let log = IndexedLogHgIdHistoryStore::new(&tempdir, &empty_config(), StoreType::Shared)?;
+        let log = IndexedLogHgIdHistoryStore::new(&tempdir, &empty_config(), StoreType::Rotated)?;
         let k = key("a", "1");
         let nodeinfo = NodeInfo {
             parents: [key("a", "2"), null_key("a")],
@@ -337,7 +345,7 @@ mod tests {
         log.add(&k, &nodeinfo)?;
         log.flush()?;
 
-        let log = IndexedLogHgIdHistoryStore::new(&tempdir, &empty_config(), StoreType::Shared)?;
+        let log = IndexedLogHgIdHistoryStore::new(&tempdir, &empty_config(), StoreType::Rotated)?;
         let read_nodeinfo = log.get_node_info(&k)?;
         assert_eq!(Some(nodeinfo), read_nodeinfo);
         Ok(())
@@ -346,7 +354,7 @@ mod tests {
     #[test]
     fn test_corrupted() -> Result<()> {
         let tempdir = TempDir::new()?;
-        let log = IndexedLogHgIdHistoryStore::new(&tempdir, &empty_config(), StoreType::Shared)?;
+        let log = IndexedLogHgIdHistoryStore::new(&tempdir, &empty_config(), StoreType::Rotated)?;
         let mut rng = ChaChaRng::from_seed([0u8; 32]);
 
         let nodes = get_nodes(&mut rng);
@@ -362,7 +370,7 @@ mod tests {
         rotate_log_path.push("log");
         remove_file(rotate_log_path)?;
 
-        let log = IndexedLogHgIdHistoryStore::new(&tempdir, &empty_config(), StoreType::Shared)?;
+        let log = IndexedLogHgIdHistoryStore::new(&tempdir, &empty_config(), StoreType::Rotated)?;
         for (key, info) in nodes.iter() {
             log.add(key, info)?;
         }
@@ -375,7 +383,7 @@ mod tests {
     #[test]
     fn test_iter() -> Result<()> {
         let tempdir = TempDir::new()?;
-        let log = IndexedLogHgIdHistoryStore::new(&tempdir, &empty_config(), StoreType::Shared)?;
+        let log = IndexedLogHgIdHistoryStore::new(&tempdir, &empty_config(), StoreType::Rotated)?;
         let k = key("a", "1");
         let nodeinfo = NodeInfo {
             parents: [key("a", "2"), null_key("a")],
@@ -385,5 +393,51 @@ mod tests {
 
         assert!(log.to_keys().into_iter().all(|e| e.unwrap() == k));
         Ok(())
+    }
+
+    fn get_nodes(mut rng: &mut ChaChaRng) -> HashMap<Key, NodeInfo> {
+        let file1 = RepoPath::from_str("path").unwrap();
+        let file2 = RepoPath::from_str("path/file").unwrap();
+        let null = HgId::null_id();
+        let node1 = HgId::random(&mut rng);
+        let node2 = HgId::random(&mut rng);
+        let node3 = HgId::random(&mut rng);
+        let node4 = HgId::random(&mut rng);
+        let node5 = HgId::random(&mut rng);
+        let node6 = HgId::random(&mut rng);
+
+        let mut nodes = HashMap::new();
+
+        // Insert key 1
+        let key1 = Key::new(file1.to_owned(), node2.clone());
+        let info = NodeInfo {
+            parents: [
+                Key::new(file1.to_owned(), node1.clone()),
+                Key::new(file1.to_owned(), null.clone()),
+            ],
+            linknode: HgId::random(&mut rng),
+        };
+        nodes.insert(key1.clone(), info);
+
+        // Insert key 2
+        let key2 = Key::new(file2.to_owned(), node3.clone());
+        let info = NodeInfo {
+            parents: [
+                Key::new(file2.to_owned(), node5.clone()),
+                Key::new(file2.to_owned(), node6.clone()),
+            ],
+            linknode: HgId::random(&mut rng),
+        };
+        nodes.insert(key2.clone(), info);
+
+        // Insert key 3
+        let key3 = Key::new(file1.to_owned(), node4.clone());
+        let info = NodeInfo {
+            parents: [key2, key1],
+            linknode: HgId::random(&mut rng),
+        };
+        nodes.insert(key3, info);
+
+        nodes
     }
 }

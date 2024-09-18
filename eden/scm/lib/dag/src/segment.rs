@@ -188,9 +188,12 @@ impl Segment {
         high: Id,
         parents: &[Id],
     ) -> Self {
+        assert!(low.is_valid());
+        assert!(high.is_valid());
         assert_eq!(low.group(), high.group());
         assert!(high >= low);
         assert!(parents.iter().all(|&p| p < low));
+        assert!(parents.iter().all(|&p| p.is_valid()));
         let mut buf = Vec::with_capacity(1 + 8 + (parents.len() + 2) * 4);
         buf.write_u8(flags.bits()).unwrap();
         buf.write_u8(level).unwrap();
@@ -296,6 +299,7 @@ mod tests {
     use quickcheck::quickcheck;
 
     use super::*;
+    use crate::tests::dbg;
 
     #[test]
     fn test_segment_roundtrip() {
@@ -355,6 +359,6 @@ mod tests {
     fn test_invalid_fmt() {
         let bytes = Bytes::from_static(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 0, 1, 10]);
         let segment = Segment(bytes);
-        assert_eq!(format!("{:?}", segment), "10-10[10] (Invalid Parent!!)");
+        assert_eq!(dbg(segment), "10-10[10] (Invalid Parent!!)");
     }
 }

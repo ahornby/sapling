@@ -16,6 +16,9 @@ gflags
 glog
 folly
 fbthrift
+wangle
+fizz
+boost
 
 [build]
 builder = make
@@ -26,3 +29,6 @@ all
 
 [make.install_args]
 install
+
+[make.test_args]
+test

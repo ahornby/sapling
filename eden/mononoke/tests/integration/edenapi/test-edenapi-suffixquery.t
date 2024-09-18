@@ -9,7 +9,7 @@
   $ setconfig experimental.edenapi-suffixquery=true
 
   $ start_and_wait_for_mononoke_server
-  $ hgmn_init repo
+  $ hg clone -q mono:repo repo
   $ cd repo
   $ drawdag << EOS
   > D # D/bar = zero\nuno\ntwo\n
@@ -22,7 +22,7 @@
   > EOS
 
 Test suffix query output errors if commit not on server:
-  $ hgedenapi debugapi -e suffix_query -i "{'Hg': '$(hg whereami)'}" -i "['.txt']"
+  $ hg debugapi -e suffix_query -i "{'Hg': '$(hg whereami)'}" -i "['.txt']" -i None
   abort: server responded 400 Bad Request for https://localhost:*/edenapi/repo/suffix_query: {"message":"CommitId not found: *","request_id":"*"}. Headers: { (glob)
       "x-request-id": "*", (glob)
       "content-type": "application/json",
@@ -40,10 +40,16 @@ API works:
   $ hg add tmp.txt
   $ hg add src/rust.rs
   $ hg commit -m "jkter"
-  $ hgedenapi push -q --to master --create
-  $ hgedenapi debugapi -e suffix_query -i "{'Hg': '$(hg whereami)'}" -i "['.txt']"
+  $ hg push -q --to master --create
+  $ hg debugapi -e suffix_query -i "{'Hg': '$(hg whereami)'}" -i "['.txt']" -i None
   [{"file_path": "tmp.txt"}]
-  $ hgedenapi debugapi -e suffix_query -i "{'Hg': '$(hg whereami)'}" -i "['.rs']"
+  $ hg debugapi -e suffix_query -i "{'Hg': '$(hg whereami)'}" -i "['.rs']" -i None
   [{"file_path": "src/rust.rs"}]
-  $ hgedenapi debugapi -e suffix_query -i "{'Hg': '$(hg whereami)'}" -i "['.cpp']"
+  $ hg debugapi -e suffix_query -i "{'Hg': '$(hg whereami)'}" -i "['.cpp']" -i None
   []
+  $ touch src/nested.txt
+  $ hg add src/nested.txt
+  $ hg commit -m "mint"
+  $ hg push -q --to master
+  $ hg debugapi -e suffix_query -i "{'Hg': '$(hg whereami)'}" -i "['.txt']" -i "['src']"
+  [{"file_path": "src/nested.txt"}]

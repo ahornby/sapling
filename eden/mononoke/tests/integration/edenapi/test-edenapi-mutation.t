@@ -8,7 +8,7 @@
   $ configure modern
   $ setconfig ui.ignorerevnum=false
 
-  $ setconfig pull.httpcommitgraph2=true
+  $ setconfig pull.httpcommitgraph2=true pull.use-commit-graph=true clone.use-rust=true clone.use-commit-graph=true
 
 Set up local hgrc and Mononoke config, with commit cloud, http pull and upload.
   $ export READ_ONLY_REPO=1
@@ -22,7 +22,6 @@ Set up local hgrc and Mononoke config, with commit cloud, http pull and upload.
   > commitcloud =
   > infinitepush =
   > rebase =
-  > remotenames =
   > share =
   > [commitcloud]
   > hostname = testhost
@@ -42,8 +41,8 @@ Set up local hgrc and Mononoke config, with commit cloud, http pull and upload.
   > httphashprefix = true
   > EOF
 Custom smartlog
-  $ function sl {
-  >  hgedenapi log -G -T "{node|short} '{desc|firstline}' {join(mutations % '(Rewritten using {operation} into {join(successors % \'{node|short}\', \', \')})', ' ')}" --hidden
+  $ function smartlog {
+  >  hg log -G -T "{node|short} '{desc|firstline}' {join(mutations % '(Rewritten using {operation} into {join(successors % \'{node|short}\', \', \')})', ' ')}" --hidden
   > }
 
 Initialize test repo.
@@ -56,31 +55,31 @@ Initialize test repo.
 
 Import and start mononoke
   $ cd $TESTTMP
-  $ hgclone_treemanifest ssh://user@dummy/repo client1 --noupdate --config clone.prefer-edenapi-clonedata=false
+  $ hg clone -q mono:repo client1 --noupdate --config clone.prefer-edenapi-clonedata=false
   DEBUG pull::httpbookmarks: edenapi fetched bookmarks: {'master': None}
-  $ hgclone_treemanifest ssh://user@dummy/repo client2 --noupdate --config clone.prefer-edenapi-clonedata=false
+  $ hg clone -q mono:repo client2 --noupdate --config clone.prefer-edenapi-clonedata=false
   DEBUG pull::httpbookmarks: edenapi fetched bookmarks: {'master': None}
   $ blobimport repo/.hg repo
   $ start_and_wait_for_mononoke_server
 Test mutations on client 1
   $ cd client1
-  $ hgedenapi up 8b2dca0c8a72 -q
+  $ hg up 8b2dca0c8a72 -q
   DEBUG pull::httpbookmarks: edenapi fetched bookmarks: {'master': None}
   DEBUG pull::httphashlookup: edenapi hash lookups: ['8b2dca0c8a726d66bf26d47835a356cc4286facd']
   DEBUG pull::httpgraph: edenapi fetched 1 graph nodes
   DEBUG pull::httpgraph: edenapi fetched graph with known 0 draft commits
-  $ hgedenapi cloud join -q
+  $ hg cloud join -q
   $ mkcommitedenapi A
   $ hg log -T{node} -r .
   929f2b9071cf032d9422b3cce9773cbe1c574822 (no-eol)
-  $ hgedenapi cloud upload -q
-  $ hgedenapi debugapi -e commitmutations -i '["929f2b9071cf032d9422b3cce9773cbe1c574822"]'
+  $ hg cloud upload -q
+  $ hg debugapi -e commitmutations -i '["929f2b9071cf032d9422b3cce9773cbe1c574822"]'
   []
   $ hg metaedit -r . -m new_message
   $ hg log -T{node} -r .
   f643b098cd183f085ba3e6107b6867ca472e87d1 (no-eol)
-  $ hgedenapi cloud upload -q
-  $ hgedenapi debugapi -e commitmutations -i '["f643b098cd183f085ba3e6107b6867ca472e87d1"]'
+  $ hg cloud upload -q
+  $ hg debugapi -e commitmutations -i '["f643b098cd183f085ba3e6107b6867ca472e87d1"]'
   [{"op": "metaedit",
     "tz": 0,
     "time": 0,
@@ -92,10 +91,10 @@ Test mutations on client 1
     "extras": [],
     "successor": bin("f643b098cd183f085ba3e6107b6867ca472e87d1"),
     "predecessors": [bin("929f2b9071cf032d9422b3cce9773cbe1c574822")]}]
-  $ hgedenapi debugapi -e commitmutations -i '["929f2b9071cf032d9422b3cce9773cbe1c574822"]'
+  $ hg debugapi -e commitmutations -i '["929f2b9071cf032d9422b3cce9773cbe1c574822"]'
   []
 Test phases from commitgraph
-  $ hgedenapi debugapi -e commitgraph2 -i '["f643b098cd183f085ba3e6107b6867ca472e87d1", "929f2b9071cf032d9422b3cce9773cbe1c574822"]' -i '[]' --sort
+  $ hg debugapi -e commitgraph2 -i '["f643b098cd183f085ba3e6107b6867ca472e87d1", "929f2b9071cf032d9422b3cce9773cbe1c574822"]' -i '[]' --sort
   [{"hgid": bin("8b2dca0c8a726d66bf26d47835a356cc4286facd"),
     "parents": [],
     "is_draft": False},
@@ -105,7 +104,7 @@ Test phases from commitgraph
    {"hgid": bin("f643b098cd183f085ba3e6107b6867ca472e87d1"),
     "parents": [bin("8b2dca0c8a726d66bf26d47835a356cc4286facd")],
     "is_draft": True}]
-  $ hgedenapi debugapi -e commitmutations -i '["f643b098cd183f085ba3e6107b6867ca472e87d1", "929f2b9071cf032d9422b3cce9773cbe1c574822"]'
+  $ hg debugapi -e commitmutations -i '["f643b098cd183f085ba3e6107b6867ca472e87d1", "929f2b9071cf032d9422b3cce9773cbe1c574822"]'
   [{"op": "metaedit",
     "tz": 0,
     "time": 0,
@@ -117,7 +116,7 @@ Test phases from commitgraph
     "extras": [],
     "successor": bin("f643b098cd183f085ba3e6107b6867ca472e87d1"),
     "predecessors": [bin("929f2b9071cf032d9422b3cce9773cbe1c574822")]}]
-  $ sl
+  $ smartlog
   @  f643b098cd18 'new_message'
   │
   │ x  929f2b9071cf 'A' (Rewritten using metaedit into f643b098cd18)
@@ -127,18 +126,18 @@ Test phases from commitgraph
 
 Test how they are propagated to client 2
   $ cd ../client2
-  $ hgedenapi debugchangelog --migrate lazy
-  $ hgedenapi pull -r f643b098cd18 -q
+  $ hg debugchangelog --migrate lazy
+  $ hg pull -r f643b098cd18 -q
   DEBUG pull::httpbookmarks: edenapi fetched bookmarks: {'master': None}
   DEBUG pull::httphashlookup: edenapi hash lookups: ['f643b098cd183f085ba3e6107b6867ca472e87d1']
   DEBUG pull::httpgraph: edenapi fetched 2 graph nodes
   DEBUG pull::httpgraph: edenapi fetched graph with known 1 draft commits
-  $ hgedenapi pull -r 929f2b9071cf -q
+  $ hg pull -r 929f2b9071cf -q
   DEBUG pull::httpbookmarks: edenapi fetched bookmarks: {'master': None}
   DEBUG pull::httphashlookup: edenapi hash lookups: ['929f2b9071cf032d9422b3cce9773cbe1c574822']
   DEBUG pull::httpgraph: edenapi fetched 1 graph nodes
   DEBUG pull::httpgraph: edenapi fetched graph with known 1 draft commits
-  $ sl
+  $ smartlog
   x  929f2b9071cf 'A' (Rewritten using metaedit into f643b098cd18)
   │
   │ o  f643b098cd18 'new_message'

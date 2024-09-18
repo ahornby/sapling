@@ -3,11 +3,6 @@
 # This software may be used and distributed according to the terms of the
 # GNU General Public License version 2.
 
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-#
-# This software may be used and distributed according to the terms of the
-# GNU General Public License version 2.
-
 """
 Default config file for testing
 """
@@ -36,7 +31,6 @@ ignore.test=$RUNTESTDIR/gitignore
 
 [devel]
 all-warnings=True
-collapse-traceback =True
 default-date=0 0
 
 [web]
@@ -53,18 +47,10 @@ use-rust=True
 [status]
 use-rust=True
 
-[extensions]
-treemanifest=
-copytrace=
-
-[treemanifest]
-sendtrees=True
-treeonly=True
-rustmanifest=True
-useruststore=True
+[workingcopy]
+rust-checkout=True
 
 [remotefilelog]
-reponame=reponame-default
 cachepath=$TESTTMP/default-hgcache
 
 [mutation]
@@ -75,14 +61,14 @@ httpcommitgraph2=true
 
 [hint]
 ack-match-full-traversal=True
+ack = smartlog-default-command
 
 [scmstore]
-contentstorefallback=True
+contentstorefallback=False
 
 [experimental]
 use-rust-changelog=True
 windows-symlinks=True
-copytrace=off
 
 [tweakdefaults]
 graftkeepdate=True
@@ -93,6 +79,10 @@ use-rust=true
 
 [copytrace]
 dagcopytrace=True
+
+[committemplate]
+commit-message-fields=Summary,"Test Plan",Reviewers,Subscribers,Tasks,Tags,"Differential Revision","Reviewed By"
+summary-field=Summary
 """
     if use_watchman:
         content += """

@@ -8,7 +8,9 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use commit_graph::BaseCommitGraphWriter;
 use commit_graph::CommitGraph;
+use commit_graph::CommitGraphWriter;
 use commit_graph_testlib::utils::from_dag;
 use commit_graph_testlib::utils::name_cs_id;
 use commit_graph_types::edges::ChangesetEdges;
@@ -18,6 +20,7 @@ use context::CoreContext;
 use fbinit::FacebookInit;
 use fbthrift::compact_protocol;
 use in_memory_commit_graph_storage::InMemoryCommitGraphStorage;
+use mononoke_macros::mononoke;
 use mononoke_types::ChangesetId;
 use mononoke_types::RepositoryId;
 use reloader::Reloader;
@@ -94,7 +97,7 @@ async fn test_equivalent_storages(
     Ok(())
 }
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn test_preloaded_commit_graph_storage(fb: FacebookInit) -> Result<()> {
     let ctx = CoreContext::test_mock(fb);
     let underlying_storage = Arc::new(InMemoryCommitGraphStorage::new(RepositoryId::new(1)));
@@ -134,7 +137,9 @@ async fn test_preloaded_commit_graph_storage(fb: FacebookInit) -> Result<()> {
     )?;
 
     let graph = CommitGraph::new(preloaded_storage.clone());
-    graph
+    let graph_writer = BaseCommitGraphWriter::new(graph.clone());
+
+    graph_writer
         .add(&ctx, name_cs_id("J"), [name_cs_id("I")].into())
         .await?;
 

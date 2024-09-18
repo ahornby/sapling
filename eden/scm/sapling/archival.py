@@ -66,7 +66,7 @@ exts = {
 
 
 def guesskind(dest):
-    for kind, extensions in pycompat.iteritems(exts):
+    for kind, extensions in exts.items():
         if any(dest.endswith(ext) for ext in extensions):
             return kind
     return None
@@ -237,7 +237,7 @@ class fileit:
         if islink:
             self.opener.symlink(data, name)
             return
-        f = self.opener(name, "w", atomictemp=True)
+        f = self.opener(name, "w", atomictemp=False)
         f.write(data)
         f.close()
         destfile = os.path.join(self.basedir, name)

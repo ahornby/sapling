@@ -10,24 +10,24 @@ import {OpenComparisonViewButton} from './ComparisonView/OpenComparisonViewButto
 import {FlexSpacer, Row} from './ComponentUtils';
 import {DropdownFields} from './DropdownFields';
 import {EmptyState} from './EmptyState';
-import {ErrorNotice} from './ErrorNotice';
 import {useCommandEvent} from './ISLShortcuts';
-import {Kbd} from './Kbd';
 import {OperationDisabledButton} from './OperationDisabledButton';
-import {Subtle} from './Subtle';
-import {Tooltip} from './Tooltip';
 import {ChangedFiles} from './UncommittedChanges';
 import {T, t} from './i18n';
 import {atomLoadableWithRefresh} from './jotaiUtils';
 import {DeleteShelveOperation} from './operations/DeleteShelveOperation';
 import {UnshelveOperation} from './operations/UnshelveOperation';
 import {RelativeDate} from './relativeDate';
-import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
+import {Button} from 'isl-components/Button';
+import {ErrorNotice} from 'isl-components/ErrorNotice';
+import {Icon} from 'isl-components/Icon';
+import {Kbd} from 'isl-components/Kbd';
+import {KeyCode, Modifier} from 'isl-components/KeyboardShortcuts';
+import {Subtle} from 'isl-components/Subtle';
+import {Tooltip} from 'isl-components/Tooltip';
 import {useAtom} from 'jotai';
 import {useEffect} from 'react';
 import {ComparisonType} from 'shared/Comparison';
-import {Icon} from 'shared/Icon';
-import {KeyCode, Modifier} from 'shared/KeyboardShortcuts';
 
 import './ShelvedChanges.css';
 
@@ -50,16 +50,16 @@ export function ShelvedChangesMenu() {
       component={dismiss => <ShelvedChangesList dismiss={dismiss} />}
       trigger="click"
       placement="bottom"
-      additionalToggles={additionalToggles}
+      additionalToggles={additionalToggles.asEventTarget()}
       group="topbar"
       title={
         <T replace={{$shortcut: <Kbd keycode={KeyCode.S} modifiers={[Modifier.ALT]} />}}>
           Shelved Changes ($shortcut)
         </T>
       }>
-      <VSCodeButton appearance="icon" data-testid="shelved-changes-button">
+      <Button icon data-testid="shelved-changes-button">
         <Icon icon="archive" />
-      </VSCodeButton>
+      </Button>
     </Tooltip>
   );
 }
@@ -114,7 +114,7 @@ function ShelvedChangesList({dismiss}: {dismiss: () => void}) {
                   <FlexSpacer />
                   <Tooltip title={t('Remove from the list of shelved changes')}>
                     <OperationDisabledButton
-                      appearance="icon"
+                      kind="icon"
                       contextKey={`delete-shelve-${change.hash}`}
                       data-testid={`delete-shelve-${change.hash}`}
                       className="unshelve-button"
@@ -129,7 +129,7 @@ function ShelvedChangesList({dismiss}: {dismiss: () => void}) {
                       'Apply these changes without removing this from your list of shelved changes',
                     )}>
                     <OperationDisabledButton
-                      appearance="icon"
+                      kind="icon"
                       contextKey={`unshelve-keep-${change.hash}`}
                       className="unshelve-button"
                       runOperation={() => {
@@ -145,7 +145,6 @@ function ShelvedChangesList({dismiss}: {dismiss: () => void}) {
                       'Apply these changes and remove this from your list of shelved changes',
                     )}>
                     <OperationDisabledButton
-                      appearance="secondary"
                       contextKey={`unshelve-${change.hash}`}
                       className="unshelve-button"
                       runOperation={() => {

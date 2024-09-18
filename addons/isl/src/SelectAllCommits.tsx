@@ -6,17 +6,17 @@
  */
 
 import {useCommand} from './ISLShortcuts';
-import {Kbd} from './Kbd';
-import {Tooltip} from './Tooltip';
 import {islDrawerState} from './drawerState';
 import {t, T} from './i18n';
 import {readAtom, writeAtom} from './jotaiUtils';
 import {dagWithPreviews} from './previews';
 import {selectedCommits} from './selection';
-import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
+import {Button} from 'isl-components/Button';
+import {Icon} from 'isl-components/Icon';
+import {Kbd} from 'isl-components/Kbd';
+import {KeyCode, Modifier} from 'isl-components/KeyboardShortcuts';
+import {Tooltip} from 'isl-components/Tooltip';
 import {useCallback} from 'react';
-import {Icon} from 'shared/Icon';
-import {KeyCode, Modifier} from 'shared/KeyboardShortcuts';
 
 /** By default, "select all" selects draft, non-obsoleted commits. */
 function getSelectAllCommitHashSet(): Set<string> {
@@ -56,17 +56,16 @@ export function SelectAllButton({dismiss}: {dismiss: () => unknown}) {
       title={t(
         'Select all draft commits. This allows more granular bulk manipulations in the sidebar.',
       )}>
-      <VSCodeButton
-        appearance="secondary"
+      <Button
         data-testid="select-all-button"
         onClick={() => {
           onClick();
           dismiss();
         }}>
         <Icon icon="check-all" slot="start" />
-        <T>Select all commits</T> <Icon icon="chevron-right" />
+        <T>Select all commits</T>
         <Kbd keycode={KeyCode.A} modifiers={[Modifier.ALT]} />
-      </VSCodeButton>
+      </Button>
     </Tooltip>
   );
 }

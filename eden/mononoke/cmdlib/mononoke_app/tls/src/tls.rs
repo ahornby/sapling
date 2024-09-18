@@ -8,7 +8,7 @@
 use clap::Args;
 
 /// Command line arguments for TLS parameters
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 #[group(requires_all = ["tls_certificate", "tls_private_key", "tls_ca"])]
 pub struct TLSArgs {
     /// TLS Certificate for auth
@@ -26,4 +26,6 @@ pub struct TLSArgs {
     /// TLS Ticket Seeds
     #[clap(long)]
     pub tls_ticket_seeds: Option<String>,
+    #[clap(long)]
+    pub disable_mtls: bool,
 }

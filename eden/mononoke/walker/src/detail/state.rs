@@ -23,7 +23,6 @@ use array_init::array_init;
 use async_trait::async_trait;
 use bonsai_hg_mapping::BonsaiHgMapping;
 use bonsai_hg_mapping::BonsaiHgMappingEntry;
-use bulkops::Direction;
 use context::CoreContext;
 use dashmap::mapref::one::Ref;
 use dashmap::DashMap;
@@ -49,6 +48,7 @@ use strum::EnumIter;
 use strum::EnumString;
 use strum::VariantNames;
 
+use crate::detail::fetcher::Direction;
 use crate::detail::graph::EdgeType;
 use crate::detail::graph::Node;
 use crate::detail::graph::NodeData;
@@ -1027,9 +1027,11 @@ impl WalkVisitor<(Node, Option<NodeData>, Option<StepStats>), EmptyRoute> for Wa
 mod tests {
     use std::mem::size_of;
 
+    use mononoke_macros::mononoke;
+
     use super::*;
 
-    #[test]
+    #[mononoke::test]
     fn test_interned_size() {
         // InternedId size is important as we have a lot of them, so test in case it changes
         assert_eq!(4, size_of::<InternedId<ChangesetId>>());

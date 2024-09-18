@@ -35,10 +35,9 @@
   $ setconfig experimental.narrow-heads=true
   $ setconfig visibility.enabled=true
 
-  $ newrepo server --config extensions.treemanifest=$TESTDIR/../sapling/ext/treemanifestserver.py
+  $ newrepo server
   $ setconfig infinitepush.server=yes infinitepush.reponame=testrepo
   $ setconfig infinitepush.indextype=disk infinitepush.storetype=disk
-  $ setconfig treemanifest.server=True extensions.treemanifest=$TESTDIR/../sapling/ext/treemanifestserver.py
   $ touch base
   $ hg commit -Aqm base
   $ hg bookmark master

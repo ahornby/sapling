@@ -4,7 +4,7 @@
 # GNU General Public License found in the LICENSE file in the root
 # directory of this source tree.
 
-This is a fork  of test-cross-repo-commit-sync-live.t that brings the via-extra mode
+This is a fork of test-cross-repo-commit-sync-live.t that brings the via-extra mode
 to be fully able to deal with mapping changes regardless of sync direction. I will
 replace that file once fully fixed.
   $ export LARGE_REPO_ID=0
@@ -20,23 +20,14 @@ replace that file once fully fixed.
   > }
   > EOF
 
-Setup configuration
-  $ setup_configerator_configs
-  $ cat > "$PUSHREDIRECT_CONF/enable" <<EOF
-  > {
-  > "per_repo": {
-  >   "1": {
-  >      "draft_push": false,
-  >      "public_push": false
-  >    }
-  >   }
-  > }
-  > EOF
-
 -- Init Mononoke thingies
-  $ XREPOSYNC=1 init_large_small_repo
+  $ create_large_small_repo
   Adding synced mapping entry
+  $ setup_configerator_configs
+  $ enable_pushredirect 1 false false
+  $ XREPOSYNC=1 start_large_small_repo
   Starting Mononoke server
+  $ init_local_large_small_clones
 
 -- Start up the sync job in the background
   $ mononoke_x_repo_sync_forever $REPOIDSMALL $REPOIDLARGE
@@ -44,13 +35,13 @@ Setup configuration
 Before the change
 -- push to a small repo
   $ cd "$TESTTMP/small-hg-client"
-  $ REPONAME=small-mon hgmn up -q master_bookmark
+  $ hg up -q master_bookmark
   $ mkdir -p non_path_shifting
   $ echo a > foo
   $ echo b > non_path_shifting/bar
   $ hg ci -Aqm "before config change"
-  $ REPONAME=small-mon hgmn push -r . --to master_bookmark -q
-  $ log 
+  $ hg push -r . --to master_bookmark -q
+  $ log
   @  before config change [public;rev=2;bc6a206054d0] default/master_bookmark
   │
   o  first post-move commit [public;rev=1;11f848659bfc]
@@ -64,19 +55,19 @@ Before the change
 
 -- check the same commit in the large repo
   $ cd "$TESTTMP/large-hg-client"
-  $ REPONAME=large-mon hgmn pull -q
-  $ REPONAME=large-mon hgmn up -q master_bookmark
+  $ hg pull -q
+  $ hg up -q master_bookmark
   $ log -r master_bookmark
   @  before config change [public;rev=3;c76f6510b5c1] default/master_bookmark
   │
   ~
-  $ REPONAME=large-mon hgmn log -r master_bookmark -T "{files % '{file}\n'}"
+  $ hg log -r master_bookmark -T "{files % '{file}\n'}"
   non_path_shifting/bar
   smallrepofolder/foo
 -- prepare for config change by making the state match both old and new config versions
   $ hg cp -q smallrepofolder smallrepofolder_after
   $ hg commit -m "prepare for config change"
-  $ REPONAME=large-mon hgmn push -q --to master_bookmark
+  $ hg push -q --to master_bookmark
 
 Make a config change
   $ update_commit_sync_map_first_option
@@ -90,8 +81,8 @@ Make a config change
   $ flush_mononoke_bookmarks
 Find the hash of mapping change commit in the large repo
   $ cd "$TESTTMP/large-hg-client"
-  $ REPONAME=large-mon hgmn pull -q
-  $ REPONAME=large-mon hgmn up -q master_bookmark
+  $ hg pull -q
+  $ hg up -q master_bookmark
 
 After the change
 -- an empty, mapping changing commit from large repo shouldn't be backsynced when forward sync is on
@@ -103,13 +94,13 @@ After the change
   EquivalentWorkingCopyAncestor(ChangesetId(Blake2(cdd50b2d186ce87fe6d2428b01caf9994a98ac51e65f7d6bb43c6a0f6e8d7a56)), CommitSyncConfigVersion("new_version"))
 
   $ cd "$TESTTMP/small-hg-client"
-  $ REPONAME=small-mon hgmn pull -r $X
-  pulling from mononoke://$LOCALIP:$LOCAL_PORT/small-mon
+  $ hg pull -r $X
+  pulling from mono:small-mon
   no changes found
   adding changesets
   adding manifests
   adding file changes
-  $ REPONAME=small-mon hgmn up -q $X
+  $ hg up -q $X
   $ log -r .^::.
   @  before config change [public;rev=2;bc6a206054d0] default/master_bookmark
   │
@@ -119,12 +110,12 @@ After the change
 
 -- push to a small repo
   $ cd "$TESTTMP/small-hg-client"
-  $ REPONAME=small-mon hgmn pull -q
-  $ REPONAME=small-mon hgmn up -q master_bookmark
+  $ hg pull -q
+  $ hg up -q master_bookmark
   $ echo a > boo
   $ echo b > non_path_shifting/baz
   $ hg ci -Aqm "after config change from small"
-  $ REPONAME=small-mon hgmn push -r . --to master_bookmark -q
+  $ hg push -r . --to master_bookmark -q
   $ log -r master_bookmark^::master_bookmark
   @  after config change from small [public;rev=3;6bfa38885cea] default/master_bookmark
   │
@@ -134,11 +125,11 @@ After the change
 
 -- push to a large repo
   $ cd "$TESTTMP/large-hg-client"
-  $ REPONAME=large-mon hgmn pull -q
-  $ REPONAME=large-mon hgmn up -q master_bookmark
+  $ hg pull -q
+  $ hg up -q master_bookmark
   $ echo a > after_change
   $ hg ci -Aqm "after config change from large"
-  $ REPONAME=large-mon hgmn push -r . --to master_bookmark -q
+  $ hg push -r . --to master_bookmark -q
 
 -- trigger xrepo sync and show that can sync commit over the config change
   $ with_stripped_logs wait_for_xrepo_sync 3
@@ -146,15 +137,15 @@ Rest of this test won't pass as we failed the previous command so is commented o
   $ flush_mononoke_bookmarks
 -- check the same commit in the large repo
   $ cd "$TESTTMP/large-hg-client"
-  $ REPONAME=large-mon hgmn pull -q
-  $ REPONAME=large-mon hgmn up -q master_bookmark
+  $ hg pull -q
+  $ hg up -q master_bookmark
   $ log -r "master_bookmark^::master_bookmark"
-  @  after config change from large [public;rev=7;ad029e9c7735] default/master_bookmark
+  @  after config change from large [public;rev=?;ad029e9c7735] default/master_bookmark (glob)
   │
-  o  after config change from small [public;rev=6;9a1a082f2f8e]
+  o  after config change from small [public;rev=?;9a1a082f2f8e] (glob)
   │
   ~
-  $ REPONAME=large-mon hgmn log -r master_bookmark -T "{files % '{file}\n'}"
+  $ hg log -r master_bookmark -T "{files % '{file}\n'}"
   after_change
 -- Verify the working copy state after the operation
   $ with_stripped_logs verify_wc $(hg whereami)

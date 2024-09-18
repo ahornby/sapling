@@ -50,6 +50,13 @@ export interface UICodeReviewProvider {
 
   RepoInfo(): JSX.Element | null;
 
+  getRemoteTrackingBranch(
+    allDiffSummaries?: Map<string, DiffSummary> | null,
+    diffId?: DiffId | null,
+  ): string | null;
+
+  getRemoteTrackingBranchFromDiffSummary(diff: DiffSummary | undefined | null): string | null;
+
   isDiffClosed(summary: DiffSummary): boolean;
 
   isDiffEligibleForCleanup(summary: DiffSummary): boolean;
@@ -84,6 +91,8 @@ export interface UICodeReviewProvider {
     commits: Array<CommitInfo>,
     allDiffSummaries: Map<string, DiffSummary>,
   ): Array<CommitInfo>;
+
+  getUpdateDiffActions(summary: DiffSummary): Array<{label: ReactNode; onClick: () => void}>;
 
   commitMessageFieldsSchema: Array<FieldConfig>;
 

@@ -30,13 +30,13 @@ use mononoke_types::BonsaiChangeset;
 use mononoke_types::ChangesetId;
 use mononoke_types::NonRootMPath;
 
-pub use crate::errors::HookFileContentProviderError;
 pub use crate::errors::HookManagerError;
+pub use crate::errors::HookStateProviderError;
 pub use crate::manager::HookManager;
-pub use crate::provider::memory::InMemoryHookFileContentProvider;
-pub use crate::provider::text_only::TextOnlyHookFileContentProvider;
-pub use crate::provider::FileChange;
-pub use crate::provider::HookFileContentProvider;
+pub use crate::provider::memory::InMemoryHookStateProvider;
+pub use crate::provider::text_only::TextOnlyHookStateProvider;
+pub use crate::provider::FileChangeType;
+pub use crate::provider::HookStateProvider;
 pub use crate::provider::PathContent;
 
 /// Whether changesets were created by a user or a service.
@@ -74,6 +74,23 @@ pub enum CrossRepoPushSource {
     PushRedirected,
 }
 
+/// Trait to be implemented by bookmarks hooks.
+///
+/// Changeset hooks run once per bookmark movement, and primarily concern themselves
+/// with bookmarks metadata.
+#[async_trait]
+pub trait BookmarkHook: Send + Sync {
+    async fn run<'this: 'cs, 'ctx: 'this, 'cs, 'provider: 'cs>(
+        &'this self,
+        ctx: &'ctx CoreContext,
+        bookmark: &BookmarkKey,
+        to: &'cs BonsaiChangeset,
+        content_provider: &'provider dyn HookStateProvider,
+        cross_repo_push_source: CrossRepoPushSource,
+        push_authored_by: PushAuthoredBy,
+    ) -> Result<HookExecution, Error>;
+}
+
 /// Trait to be implemented by changeset hooks.
 ///
 /// Changeset hooks run once per changeset, and primarily concern themselves
@@ -85,7 +102,7 @@ pub trait ChangesetHook: Send + Sync {
         ctx: &'ctx CoreContext,
         bookmark: &BookmarkKey,
         changeset: &'cs BonsaiChangeset,
-        content_provider: &'provider dyn HookFileContentProvider,
+        content_provider: &'provider dyn HookStateProvider,
         cross_repo_push_source: CrossRepoPushSource,
         push_authored_by: PushAuthoredBy,
     ) -> Result<HookExecution, Error>;
@@ -100,7 +117,7 @@ pub trait FileHook: Send + Sync {
     async fn run<'this: 'change, 'ctx: 'this, 'change, 'provider: 'change, 'path: 'change>(
         &'this self,
         ctx: &'ctx CoreContext,
-        content_provider: &'provider dyn HookFileContentProvider,
+        content_provider: &'provider dyn HookStateProvider,
         change: Option<&'change BasicFileChange>,
         path: &'path NonRootMPath,
         cross_repo_push_source: CrossRepoPushSource,
@@ -111,6 +128,7 @@ pub trait FileHook: Send + Sync {
 /// Outcome of running a hook.
 #[derive(Clone, Debug, PartialEq)]
 pub enum HookOutcome {
+    BookmarkHook(BookmarkHookExecutionId, HookExecution),
     ChangesetHook(ChangesetHookExecutionId, HookExecution),
     FileHook(FileHookExecutionId, HookExecution),
 }
@@ -118,6 +136,13 @@ pub enum HookOutcome {
 impl fmt::Display for HookOutcome {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
+            HookOutcome::BookmarkHook(id, exec) => {
+                write!(
+                    f,
+                    "{} for bookmark {}, cs {}: {}",
+                    id.hook_name, id.bookmark_name, id.cs_id, exec
+                )
+            }
             HookOutcome::ChangesetHook(id, exec) => {
                 write!(f, "{} for {}: {}", id.hook_name, id.cs_id, exec)
             }
@@ -144,6 +169,7 @@ impl HookOutcome {
 
     pub fn get_hook_name(&self) -> &str {
         match self {
+            HookOutcome::BookmarkHook(id, _) => &id.hook_name,
             HookOutcome::ChangesetHook(id, _) => &id.hook_name,
             HookOutcome::FileHook(id, _) => &id.hook_name,
         }
@@ -151,6 +177,7 @@ impl HookOutcome {
 
     pub fn get_file_path(&self) -> Option<&NonRootMPath> {
         match self {
+            HookOutcome::BookmarkHook(..) => None,
             HookOutcome::ChangesetHook(..) => None,
             HookOutcome::FileHook(id, _) => Some(&id.path),
         }
@@ -158,6 +185,7 @@ impl HookOutcome {
 
     pub fn get_changeset_id(&self) -> ChangesetId {
         match self {
+            HookOutcome::BookmarkHook(id, _) => id.cs_id,
             HookOutcome::ChangesetHook(id, _) => id.cs_id,
             HookOutcome::FileHook(id, _) => id.cs_id,
         }
@@ -165,16 +193,34 @@ impl HookOutcome {
 
     pub fn get_execution(&self) -> &HookExecution {
         match self {
+            HookOutcome::BookmarkHook(_, exec) => exec,
             HookOutcome::ChangesetHook(_, exec) => exec,
             HookOutcome::FileHook(_, exec) => exec,
         }
     }
 
+    pub fn set_execution(&mut self, new_exec: HookExecution) {
+        match self {
+            HookOutcome::BookmarkHook(_, exec) => *exec = new_exec,
+            HookOutcome::ChangesetHook(_, exec) => *exec = new_exec,
+            HookOutcome::FileHook(_, exec) => *exec = new_exec,
+        }
+    }
+
     pub fn into_rejection(self) -> Option<HookRejection> {
         match self {
-            HookOutcome::ChangesetHook(_, HookExecution::Accepted)
+            HookOutcome::BookmarkHook(_, HookExecution::Accepted)
+            | HookOutcome::ChangesetHook(_, HookExecution::Accepted)
             | HookOutcome::FileHook(_, HookExecution::Accepted) => None,
-            HookOutcome::ChangesetHook(
+            HookOutcome::BookmarkHook(
+                BookmarkHookExecutionId {
+                    cs_id,
+                    bookmark_name: _,
+                    hook_name,
+                },
+                HookExecution::Rejected(reason),
+            )
+            | HookOutcome::ChangesetHook(
                 ChangesetHookExecutionId { cs_id, hook_name },
                 HookExecution::Rejected(reason),
             )
@@ -217,6 +263,7 @@ pub enum HookExecution {
 impl From<HookOutcome> for HookExecution {
     fn from(outcome: HookOutcome) -> Self {
         match outcome {
+            HookOutcome::BookmarkHook(_, r) => r,
             HookOutcome::ChangesetHook(_, r) => r,
             HookOutcome::FileHook(_, r) => r,
         }
@@ -264,6 +311,13 @@ impl HookRejectionInfo {
             long_description,
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Hash, Eq)]
+pub struct BookmarkHookExecutionId {
+    pub cs_id: ChangesetId,
+    pub bookmark_name: String,
+    pub hook_name: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Hash, Eq)]

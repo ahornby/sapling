@@ -15,11 +15,8 @@ import {copyUrlForFile, supportsBrowseUrlForHash} from './BrowseRepo';
 import {type ChangedFilesDisplayType} from './ChangedFileDisplayTypePicker';
 import {generatedStatusToLabel, generatedStatusDescription} from './GeneratedFile';
 import {PartialFileSelectionWithMode} from './PartialFileSelection';
-import {Subtle} from './Subtle';
 import {SuspenseBoundary} from './SuspenseBoundary';
-import {Tooltip} from './Tooltip';
 import {holdingAltAtom, holdingCtrlAtom} from './atoms/keyboardAtoms';
-import {Checkbox} from './components/Checkbox';
 import {externalMergeToolAtom} from './externalMergeTool';
 import {T, t} from './i18n';
 import {readAtom} from './jotaiUtils';
@@ -38,13 +35,16 @@ import {optimisticMergeConflicts} from './previews';
 import {copyAndShowToast} from './toast';
 import {ConflictType, succeedableRevset} from './types';
 import {usePromise} from './usePromise';
-import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
+import {Button} from 'isl-components/Button';
+import {Checkbox} from 'isl-components/Checkbox';
+import {Icon} from 'isl-components/Icon';
+import {isMac} from 'isl-components/OperatingSystem';
+import {Subtle} from 'isl-components/Subtle';
+import {Tooltip} from 'isl-components/Tooltip';
 import {useAtomValue} from 'jotai';
 import React from 'react';
 import {labelForComparison, revsetForComparison, ComparisonType} from 'shared/Comparison';
 import {useContextMenu} from 'shared/ContextMenu';
-import {Icon} from 'shared/Icon';
-import {isMac} from 'shared/OperatingSystem';
 import {basename, notEmpty} from 'shared/utils';
 
 /**
@@ -213,15 +213,15 @@ function FileActions({
   if (platform.openDiff != null && !conflictStatuses.has(file.status)) {
     actions.push(
       <Tooltip title={t('Open diff view')} key="open-diff-view" delayMs={1000}>
-        <VSCodeButton
+        <Button
           className="file-show-on-hover"
-          appearance="icon"
+          icon
           data-testid="file-open-diff-button"
           onClick={() => {
             platform.openDiff?.(file.path, comparison);
           }}>
           <Icon icon="request-changes" />
-        </VSCodeButton>
+        </Button>
       </Tooltip>,
     );
   }
@@ -240,10 +240,10 @@ function FileActions({
         }
         key="revert"
         delayMs={1000}>
-        <VSCodeButton
+        <Button
           className="file-show-on-hover"
           key={file.path}
-          appearance="icon"
+          icon
           data-testid="file-revert-button"
           onClick={() => {
             platform
@@ -270,7 +270,7 @@ function FileActions({
               });
           }}>
           <Icon icon="discard" />
-        </VSCodeButton>
+        </Button>
       </Tooltip>,
     );
   }
@@ -282,33 +282,33 @@ function FileActions({
           title={t('Stop tracking this file, without removing from the filesystem')}
           key="forget"
           delayMs={1000}>
-          <VSCodeButton
+          <Button
             className="file-show-on-hover"
             key={file.path}
-            appearance="icon"
+            icon
             onClick={() => {
               runOperation(new ForgetOperation(file.path));
             }}>
             <Icon icon="circle-slash" />
-          </VSCodeButton>
+          </Button>
         </Tooltip>,
       );
     } else if (file.status === '?') {
       actions.push(
         <Tooltip title={t('Start tracking this file')} key="add" delayMs={1000}>
-          <VSCodeButton
+          <Button
             className="file-show-on-hover"
             key={file.path}
-            appearance="icon"
+            icon
             onClick={() => runOperation(new AddOperation(file.path))}>
             <Icon icon="add" />
-          </VSCodeButton>
+          </Button>
         </Tooltip>,
         <Tooltip title={t('Remove this file from the filesystem')} key="remove" delayMs={1000}>
-          <VSCodeButton
+          <Button
             className="file-show-on-hover"
             key={file.path}
-            appearance="icon"
+            icon
             data-testid="file-action-delete"
             onClick={async () => {
               const ok = await platform.confirm(
@@ -320,31 +320,31 @@ function FileActions({
               runOperation(new PurgeOperation([file.path]));
             }}>
             <Icon icon="trash" />
-          </VSCodeButton>
+          </Button>
         </Tooltip>,
       );
     } else if (file.status === 'Resolved') {
       actions.push(
         <Tooltip title={t('Mark as unresolved')} key="unresolve-mark">
-          <VSCodeButton
+          <Button
             key={file.path}
-            appearance="icon"
+            icon
             onClick={() => runOperation(new ResolveOperation(file.path, ResolveTool.unmark))}>
             <Icon icon="circle-slash" />
-          </VSCodeButton>
+          </Button>
         </Tooltip>,
       );
     } else if (file.status === 'U') {
       actions.push(
         <Tooltip title={t('Mark as resolved')} key="resolve-mark">
-          <VSCodeButton
+          <Button
             className="file-show-on-hover"
             data-testid="file-action-resolve"
             key={file.path}
-            appearance="icon"
+            icon
             onClick={() => runOperation(new ResolveOperation(file.path, ResolveTool.mark))}>
             <Icon icon="check" />
-          </VSCodeButton>
+          </Button>
         </Tooltip>,
       );
       if (
@@ -355,17 +355,17 @@ function FileActions({
       ) {
         actions.push(
           <Tooltip title={t('Delete file')} key="resolve-delete">
-            <VSCodeButton
+            <Button
               className="file-show-on-hover"
               data-testid="file-action-resolve-delete"
-              appearance="icon"
+              icon
               onClick={() => {
                 runOperation(new RmOperation(file.path, /* force */ true));
                 // then explicitly mark the file as resolved
                 runOperation(new ResolveOperation(file.path, ResolveTool.mark));
               }}>
               <Icon icon="trash" />
-            </VSCodeButton>
+            </Button>
           </Tooltip>,
         );
       } else {
@@ -375,26 +375,26 @@ function FileActions({
               replace: {$local: CONFLICT_SIDE_LABELS.local},
             })}
             key="resolve-local">
-            <VSCodeButton
+            <Button
               className="file-show-on-hover"
               key={file.path}
-              appearance="icon"
+              icon
               onClick={() => runOperation(new ResolveOperation(file.path, ResolveTool.local))}>
               <Icon icon="fold-up" />
-            </VSCodeButton>
+            </Button>
           </Tooltip>,
           <Tooltip
             title={t('Take $incoming', {
               replace: {$incoming: CONFLICT_SIDE_LABELS.incoming},
             })}
             key="resolve-other">
-            <VSCodeButton
+            <Button
               className="file-show-on-hover"
               key={file.path}
-              appearance="icon"
+              icon
               onClick={() => runOperation(new ResolveOperation(file.path, ResolveTool.other))}>
               <Icon icon="fold-down" />
-            </VSCodeButton>
+            </Button>
           </Tooltip>,
           <Tooltip
             title={t('Combine both $incoming and $local', {
@@ -404,13 +404,13 @@ function FileActions({
               },
             })}
             key="resolve-both">
-            <VSCodeButton
+            <Button
               className="file-show-on-hover"
               key={file.path}
-              appearance="icon"
+              icon
               onClick={() => runOperation(new ResolveOperation(file.path, ResolveTool.both))}>
               <Icon icon="fold" />
-            </VSCodeButton>
+            </Button>
           </Tooltip>,
         );
       }
@@ -501,33 +501,21 @@ function PartialSelectionAction({file}: {file: UIChangedFile}) {
       component={() => (
         <div style={{maxWidth: '300px'}}>
           <div>
-            <T
-              replace={{
-                $beta: (
-                  <span
-                    style={{
-                      color: 'var(--scm-removed-foreground)',
-                      marginLeft: 'var(--halfpad)',
-                      fontSize: '80%',
-                    }}>
-                    (Beta)
-                  </span>
-                ),
-              }}>
-              Toggle chunk selection $beta
-            </T>
+            <T>Toggle chunk selection</T>
           </div>
           <div>
-            <T>
-              Shows changed files in your commit and lets you select individual chunks or lines to
-              include.
-            </T>
+            <Subtle>
+              <T>
+                Shows changed files in your commit and lets you select individual chunks or lines to
+                include.
+              </T>
+            </Subtle>
           </div>
         </div>
       )}>
-      <VSCodeButton className="file-show-on-hover" appearance="icon" onClick={handleClick}>
+      <Button className="file-show-on-hover" icon onClick={handleClick}>
         <Icon icon="diff" />
-      </VSCodeButton>
+      </Button>
     </Tooltip>
   );
 }

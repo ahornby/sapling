@@ -8,15 +8,16 @@
 import type {CommitInfo} from '../types';
 
 import {Row} from '../ComponentUtils';
-import {SuspenseBoundary} from '../SuspenseBoundary';
-import {Tooltip} from '../Tooltip';
 import {T, t} from '../i18n';
+import {SLOC_THRESHOLD_FOR_SPLIT_SUGGESTIONS} from '../sloc/diffStatConstants';
 import {
-  useFetchPendingSignificantLinesOfCode,
   useFetchSignificantLinesOfCode,
+  useFetchPendingSignificantLinesOfCode,
 } from '../sloc/useFetchSignificantLinesOfCode';
 import * as stylex from '@stylexjs/stylex';
-import {Icon} from 'shared/Icon';
+import {ErrorBoundary} from 'isl-components/ErrorNotice';
+import {Icon} from 'isl-components/Icon';
+import {Tooltip} from 'isl-components/Tooltip';
 
 type Props = {commit: CommitInfo};
 const styles = stylex.create({
@@ -38,39 +39,88 @@ export function LoadingDiffStatsView() {
   );
 }
 export function DiffStats({commit}: Props) {
-  const significantLinesOfCode = useFetchSignificantLinesOfCode(commit);
-  return <ResolvedDiffStatsView significantLinesOfCode={significantLinesOfCode} />;
-}
+  const {slocInfo, isLoading} = useFetchSignificantLinesOfCode(commit);
+  const significantLinesOfCode = slocInfo?.sloc;
+  const strictSignificantLinesOfCode = slocInfo?.strictSloc;
 
-export function PendingDiffStats({commit}: Props) {
+  if (isLoading && significantLinesOfCode == null) {
+    return <LoadingDiffStatsView />;
+  } else if (!isLoading && significantLinesOfCode == null) {
+    return null;
+  }
+
   return (
-    <SuspenseBoundary fallback={<LoadingDiffStatsView />}>
-      <PendingDiffStatsView commit={commit} />
-    </SuspenseBoundary>
+    <ResolvedDiffStatsView
+      significantLinesOfCode={significantLinesOfCode}
+      strictSignificantLinesOfCode={strictSignificantLinesOfCode}
+    />
   );
 }
 
-export function PendingDiffStatsView({commit}: Props) {
-  const significantLinesOfCode = useFetchPendingSignificantLinesOfCode(commit);
-  return <ResolvedDiffStatsView significantLinesOfCode={significantLinesOfCode} />;
+export function PendingDiffStats({showWarning = false}: {showWarning?: boolean}) {
+  return (
+    <ErrorBoundary>
+      <PendingDiffStatsView showWarning={showWarning} />
+    </ErrorBoundary>
+  );
+}
+
+export function PendingDiffStatsView({showWarning = false}: {showWarning?: boolean}) {
+  const {slocInfo, isLoading} = useFetchPendingSignificantLinesOfCode();
+  const significantLinesOfCode = slocInfo?.sloc;
+  const strictSignificantLinesOfCode = slocInfo?.strictSloc;
+
+  if (isLoading && significantLinesOfCode == null) {
+    return <LoadingDiffStatsView />;
+  } else if (!isLoading && significantLinesOfCode == null) {
+    return null;
+  }
+
+  return (
+    <ResolvedDiffStatsView
+      significantLinesOfCode={significantLinesOfCode}
+      strictSignificantLinesOfCode={strictSignificantLinesOfCode}
+      showWarning={showWarning}
+    />
+  );
 }
 
 function ResolvedDiffStatsView({
   significantLinesOfCode,
+  strictSignificantLinesOfCode,
+  showWarning,
 }: {
   significantLinesOfCode: number | undefined;
+  strictSignificantLinesOfCode: number | undefined;
+  showWarning?: boolean;
 }) {
   if (significantLinesOfCode == null) {
     return null;
   }
+  const extras =
+    showWarning &&
+    strictSignificantLinesOfCode &&
+    strictSignificantLinesOfCode > SLOC_THRESHOLD_FOR_SPLIT_SUGGESTIONS ? (
+      <Tooltip
+        title={t(
+          //formatting this on multiple lines to look good in the tooltip
+          `Consider unselecting some of these changes.
+
+Small Diffs lead to quicker review times.
+`,
+        )}>
+        <Icon icon="warning" color="yellow" />
+      </Tooltip>
+    ) : null;
+
   return (
-    <DiffStatsView>
+    <DiffStatsView extras={extras}>
       <T replace={{$num: significantLinesOfCode}}>$num lines</T>
     </DiffStatsView>
   );
 }
 
-function DiffStatsView({children}: {children: React.ReactNode}) {
+function DiffStatsView({extras, children}: {extras?: React.ReactNode; children: React.ReactNode}) {
   return (
     <Row xstyle={styles.locInfo}>
       <Icon icon="code" />
@@ -81,6 +131,7 @@ function DiffStatsView({children}: {children: React.ReactNode}) {
         )}>
         <Icon icon="info" />
       </Tooltip>
+      {extras}
     </Row>
   );
 }

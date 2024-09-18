@@ -84,7 +84,6 @@ if sys.platform == "win32":
         "start_test.StartTest": True,
         "start_test.StartWithRepoTestHg": True,
         "stats_test.GenericStatsTest": [
-            "test_writing_untracked_file_bumps_write_counter",  # counter not implemented for PrjFS (T147665665)
             "test_summary_counters_available",  # counter not implemented for PrjFS (T147669123)
         ],
         "stats_test.ObjectCacheStatsTest": [
@@ -186,6 +185,7 @@ elif sys.platform.startswith("linux") and not os.path.exists("/etc/redhat-releas
         # issue.
         "test_post_clone_permissions"
     ]
+
 elif sys.platform.startswith("darwin"):
     # OSERROR AF_UNIX path too long
     TEST_DISABLED["hg.status_test.StatusTestTreeOnly"] = [

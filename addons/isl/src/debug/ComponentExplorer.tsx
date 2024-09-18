@@ -7,16 +7,16 @@
 
 import {T} from '../i18n';
 import {useModal} from '../useModal';
-import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
+import {Button} from 'isl-components/Button';
+import {Icon} from 'isl-components/Icon';
 import {Suspense, lazy} from 'react';
-import {Icon} from 'shared/Icon';
 
-const ComponentExplorerModal = lazy(() => import('./ComponentExplorerModal'));
+const ComponentExplorer = lazy(() => import('isl-components/explorer/ComponentExplorer'));
 
 export function ComponentExplorerButton({dismiss}: {dismiss: () => unknown}) {
   const showModal = useModal();
   return (
-    <VSCodeButton
+    <Button
       onClick={() => {
         dismiss();
         showModal({
@@ -26,15 +26,14 @@ export function ComponentExplorerButton({dismiss}: {dismiss: () => unknown}) {
           height: 'inherit',
           type: 'custom',
           dataTestId: 'component-explorer',
-          component: ({returnResultAndDismiss}) => (
+          component: () => (
             <Suspense fallback={<Icon icon="loading" size="M" />}>
-              <ComponentExplorerModal dismiss={returnResultAndDismiss} />
+              <ComponentExplorer />
             </Suspense>
           ),
         });
-      }}
-      appearance="secondary">
+      }}>
       <T>Open Component Explorer</T>
-    </VSCodeButton>
+    </Button>
   );
 }

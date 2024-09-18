@@ -1,7 +1,6 @@
 load("@fbcode_macros//build_defs:rust_library.bzl", "rust_library")
-load("@fbsource//tools/build_defs:glob_defs.bzl", "glob")
 
-oncall("mercurial_release")
+oncall("sapling")
 
 rust_library(
     name = "gitdag",
@@ -13,7 +12,6 @@ rust_library(
         "fbsource//third-party/rust:anyhow",
         "fbsource//third-party/rust:git2",
         "fbsource//third-party/rust:parking_lot",
-        "fbsource//third-party/rust:phf",
         "fbsource//third-party/rust:tracing",
         "//eden/scm/lib/dag:dag",
         "//eden/scm/lib/nonblocking:nonblocking",

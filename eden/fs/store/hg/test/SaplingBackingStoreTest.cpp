@@ -6,10 +6,10 @@
  */
 
 #include <folly/executors/CPUThreadPoolExecutor.h>
-#include <folly/experimental/TestUtil.h>
 #include <folly/logging/xlog.h>
 #include <folly/portability/GMock.h>
 #include <folly/portability/GTest.h>
+#include <folly/testing/TestUtil.h>
 #include <algorithm>
 #include <memory>
 
@@ -40,7 +40,7 @@ struct TestRepo {
   Hash20 manifest1;
 
   TestRepo() {
-    repo.hgInit(testPath + "cache"_pc);
+    repo.hgInit(testPath + "cache"_pc, {}, /* isEagerRepo */ true);
 
     repo.mkdir("foo");
     repo.writeFile("foo/bar.txt", "bar\n");
@@ -66,8 +66,10 @@ std::vector<PathComponent> getTreeNames(
 }
 
 struct SaplingBackingStoreTestBase : TestRepo, ::testing::Test {
+  std::shared_ptr<EdenConfig> testEdenConfig =
+      EdenConfig::createTestEdenConfig();
   std::shared_ptr<ReloadableConfig> edenConfig{
-      std::make_shared<ReloadableConfig>(EdenConfig::createTestEdenConfig())};
+      std::make_shared<ReloadableConfig>(testEdenConfig)};
   EdenStatsPtr stats{makeRefPtr<EdenStats>()};
   std::shared_ptr<MemoryLocalStore> localStore{
       std::make_shared<MemoryLocalStore>(stats.copy())};
@@ -106,6 +108,7 @@ struct SaplingBackingStoreWithFaultInjectorTest : SaplingBackingStoreTestBase {
           std::make_unique<BackingStoreLogger>(),
           &faultInjector);
 };
+
 struct SaplingBackingStoreWithFaultInjectorIgnoreConfigTest
     : SaplingBackingStoreTestBase {
   std::shared_ptr<TestConfigSource> testConfigSource{
@@ -207,6 +210,169 @@ TEST_F(SaplingBackingStoreWithFaultInjectorTest, getBlob) {
   }
 }
 
+TEST_F(SaplingBackingStoreNoFaultInjectorTest, getGlobFilesMultiple) {
+  auto suffixes = std::vector<std::string>{".txt"};
+  auto globFiles =
+      queuedBackingStore->getGlobFiles(commit1, suffixes).get(kTestTimeout);
+  auto paths = globFiles.globFiles;
+  auto commitId = queuedBackingStore->renderRootId(globFiles.rootId);
+
+  EXPECT_EQ(commitId, queuedBackingStore->renderRootId(commit1));
+
+  // TODO(T189729875) Make it check the files created during setup
+  // The globFiles SaplingRemoteAPI endpoint is currently mocked out so files
+  // returned are always the same dependent on the given suffix.
+  std::sort(paths.begin(), paths.end());
+  auto expected_result = std::vector<std::string>{"baz.txt", "foo.txt"};
+  EXPECT_EQ(paths.size(), 2);
+  for (int i = 0; i < 2; i++) {
+    EXPECT_EQ(paths[i], expected_result[i]);
+  }
+}
+
+TEST_F(SaplingBackingStoreNoFaultInjectorTest, getGlobFilesSingle) {
+  auto suffixes = std::vector<std::string>{".rs"};
+  auto globFiles =
+      queuedBackingStore->getGlobFiles(commit1, suffixes).get(kTestTimeout);
+  auto paths = globFiles.globFiles;
+  auto commitId = queuedBackingStore->renderRootId(globFiles.rootId);
+
+  EXPECT_EQ(commitId, queuedBackingStore->renderRootId(commit1));
+
+  // TODO(T189729875) Make it check the files created during setup
+  // The globFiles SaplingRemoteAPI endpoint is currently mocked out so files
+  // returned are always the same dependent on the given suffix.
+  std::sort(paths.begin(), paths.end());
+  auto expected_result = std::vector<std::string>{"bar.rs"};
+  EXPECT_EQ(paths.size(), 1);
+  EXPECT_EQ(paths[0], expected_result[0]);
+}
+TEST_F(SaplingBackingStoreNoFaultInjectorTest, getGlobFilesNone) {
+  auto suffixes = std::vector<std::string>{".bzl"};
+  auto globFiles =
+      queuedBackingStore->getGlobFiles(commit1, suffixes).get(kTestTimeout);
+  auto paths = globFiles.globFiles;
+  auto commitId = queuedBackingStore->renderRootId(globFiles.rootId);
+
+  EXPECT_EQ(commitId, queuedBackingStore->renderRootId(commit1));
+
+  // TODO(T189729875) Make it check the files created during setup
+  // The globFiles SaplingRemoteAPI endpoint is currently mocked out so files
+  // returned are always the same dependent on the given suffix.
+  EXPECT_EQ(paths.size(), 0);
+}
+
+TEST_F(SaplingBackingStoreNoFaultInjectorTest, getGlobFilesNested) {
+  auto suffixes = std::vector<std::string>{".cpp"};
+  auto globFiles =
+      queuedBackingStore->getGlobFiles(commit1, suffixes).get(kTestTimeout);
+  auto paths = globFiles.globFiles;
+  auto commitId = queuedBackingStore->renderRootId(globFiles.rootId);
+
+  EXPECT_EQ(commitId, queuedBackingStore->renderRootId(commit1));
+
+  // TODO(T189729875) Make it check the files created during setup
+  // The globFiles SaplingRemoteAPI endpoint is currently mocked out so files
+  // returned are always the same dependent on the given suffix.
+  std::sort(paths.begin(), paths.end());
+  auto expected_result =
+      std::vector<std::string>{"fuji/peak.cpp", "ranier.cpp"};
+  EXPECT_EQ(paths.size(), 2);
+  for (int i = 0; i < 2; i++) {
+    EXPECT_EQ(paths[i], expected_result[i]);
+  }
+}
+
+TEST_F(SaplingBackingStoreNoFaultInjectorTest, cachingPolicyConstruction) {
+  // No caching
+  testEdenConfig->hgEnableTreeLocalStoreCaching.setValue(
+      false, ConfigSourceType::UserConfig);
+  testEdenConfig->hgEnableBlobLocalStoreCaching.setValue(
+      false, ConfigSourceType::UserConfig);
+  testEdenConfig->hgEnableBlobMetaLocalStoreCaching.setValue(
+      false, ConfigSourceType::UserConfig);
+  EXPECT_EQ(
+      queuedBackingStore->constructLocalStoreCachingPolicy(),
+      BackingStore::LocalStoreCachingPolicy::NoCaching);
+
+  // Trees
+  testEdenConfig->hgEnableTreeLocalStoreCaching.setValue(
+      true, ConfigSourceType::UserConfig);
+  testEdenConfig->hgEnableBlobLocalStoreCaching.setValue(
+      false, ConfigSourceType::UserConfig);
+  testEdenConfig->hgEnableBlobMetaLocalStoreCaching.setValue(
+      false, ConfigSourceType::UserConfig);
+  EXPECT_EQ(
+      queuedBackingStore->constructLocalStoreCachingPolicy(),
+      BackingStore::LocalStoreCachingPolicy::Trees);
+
+  // Blobs
+  testEdenConfig->hgEnableTreeLocalStoreCaching.setValue(
+      false, ConfigSourceType::UserConfig);
+  testEdenConfig->hgEnableBlobLocalStoreCaching.setValue(
+      true, ConfigSourceType::UserConfig);
+  testEdenConfig->hgEnableBlobMetaLocalStoreCaching.setValue(
+      false, ConfigSourceType::UserConfig);
+  EXPECT_EQ(
+      queuedBackingStore->constructLocalStoreCachingPolicy(),
+      BackingStore::LocalStoreCachingPolicy::Blobs);
+
+  // BlobMetadata
+  testEdenConfig->hgEnableTreeLocalStoreCaching.setValue(
+      false, ConfigSourceType::UserConfig);
+  testEdenConfig->hgEnableBlobLocalStoreCaching.setValue(
+      false, ConfigSourceType::UserConfig);
+  testEdenConfig->hgEnableBlobMetaLocalStoreCaching.setValue(
+      true, ConfigSourceType::UserConfig);
+  EXPECT_EQ(
+      queuedBackingStore->constructLocalStoreCachingPolicy(),
+      BackingStore::LocalStoreCachingPolicy::BlobMetadata);
+
+  // TreesAndBlobs
+  testEdenConfig->hgEnableTreeLocalStoreCaching.setValue(
+      true, ConfigSourceType::UserConfig);
+  testEdenConfig->hgEnableBlobLocalStoreCaching.setValue(
+      true, ConfigSourceType::UserConfig);
+  testEdenConfig->hgEnableBlobMetaLocalStoreCaching.setValue(
+      false, ConfigSourceType::UserConfig);
+  EXPECT_EQ(
+      queuedBackingStore->constructLocalStoreCachingPolicy(),
+      BackingStore::LocalStoreCachingPolicy::TreesAndBlobs);
+
+  // TreesAndBlobMetadata
+  testEdenConfig->hgEnableTreeLocalStoreCaching.setValue(
+      true, ConfigSourceType::UserConfig);
+  testEdenConfig->hgEnableBlobLocalStoreCaching.setValue(
+      false, ConfigSourceType::UserConfig);
+  testEdenConfig->hgEnableBlobMetaLocalStoreCaching.setValue(
+      true, ConfigSourceType::UserConfig);
+  EXPECT_EQ(
+      queuedBackingStore->constructLocalStoreCachingPolicy(),
+      BackingStore::LocalStoreCachingPolicy::TreesAndBlobMetadata);
+
+  // BlobsAndBlobMetadata
+  testEdenConfig->hgEnableTreeLocalStoreCaching.setValue(
+      false, ConfigSourceType::UserConfig);
+  testEdenConfig->hgEnableBlobLocalStoreCaching.setValue(
+      true, ConfigSourceType::UserConfig);
+  testEdenConfig->hgEnableBlobMetaLocalStoreCaching.setValue(
+      true, ConfigSourceType::UserConfig);
+  EXPECT_EQ(
+      queuedBackingStore->constructLocalStoreCachingPolicy(),
+      BackingStore::LocalStoreCachingPolicy::BlobsAndBlobMetadata);
+
+  // Anything
+  testEdenConfig->hgEnableTreeLocalStoreCaching.setValue(
+      true, ConfigSourceType::UserConfig);
+  testEdenConfig->hgEnableBlobLocalStoreCaching.setValue(
+      true, ConfigSourceType::UserConfig);
+  testEdenConfig->hgEnableBlobMetaLocalStoreCaching.setValue(
+      true, ConfigSourceType::UserConfig);
+  EXPECT_EQ(
+      queuedBackingStore->constructLocalStoreCachingPolicy(),
+      BackingStore::LocalStoreCachingPolicy::Anything);
+}
+
 TEST_F(SaplingBackingStoreWithFaultInjectorIgnoreConfigTest, getTreeBatch) {
   // force a reload
   updateTestEdenConfig(
@@ -271,12 +437,10 @@ TEST_F(SaplingBackingStoreWithFaultInjectorTest, getTreeBatch) {
         std::vector{request}, sapling::FetchMode::LocalOnly);
   });
 
-  // its a bit of a hack, but we need to make sure getTreebatch has hit the
-  // fault before we edit the config and unblock it. TODO: We should rewrite
-  // SaplingBackingStore with futures so that this is more testable:
-  // T171328733.
-  /* sleep override */
-  sleep(10);
+  // TODO: We should rewrite SaplingBackingStore with futures so that this is
+  // more testable: T171328733.
+  ASSERT_TRUE(
+      faultInjector.waitUntilBlocked("SaplingBackingStore::getTreeBatch", 10s));
 
   // force a reload
   updateTestEdenConfig(

@@ -11,7 +11,6 @@ include "eden/mononoke/filenodes/if/filenodes.thrift"
 include "eden/mononoke/mercurial/types/if/mercurial_thrift.thrift"
 include "eden/mononoke/mononoke_types/serialization/id.thrift"
 include "eden/mononoke/mononoke_types/serialization/changeset_info.thrift"
-include "eden/mononoke/mononoke_types/serialization/bssm.thrift"
 include "eden/mononoke/mononoke_types/serialization/test_manifest.thrift"
 
 struct DerivedDataType {
@@ -46,6 +45,7 @@ struct DeriveRequest {
   3: binary changeset_id;
   4: string config_name;
   5: DerivationType derivation_type;
+  6: optional i64 bubble_id;
 } (rust.exhaustive)
 
 struct DeriveResponse {
@@ -65,17 +65,20 @@ union DerivedData {
   5: DerivedDataBlame blame;
   6: DerivedDataHgChangeset hg_changeset;
   7: DerivedDataChangesetInfo changeset_info;
-  8: DerivedDataDeletedManifest deleted_manifest;
+  // 8: deleted deleted_manifest
   9: DerivedDataSkeletonManifest skeleton_manifest;
   10: DerivedDataTreeHandle tree_handle;
   11: DerivedDataDeletedManifestV2 deleted_manifest_v2;
-  12: DerivedDataBasenameSuffixSkeletonManifest basename_suffix_skeleton_manifest;
+  // 12: deleted basename_suffix_skeleton_manifest
   13: DerivedDataCommitHandle commit_handle;
-  14: DerivedDataGitDeltaManifest git_delta_manifest;
+  // 14: deleted git_delta_manifest
   15: DerivedDataTestManifest test_manifest;
   16: DerivedDataTestShardedManifest test_sharded_manifest;
   17: DerivedDataBssmV3 bssm_v3;
   18: DerivedDataHgAugmentedManifest hg_augmented_manifest;
+  19: DerivedDataGitDeltaManifestV2 git_delta_manifest_v2;
+  20: DerivedDataSkeletonManifestV2 skeleton_manifest_v2;
+  21: DerivedDataCcsm ccsm;
 }
 
 union DerivedDataFsnode {
@@ -117,20 +120,20 @@ union DerivedDataChangesetInfo {
   1: changeset_info.ChangesetInfo changeset_info;
 }
 
-union DerivedDataDeletedManifest {
-  1: id.DeletedManifestId root_deleted_manifest_id;
-}
-
 union DerivedDataDeletedManifestV2 {
   1: id.DeletedManifestV2Id root_deleted_manifest_v2_id;
 }
 
-union DerivedDataBasenameSuffixSkeletonManifest {
-  1: bssm.BssmDirectory root_basename_suffix_skeleton_manifest;
-}
-
 union DerivedDataBssmV3 {
   1: id.BssmV3DirectoryId root_bssm_v3_directory_id;
+}
+
+union DerivedDataSkeletonManifestV2 {
+  1: id.SkeletonManifestV2Id root_skeleton_manifest_v2_id;
+}
+
+union DerivedDataCcsm {
+  1: id.CaseConflictSkeletonManifestId root_ccsm_id;
 }
 
 union DerivedDataTestManifest {
@@ -153,12 +156,11 @@ union DerivedDataCommitHandle {
   1: git_types_thrift.MappedGitCommitId mapped_commit_id;
 }
 
-union DerivedDataGitDeltaManifest {
-  1: git_types_thrift.GitDeltaManifestId root_git_delta_manifest_id;
-}
-
 union DerivedDataHgAugmentedManifest {
   1: mercurial_thrift.HgNodeHash root_hg_augmented_manifest_id;
+}
+union DerivedDataGitDeltaManifestV2 {
+  1: git_types_thrift.GitDeltaManifestV2Id root_git_delta_manifest_v2_id;
 }
 
 struct DerivedDataTypeNotEnabled {
@@ -188,6 +190,11 @@ struct DisabledDerivation {
   3: string repo_name;
 } (rust.exhaustive)
 
+struct TypeDisabledForEphemeralBubbles {
+  1: string type_name;
+  2: i32 repo_id;
+} (rust.exhaustive)
+
 struct DisabledFilenodes {} (rust.exhaustive)
 
 union RequestErrorReason {
@@ -197,6 +204,7 @@ union RequestErrorReason {
   4: UnknownDerivedDataConfig unknown_derived_data_config;
   5: UnknownDerivationType unknown_derivation_type;
   6: DisabledDerivation disabled_derivation;
+  7: TypeDisabledForEphemeralBubbles type_disabled_for_ephemeral_bubbles;
 }
 
 safe permanent client exception RequestError {

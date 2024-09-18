@@ -130,7 +130,6 @@ blackbox=
 chistedit=
 clindex=
 conflictinfo=
-copytrace=
 debugnetwork=
 dialect=
 directaccess=
@@ -157,7 +156,6 @@ rage=!
 rebase=
 remotefilelog=
 remotenames=
-schemes=
 shelve=
 smartlog=
 sparse=
@@ -219,8 +217,6 @@ http=True
 retryprefetch=True
 fetchpacks=True
 getpackversion=2
-write-hgcache-to-indexedlog=True
-write-local-to-indexedlog=True
 
 [remotenames]
 autopullpattern=re:^remote/[A-Za-z0-9._/-]+$
@@ -512,7 +508,7 @@ verify=False
 [committemplate]
 changeset = {if(desc, desc, emptymsg)}\n
     HG: Enter commit message.  Lines beginning with 'HG:' are removed.
-    HG: {extramsg}
+    HG: Leave message empty to abort commit.
     HG: --
     HG: user: {author}\n{ifgt(parents|count, 1,
    "HG: merging:\n{parents % 'HG:   {node|short}: {desc|firstline}\n'}")
@@ -585,10 +581,6 @@ show=True
 default-destination-dir=$HOME
 nativecheckout=True
 nativepull=True
-
-[commands]
-naked-default.in-repo=hg
-naked-default.no-repo=help
 
 [scale]
 largeworkingcopy=True

@@ -21,8 +21,8 @@ use fsnodes::RootFsnodeId;
 use futures::stream::BoxStream;
 use futures::stream::StreamExt;
 use futures::stream::TryStreamExt;
-use manifest::AsyncManifest;
 use manifest::Entry;
+use manifest::Manifest;
 use manifest::ManifestOps;
 use manifest::PathOrPrefix;
 use manifest::StoreLoadable;
@@ -91,9 +91,9 @@ enum ListItem {
 }
 
 impl ListItem {
-    fn new<TreeId, LeafId>(path: MPath, entry: Entry<TreeId, LeafId>) -> Self
+    fn new<TreeId, Leaf>(path: MPath, entry: Entry<TreeId, Leaf>) -> Self
     where
-        Entry<TreeId, LeafId>: Listable,
+        Entry<TreeId, Leaf>: Listable,
     {
         match entry {
             Entry::Tree(..) => ListItem::Directory(path, entry.list_item()),
@@ -170,12 +170,16 @@ impl Listable for Entry<HgAugmentedManifestId, HgAugmentedFileLeafNode> {
         match self {
             Entry::Tree(tree) => tree.to_string(),
             Entry::Leaf(leaf) => format!(
-                "{}\ttype={}\tsize={}\tblake3={}\tsha1={}",
+                "{}\ttype={}\tsize={}\tblake3={}\tsha1={}{}",
                 leaf.filenode,
                 leaf.file_type,
                 leaf.total_size,
                 leaf.content_blake3,
                 leaf.content_sha1,
+                match leaf.file_header_metadata {
+                    None => String::new(),
+                    Some(data) => format!("\tmetadata=<{} bytes>", data.len()),
+                }
             ),
         }
     }
@@ -201,12 +205,12 @@ async fn list<TreeId>(
 where
     TreeId: StoreLoadable<RepoBlobstore> + Clone + Send + Sync + Eq + Unpin + 'static,
     <TreeId as StoreLoadable<RepoBlobstore>>::Value:
-        AsyncManifest<RepoBlobstore, TreeId = TreeId> + Send + Sync,
-    <<TreeId as StoreLoadable<RepoBlobstore>>::Value as AsyncManifest<RepoBlobstore>>::LeafId:
+        Manifest<RepoBlobstore, TreeId = TreeId> + Send + Sync,
+    <<TreeId as StoreLoadable<RepoBlobstore>>::Value as Manifest<RepoBlobstore>>::Leaf:
         Clone + Send + Eq + Unpin,
     Entry<
         TreeId,
-        <<TreeId as StoreLoadable<RepoBlobstore>>::Value as AsyncManifest<RepoBlobstore>>::LeafId,
+        <<TreeId as StoreLoadable<RepoBlobstore>>::Value as Manifest<RepoBlobstore>>::Leaf,
     >: Listable,
 {
     if directory {
@@ -356,11 +360,7 @@ pub(super) async fn list_manifest(
     repo: &Repo,
     args: ListManifestArgs,
 ) -> Result<()> {
-    let cs_id = args
-        .changeset_args
-        .resolve_changeset(ctx, repo)
-        .await?
-        .ok_or_else(|| anyhow!("Changeset not found"))?;
+    let cs_id = args.changeset_args.resolve_changeset(ctx, repo).await?;
 
     let path = args.path.as_deref().unwrap_or("");
     let path: MPath = MPath::new(path).with_context(|| anyhow!("Invalid path: {}", path))?;

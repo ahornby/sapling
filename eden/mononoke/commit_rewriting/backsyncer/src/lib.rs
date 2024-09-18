@@ -51,10 +51,10 @@ use bookmarks::BookmarkUpdateReason;
 use bookmarks::Bookmarks;
 use bookmarks::BookmarksArc;
 use bookmarks::Freshness;
-use changesets::Changesets;
 use cloned::cloned;
 use commit_graph::CommitGraph;
 use commit_graph::CommitGraphRef;
+use commit_graph::CommitGraphWriter;
 use context::CoreContext;
 use cross_repo_sync::find_toposorted_unsynced_ancestors;
 use cross_repo_sync::CandidateSelectionHint;
@@ -96,7 +96,7 @@ use slog::info;
 use slog::warn;
 use sql::Transaction;
 use sql_ext::TransactionResult;
-use synced_commit_mapping::SyncedCommitMapping;
+use sql_query_config::SqlQueryConfig;
 use thiserror::Error;
 use wireproto_handler::TargetRepoDbs;
 
@@ -111,7 +111,6 @@ pub struct Repo(
     RepoBookmarkAttrs,
     dyn Bookmarks,
     dyn BookmarkUpdateLog,
-    dyn Changesets,
     FilestoreConfig,
     dyn MutableCounters,
     dyn Phases,
@@ -120,7 +119,9 @@ pub struct Repo(
     RepoDerivedData,
     RepoIdentity,
     CommitGraph,
+    dyn CommitGraphWriter,
     dyn Filenodes,
+    SqlQueryConfig,
 );
 
 #[cfg(test)]
@@ -153,14 +154,13 @@ pub enum BacksyncLimit {
 ///
 /// We also use a hard-coded timeout to avoid being stuck forever waiting for the backsync if it is
 /// lagging. Not having this timeout has caused SEVs in the past, blocking lands.
-pub async fn ensure_backsynced<M, R>(
+pub async fn ensure_backsynced<R>(
     ctx: CoreContext,
-    commit_syncer: CommitSyncer<M, R>,
+    commit_syncer: CommitSyncer<R>,
     target_repo_dbs: Arc<TargetRepoDbs>,
     log_id: BookmarkUpdateLogId,
 ) -> Result<(), Error>
 where
-    M: SyncedCommitMapping + Clone + 'static,
     R: RepoLike + Send + Sync + Clone + 'static,
 {
     let timeout = Duration::from_secs(
@@ -199,9 +199,9 @@ where
     bail!("Timeout expired while waiting for backsyncing")
 }
 
-pub async fn backsync_latest<M, R>(
+pub async fn backsync_latest<R>(
     ctx: CoreContext,
-    commit_syncer: CommitSyncer<M, R>,
+    commit_syncer: CommitSyncer<R>,
     target_repo_dbs: Arc<TargetRepoDbs>,
     limit: BacksyncLimit,
     cancellation_requested: Arc<AtomicBool>,
@@ -210,7 +210,6 @@ pub async fn backsync_latest<M, R>(
     commit_only_backsync_future: Box<dyn Future<Output = ()> + Send + Unpin>,
 ) -> Result<Box<dyn Future<Output = ()> + Send + Unpin>, Error>
 where
-    M: SyncedCommitMapping + Clone + 'static,
     R: RepoLike + Send + Sync + Clone + 'static,
 {
     // TODO(ikostia): start borrowing `CommitSyncer`, no reason to consume it
@@ -230,7 +229,7 @@ where
         BacksyncLimit::Limit(limit) => limit,
         BacksyncLimit::NoLimit => {
             // Set limit extremely high to read all new values
-            u64::max_value()
+            u64::MAX
         }
     };
     let next_entries: Vec<_> = commit_syncer
@@ -242,6 +241,7 @@ where
             log_entries_limit,
             Freshness::MostRecent,
         )
+        .boxed()
         .try_collect()
         .await?;
 
@@ -267,13 +267,14 @@ where
             disable_lease,
             commit_only_backsync_future,
         )
+        .boxed()
         .await
     }
 }
 
-async fn sync_entries<M, R>(
+async fn sync_entries<R>(
     mut ctx: CoreContext,
-    commit_syncer: &CommitSyncer<M, R>,
+    commit_syncer: &CommitSyncer<R>,
     target_repo_dbs: Arc<TargetRepoDbs>,
     entries: Vec<BookmarkUpdateLogEntry>,
     mut counter: BookmarkUpdateLogId,
@@ -283,7 +284,6 @@ async fn sync_entries<M, R>(
     mut commit_only_backsync_future: Box<dyn Future<Output = ()> + Send + Unpin>,
 ) -> Result<Box<dyn Future<Output = ()> + Send + Unpin>, Error>
 where
-    M: SyncedCommitMapping + Clone + 'static,
     R: RepoLike + Send + Sync + Clone + 'static,
 {
     for entry in entries {
@@ -322,9 +322,9 @@ where
 // This function is the inner function for sync_entries and shouldn't be called by other callers.
 // It encapsulates of what we consider as doing a single "backsyncing" for bookmark entry: an
 // activity that we want to time and log.
-async fn do_sync_entry<M, R>(
+async fn do_sync_entry<R>(
     ctx: CoreContext,
-    commit_syncer: &CommitSyncer<M, R>,
+    commit_syncer: &CommitSyncer<R>,
     target_repo_dbs: &Arc<TargetRepoDbs>,
     entry: BookmarkUpdateLogEntry,
     counter: &mut BookmarkUpdateLogId,
@@ -335,7 +335,6 @@ async fn do_sync_entry<M, R>(
     scuba_log_tag: &mut String,
 ) -> Result<Box<dyn Future<Output = ()> + Send + Unpin>, Error>
 where
-    M: SyncedCommitMapping + Clone + 'static,
     R: RepoLike + Send + Sync + Clone + 'static,
 {
     let entry_id = entry.id;
@@ -461,7 +460,7 @@ where
     );
     scuba_sample.add(
         "backsync_duration_ms",
-        u64::try_from(start_instant.elapsed().as_millis()).unwrap_or(u64::max_value()),
+        u64::try_from(start_instant.elapsed().as_millis()).unwrap_or(u64::MAX),
     );
     scuba_sample.add("backsync_previously_done", maybe_log_id.is_none());
 
@@ -529,15 +528,14 @@ async fn commits_added_by_bookmark_move(
     }
 }
 
-async fn backsync_bookmark<M, R>(
+async fn backsync_bookmark<R>(
     ctx: CoreContext,
-    commit_syncer: &CommitSyncer<M, R>,
+    commit_syncer: &CommitSyncer<R>,
     target_repo_dbs: Arc<TargetRepoDbs>,
     prev_counter: Option<BookmarkUpdateLogId>,
     log_entry: &BookmarkUpdateLogEntry,
 ) -> Result<Option<BookmarkUpdateLogId>, Error>
 where
-    M: SyncedCommitMapping + Clone + 'static,
     R: RepoLike + Send + Sync + Clone + 'static,
 {
     let prev_counter: Option<i64> = prev_counter.map(|x| x.try_into()).transpose()?;
@@ -729,7 +727,7 @@ where
             });
 
             let res = bookmark_txn
-                .commit_with_hook(txn_hook)
+                .commit_with_hooks(vec![txn_hook])
                 .await?
                 .map(|x| x.into());
             log_new_bonsai_changesets(

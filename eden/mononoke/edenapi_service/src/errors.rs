@@ -74,10 +74,9 @@ pub enum ErrorKind {
         "Invalid file content upload token in 'upload/filenodes' request for filenode: {0}, reason: {1}"
     )]
     UploadHgFilenodeRequestInvalidToken(HgId, String),
-    #[error("Workspace not found in commit cloud: {0}")]
-    CloudWorkspaceNotFound(String),
     #[error("CommitId not found: {0}")]
     CommitIdNotFound(CommitId),
+    #[allow(dead_code)]
     #[error("Invalid Request, reason: {0}")]
     InvalidRequest(String),
 }
@@ -105,6 +104,7 @@ impl MononokeErrorExt for MononokeError {
             ServicePermissionDenied { .. } => HttpError::e403,
             NotAvailable { .. } => HttpError::e503,
             HookFailure(_) => HttpError::e400,
+            NonFastForwardMove { .. } => HttpError::e400,
             PushrebaseConflicts(_) => HttpError::e400,
             AuthorizationError(_) => HttpError::e403,
             InternalError(_) => HttpError::e500,

@@ -117,6 +117,7 @@ Check that preexisting directory is not removed in failure case
 
 Check that prexisting repo is not modified
   $ mkdir $TESTTMP/failure-clone/.hg
+  $ touch $TESTTMP/failure-clone/.hg/requires
   $ hg clone -Uq test:e1 $TESTTMP/failure-clone
   TRACE cmdclone: performing rust clone
   abort: .hg directory already exists at clone destination $TESTTMP/failure-clone
@@ -178,9 +179,6 @@ Can specify selectivepull branch via URL fragment:
 Test various --eden errors:
   $ hg clone -Uq test:e1 --eden-backing-repo /foo/bar
   abort: --eden-backing-repo requires --eden
-  [255]
-  $ hg clone -q test:e1 --eden --enable-profile foo
-  abort: --enable-profile is not compatible with --eden
   [255]
   $ hg clone -q test:e1 -u foo --eden
   abort: some specified options are not compatible with --eden
@@ -276,6 +274,6 @@ Default to "tip" if selectivepulldefault not available.
 Don't perform any queries for null commit id.
   $ LOG= hg clone -Uq ./e1 no_workingcopy
   $ cd no_workingcopy
-  $ LOG=trace hg status -m 2>trace
+  $ LOG=dag::protocol=trace hg status -m 2>trace
   $ grep 0000000000000000000000000000000000000000 trace
   [1]

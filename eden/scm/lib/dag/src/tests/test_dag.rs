@@ -6,6 +6,8 @@
  */
 
 use std::collections::HashMap;
+use std::ops::Deref;
+use std::ops::DerefMut;
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -28,12 +30,12 @@ use crate::ops::IdConvert;
 use crate::protocol;
 use crate::protocol::RemoteIdConvertProtocol;
 #[cfg(feature = "render")]
-use crate::render::render_namedag;
+use crate::render::render_dag;
 use crate::tests::DrawDag;
 use crate::CloneData;
+use crate::Dag;
 use crate::Group;
 use crate::Level;
-use crate::NameDag;
 use crate::Result;
 use crate::Set;
 use crate::Vertex;
@@ -41,7 +43,7 @@ use crate::VertexListWithOptions;
 
 /// Dag structure for testing purpose.
 pub struct TestDag {
-    pub dag: NameDag,
+    pub dag: Dag,
     pub seg_size: usize,
     pub dir: tempfile::TempDir,
     pub output: Arc<Mutex<Vec<String>>>,
@@ -100,7 +102,7 @@ impl TestDag {
     /// Creates a `TestDag` with a specific segment size.
     pub fn new_with_segment_size(seg_size: usize) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let dag = NameDag::open(dir.path().join("n")).unwrap();
+        let dag = Dag::open(dir.path().join("n")).unwrap();
         Self {
             dir,
             dag,
@@ -111,7 +113,7 @@ impl TestDag {
 
     /// Reopen the dag. Drop in-memory state including caches.
     pub fn reopen(&mut self) {
-        let mut dag = NameDag::open(self.dir.path().join("n")).unwrap();
+        let mut dag = Dag::open(self.dir.path().join("n")).unwrap();
         dag.set_remote_protocol(self.dag.get_remote_protocol());
         self.dag = dag;
     }
@@ -228,7 +230,7 @@ impl TestDag {
     #[cfg(feature = "render")]
     /// Render the graph.
     pub fn render_graph(&self) -> String {
-        render_namedag(&self.dag, |v| {
+        render_dag(&self.dag, |v| {
             Some(
                 non_blocking_result(self.dag.vertex_id(v.clone()))
                     .unwrap()
@@ -332,12 +334,8 @@ impl TestDag {
 
     /// Describe segments at the given level and group as a string.
     pub fn debug_segments(&self, level: Level, group: Group) -> String {
-        let lines = crate::namedag::debug_segments_by_level_group(
-            &self.dag.dag,
-            &self.dag.map,
-            level,
-            group,
-        );
+        let lines =
+            crate::dag::debug_segments_by_level_group(&self.dag.dag, &self.dag.map, level, group);
         lines
             .iter()
             .map(|l| format!("\n        {}", l))
@@ -455,6 +453,20 @@ impl TestDag {
     }
 }
 
+impl Deref for TestDag {
+    type Target = Dag;
+
+    fn deref(&self) -> &Self::Target {
+        &self.dag
+    }
+}
+
+impl DerefMut for TestDag {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.dag
+    }
+}
+
 pub(crate) struct ProtocolMonitor {
     pub(crate) inner: Box<dyn RemoteIdConvertProtocol>,
     pub(crate) output: Arc<Mutex<Vec<String>>>,
@@ -506,7 +518,7 @@ impl From<Set> for VertexListWithOptions {
 }
 
 fn to_head_opts(set: Set) -> VertexListWithOptions {
-    use crate::nameset::SyncNameSetQuery;
+    use crate::set::SyncSetQuery;
     let heads_vec = set.iter().unwrap().collect::<Result<Vec<_>>>().unwrap();
     VertexListWithOptions::from(heads_vec).with_desired_group(Group::MASTER)
 }

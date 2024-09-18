@@ -12,7 +12,6 @@ import type {ReactNode} from 'react';
 import {useShowConfirmSubmitStack} from '../ConfirmSubmitStack';
 import {Internal} from '../Internal';
 import {Link} from '../Link';
-import {Tooltip} from '../Tooltip';
 import {clipboardCopyLink, clipboardCopyText} from '../clipboard';
 import {T, t} from '../i18n';
 import {CircleEllipsisIcon} from '../icons/CircleEllipsisIcon';
@@ -23,16 +22,18 @@ import {useRunOperation} from '../operationsState';
 import platform from '../platform';
 import {exactRevset} from '../types';
 import {codeReviewProvider, diffSummary} from './CodeReviewInfo';
-import {DiffCommentsDetails} from './DiffComments';
 import {openerUrlForDiffUrl} from './github/GitHubUrlOpener';
 import {SyncStatus, syncStatusAtom} from './syncStatus';
 import * as stylex from '@stylexjs/stylex';
-import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
+import {Button} from 'isl-components/Button';
+import {Icon} from 'isl-components/Icon';
+import {Tooltip} from 'isl-components/Tooltip';
 import {useAtomValue} from 'jotai';
-import {Component, Suspense, useState} from 'react';
-import {Icon} from 'shared/Icon';
+import {Component, lazy, Suspense, useState} from 'react';
 
 import './DiffBadge.css';
+
+const DiffCommentsDetails = lazy(() => import('./DiffComments'));
 
 export const showDiffNumberConfig = configBackedAtom<boolean>('isl.show-diff-number', false);
 
@@ -189,7 +190,7 @@ function DownloadNewVersionButton({
   const runOperation = useRunOperation();
   const tooltip = bothChanged
     ? t(
-        'Both remote and local verisons have changed.\n\n$provider has a new version of this Diff, but this commit has also changed locally since it was last submitted. You can download the new remote version, but it may not include your other local changes.',
+        'Both remote and local versions have changed.\n\n$provider has a new version of this Diff, but this commit has also changed locally since it was last submitted. You can download the new remote version, but it may not include your other local changes.',
         {replace: {$provider: provider.label}},
       )
     : t('$provider has a newer version of this Diff. Click to download the newer version.', {
@@ -198,8 +199,8 @@ function DownloadNewVersionButton({
 
   return (
     <Tooltip title={tooltip}>
-      <VSCodeButton
-        appearance="icon"
+      <Button
+        icon
         onClick={async () => {
           if (bothChanged) {
             const confirmed = await platform.confirm(tooltip);
@@ -215,7 +216,7 @@ function DownloadNewVersionButton({
         }}>
         <Icon icon="cloud-download" slot="start" />
         <T>Download New Version</T>
-      </VSCodeButton>
+      </Button>
     </Tooltip>
   );
 }
@@ -233,8 +234,8 @@ function ResubmitSyncButton({
   return (
     <Tooltip
       title={t('This commit has changed locally since it was last submitted. Click to resubmit.')}>
-      <VSCodeButton
-        appearance="icon"
+      <Button
+        icon
         data-testid="commit-submit-button"
         onClick={async () => {
           const confirmation = await confirmShouldSubmit('submit', [commit]);
@@ -250,7 +251,7 @@ function ResubmitSyncButton({
         }}>
         <Icon icon="cloud-upload" slot="start" />
         <T>Submit</T>
-      </VSCodeButton>
+      </Button>
     </Tooltip>
   );
 }
@@ -282,13 +283,19 @@ function DiffComments({diff, diffId}: {diff: DiffSummary; diffId: DiffId}) {
     return null;
   }
   return (
-    <Tooltip trigger="click" component={() => <DiffCommentsDetails diffId={diffId} />}>
-      <VSCodeButton appearance="icon">
+    <Tooltip
+      trigger="click"
+      component={() => (
+        <Suspense>
+          <DiffCommentsDetails diffId={diffId} />
+        </Suspense>
+      )}>
+      <Button icon>
         <span className="diff-comments-count">
           {diff.commentCount}
           <Icon icon={diff.anyUnresolvedComments ? 'comment-unresolved' : 'comment'} />
         </span>
-      </VSCodeButton>
+      </Button>
     </Tooltip>
   );
 }

@@ -163,7 +163,7 @@ impl SourceControlServiceImpl {
         let force_local_pushrebase = justknobs::eval(
             "scm/mononoke:scs_force_local_pushrebase",
             None,
-            Some(repo.inner_repo().repo_identity().name()),
+            Some(repo.repo().repo_identity().name()),
         )
         .unwrap_or(true);
 

@@ -11,27 +11,19 @@ In this test we ensure that a merge into the large repo that doesn't involve
   $ export COMMIT_SCRIBE_CATEGORY=mononoke_commits
   $ export BOOKMARK_SCRIBE_CATEGORY=mononoke_bookmark
 
-  $ setup_configerator_configs
-  $ cat > "$PUSHREDIRECT_CONF/enable" <<EOF
-  > {
-  > "per_repo": {
-  >   "1": {
-  >      "draft_push": false,
-  >      "public_push": true
-  >    }
-  >   }
-  > }
-  > EOF
-
-  $ init_large_small_repo
+  $ create_large_small_repo
   Adding synced mapping entry
+  $ setup_configerator_configs
+  $ enable_pushredirect 1
+  $ start_large_small_repo
   Starting Mononoke server
+  $ init_local_large_small_clones
 
   $ testtool_drawdag --print-hg-hashes -R large-mon --no-default-files <<'EOF'
   >        M1
   >       /  \
   >     A1    |  # modify: A1 unrelatedfolder/newrepo "content"
-  >           E1 
+  >           E1
   > EOF
   A1=dc5b1bb7a82bef93a47a92b4f9ac5fb54597cd78
   E1=7614fd547c87f4952b0196834ce4dbee6eaf4eed
@@ -39,11 +31,11 @@ In this test we ensure that a merge into the large repo that doesn't involve
 
 Push a M1 to a large repo
   $ cd "$TESTTMP/large-hg-client"
-  $ REPONAME=large-mon hgmn pull -qr $M1
-  $ REPONAME=large-mon hgmn up -q master_bookmark^
+  $ hg pull -qr $M1
+  $ hg up -q master_bookmark^
   $ hg merge -r "$M1" -q
   $ hg ci -m 'merge commit in large repo #1'
-  $ REPONAME=large-mon hgmn push -r . --to master_bookmark -q
+  $ hg push -r . --to master_bookmark -q
 
 Backsync to a small repo
   $ quiet_grep "syncing bookmark" -- backsync_large_to_small
@@ -70,11 +62,11 @@ Skip empty commits option
 
 Push a M2 to a large repo
   $ cd "$TESTTMP/large-hg-client"
-  $ REPONAME=large-mon hgmn pull -qr $M2
-  $ REPONAME=large-mon hgmn up -q master_bookmark^
+  $ hg pull -qr $M2
+  $ hg up -q master_bookmark^
   $ hg merge -r "$M2" -q
   $ hg ci -m 'merge commit in large repo #2 - should be non-merge in small repo'
-  $ REPONAME=large-mon hgmn push -r . --to master_bookmark -q
+  $ hg push -r . --to master_bookmark -q
 
 Backsync to a small repo
   $ quiet_grep "syncing bookmark" -- backsync_large_to_small
@@ -84,7 +76,7 @@ Backsync to a small repo
 Pull from a small repo. Check that both merges are synced
 although the second one became non-merge commit
   $ cd "$TESTTMP/small-hg-client"
-  $ REPONAME=small-mon hgmn pull -q
+  $ hg pull -q
   $ log -r :
   o  merge commit in large repo #2 - should be non-merge in small repo [public;rev=5;5be69a1c5de7] default/master_bookmark
   │

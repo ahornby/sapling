@@ -121,6 +121,7 @@ class FilteredBackingStore
   FRIEND_TEST(FakeSubstringFilteredBackingStoreTest, getBlob);
   FRIEND_TEST(FakeSubstringFilteredBackingStoreTest, getTree);
   FRIEND_TEST(FakeSubstringFilteredBackingStoreTest, getRootTree);
+  FRIEND_TEST(FakeSubstringFilteredBackingStoreTest, getGlobFiles);
 
   ImmediateFuture<GetRootTreeResult> getRootTree(
       const RootId& rootId,
@@ -135,6 +136,10 @@ class FilteredBackingStore
       const ObjectId& id,
       const ObjectFetchContextPtr& context) override;
 
+  folly::SemiFuture<GetTreeMetaResult> getTreeMetadata(
+      const ObjectId& id,
+      const ObjectFetchContextPtr& context) override;
+
   folly::SemiFuture<GetBlobResult> getBlob(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) override;
@@ -146,6 +151,10 @@ class FilteredBackingStore
   FOLLY_NODISCARD folly::SemiFuture<folly::Unit> prefetchBlobs(
       ObjectIdRange ids,
       const ObjectFetchContextPtr& context) override;
+
+  ImmediateFuture<GetGlobFilesResult> getGlobFiles(
+      const RootId& id,
+      const std::vector<std::string>& globs) override;
 
   /*
    * Does the actual filtering logic for tree and root-tree objects.

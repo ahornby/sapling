@@ -46,6 +46,8 @@ class UsageService;
 
 extern const char* const kServiceName;
 
+const int EXPENSIVE_GLOB_FILES_DURATION = 5;
+
 struct ThriftRequestTraceEvent : TraceEventBase {
   enum Type : unsigned char {
     START,
@@ -279,6 +281,10 @@ class EdenServiceHandler : virtual public StreamingEdenServiceSvIf,
   semifuture_debugGetBlobMetadata(
       std::unique_ptr<DebugGetBlobMetadataRequest> request) override;
 
+  folly::SemiFuture<std::unique_ptr<DebugGetScmTreeResponse>>
+  semifuture_debugGetTree(
+      std::unique_ptr<DebugGetScmTreeRequest> request) override;
+
   void debugInodeStatus(
       std::vector<TreeInodeDebugInfo>& inodeInfo,
       std::unique_ptr<std::string> mountPoint,
@@ -300,6 +306,10 @@ class EdenServiceHandler : virtual public StreamingEdenServiceSvIf,
 
   void debugOutstandingThriftRequests(
       std::vector<ThriftRequestMetadata>& outstandingCalls) override;
+
+  void debugOutstandingHgEvents(
+      std::vector<HgEvent>& outstandingEvents,
+      std::unique_ptr<std::string> mountPoint) override;
 
   void debugStartRecordingActivity(
       ActivityRecorderResult& result,
@@ -372,6 +382,9 @@ class EdenServiceHandler : virtual public StreamingEdenServiceSvIf,
   void injectFault(std::unique_ptr<FaultDefinition> fault) override;
   bool removeFault(std::unique_ptr<RemoveFaultArg> fault) override;
   int64_t unblockFault(std::unique_ptr<UnblockFaultArg> info) override;
+  void getBlockedFaults(
+      GetBlockedFaultsResponse& out,
+      std::unique_ptr<GetBlockedFaultsRequest> request) override;
 
   folly::SemiFuture<std::unique_ptr<SetPathObjectIdResult>>
   semifuture_setPathObjectId(
@@ -396,6 +409,10 @@ class EdenServiceHandler : virtual public StreamingEdenServiceSvIf,
   void checkPrivHelper(PrivHelperInfo& result) override;
 
   int64_t getPid() override;
+
+  void getCheckoutProgressInfo(
+      CheckoutProgressInfoResponse& ret,
+      std::unique_ptr<CheckoutProgressInfoRequest> params) override;
 
   /**
    * A thrift client has requested that we shutdown.
@@ -447,13 +464,17 @@ class EdenServiceHandler : virtual public StreamingEdenServiceSvIf,
       const EdenMount& edenMount,
       const std::vector<std::string>& paths,
       EntryAttributeFlags reqBitmask,
+      AttributesRequestScope reqScope,
       SyncBehavior sync,
-      const ObjectFetchContextPtr& fetchContext);
+      const ObjectFetchContextPtr& fetchContext,
+      bool getEntryAttributesForPath);
   ImmediateFuture<EntryAttributes> getEntryAttributesForPath(
       const EdenMount& edenMount,
       EntryAttributeFlags reqBitmask,
+      AttributesRequestScope reqScope,
       std::string_view path,
-      const ObjectFetchContextPtr& fetchContext);
+      const ObjectFetchContextPtr& fetchContext,
+      bool getEntryAttributesForPath);
 
   folly::Synchronized<std::unordered_map<uint64_t, ThriftRequestTraceEvent>>
       outstandingThriftRequests_;

@@ -12,8 +12,9 @@
 
 setup configuration
   $ REPOTYPE="blob_files"
-  $ REPOID=$LARGE_REPO_ID REPONAME=large-mon setup_common_config $REPOTYPE
-  $ REPOID=$SMALL_REPO_ID REPONAME=small-mon-1 setup_common_config $REPOTYPE
+  $ setconfig push.edenapi=true
+  $ ENABLE_API_WRITES=1 REPOID=$LARGE_REPO_ID REPONAME=large-mon setup_common_config $REPOTYPE
+  $ ENABLE_API_WRITES=1 REPOID=$SMALL_REPO_ID REPONAME=small-mon-1 setup_common_config $REPOTYPE
 
   $ cat >> "$TESTTMP/mononoke-config/common/commitsyncmap.toml" <<EOF
   > [megarepo_test]
@@ -31,16 +32,7 @@ setup configuration
 
 setup configerator configs
   $ setup_configerator_configs
-  $ cat > "$PUSHREDIRECT_CONF/enable" <<EOF
-  > {
-  > "per_repo": {
-  >   "1": {
-  >      "draft_push": false,
-  >      "public_push": true
-  >    }
-  >   }
-  > }
-  > EOF
+  $ enable_pushredirect 1
   $ cat > "$COMMIT_SYNC_CONF/current" <<EOF
   > {
   >   "repos": {
@@ -111,14 +103,14 @@ setup hg server repos
   > }
 
   $ cd $TESTTMP
-  $ hginit_treemanifest small-hg-srv-1
-  $ cd "$TESTTMP/small-hg-srv-1"
+  $ hginit_treemanifest small-mon-1
+  $ cd "$TESTTMP/small-mon-1"
   $ echo 1 > file.txt
   $ hg addremove -q && hg ci -q -m 'pre-move commit 1'
 
   $ cd "$TESTTMP"
-  $ cp -r small-hg-srv-1 large-hg-srv
-  $ cd large-hg-srv
+  $ cp -r small-mon-1 large-mon
+  $ cd large-mon
   $ mkdir smallrepofolder1
   $ hg mv file.txt smallrepofolder1/file.txt
   $ hg ci -m 'move commit'
@@ -129,7 +121,7 @@ setup hg server repos
   $ create_first_post_move_commit smallrepofolder1
   $ hg book -r . master_bookmark
 
-  $ cd "$TESTTMP/small-hg-srv-1"
+  $ cd "$TESTTMP/small-mon-1"
   $ create_first_post_move_commit .
   $ hg book -r . master_bookmark
 
@@ -137,24 +129,23 @@ blobimport hg servers repos into Mononoke repos
   $ cd $TESTTMP
   $ REPOIDLARGE=0
   $ REPOIDSMALL1=1
-  $ REPOID="$REPOIDLARGE" blobimport large-hg-srv/.hg large-mon
-  $ REPOID="$REPOIDSMALL1" blobimport small-hg-srv-1/.hg small-mon-1
+  $ REPOID="$REPOIDLARGE" blobimport large-mon/.hg large-mon
+  $ REPOID="$REPOIDSMALL1" blobimport small-mon-1/.hg small-mon-1
 
 setup hg client repos
   $ function init_client() {
   > cd "$TESTTMP"
-  > hgclone_treemanifest ssh://user@dummy/"$1" "$2" --noupdate --config extensions.remotenames=
+  > hg clone -q mono:"$1" "$2" --noupdate
   > cd "$TESTTMP/$2"
   > cat >> .hg/hgrc <<EOF
   > [extensions]
   > pushrebase =
-  > remotenames =
   > EOF
   > }
 
-  $ init_client small-hg-srv-1 small-hg-client-1
+  $ init_client small-mon-1 small-hg-client-1
   $ cd "$TESTTMP"
-  $ init_client large-hg-srv large-hg-client
+  $ init_client large-mon large-hg-client
 
 Setup helpers
   $ LARGE_MASTER_BONSAI=$(mononoke_newadmin bookmarks --repo-id $REPOIDLARGE get master_bookmark)
@@ -168,10 +159,10 @@ Make sure mapping is set up and we know what we don't have to sync initial entri
 
 Normal pushrebase with one commit
   $ cd "$TESTTMP/small-hg-client-1"
-  $ REPONAME=small-mon-1 hgmn up -q master_bookmark
+  $ hg up -q master_bookmark
   $ echo 2 > 2 && hg addremove -q && hg ci -q -m newcommit
-  $ REPONAME=small-mon-1 hgmn push -r . --to master_bookmark 2>&1 | grep updating
-  updating bookmark master_bookmark
+  $ hg push -r . --to master_bookmark 2>&1 | grep "updated remote bookmark"
+  updated remote bookmark master_bookmark to 6989db12d1e5
 -- newcommit was correctly pushed to master_bookmark
   $ log -r master_bookmark
   @  newcommit [public;rev=2;6989db12d1e5] default/master_bookmark
@@ -184,7 +175,7 @@ Normal pushrebase with one commit
   o  first post-move commit [public;rev=3;bca7e9574548] default/master_bookmark
   │
   ~
-  $ REPONAME=large-mon hgmn pull -q
+  $ hg pull -q
   $ log -r master_bookmark
   o  newcommit [public;rev=4;7c9a729ceb57] default/master_bookmark
   │
@@ -197,11 +188,11 @@ Live change of the config, without Mononoke restart
   $ force_update_configerator
 
   $ cd "$TESTTMP"/small-hg-client-1
-  $ REPONAME=small-mon-1 hgmn up master_bookmark -q
+  $ hg up master_bookmark -q
   $ echo 1 >> 1 && hg add 1 && hg ci -m 'change of mapping'
   $ hg revert -r .^ 1
   $ hg commit --amend
-  $ REPONAME=small-mon-1  hgmn push -r . --to master_bookmark -q
+  $ hg push -r . --to master_bookmark -q
   $ quiet_grep "all is well" -- megarepo_tool_multirepo --source-repo-id $REPOIDLARGE --target-repo-id $REPOIDSMALL1 check-push-redirection-prereqs master_bookmark master_bookmark TEST_VERSION_NAME_LIVE_V1
   * all is well! (glob)
   $ quiet_grep "all is well" -- megarepo_tool_multirepo --source-repo-id $REPOIDLARGE --target-repo-id $REPOIDSMALL1 check-push-redirection-prereqs master_bookmark master_bookmark TEST_VERSION_NAME_LIVE_V2
@@ -228,35 +219,23 @@ Live change of the config, without Mononoke restart
 Do a push it should fail because we disallow pushing over a changeset that changes the mapping
   $ mkdir -p special
   $ echo f > special/f && hg ci -Aqm post_config_change_commit
-  $ REPONAME=small-mon-1 hgmn push -r . --to master_bookmark
-  pushing rev 318b198c67b1 to destination mononoke://$LOCALIP:$LOCAL_PORT/small-mon-1 bookmark master_bookmark
-  searching for changes
-  remote: Command failed
-  remote:   Error:
-  remote:     Pushrebase failed: Force failed pushrebase, please do a manual rebase. (Bonsai changeset id that triggered it is *) (glob)
-  remote: 
-  remote:   Root cause:
-  remote:     Force failed pushrebase, please do a manual rebase. (Bonsai changeset id that triggered it is *) (glob)
-  remote: 
-  remote:   Caused by:
-  remote:     Force failed pushrebase, please do a manual rebase. (Bonsai changeset id that triggered it is *) (glob)
-  remote: 
-  remote:   Debug context:
-  remote:     PushrebaseError(
-  remote:         ForceFailPushrebase(
-  remote:             ChangesetId(
-  remote:                 Blake2(*), (glob)
-  remote:             ),
-  remote:         ),
-  remote:     )
-  abort: unexpected EOL, expected netstring digit
+  $ hg push -r . --to master_bookmark
+  pushing rev 318b198c67b1 to destination https://localhost:$LOCAL_PORT/edenapi/ bookmark master_bookmark
+  edenapi: queue 1 commit for upload
+  edenapi: queue 1 file for upload
+  edenapi: uploaded 1 file
+  edenapi: queue 2 trees for upload
+  edenapi: uploaded 2 trees
+  edenapi: uploaded 1 changeset
+  pushrebasing stack (ef1b32df8f95, 318b198c67b1] (1 commit) to remote bookmark master_bookmark
+  abort: Server error: invalid request: Pushrebase failed: Force failed pushrebase, please do a manual rebase. (Bonsai changeset id that triggered it is *) (glob)
   [255]
 
 Again, normal pushrebase with one commit
   $ cd "$TESTTMP/small-hg-client-1"
   $ hg st
-  $ REPONAME=small-mon-1 hgmn pull -q
-  $ REPONAME=small-mon-1 hgmn up -q master_bookmark
+  $ hg pull -q
+  $ hg up -q master_bookmark
   $ hg log -r master_bookmark
   commit:      * (glob)
   bookmark:    default/master_bookmark
@@ -267,13 +246,13 @@ Again, normal pushrebase with one commit
   
   $ mkdir -p special
   $ echo f > special/f && hg ci -Aqm post_config_change_commit
-  $ REPONAME=small-mon-1 hgmn push -r . --to master_bookmark 2>&1 | grep updating
-  updating bookmark master_bookmark
+  $ hg push -r . --to master_bookmark 2>&1 | grep "updated remote bookmark"
+  updated remote bookmark master_bookmark to * (glob)
 
 -- in the large repo, new commit touched an after_change path
   $ cd "$TESTTMP"/large-hg-client
-  $ REPONAME=large-mon hgmn pull -q
-  $ REPONAME=large-mon hgmn log -T "{files % '{file}\n'}" -r master_bookmark
+  $ hg pull -q
+  $ hg log -T "{files % '{file}\n'}" -r master_bookmark
   specialsmallrepofolder_after_change/f
 
   $ EXPECTED_RC=1 quiet_grep "NonRootMPath" -- megarepo_tool_multirepo --source-repo-id $REPOIDLARGE --target-repo-id $REPOIDSMALL1 check-push-redirection-prereqs master_bookmark master_bookmark TEST_VERSION_NAME_LIVE_V1

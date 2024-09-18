@@ -9,11 +9,6 @@ import {CommitCloudInfo} from './CommitCloud';
 import {DropdownFields} from './DropdownFields';
 import {useCommandEvent} from './ISLShortcuts';
 import {Internal} from './Internal';
-import {Kbd} from './Kbd';
-import {Tooltip} from './Tooltip';
-import {Checkbox} from './components/Checkbox';
-import {Divider} from './components/Divider';
-import {TextField} from './components/TextField';
 import {findPublicBaseAncestor} from './getCommitTree';
 import {t, T} from './i18n';
 import {configBackedAtom, readAtom} from './jotaiUtils';
@@ -26,11 +21,16 @@ import {useRunOperation} from './operationsState';
 import {dagWithPreviews} from './previews';
 import {forceFetchCommit} from './serverAPIState';
 import {succeedableRevset, exactRevset} from './types';
-import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
+import {Button} from 'isl-components/Button';
+import {Checkbox} from 'isl-components/Checkbox';
+import {Divider} from 'isl-components/Divider';
+import {Icon} from 'isl-components/Icon';
+import {Kbd} from 'isl-components/Kbd';
+import {KeyCode, Modifier} from 'isl-components/KeyboardShortcuts';
+import {TextField} from 'isl-components/TextField';
+import {Tooltip} from 'isl-components/Tooltip';
 import {useAtom} from 'jotai';
 import {useEffect, useRef, useState} from 'react';
-import {Icon} from 'shared/Icon';
-import {KeyCode, Modifier} from 'shared/KeyboardShortcuts';
 import {nullthrows} from 'shared/utils';
 
 import './DownloadCommitsMenu.css';
@@ -42,7 +42,7 @@ export function DownloadCommitsTooltipButton() {
       trigger="click"
       component={dismiss => <DownloadCommitsTooltip dismiss={dismiss} />}
       placement="bottom"
-      additionalToggles={additionalToggles}
+      additionalToggles={additionalToggles.asEventTarget()}
       group="topbar"
       title={
         <div>
@@ -51,9 +51,9 @@ export function DownloadCommitsTooltipButton() {
           </T>
         </div>
       }>
-      <VSCodeButton appearance="icon" data-testid="download-commits-tooltip-button">
+      <Button icon data-testid="download-commits-tooltip-button">
         <Icon icon="cloud-download" />
-      </VSCodeButton>
+      </Button>
     </Tooltip>
   );
 }
@@ -173,13 +173,12 @@ function DownloadCommitsTooltip({dismiss}: {dismiss: () => unknown}) {
             }}
             ref={downloadDiffTextArea}
           />
-          <VSCodeButton
-            appearance="secondary"
+          <Button
             data-testid="download-commit-button"
             disabled={enteredRevset.trim().length === 0}
             onClick={doCommitDownload}>
             <T>Pull</T>
-          </VSCodeButton>
+          </Button>
         </div>
         <div className="download-commits-input-row">
           <Tooltip title={t('After downloading this commit, also go there')}>

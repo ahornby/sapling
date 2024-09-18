@@ -5,9 +5,10 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-import type {TypeaheadKind, TypeaheadResult} from './CommitInfoView/types';
+import type {TypeaheadKind} from './CommitInfoView/types';
 import type {InternalTypes} from './InternalTypes';
 import type {Serializable} from './serialize';
+import type {TypeaheadResult} from 'isl-components/Types';
 import type {TrackEventName} from 'isl-server/src/analytics/eventNames';
 import type {TrackDataWithEventName} from 'isl-server/src/analytics/types';
 import type {GitHubDiffSummary} from 'isl-server/src/github/githubCodeReviewProvider';
@@ -123,6 +124,7 @@ export type RepositoryError =
       command: string;
       path: string | undefined;
     }
+  | {type: 'edenFsUnhealthy'; cwd: string}
   | {type: 'cwdNotARepository'; cwd: string}
   | {type: 'cwdDoesNotExist'; cwd: string}
   | {
@@ -166,6 +168,21 @@ export type ApplicationInfo = {
   version: string;
   logFilePath: string;
 };
+
+/**
+ * Which "mode" for the App to run. Controls the basic rendering.
+ * Useful to render full-screen alternate views.
+ * isl => normal, full ISL
+ * comparison => just the comparison viewer is rendered, set to some specific comparison
+ */
+export type AppMode =
+  | {
+      mode: 'isl';
+    }
+  | {
+      mode: 'comparison';
+      comparison: Comparison;
+    };
 
 export type CodeReviewSystem =
   | {
@@ -219,6 +236,13 @@ export type StableInfo = {
   date: Date;
 };
 
+export type SlocInfo = {
+  /** Significant lines of code for commit */
+  sloc: number | undefined;
+  /** Significant lines of code for commit (filtering out test and markdown files) */
+  strictSloc: number | undefined;
+};
+
 export type CommitInfo = {
   title: string;
   hash: Hash;
@@ -252,6 +276,12 @@ export type CommitInfo = {
    * there are multiple predecessors.
    */
   closestPredecessors?: ReadonlyArray<Hash>;
+  /**
+   * If this is a fake optimistic commit created by a running Operation,
+   * this is the revset that can be used by sl to find the real commit.
+   * This is only valid after the operation which creates this commit has completed.
+   */
+  optimisticRevset?: Revset;
   /** only a subset of the total files for this commit */
   filesSample: ReadonlyArray<ChangedFile>;
   totalFileCount: number;
@@ -259,6 +289,16 @@ export type CommitInfo = {
   diffId?: DiffId;
   isFollower?: boolean;
   stableCommitMetadata?: ReadonlyArray<StableCommitMetadata>;
+  /**
+   * Longest path prefix shared by all files in this commit.
+   * For example, if a commit changes files like `a/b/c` and `a/b/d`, this is `a/b/`.
+   * Note: this always acts on `/` delimited paths, and is done on complete subdir names,
+   * never on matching prefixes of directories. For example, `a/dir1/a` and `a/dir2/a`
+   * have `a/` as the common prefix, not `a/dir`.
+   * If no commonality is found (due to edits to top level files or multiple subdirs), this is empty string.
+   * This can be useful to determine if a commit is relevant to your cwd.
+   */
+  maxCommonPathPrefix: RepoRelativePath;
 };
 export type SuccessorInfo = {
   hash: string;
@@ -280,12 +320,18 @@ export type FilesSample = {
   totalFileCount: number;
 };
 
+/** A revset that selects for a commit which we only have a fake optimistic preview of */
+export type OptimisticRevset = {type: 'optimistic-revset'; revset: Revset; fake: string};
+/** A revset that selects for the latest version of a commit hash */
 export type SucceedableRevset = {type: 'succeedable-revset'; revset: Revset};
+/** A revset that selects for a specific commit, without considering any successors */
 export type ExactRevset = {type: 'exact-revset'; revset: Revset};
 
 /**
  * Most arguments to eden commands are literal `string`s, except:
  * - When specifying file paths, the server needs to know which args are files to convert them to be cwd-relative.
+ *     - For long file lists, we pass them in a single bulk arg, which will be passed via stdin instead
+ *       to avoid command line length limits.
  * - When specifying commit hashes, you may be acting on optimistic version of those hashes.
  *   The server can re-write hashes using a revset that transforms into the latest successor instead.
  *   This allows you to act on the optimistic versions of commits in queued commands,
@@ -297,9 +343,11 @@ export type ExactRevset = {type: 'exact-revset'; revset: Revset};
 export type CommandArg =
   | string
   | {type: 'repo-relative-file'; path: RepoRelativePath}
+  | {type: 'repo-relative-file-list'; paths: Array<RepoRelativePath>}
   | {type: 'config'; key: string; value: string}
   | ExactRevset
-  | SucceedableRevset;
+  | SucceedableRevset
+  | OptimisticRevset;
 
 /**
  * What process to execute a given operation in, such as `sl`
@@ -323,6 +371,16 @@ export enum CommandRunner {
  */
 export function succeedableRevset(revset: Revset): SucceedableRevset {
   return {type: 'succeedable-revset', revset};
+}
+
+/**
+ * {@link CommandArg} representing a hash or revset for a fake optimistic commit.
+ * This enables queued commands to act on optimistic state without knowing
+ * the optimistic commit's hashes directly, and without knowing a predecessor hash at all.
+ * The fake optimistic commit hash is also stored to know what the revset refers to.
+ */
+export function optimisticRevset(revset: Revset, fake: string): OptimisticRevset {
+  return {type: 'optimistic-revset', revset, fake};
 }
 
 /**
@@ -511,11 +569,12 @@ export type PlatformSpecificClientToServerMessages =
   | {type: 'platform/openContainingFolder'; path: RepoRelativePath}
   | {type: 'platform/openDiff'; path: RepoRelativePath; comparison: Comparison}
   | {type: 'platform/openExternal'; url: string}
+  | {type: 'platform/changeTitle'; title: string}
   | {type: 'platform/confirm'; message: string; details?: string | undefined}
   | {type: 'platform/subscribeToAvailableCwds'}
   | {type: 'platform/subscribeToUnsavedFiles'}
   | {type: 'platform/saveAllUnsavedFiles'}
-  | {type: 'platform/setPersistedState'; data?: string}
+  | {type: 'platform/setPersistedState'; key: string; data?: string}
   | {
       type: 'platform/setVSCodeConfig';
       config: string;
@@ -550,6 +609,10 @@ export type CodeReviewProviderSpecificClientToServerMessages =
   | never
   | InternalTypes['PhabricatorClientToServerMessages'];
 
+export type CodeReviewProviderSpecificServerToClientMessages =
+  | never
+  | InternalTypes['PhabricatorServerToClientMessages'];
+
 export type PageVisibility = 'focused' | 'visible' | 'hidden';
 
 export type FileABugFields = {title: string; description: string; repro: string};
@@ -562,16 +625,6 @@ export type FileABugProgress =
   | {status: 'success'; taskNumber: string; taskLink: string}
   | {status: 'error'; error: Error};
 export type FileABugProgressMessage = {type: 'fileBugReportProgress'} & FileABugProgress;
-
-/**
- * Like ClientToServerMessage, but these messages will be followed
- * on the message bus by an additional binary ArrayBuffer payload message.
- */
-export type ClientToServerMessageWithPayload = {
-  type: 'uploadFile';
-  filename: string;
-  id: string;
-} & {hasBinaryPayload: true};
 
 export type SubscriptionKind = 'uncommittedChanges' | 'smartlogCommits' | 'mergeConflicts';
 
@@ -637,19 +690,24 @@ export type LocalStorageName =
   | 'isl.bookmarks'
   | 'isl.ui-zoom'
   | 'isl.has-shown-getting-started'
+  | 'isl.dismissed-split-suggestion'
   | 'isl.amend-autorestack'
   | 'isl.dismissed-alerts'
   | 'isl.debug-react-tools'
   | 'isl.debug-redux-tools'
   | 'isl.condense-obsolete-stacks'
+  | 'isl.deemphasize-cwd-irrelevant-commits'
   | 'isl.split-suggestion-enabled'
   | 'isl.comparison-display-mode'
   | 'isl.expand-generated-files'
   | 'isl-color-theme'
-  | 'isl.auto-resolve-before-continue';
+  | 'isl.auto-resolve-before-continue'
+  // These keys are prefixes, with further dynamic keys appended afterwards
+  | 'isl.edited-commit-messages:';
 
 export type ClientToServerMessage =
   | {type: 'heartbeat'; id: string}
+  | {type: 'stress'; id: number; time: number; message: string}
   | {type: 'refresh'}
   | {type: 'getConfig'; name: ConfigName}
   | {type: 'setConfig'; name: SettableConfigName; value: string}
@@ -664,6 +722,12 @@ export type ClientToServerMessage =
   | {type: 'fetchShelvedChanges'}
   | {type: 'fetchLatestCommit'; revset: string}
   | {type: 'fetchCommitChangedFiles'; hash: Hash; limit: number}
+  | {
+      type: 'uploadFile';
+      filename: string;
+      id: string;
+      b64Content: string;
+    }
   | {type: 'renderMarkup'; markup: string; id: number}
   | {type: 'typeahead'; kind: TypeaheadKind; query: string; id: string}
   | {type: 'requestRepoInfo'}
@@ -714,6 +778,12 @@ export type ClientToServerMessage =
       requestId: number;
       hash: Hash;
       includedFiles: string[];
+    }
+  | {
+      type: 'fetchPendingAmendSignificantLinesOfCode';
+      requestId: number;
+      hash: Hash;
+      includedFiles: string[];
     };
 
 export type SubscriptionResultsData = {
@@ -737,6 +807,7 @@ export type ServerToClientMessage =
   | BeganFetchingUncommittedChangesEvent
   | FileABugProgressMessage
   | {type: 'heartbeat'; id: string}
+  | {type: 'stress'; id: number; time: number; message: string}
   | {type: 'gotConfig'; name: ConfigName; value: string | undefined}
   | {
       type: 'fetchedGeneratedStatuses';
@@ -792,14 +863,24 @@ export type ServerToClientMessage =
   | {type: 'getUiState'}
   | OperationProgressEvent
   | PlatformSpecificServerToClientMessages
-  | {type: 'fetchedSignificantLinesOfCode'; hash: Hash; linesOfCode: Result<number>}
+  | CodeReviewProviderSpecificServerToClientMessages
+  | {
+      type: 'fetchedSignificantLinesOfCode';
+      hash: Hash;
+      result: Result<{linesOfCode: number; strictLinesOfCode: number}>;
+    }
   | {
       type: 'fetchedPendingSignificantLinesOfCode';
       requestId: number;
       hash: Hash;
-      linesOfCode: Result<number>;
+      result: Result<{linesOfCode: number; strictLinesOfCode: number}>;
+    }
+  | {
+      type: 'fetchedPendingAmendSignificantLinesOfCode';
+      requestId: number;
+      hash: Hash;
+      result: Result<{linesOfCode: number; strictLinesOfCode: number}>;
     };
-
 export type Disposable = {
   dispose(): void;
 };

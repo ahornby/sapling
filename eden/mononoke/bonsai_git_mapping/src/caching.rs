@@ -182,7 +182,7 @@ fn memcache_deserialize(bytes: Bytes) -> McResult<BonsaiGitMappingCacheEntry> {
 }
 
 fn memcache_serialize(entry: &BonsaiGitMappingCacheEntry) -> Bytes {
-    compact_protocol::serialize(&entry.clone().into_thrift())
+    compact_protocol::serialize(entry.clone().into_thrift())
 }
 
 const CHUNK_SIZE: usize = 1000;
@@ -277,7 +277,10 @@ impl BonsaiGitMapping for CachingBonsaiGitMapping {
 }
 
 fn get_cache_key(repo_id: RepositoryId, cs: &BonsaiOrGitSha) -> String {
-    format!("{}.{:?}", repo_id.prefix(), cs)
+    match cs {
+        BonsaiOrGitSha::Bonsai(id) => format!("{}.B.{}", repo_id.prefix(), id),
+        BonsaiOrGitSha::GitSha1(sha) => format!("{}.G.{}", repo_id.prefix(), sha),
+    }
 }
 
 impl MemcacheEntity for BonsaiGitMappingCacheEntry {

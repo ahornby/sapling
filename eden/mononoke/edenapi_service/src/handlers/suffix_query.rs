@@ -17,6 +17,8 @@ use futures::StreamExt;
 use gotham_ext::error::HttpError;
 use itertools::EitherOrBoth;
 use mononoke_api::ChangesetFileOrdering;
+use mononoke_api::Repo;
+use mononoke_types::MPath;
 use types::RepoPathBuf;
 use vec1::Vec1;
 
@@ -42,10 +44,16 @@ impl SaplingRemoteApiHandler for SuffixQueryHandler {
     }
 
     async fn handler(
-        ectx: SaplingRemoteApiContext<Self::PathExtractor, Self::QueryStringExtractor>,
+        ectx: SaplingRemoteApiContext<Self::PathExtractor, Self::QueryStringExtractor, Repo>,
         request: Self::Request,
     ) -> HandlerResult<'async_trait, Self::Response> {
         let repo = ectx.repo();
+        let prefixes = request.prefixes.map(|prefixes| {
+            prefixes
+                .into_iter()
+                .map(|prefix| MPath::try_from(&prefix).unwrap())
+                .collect()
+        });
         let suffixes = Vec1::try_from_vec(request.basename_suffixes)
             .with_context(|| anyhow!("No suffixes provided"))
             .map_err(HttpError::e400)?;
@@ -53,7 +61,7 @@ impl SaplingRemoteApiHandler for SuffixQueryHandler {
 
         // Changeset may return None if given an incorrect commit id.
         let changeset = repo
-            .repo()
+            .repo_ctx()
             .changeset(commit.clone())
             .await
             .with_context(|| anyhow!("Error getting changeset {}", commit.clone()))?
@@ -65,7 +73,7 @@ impl SaplingRemoteApiHandler for SuffixQueryHandler {
             // Will cause server to return 500 error.
             let matched_files = changeset
                 .find_files_with_bssm_v3(
-                    None,
+                    prefixes,
                     EitherOrBoth::Right(suffixes),
                     ChangesetFileOrdering::Unordered,
                 ).await?;

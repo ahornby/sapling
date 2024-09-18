@@ -57,7 +57,7 @@ struct RequestContext {
 
 @scope.Field
 struct Arc {
-// # `rust.Box`
+// # `rust.Arc`
 //
 // Indicates that a field's value should be shared.
 }
@@ -80,6 +80,7 @@ struct Exhaustive {
 
 @scope.Struct
 @scope.Typedef
+@scope.Union
 struct Ord {
 // # `rust.Ord`
 //
@@ -328,7 +329,7 @@ struct Adapter {
   // @scope.Transitive, `crate::` will be replaced with the name of the crate in which the
   // transitive annotation is defined.
   1: string name;
-} (thrift.uri = "facebook.com/thrift/annotation/rust/Adapter")
+}
 
 @scope.Enum
 @scope.Struct
@@ -354,7 +355,7 @@ struct Derive {
   // @scope.Transitive, `crate::` will be replaced with the name of the crate in which the
   // transitive annotation is defined.
   1: list<string> derives;
-} (thrift.uri = "facebook.com/thrift/annotation/rust/Derive")
+}
 
 @scope.Function
 @scope.Service
@@ -408,4 +409,4 @@ struct ServiceExn {
   // }
   // ```
   1: bool anyhow_to_application_exn;
-} (thrift.uri = "facebook.com/thrift/annotation/rust/ServiceExn")
+}

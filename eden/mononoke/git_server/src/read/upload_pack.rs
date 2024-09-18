@@ -9,7 +9,9 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use anyhow::Error;
+use anyhow::Result;
 use async_stream::try_stream;
+use bonsai_git_mapping::BonsaiGitMappingRef;
 use bonsai_git_mapping::BonsaisOrGitShas;
 use bytes::Bytes;
 use futures::future::try_join4;
@@ -19,32 +21,31 @@ use gix_hash::ObjectId;
 use gotham::mime;
 use gotham::state::FromState;
 use gotham::state::State;
-use gotham_ext::body_ext::BodyExt;
 use gotham_ext::error::HttpError;
 use gotham_ext::response::BytesBody;
-use gotham_ext::response::EmptyBody;
 use gotham_ext::response::ResponseStream;
 use gotham_ext::response::ResponseTryStreamExt;
 use gotham_ext::response::StreamBody;
 use gotham_ext::response::TryIntoResponse;
-use http::HeaderMap;
 use hyper::Body;
 use hyper::Response;
 use mononoke_types::ChangesetId;
 use packetline::encode::delim_to_write;
 use packetline::encode::flush_to_write;
 use packetline::encode::write_data_channel;
+use packetline::encode::write_progress_channel;
 use packetline::encode::write_text_packetline;
 use packetline::FLUSH_LINE;
 use packfile::pack::DeltaForm;
 use packfile::pack::PackfileWriter;
-use protocol::generator::bonsai_git_mappings_by_bonsai;
 use protocol::generator::fetch_response;
 use protocol::generator::ls_refs_response;
-use protocol::generator::ref_oid_mapping;
 use protocol::generator::shallow_info as fetch_shallow_info;
+use protocol::mapping::bonsai_git_mappings_by_bonsai;
+use protocol::mapping::ref_oid_mapping;
 use protocol::types::PackfileConcurrency;
 use protocol::types::ShallowInfoResponse;
+use repo_identity::RepoIdentityRef;
 use rustc_hash::FxHashSet;
 use tokio::io::ErrorKind;
 use tokio::sync::mpsc;
@@ -56,13 +57,13 @@ use crate::command::Command;
 use crate::command::FetchArgs;
 use crate::command::LsRefsArgs;
 use crate::command::RequestCommand;
-use crate::model::GitMethod;
 use crate::model::GitMethodInfo;
-use crate::model::GitMethodVariant;
 use crate::model::RepositoryParams;
 use crate::model::RepositoryRequestContext;
 use crate::model::ResponseType;
 use crate::model::Service;
+use crate::util::empty_body;
+use crate::util::get_body;
 
 /// The header for the packfile section of the response
 const PACKFILE_HEADER: &[u8] = b"packfile";
@@ -76,8 +77,6 @@ const SHALLOW_INFO_HEADER: &[u8] = b"shallow-info";
 const ACK: &str = "ACK";
 /// Acknowledgement that the object sent by the client does not exist on the server
 const NAK: &[u8] = b"NAK";
-/// Flag representing that the server is ready to send the required packfile to the client
-const READY_FLAG: &[u8] = b"ready";
 
 #[derive(Debug, Clone)]
 struct FetchResponseHeaders {
@@ -96,7 +95,7 @@ async fn pack_header() -> Result<Bytes, Error> {
 }
 
 fn concurrency(context: &RepositoryRequestContext) -> PackfileConcurrency {
-    match &context.repo.repo_config.git_concurrency {
+    match &context.repo.repo_config.git_configs.git_concurrency {
         Some(concurrency) => PackfileConcurrency::new(
             concurrency.trees_and_blobs,
             concurrency.commits,
@@ -120,17 +119,16 @@ async fn acknowledgements(
     let git_shas = BonsaisOrGitShas::from_object_ids(args.haves.iter())?;
     let entries = context
         .repo
-        .bonsai_git_mapping
+        .bonsai_git_mapping()
         .get(&context.ctx, git_shas)
         .await
         .with_context(|| {
             format!(
                 "Failed to fetch bonsai_git_mapping for repo {}",
-                context.repo.name
+                context.repo.repo_identity().name()
             )
         })?;
     let mut output_buffer = vec![];
-    let mut header = None;
     write_text_packetline(ACKNOWLEDGEMENTS_HEADER, &mut output_buffer).await?;
     if entries.is_empty() && !args.haves.is_empty() {
         // None of the Git Shas provided by the client are recognized by the server
@@ -144,18 +142,8 @@ async fn acknowledgements(
             )
             .await?;
         }
-        // Provide the ready flag to indicate that we are ready to send the required
-        // packfile to the client
-        write_text_packetline(READY_FLAG, &mut output_buffer).await?;
-        // Since we identified at least one Git Sha that was requested by the client,
-        // we are in a position to send the packfile to the client. Populate the header
-        // of the packfile
-        header = Some(pack_header().await?);
     }
-    // Add a delim line to indicate the end of the acknowledgements section. Note that
-    // the delim line will not be followed by a newline character
-    delim_to_write(&mut output_buffer).await?;
-    Ok((Some(Bytes::from(output_buffer)), header))
+    Ok((Some(Bytes::from(output_buffer)), None))
 }
 
 async fn git_commits(
@@ -168,7 +156,7 @@ async fn git_commits(
         .with_context(|| {
             format!(
                 "Failed to fetch bonsai_git_mapping for repo {}",
-                context.repo.name
+                context.repo.repo_identity().name()
             )
         })
 }
@@ -310,6 +298,10 @@ impl Iterator for FetchResponseHeaders {
     fn next(&mut self) -> Option<Self::Item> {
         if let Some(acknowledgements) = self.acknowledgements.take() {
             Some(acknowledgements)
+        } else if !self.include_pack() {
+            // If we are not sending the packfile, we do not send any other section
+            // except acknowledgements
+            None
         } else if let Some(shallow_info) = self.shallow_info.take() {
             Some(shallow_info)
         } else if let Some(wanted_refs) = self.wanted_refs.take() {
@@ -322,57 +314,18 @@ impl Iterator for FetchResponseHeaders {
     }
 }
 
-async fn get_body(state: &mut State) -> Result<Bytes, HttpError> {
-    Body::take_from(state)
-        .try_concat_body(&HeaderMap::new())
-        .map_err(HttpError::e500)?
-        .await
-        .map_err(HttpError::e500)
-}
-
-fn git_method_info(command: &Command, repo: String) -> GitMethodInfo {
-    let (method, variants) = match command {
-        Command::LsRefs(_) => (GitMethod::LsRefs, vec![GitMethodVariant::Standard]),
-        Command::Fetch(ref fetch_args) => {
-            let method = if fetch_args.haves.is_empty() && fetch_args.done {
-                GitMethod::Clone
-            } else {
-                GitMethod::Pull
-            };
-            let mut variants = vec![];
-            if fetch_args.is_shallow() {
-                variants.push(GitMethodVariant::Shallow);
-            }
-            if fetch_args.is_filter() {
-                variants.push(GitMethodVariant::Filter);
-            }
-            if variants.is_empty() {
-                variants.push(GitMethodVariant::Standard);
-            }
-            (method, variants)
-        }
-    };
-    GitMethodInfo {
-        method,
-        variants,
-        repo,
-    }
-}
-
 pub async fn upload_pack(state: &mut State) -> Result<Response<Body>, HttpError> {
     let body_bytes = get_body(state).await?;
     // We got a flush line packet to keep the connection alive. Just return Ok.
     if body_bytes == packetline::FLUSH_LINE {
-        return EmptyBody::new()
-            .try_into_response(state)
-            .map_err(HttpError::e500);
+        return empty_body(state);
     }
     let request_command =
         RequestCommand::parse_from_packetline(&body_bytes).map_err(HttpError::e400)?;
     let repo_name = RepositoryParams::borrow_from(state).repo_name();
     let request_context = RepositoryRequestContext::instantiate(
         state,
-        git_method_info(&request_command.command, repo_name),
+        GitMethodInfo::from_command(&request_command.command, repo_name),
     )
     .await?;
     state.put(Service::GitUploadPack);
@@ -388,6 +341,9 @@ pub async fn upload_pack(state: &mut State) -> Result<Response<Body>, HttpError>
             let output = output.map_err(HttpError::e500)?.try_into_response(state);
             output.map_err(HttpError::e500)
         }
+        Command::Push(_) => Err(HttpError::e500(anyhow::anyhow!(
+            "Push command directed to incorrect upload-pack handler"
+        ))),
     }
 }
 
@@ -421,17 +377,29 @@ pub async fn fetch(
         FetchResponseHeaders::from_request(request_context.clone(), args.clone()).await?;
     let include_pack = fetch_response_headers.include_pack();
     let shallow_response = fetch_response_headers.shallow_response.take();
+
+    // Some repos might be configured to display a message to users when they
+    // run `git pull`.
+    let mb_fetch_msg = git_fetch_message(request_context).await?;
     let bytes_stream = ResponseStream::new(try_stream! {
-        let mut pack_reader = tokio_stream::wrappers::ReceiverStream::new(reader).ready_chunks(100_000_000);
         for header in fetch_response_headers {
             yield header;
         }
-        while let Some(chunks) = pack_reader.next().await {
-            for chunk in chunks {
-                let mut buf = Vec::with_capacity(chunk.len());
-                // Write the actual packfile content to the data channel
-                write_data_channel(chunk.as_ref(), &mut buf).await?;
+        // Only include the packfile if it is requested by client
+        if include_pack {
+            let mut pack_reader = tokio_stream::wrappers::ReceiverStream::new(reader).ready_chunks(100_000_000);
+            if let Some(fetch_msg) = mb_fetch_msg {
+                let mut buf = Vec::with_capacity(fetch_msg.len());
+                write_progress_channel(fetch_msg.as_ref(), &mut buf).await?;
                 yield Bytes::from(buf);
+            }
+            while let Some(chunks) = pack_reader.next().await {
+                for chunk in chunks {
+                    let mut buf = Vec::with_capacity(chunk.len());
+                    // Write the actual packfile content to the data channel
+                    write_data_channel(chunk.as_ref(), &mut buf).await?;
+                    yield Bytes::from(buf);
+                }
             }
         }
         let mut buf = Vec::with_capacity(FLUSH_LINE.len());
@@ -442,10 +410,6 @@ pub async fn fetch(
     tokio::spawn({
         let request_context = request_context.clone();
         async move {
-            // If we don't need to send back a packfile, just return early
-            if !include_pack {
-                return Ok(());
-            }
             let response_stream = fetch_response(
                 request_context.ctx.clone(),
                 &request_context.repo,
@@ -466,4 +430,23 @@ pub async fn fetch(
 
     let body = StreamBody::new(bytes_stream, mime::APPLICATION_OCTET_STREAM);
     Ok(body)
+}
+
+/// Checks if there are any messages that should be displayed to the user when
+/// running `git pull` on this repo.
+async fn git_fetch_message(request_context: &RepositoryRequestContext) -> Result<Option<String>> {
+    let repo = &request_context.repo;
+    let repo_name = repo.repo_identity().name();
+
+    let should_display_message = justknobs::eval(
+        "scm/mononoke:display_repo_fetch_message_on_git_server",
+        None,
+        Some(repo_name),
+    )?;
+
+    if should_display_message {
+        Ok(repo.repo_config.git_configs.fetch_message.clone())
+    } else {
+        Ok(None)
+    }
 }

@@ -18,6 +18,7 @@ use sql_ext::SqlConnections;
 
 use super::BonsaiTagMapping;
 use super::BonsaiTagMappingEntry;
+use crate::Freshness;
 
 mononoke_queries! {
     write AddOrUpdateBonsaiTagMapping(values: (
@@ -29,6 +30,12 @@ mononoke_queries! {
     )) {
         none,
         "REPLACE INTO bonsai_tag_mapping (repo_id, tag_name, changeset_id, tag_hash, target_is_tag) VALUES {values}"
+    }
+
+    write DeleteBonsaiTagMappingsByName(repo_id: RepositoryId,
+        >list tag_names: String) {
+        none,
+        "DELETE FROM bonsai_tag_mapping WHERE repo_id = {repo_id} AND tag_name IN {tag_names}"
     }
 
     read SelectAllMappings(
@@ -123,19 +130,21 @@ impl BonsaiTagMapping for SqlBonsaiTagMapping {
     async fn get_entry_by_tag_name(
         &self,
         tag_name: String,
+        freshness: Freshness,
     ) -> Result<Option<BonsaiTagMappingEntry>> {
-        let results = SelectMappingByTagName::query(
-            &self.connections.read_connection,
-            &self.repo_id,
-            &tag_name,
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "Failure in fetching entry for tag {} in repo {}",
-                tag_name, self.repo_id
-            )
-        })?;
+        let connection = if freshness == Freshness::Latest {
+            &self.connections.read_master_connection
+        } else {
+            &self.connections.read_connection
+        };
+        let results = SelectMappingByTagName::query(connection, &self.repo_id, &tag_name)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failure in fetching entry for tag {} in repo {}",
+                    tag_name, self.repo_id
+                )
+            })?;
         // This should not happen but since this is new code, extra checks dont hurt.
         if results.len() > 1 {
             anyhow::bail!(
@@ -226,6 +235,22 @@ impl BonsaiTagMapping for SqlBonsaiTagMapping {
             format!(
                 "Failed to add mappings in repo {} for entries {:?}",
                 self.repo_id, entries,
+            )
+        })?;
+        Ok(())
+    }
+
+    async fn delete_mappings_by_name(&self, tag_names: Vec<String>) -> Result<()> {
+        DeleteBonsaiTagMappingsByName::query(
+            &self.connections.write_connection,
+            &self.repo_id,
+            tag_names.as_slice(),
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to delete mappings in repo {} for tag names {:?}",
+                self.repo_id, tag_names,
             )
         })?;
         Ok(())

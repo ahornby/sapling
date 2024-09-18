@@ -1,7 +1,6 @@
 load("@fbcode_macros//build_defs:rust_library.bzl", "rust_library")
 load("@fbcode_macros//build_defs:rust_unittest.bzl", "rust_unittest")
 load("@fbcode_macros//build_defs/lib:rust_oss.bzl", "rust_oss")
-load("@fbsource//tools/build_defs:glob_defs.bzl", "glob")
 
 oncall("mononoke")
 
@@ -28,6 +27,7 @@ rust_library(
         ":packblob",
         ":prefixblob",
         ":readonlyblob",
+        ":s3blob",
         ":samplingblob",
         ":sqlblob",
         ":throttledblob",
@@ -42,7 +42,7 @@ rust_library(
         "//eden/mononoke/common/scuba_ext:scuba_ext",
         "//eden/mononoke/common/sql_construct:sql_construct",
         "//eden/mononoke/facebook/manifoldblob:manifoldblob",
-        "//eden/mononoke/facebook/s3blob:s3blob",
+        "//eden/mononoke/facebook/s3pool:s3pool",
         "//eden/mononoke/metaconfig:metaconfig_types",
     ],
 )
@@ -53,6 +53,7 @@ rust_library(
     test_deps = [
         "//common/rust/shed/fbinit:fbinit",
         "//common/rust/shed/fbinit:fbinit-tokio",
+        "//eden/mononoke/mononoke_macros:mononoke_macros",
     ],
     deps = [
         "fbsource//third-party/rust:abomonation",
@@ -82,6 +83,7 @@ rust_library(
         ":memblob",
         "//common/rust/shed/borrowed:borrowed",
         "//common/rust/shed/fbinit:fbinit-tokio",
+        "//eden/mononoke/mononoke_macros:mononoke_macros",
     ],
     deps = [
         "fbsource//third-party/rust:anyhow",
@@ -127,6 +129,7 @@ rust_unittest(
         "//common/rust/shed/borrowed:borrowed",
         "//common/rust/shed/fbinit:fbinit",
         "//common/rust/shed/fbinit:fbinit-tokio",
+        "//eden/mononoke/mononoke_macros:mononoke_macros",
         "//eden/mononoke/mononoke_types:mononoke_types",
         "//eden/mononoke/server/context:context",
     ],
@@ -141,6 +144,7 @@ rust_library(
         "//common/rust/shed/borrowed:borrowed",
         "//common/rust/shed/fbinit:fbinit",
         "//common/rust/shed/fbinit:fbinit-tokio",
+        "//eden/mononoke/mononoke_macros:mononoke_macros",
     ],
     deps = [
         "fbsource//third-party/rust:anyhow",
@@ -160,6 +164,7 @@ rust_library(
     test_deps = [
         "//common/rust/shed/fbinit:fbinit",
         "//common/rust/shed/fbinit:fbinit-tokio",
+        "//eden/mononoke/mononoke_macros:mononoke_macros",
     ],
     deps = [
         "fbsource//third-party/rust:anyhow",
@@ -187,6 +192,7 @@ rust_library(
         "//common/rust/shed/borrowed:borrowed",
         "//common/rust/shed/fbinit:fbinit",
         "//common/rust/shed/fbinit:fbinit-tokio",
+        "//eden/mononoke/mononoke_macros:mononoke_macros",
     ],
     deps = [
         "fbsource//third-party/rust:anyhow",
@@ -220,6 +226,7 @@ rust_library(
         "//common/rust/shed/borrowed:borrowed",
         "//common/rust/shed/fbinit:fbinit",
         "//common/rust/shed/fbinit:fbinit-tokio",
+        "//eden/mononoke/mononoke_macros:mononoke_macros",
     ],
     deps = [
         "fbsource//third-party/rust:anyhow",
@@ -239,6 +246,31 @@ rust_library(
 )
 
 rust_library(
+    name = "s3blob",
+    srcs = glob(["s3blob/src/*.rs"]),
+    autocargo = {"cargo_toml_dir": "s3blob"},
+    deps = [
+        "fbsource//third-party/rust:anyhow",
+        "fbsource//third-party/rust:async-trait",
+        "fbsource//third-party/rust:chrono",
+        "fbsource//third-party/rust:hyper",
+        "fbsource//third-party/rust:hyper-openssl",
+        "fbsource//third-party/rust:nonzero_ext",
+        "fbsource//third-party/rust:openssl",
+        "fbsource//third-party/rust:rusoto_core",
+        "fbsource//third-party/rust:rusoto_credential",
+        "fbsource//third-party/rust:rusoto_s3",
+        "fbsource//third-party/rust:rusoto_sts",
+        "fbsource//third-party/rust:tokio",
+        "//common/rust/shed/futures_stats:futures_stats",
+        "//common/rust/shed/time_ext:time_ext",
+        "//eden/mononoke/blobstore:blobstore",
+        "//eden/mononoke/mononoke_types:mononoke_types",
+        "//eden/mononoke/server/context:context",
+    ],
+)
+
+rust_library(
     name = "sqlblob",
     srcs = glob([
         "sqlblob/src/**/*.rs",
@@ -250,6 +282,7 @@ rust_library(
         "fbsource//third-party/rust:tokio",
         "//common/rust/shed/borrowed:borrowed",
         "//common/rust/shed/fbinit:fbinit-tokio",
+        "//eden/mononoke/mononoke_macros:mononoke_macros",
         "//eden/mononoke/server/context:context",
     ],
     deps = [
@@ -338,6 +371,7 @@ rust_library(
         "//common/rust/shed/fbinit:fbinit-tokio",
         "//common/rust/shed/lock_ext:lock_ext",
         "//eden/mononoke/common/sql_construct:sql_construct",
+        "//eden/mononoke/mononoke_macros:mononoke_macros",
     ],
     deps = [
         "fbsource//third-party/rust:anyhow",
@@ -384,6 +418,7 @@ rust_library(
         "//common/rust/shed/borrowed:borrowed",
         "//common/rust/shed/fbinit:fbinit",
         "//common/rust/shed/fbinit:fbinit-tokio",
+        "//eden/mononoke/mononoke_macros:mononoke_macros",
     ],
     deps = [
         "fbsource//third-party/rust:anyhow",
@@ -404,6 +439,7 @@ rust_library(
         "//common/rust/shed/borrowed:borrowed",
         "//common/rust/shed/fbinit:fbinit",
         "//common/rust/shed/fbinit:fbinit-tokio",
+        "//eden/mononoke/mononoke_macros:mononoke_macros",
     ],
     deps = [
         "fbsource//third-party/rust:anyhow",
@@ -424,6 +460,7 @@ rust_library(
         "//common/rust/shed/borrowed:borrowed",
         "//common/rust/shed/fbinit:fbinit",
         "//common/rust/shed/fbinit:fbinit-tokio",
+        "//eden/mononoke/mononoke_macros:mononoke_macros",
     ],
     deps = [
         "fbsource//third-party/rust:anyhow",
@@ -498,6 +535,7 @@ rust_library(
         "//common/rust/shed/fbinit:fbinit-tokio",
         "//common/rust/shed/slog_glog_fmt:slog_glog_fmt",
         "//eden/mononoke/common/scuba_ext:scuba_ext",
+        "//eden/mononoke/mononoke_macros:mononoke_macros",
     ],
     deps = [
         "fbsource//third-party/rust:anyhow",
@@ -537,6 +575,7 @@ rust_library(
         "//common/rust/shed/fbinit:fbinit-tokio",
         "//eden/mononoke/common/scuba_ext:scuba_ext",
         "//eden/mononoke/metaconfig:metaconfig_types",
+        "//eden/mononoke/mononoke_macros:mononoke_macros",
         "//eden/mononoke/mononoke_types:mononoke_types-mocks",
     ],
     deps = [
@@ -548,8 +587,8 @@ rust_library(
         "fbsource//third-party/rust:chrono",
         "fbsource//third-party/rust:derivative",
         "fbsource//third-party/rust:futures",
-        "fbsource//third-party/rust:itertools",
         "fbsource//third-party/rust:serde",
+        "fbsource//third-party/rust:smallvec",
         "fbsource//third-party/rust:thiserror",
         "fbsource//third-party/rust:tokio",
         "fbsource//third-party/rust:vec1",
@@ -557,15 +596,17 @@ rust_library(
         ":prefixblob",
         "//common/rust/shed/facet:facet",
         "//common/rust/shed/futures_lazy_shared:futures_lazy_shared",
-        "//common/rust/shed/sorted_vector_map:sorted_vector_map",
         "//common/rust/shed/sql:sql",
         "//eden/mononoke/blobrepo:repo_blobstore",
-        "//eden/mononoke/changesets:changesets",
+        "//eden/mononoke/bonsai_globalrev_mapping:bonsai_globalrev_mapping",
         "//eden/mononoke/common/rust/sql_ext:sql_ext",
         "//eden/mononoke/common/sql_construct:sql_construct",
         "//eden/mononoke/filestore:filestore",
         "//eden/mononoke/metaconfig:metaconfig_types",
         "//eden/mononoke/mononoke_types:mononoke_types",
+        "//eden/mononoke/repo_attributes/commit_graph/commit_graph:commit_graph",
+        "//eden/mononoke/repo_attributes/commit_graph/commit_graph_types:commit_graph_types",
+        "//eden/mononoke/repo_attributes/commit_graph/memwrites_commit_graph_storage:memwrites_commit_graph_storage",
         "//eden/mononoke/repo_attributes/repo_identity:repo_identity",
         "//eden/mononoke/repo_attributes/sql_query_config:sql_query_config",
         "//eden/mononoke/server/context:context",

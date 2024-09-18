@@ -27,19 +27,16 @@ use bonsai_tag_mapping::SqlBonsaiTagMappingBuilder;
 use bookmarks::bookmark_heads_fetcher;
 use bookmarks::ArcBookmarkUpdateLog;
 use bookmarks::ArcBookmarks;
-use bookmarks::BookmarkKey;
 use bookmarks_cache::ArcBookmarksCache;
 use cacheblob::InProcessLease;
 use cacheblob::LeaseOps;
-use changeset_fetcher::ArcChangesetFetcher;
-use changeset_fetcher::SimpleChangesetFetcher;
-use changesets::ArcChangesets;
-use changesets_impl::SqlChangesetsBuilder;
 use commit_cloud::sql::builder::SqlCommitCloudBuilder;
 use commit_cloud::ArcCommitCloud;
+use commit_cloud::CommitCloud;
 use commit_graph::ArcCommitGraph;
+use commit_graph::ArcCommitGraphWriter;
+use commit_graph::BaseCommitGraphWriter;
 use commit_graph::CommitGraph;
-use commit_graph_compat::ChangesetsCommitGraphCompat;
 use context::CoreContext;
 use dbbookmarks::ArcSqlBookmarks;
 use dbbookmarks::SqlBookmarksBuilder;
@@ -49,6 +46,8 @@ use fbinit::FacebookInit;
 use filenodes::ArcFilenodes;
 use filestore::ArcFilestoreConfig;
 use filestore::FilestoreConfig;
+use git_source_of_truth::ArcGitSourceOfTruthConfig;
+use git_source_of_truth::SqlGitSourceOfTruthConfigBuilder;
 use git_symbolic_refs::ArcGitSymbolicRefs;
 use git_symbolic_refs::SqlGitSymbolicRefsBuilder;
 use hook_manager::manager::ArcHookManager;
@@ -64,12 +63,11 @@ use metaconfig_types::ArcRepoConfig;
 use metaconfig_types::BlameVersion;
 use metaconfig_types::DerivedDataConfig;
 use metaconfig_types::DerivedDataTypesConfig;
+use metaconfig_types::GitDeltaManifestV2Config;
 use metaconfig_types::HookManagerParams;
 use metaconfig_types::InfinitepushNamespace;
 use metaconfig_types::InfinitepushParams;
 use metaconfig_types::RepoConfig;
-use metaconfig_types::SegmentedChangelogConfig;
-use metaconfig_types::SegmentedChangelogHeadConfig;
 use metaconfig_types::SourceControlServiceParams;
 use metaconfig_types::UnodeVersion;
 use mononoke_types::DerivableType;
@@ -80,9 +78,12 @@ use mutable_renames::ArcMutableRenames;
 use mutable_renames::MutableRenames;
 use mutable_renames::SqlMutableRenamesStore;
 use newfilenodes::NewFilenodesBuilder;
+use permission_checker::dummy::DummyAclProvider;
 use phases::ArcPhases;
 use pushrebase_mutation_mapping::ArcPushrebaseMutationMapping;
 use pushrebase_mutation_mapping::SqlPushrebaseMutationMappingConnection;
+use pushredirect::ArcPushRedirectionConfig;
+use pushredirect::NoopPushRedirectionConfig;
 use redactedblobstore::RedactedBlobs;
 use regex::Regex;
 use rendezvous::RendezVousOptions;
@@ -94,26 +95,28 @@ use repo_cross_repo::ArcRepoCrossRepo;
 use repo_cross_repo::RepoCrossRepo;
 use repo_derived_data::ArcRepoDerivedData;
 use repo_derived_data::RepoDerivedData;
-use repo_hook_file_content_provider::RepoHookFileContentProvider;
+use repo_hook_file_content_provider::RepoHookStateProvider;
 use repo_identity::ArcRepoIdentity;
 use repo_identity::RepoIdentity;
 use repo_lock::AlwaysUnlockedRepoLock;
 use repo_lock::ArcRepoLock;
 use repo_lock::SqlRepoLock;
+use repo_metadata_checkpoint::ArcRepoMetadataCheckpoint;
+use repo_metadata_checkpoint::SqlRepoMetadataCheckpointBuilder;
 use repo_permission_checker::AlwaysAllowRepoPermissionChecker;
 use repo_permission_checker::ArcRepoPermissionChecker;
 use repo_sparse_profiles::ArcRepoSparseProfiles;
 use repo_sparse_profiles::RepoSparseProfiles;
 use repo_sparse_profiles::SqlSparseProfilesSizes;
-use requests_table::SqlLongRunningRequestsQueue;
+use repo_stats_logger::ArcRepoStatsLogger;
+use repo_stats_logger::RepoStatsLogger;
 use scuba_ext::MononokeScubaSampleBuilder;
-use segmented_changelog::new_test_segmented_changelog;
-use segmented_changelog::SegmentedChangelogSqlConnections;
-use segmented_changelog_types::ArcSegmentedChangelog;
 use sql::rusqlite::Connection as SqliteConnection;
 use sql::sqlite::SqliteCallbacks;
 use sql::Connection;
 use sql::SqlConnections;
+use sql_commit_graph_storage::ArcCommitGraphBulkFetcher;
+use sql_commit_graph_storage::CommitGraphBulkFetcher;
 use sql_commit_graph_storage::SqlCommitGraphStorageBuilder;
 use sql_construct::SqlConstruct;
 use sql_query_config::ArcSqlQueryConfig;
@@ -123,7 +126,7 @@ use streaming_clone::ArcStreamingClone;
 use streaming_clone::StreamingCloneBuilder;
 use strum::IntoEnumIterator;
 use synced_commit_mapping::ArcSyncedCommitMapping;
-use synced_commit_mapping::SqlSyncedCommitMapping;
+use synced_commit_mapping::SqlSyncedCommitMappingBuilder;
 use warm_bookmarks_cache::WarmBookmarksCacheBuilder;
 use wireproto_handler::ArcRepoHandlerBase;
 use wireproto_handler::PushRedirectorBase;
@@ -155,16 +158,28 @@ pub struct TestRepoFactory {
     filenodes_override: Option<Box<dyn Fn(ArcFilenodes) -> ArcFilenodes + Send + Sync>>,
 }
 
+/// The default derived data types configuration for test repositories.
+///
+/// This configuration enables all derived data types at the latest version.
+pub fn default_test_repo_derived_data_types_config() -> DerivedDataTypesConfig {
+    DerivedDataTypesConfig {
+        types: DerivableType::iter().collect(),
+        unode_version: UnodeVersion::V2,
+        blame_version: BlameVersion::V2,
+        git_delta_manifest_v2_config: Some(GitDeltaManifestV2Config {
+            max_inlined_object_size: 100,
+            max_inlined_delta_size: 100,
+            delta_chunk_size: 1000,
+        }),
+        ..Default::default()
+    }
+}
+
 /// The default configuration for test repositories.
 ///
 /// This configuration enables all derived data types at the latest version.
 pub fn default_test_repo_config() -> RepoConfig {
-    let derived_data_types_config = DerivedDataTypesConfig {
-        types: DerivableType::iter().collect(),
-        unode_version: UnodeVersion::V2,
-        blame_version: BlameVersion::V2,
-        ..Default::default()
-    };
+    let derived_data_types_config = default_test_repo_derived_data_types_config();
     RepoConfig {
         derived_data_config: DerivedDataConfig {
             scuba_table: None,
@@ -173,13 +188,6 @@ pub fn default_test_repo_config() -> RepoConfig {
                 "default".to_string() => derived_data_types_config.clone(),
                 "backfilling".to_string() => derived_data_types_config
             ],
-        },
-        segmented_changelog_config: SegmentedChangelogConfig {
-            enabled: true,
-            heads_to_include: vec![SegmentedChangelogHeadConfig::Bookmark(
-                BookmarkKey::new("master").unwrap(),
-            )],
-            ..Default::default()
         },
         infinitepush: InfinitepushParams {
             namespace: Some(InfinitepushNamespace::new(
@@ -241,7 +249,6 @@ impl TestRepoFactory {
         metadata_con.execute_batch(MegarepoMapping::CREATION_QUERY)?;
         metadata_con.execute_batch(SqlMutableCountersBuilder::CREATION_QUERY)?;
         metadata_con.execute_batch(SqlBookmarksBuilder::CREATION_QUERY)?;
-        metadata_con.execute_batch(SqlChangesetsBuilder::CREATION_QUERY)?;
         metadata_con.execute_batch(SqlBonsaiGitMappingBuilder::CREATION_QUERY)?;
         metadata_con.execute_batch(SqlBonsaiGlobalrevMappingBuilder::CREATION_QUERY)?;
         metadata_con.execute_batch(SqlBonsaiSvnrevMappingBuilder::CREATION_QUERY)?;
@@ -250,10 +257,8 @@ impl TestRepoFactory {
         metadata_con.execute_batch(SqlGitSymbolicRefsBuilder::CREATION_QUERY)?;
         metadata_con.execute_batch(SqlPhasesBuilder::CREATION_QUERY)?;
         metadata_con.execute_batch(SqlPushrebaseMutationMappingConnection::CREATION_QUERY)?;
-        metadata_con.execute_batch(SqlLongRunningRequestsQueue::CREATION_QUERY)?;
         metadata_con.execute_batch(SqlMutableRenamesStore::CREATION_QUERY)?;
-        metadata_con.execute_batch(SqlSyncedCommitMapping::CREATION_QUERY)?;
-        metadata_con.execute_batch(SegmentedChangelogSqlConnections::CREATION_QUERY)?;
+        metadata_con.execute_batch(SqlSyncedCommitMappingBuilder::CREATION_QUERY)?;
         metadata_con.execute_batch(SqlRepoLock::CREATION_QUERY)?;
         metadata_con.execute_batch(SqlSparseProfilesSizes::CREATION_QUERY)?;
         metadata_con.execute_batch(StreamingCloneBuilder::CREATION_QUERY)?;
@@ -397,39 +402,6 @@ impl TestRepoFactory {
         Arc::new(RepoIdentity::new(repo_config.repoid, self.name.clone()))
     }
 
-    /// Construct Changesets using the in-memory metadata database.
-    pub fn changesets(
-        &self,
-        repo_identity: &ArcRepoIdentity,
-        commit_graph: &ArcCommitGraph,
-        repo_config: &ArcRepoConfig,
-    ) -> Result<ArcChangesets> {
-        let changesets = Arc::new(
-            SqlChangesetsBuilder::from_sql_connections(self.metadata_db.clone())
-                .build(RendezVousOptions::for_test(), repo_identity.id()),
-        );
-
-        Ok(Arc::new(ChangesetsCommitGraphCompat::new(
-            self.fb,
-            changesets,
-            commit_graph.clone(),
-            repo_identity.name().to_string(),
-            repo_config.commit_graph_config.scuba_table.as_deref(),
-        )?))
-    }
-
-    /// Construct a Changeset Fetcher.
-    pub fn changeset_fetcher(
-        &self,
-        repo_identity: &ArcRepoIdentity,
-        changesets: &ArcChangesets,
-    ) -> ArcChangesetFetcher {
-        Arc::new(SimpleChangesetFetcher::new(
-            changesets.clone(),
-            repo_identity.id(),
-        ))
-    }
-
     /// Construct SQL bookmarks using the in-memory metadata database.
     pub fn sql_bookmarks(&self, repo_identity: &ArcRepoIdentity) -> Result<ArcSqlBookmarks> {
         Ok(Arc::new(
@@ -453,11 +425,11 @@ impl TestRepoFactory {
         &self,
         repo_identity: &ArcRepoIdentity,
         bookmarks: &ArcBookmarks,
-        changeset_fetcher: &ArcChangesetFetcher,
+        commit_graph: &ArcCommitGraph,
     ) -> ArcPhases {
         let sql_phases_builder = SqlPhasesBuilder::from_sql_connections(self.metadata_db.clone());
         let heads_fetcher = bookmark_heads_fetcher(bookmarks.clone());
-        sql_phases_builder.build(repo_identity.id(), changeset_fetcher.clone(), heads_fetcher)
+        sql_phases_builder.build(repo_identity.id(), commit_graph.clone(), heads_fetcher)
     }
 
     /// Construct Bonsai Hg Mapping using the in-memory metadata database.
@@ -515,12 +487,32 @@ impl TestRepoFactory {
         ))
     }
 
+    /// Construct Repo Metadata Checkpoint using the in-memory metadata
+    pub fn repo_metadata_checkpoint(
+        &self,
+        repo_identity: &ArcRepoIdentity,
+    ) -> Result<ArcRepoMetadataCheckpoint> {
+        Ok(Arc::new(
+            SqlRepoMetadataCheckpointBuilder::from_sql_connections(self.metadata_db.clone())
+                .build(repo_identity.id()),
+        ))
+    }
+
     /// Construct Git Symbolic Refs using the in-memory metadata
     /// database.
     pub fn git_symbolic_refs(&self, repo_identity: &ArcRepoIdentity) -> Result<ArcGitSymbolicRefs> {
         Ok(Arc::new(
             SqlGitSymbolicRefsBuilder::from_sql_connections(self.metadata_db.clone())
                 .build(repo_identity.id()),
+        ))
+    }
+
+    /// Construct Git Push Redirect Config using the in-memory metadata
+    /// database.
+    pub fn git_source_of_truth_config(&self) -> Result<ArcGitSourceOfTruthConfig> {
+        Ok(Arc::new(
+            SqlGitSourceOfTruthConfigBuilder::from_sql_connections(self.metadata_db.clone())
+                .build(),
         ))
     }
 
@@ -568,36 +560,18 @@ impl TestRepoFactory {
         ))
     }
 
-    /// Construct Segmented Changelog.  Segmented changelog is disabled in
-    /// test repos.
-    pub fn segmented_changelog(
-        &self,
-        repo_identity: &ArcRepoIdentity,
-        repo_config: &ArcRepoConfig,
-        changeset_fetcher: &ArcChangesetFetcher,
-        bookmarks: &ArcBookmarks,
-    ) -> Result<ArcSegmentedChangelog> {
-        new_test_segmented_changelog(
-            self.ctx.clone(),
-            repo_identity.id(),
-            &repo_config.segmented_changelog_config,
-            changeset_fetcher.clone(),
-            bookmarks.clone(),
-        )
-    }
-
     /// Construct RepoDerivedData.  Derived data uses an in-process lease for
     /// tests.
     pub fn repo_derived_data(
         &self,
         repo_identity: &ArcRepoIdentity,
         repo_config: &ArcRepoConfig,
-        changesets: &ArcChangesets,
         commit_graph: &ArcCommitGraph,
         bonsai_hg_mapping: &ArcBonsaiHgMapping,
         bonsai_git_mapping: &ArcBonsaiGitMapping,
         filenodes: &ArcFilenodes,
         repo_blobstore: &ArcRepoBlobstore,
+        filestore_config: &ArcFilestoreConfig,
     ) -> Result<ArcRepoDerivedData> {
         let lease = self.derived_data_lease.as_ref().map_or_else(
             || Arc::new(InProcessLease::new()) as Arc<dyn LeaseOps>,
@@ -606,12 +580,12 @@ impl TestRepoFactory {
         Ok(Arc::new(RepoDerivedData::new(
             repo_identity.id(),
             repo_identity.name().to_string(),
-            changesets.clone(),
             commit_graph.clone(),
             bonsai_hg_mapping.clone(),
             bonsai_git_mapping.clone(),
             filenodes.clone(),
             repo_blobstore.as_ref().clone(),
+            **filestore_config,
             lease,
             MononokeScubaSampleBuilder::with_discard(),
             repo_config.derived_data_config.clone(),
@@ -658,9 +632,10 @@ impl TestRepoFactory {
 
     /// The commit mapping bettween repos for synced commits.
     pub fn synced_commit_mapping(&self) -> Result<ArcSyncedCommitMapping> {
-        Ok(Arc::new(SqlSyncedCommitMapping::from_sql_connections(
-            self.metadata_db.clone(),
-        )))
+        Ok(Arc::new(
+            SqlSyncedCommitMappingBuilder::from_sql_connections(self.metadata_db.clone())
+                .build(RendezVousOptions::for_test()),
+        ))
     }
 
     /// Cross-repo sync manager for this repo
@@ -747,11 +722,15 @@ impl TestRepoFactory {
         repo_derived_data: &ArcRepoDerivedData,
         bookmarks: &ArcBookmarks,
         repo_blobstore: &ArcRepoBlobstore,
+        bonsai_tag_mapping: &ArcBonsaiTagMapping,
+        bonsai_git_mapping: &ArcBonsaiGitMapping,
     ) -> ArcHookManager {
-        let content_store = RepoHookFileContentProvider::from_parts(
+        let content_store = RepoHookStateProvider::from_parts(
             bookmarks.clone(),
             repo_blobstore.clone(),
             repo_derived_data.clone(),
+            bonsai_tag_mapping.clone(),
+            bonsai_git_mapping.clone(),
         );
 
         Arc::new(HookManager::new_test(
@@ -805,6 +784,24 @@ impl TestRepoFactory {
         Ok(Arc::new(CommitGraph::new(Arc::new(sql_storage))))
     }
 
+    /// Commit graph writer
+    pub fn commit_graph_writer(&self, commit_graph: &CommitGraph) -> Result<ArcCommitGraphWriter> {
+        let base_writer = BaseCommitGraphWriter::new(commit_graph.clone());
+        Ok(Arc::new(base_writer))
+    }
+
+    /// Commit graph bulk fetcher
+    pub fn commit_graph_bulk_fetcher(
+        &self,
+        repo_identity: &RepoIdentity,
+    ) -> Result<ArcCommitGraphBulkFetcher> {
+        let sql_storage =
+            SqlCommitGraphStorageBuilder::from_sql_connections(self.metadata_db.clone())
+                .build(RendezVousOptions::for_test(), repo_identity.id());
+
+        Ok(Arc::new(CommitGraphBulkFetcher::new(Arc::new(sql_storage))))
+    }
+
     /// Warm bookmarks cache
     pub async fn warm_bookmarks_cache(
         &self,
@@ -837,12 +834,24 @@ impl TestRepoFactory {
         bonsai_hg_mapping: &ArcBonsaiHgMapping,
         repo_derived_data: &ArcRepoDerivedData,
     ) -> Result<ArcCommitCloud> {
-        Ok(Arc::new(commit_cloud::CommitCloud {
-            storage: SqlCommitCloudBuilder::from_sql_connections(self.metadata_db.clone())
-                .new(false),
-            bonsai_hg_mapping: bonsai_hg_mapping.clone(),
-            repo_derived_data: repo_derived_data.clone(),
-            core_ctx: self.ctx.clone(),
-        }))
+        let cc = CommitCloud::new(
+            SqlCommitCloudBuilder::from_sql_connections(self.metadata_db.clone()).new(false),
+            bonsai_hg_mapping.clone(),
+            repo_derived_data.clone(),
+            self.ctx.clone(),
+            DummyAclProvider::new(self.fb),
+            self.config.commit_cloud_config.clone().into(),
+        );
+        Ok(Arc::new(cc))
+    }
+
+    /// Function to create a logger for repos stats
+    pub async fn repo_stats_logger(&self) -> Result<ArcRepoStatsLogger> {
+        Ok(Arc::new(RepoStatsLogger::noop()))
+    }
+
+    /// Function to create an object to configure push redirection
+    pub async fn push_redirection_config(&self) -> Result<ArcPushRedirectionConfig> {
+        Ok(Arc::new(NoopPushRedirectionConfig {}))
     }
 }

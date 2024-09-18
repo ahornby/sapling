@@ -10,12 +10,12 @@ import type {CommitMessageFields, FieldConfig, FieldsBeingEdited} from './types'
 import type {ReactNode} from 'react';
 
 import {InlineBadge} from '../InlineBadge';
-import {Subtle} from '../Subtle';
-import {Tooltip} from '../Tooltip';
 import {YouAreHereLabel} from '../YouAreHereLabel';
 import {t, T} from '../i18n';
 import platform from '../platform';
 import {RelativeDate} from '../relativeDate';
+import {Subtle} from 'isl-components/Subtle';
+import {Tooltip} from 'isl-components/Tooltip';
 
 export function CommitTitleByline({commit}: {commit: CommitInfo}) {
   const createdByInfo = (
@@ -88,16 +88,6 @@ export function getFieldToAutofocus(
     }
   }
   return undefined;
-}
-
-/**
- * VSCodeTextArea elements use custom components, which renders in a shadow DOM.
- * Most often, we want to access the inner <textarea>, which acts like a normal textarea.
- */
-export function getInnerTextareaForVSCodeTextArea(
-  outer: HTMLElement | null,
-): HTMLTextAreaElement | null {
-  return outer == null ? null : (outer as unknown as {control: HTMLTextAreaElement}).control;
 }
 
 export function getOnClickToken(

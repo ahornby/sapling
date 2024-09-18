@@ -85,11 +85,21 @@ pub(crate) mod ffi {
         entries: Vec<TreeEntry>,
     }
 
+    #[derive(Debug)]
+    pub struct TreeAuxData {
+        digest_size: u64,
+        digest_blake3: [u8; 32],
+    }
+
     pub struct Request {
         node: *const u8,
         cause: FetchCause,
         // TODO: mode: FetchMode
         // TODO: cri: ClientRequestInfo
+    }
+
+    pub struct GlobFilesResponse {
+        files: Vec<String>,
     }
 
     pub struct Blob {
@@ -106,6 +116,7 @@ pub(crate) mod ffi {
         include!("eden/scm/lib/backingstore/include/ffi.h");
 
         type GetTreeBatchResolver;
+        type GetTreeAuxBatchResolver;
         type GetBlobBatchResolver;
         type GetFileAuxBatchResolver;
 
@@ -114,6 +125,13 @@ pub(crate) mod ffi {
             index: usize,
             error: String,
             tree: SharedPtr<Tree>,
+        );
+
+        unsafe fn sapling_backingstore_get_tree_aux_batch_handler(
+            resolve_state: SharedPtr<GetTreeAuxBatchResolver>,
+            index: usize,
+            error: String,
+            tree: SharedPtr<TreeAuxData>,
         );
 
         unsafe fn sapling_backingstore_get_blob_batch_handler(
@@ -159,6 +177,19 @@ pub(crate) mod ffi {
             resolver: SharedPtr<GetTreeBatchResolver>,
         );
 
+        pub fn sapling_backingstore_get_tree_aux(
+            store: &BackingStore,
+            node: &[u8],
+            fetch_mode: FetchMode,
+        ) -> Result<SharedPtr<TreeAuxData>>;
+
+        pub fn sapling_backingstore_get_tree_aux_batch(
+            store: &BackingStore,
+            requests: &[Request],
+            fetch_mode: FetchMode,
+            resolver: SharedPtr<GetTreeAuxBatchResolver>,
+        );
+
         pub fn sapling_backingstore_get_blob(
             store: &BackingStore,
             node: &[u8],
@@ -186,6 +217,12 @@ pub(crate) mod ffi {
         );
 
         pub fn sapling_backingstore_flush(store: &BackingStore);
+
+        pub fn sapling_backingstore_get_glob_files(
+            store: &BackingStore,
+            commit_id: &[u8],
+            suffixes: Vec<String>,
+        ) -> Result<SharedPtr<GlobFilesResponse>>;
     }
 }
 
@@ -257,6 +294,38 @@ pub fn sapling_backingstore_get_tree_batch(
     });
 }
 
+pub fn sapling_backingstore_get_tree_aux(
+    store: &BackingStore,
+    node: &[u8],
+    fetch_mode: ffi::FetchMode,
+) -> Result<SharedPtr<ffi::TreeAuxData>> {
+    Ok(SharedPtr::new(
+        store
+            .get_tree_aux(node, FetchMode::from(fetch_mode))
+            .and_then(|opt| opt.ok_or_else(|| Error::msg("no tree aux data found")))?
+            .into(),
+    ))
+}
+
+pub fn sapling_backingstore_get_tree_aux_batch(
+    store: &BackingStore,
+    requests: &[ffi::Request],
+    fetch_mode: ffi::FetchMode,
+    resolver: SharedPtr<ffi::GetTreeAuxBatchResolver>,
+) {
+    let keys: Vec<Key> = requests.iter().map(|req| req.key()).collect();
+
+    store.get_tree_aux_batch(keys, FetchMode::from(fetch_mode), |idx, result| {
+        let result = result.and_then(|opt| opt.ok_or_else(|| Error::msg("no aux data found")));
+        let resolver = resolver.clone();
+        let (error, aux) = match result {
+            Ok(aux) => (String::default(), SharedPtr::new(aux.into())),
+            Err(error) => (format!("{:?}", error), SharedPtr::null()),
+        };
+        unsafe { ffi::sapling_backingstore_get_tree_aux_batch_handler(resolver, idx, error, aux) };
+    });
+}
+
 pub fn sapling_backingstore_get_blob(
     store: &BackingStore,
     node: &[u8],
@@ -325,4 +394,15 @@ pub fn sapling_backingstore_get_file_aux_batch(
 pub fn sapling_backingstore_flush(store: &BackingStore) {
     store.flush();
     store.refresh();
+}
+
+pub fn sapling_backingstore_get_glob_files(
+    store: &BackingStore,
+    commit_id: &[u8],
+    suffixes: Vec<String>,
+) -> Result<SharedPtr<ffi::GlobFilesResponse>> {
+    let files = store
+        .get_glob_files(commit_id, suffixes)
+        .and_then(|opt| opt.ok_or_else(|| Error::msg("failed to retrieve glob file")))?;
+    Ok(SharedPtr::new(ffi::GlobFilesResponse { files }))
 }

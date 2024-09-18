@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use anyhow::anyhow;
 use anyhow::Error;
-use blobrepo::BlobRepo;
+use changesets_creation::save_changesets;
 use commit_transformation::create_source_to_target_multi_mover;
 use context::CoreContext;
 use maplit::btreemap;
@@ -27,7 +27,9 @@ use megarepo_mapping::Source;
 use megarepo_mapping::SourceMappingRules;
 use megarepo_mapping::SourceName;
 use megarepo_mapping::SyncTargetConfig;
+use metaconfig_types::RepoConfigArc;
 use mononoke_api::Mononoke;
+use mononoke_api::MononokeRepo;
 use mononoke_api::Repo;
 use mononoke_types::ChangesetId;
 use mononoke_types::RepositoryId;
@@ -39,15 +41,15 @@ use tests_utils::list_working_copy_utf8;
 use tests_utils::resolve_cs_id;
 use tests_utils::CreateCommitContext;
 
-pub struct MegarepoTest {
-    pub blobrepo: BlobRepo,
+pub struct MegarepoTest<R> {
+    pub repo: R,
     pub megarepo_mapping: Arc<MegarepoMapping>,
-    pub mononoke: Arc<Mononoke>,
+    pub mononoke: Arc<Mononoke<R>>,
     pub configs_storage: TestMononokeMegarepoConfigs,
     pub mutable_renames: Arc<MutableRenames>,
 }
 
-impl MegarepoTest {
+impl MegarepoTest<Repo> {
     pub async fn new(ctx: &CoreContext) -> Result<Self, Error> {
         let id = RepositoryId::new(0);
         let mut factory = TestRepoFactory::new(ctx.fb)?;
@@ -57,21 +59,23 @@ impl MegarepoTest {
         let repo_identity = factory.repo_identity(&config);
         let mutable_renames = factory.mutable_renames(&repo_identity)?;
         let repo: Repo = factory.build().await?;
-        let blobrepo = repo.blob_repo().clone();
-        let mononoke = Arc::new(Mononoke::new_test(vec![("repo".to_string(), repo)]).await?);
+        let mononoke =
+            Arc::new(Mononoke::new_test(vec![("repo".to_string(), repo.clone())]).await?);
         let configs_storage = TestMononokeMegarepoConfigs::new(ctx.logger());
 
         Ok(Self {
-            blobrepo,
+            repo,
             megarepo_mapping,
             mononoke,
             configs_storage,
             mutable_renames,
         })
     }
+}
 
+impl<R: MononokeRepo> MegarepoTest<R> {
     pub fn repo_id(&self) -> RepositoryId {
-        self.blobrepo.repo_identity().id()
+        self.repo.repo_identity().id()
     }
 
     pub fn target(&self, bookmark: String) -> Target {
@@ -87,30 +91,31 @@ impl MegarepoTest {
         version: &SyncConfigVersion,
         target: &Target,
     ) -> Result<ChangesetId, Error> {
-        let initial_config = self.configs_storage.get_config_by_version(
-            ctx.clone(),
-            target.clone(),
-            version.clone(),
-        )?;
+        let repo_config = self.repo.repo_config_arc();
 
-        let mut init_target_cs = CreateCommitContext::new_root(ctx, &self.blobrepo);
+        let initial_config = self
+            .configs_storage
+            .get_config_by_version(ctx.clone(), repo_config, target.clone(), version.clone())
+            .await?;
+
+        let mut init_target_cs = CreateCommitContext::new_root(ctx, &self.repo);
 
         let mut remapping_state = btreemap! {};
         for source in initial_config.sources {
             let mover = create_source_to_target_multi_mover(source.mapping.clone())?;
             let init_source_cs_id = match source.revision {
                 SourceRevision::bookmark(bookmark) => {
-                    resolve_cs_id(ctx, &self.blobrepo, bookmark).await?
+                    resolve_cs_id(ctx, &self.repo, bookmark).await?
                 }
                 SourceRevision::hash(hash) => {
                     let cs_id = ChangesetId::from_bytes(hash)?;
-                    resolve_cs_id(ctx, &self.blobrepo, cs_id).await?
+                    resolve_cs_id(ctx, &self.repo, cs_id).await?
                 }
                 _ => {
                     unimplemented!()
                 }
             };
-            let source_wc = list_working_copy_utf8(ctx, &self.blobrepo, init_source_cs_id).await?;
+            let source_wc = list_working_copy_utf8(ctx, &self.repo, init_source_cs_id).await?;
 
             for (file, content) in source_wc {
                 let target_files = mover(&file)?;
@@ -128,13 +133,13 @@ impl MegarepoTest {
             Some(target.bookmark.to_owned()),
         );
         remapping_state
-            .save_in_changeset(ctx, &self.blobrepo, &mut init_target_cs)
+            .save_in_changeset(ctx, &self.repo, &mut init_target_cs)
             .await?;
         let init_target_cs = init_target_cs.freeze()?;
         let init_target_cs_id = init_target_cs.get_changeset_id();
-        blobrepo::save_bonsai_changesets(vec![init_target_cs], ctx.clone(), &self.blobrepo).await?;
+        save_changesets(ctx, &self.repo, vec![init_target_cs]).await?;
 
-        bookmark(ctx, &self.blobrepo, target.bookmark.clone())
+        bookmark(ctx, &self.repo, target.bookmark.clone())
             .set_to(init_target_cs_id)
             .await?;
         Ok(init_target_cs_id)

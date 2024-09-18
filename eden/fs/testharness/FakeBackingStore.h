@@ -130,6 +130,13 @@ class FakeBackingStore final : public BackingStore {
       const FakeTreeBuilder& builder);
 
   /**
+   * Add a Glob to the backing store
+   */
+  StoredGlob* putGlob(
+      std::pair<RootId, std::string> suffixQuery,
+      std::vector<std::string> contents);
+
+  /**
    * Look up a StoredTree.
    *
    * Throws an error if the specified hash does not exist.  Never returns null.
@@ -142,6 +149,13 @@ class FakeBackingStore final : public BackingStore {
    * Throws an error if the specified hash does not exist.  Never returns null.
    */
   StoredBlob* getStoredBlob(ObjectId hash);
+
+  /**
+   * Look up a StoredGlob.
+   *
+   * Throws an error if the specified hash does not exist.  Never returns null.
+   */
+  StoredGlob* getStoredGlob(std::pair<RootId, std::string> suffixQuery);
 
   /**
    * Manually clear the list of outstanding requests to avoid cycles during
@@ -172,6 +186,10 @@ class FakeBackingStore final : public BackingStore {
     std::unordered_map<RootId, std::unique_ptr<StoredHash>> commits;
     std::unordered_map<ObjectId, std::unique_ptr<StoredTree>> trees;
     std::unordered_map<ObjectId, std::unique_ptr<StoredBlob>> blobs;
+    std::unordered_map<
+        std::pair<RootId, std::string>,
+        std::unique_ptr<StoredGlob>>
+        globs;
 
     std::unordered_map<RootId, size_t> commitAccessCounts;
     std::unordered_map<ObjectId, size_t> accessCounts;
@@ -190,6 +208,7 @@ class FakeBackingStore final : public BackingStore {
   FRIEND_TEST(FakeBackingStoreTest, getBlob);
   FRIEND_TEST(FakeBackingStoreTest, getTree);
   FRIEND_TEST(FakeBackingStoreTest, getRootTree);
+  FRIEND_TEST(FakeBackingStoreTest, getGlobFiles);
 
   ImmediateFuture<GetRootTreeResult> getRootTree(
       const RootId& commitID,
@@ -202,12 +221,18 @@ class FakeBackingStore final : public BackingStore {
   folly::SemiFuture<GetTreeResult> getTree(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) override;
+  folly::SemiFuture<GetTreeMetaResult> getTreeMetadata(
+      const ObjectId& /*id*/,
+      const ObjectFetchContextPtr& /*context*/) override;
   folly::SemiFuture<GetBlobResult> getBlob(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) override;
   folly::SemiFuture<GetBlobMetaResult> getBlobMetadata(
       const ObjectId& id,
       const ObjectFetchContextPtr& context) override;
+  ImmediateFuture<GetGlobFilesResult> getGlobFiles(
+      const RootId& id,
+      const std::vector<std::string>& globs) override;
 
   LocalStoreCachingPolicy localStoreCachingPolicy_;
   std::shared_ptr<ServerState> serverState_;

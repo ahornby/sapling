@@ -260,3 +260,172 @@ function make_changes_to_git_repos_a_b_c {
 function print_section() {
     printf "\n\nNOTE: %s\n" "$1"
 }
+
+# Create a commit in repo_b that can be used to update its submodule pointer
+# from the large repo
+function create_repo_b_commits_for_submodule_pointer_update {
+  export REPO_B_GIT_COMMIT_HASH;
+
+  print_section "Create a commit in repo_b"
+  #  Create a commit in repo_b to update its repo_a pointer from the large repo
+  cd "$GIT_REPO_B" || exit
+  echo "new file abc" > abc
+  git add .
+  git commit -q -am "Add file to repo_b"
+
+  cd "$TESTTMP" || exit
+
+  # Import this commit to repo_b mononoke mirror
+  REPOID="$REPO_B_ID" with_stripped_logs gitimport "$GIT_REPO_B" --bypass-derived-data-backfilling  \
+    --bypass-readonly --generate-bookmarks full-repo > "$TESTTMP/gitimport_output"
+
+  REPO_B_BONSAI=$(rg ".*Ref: \"refs/heads/master\": Some\(ChangesetId\(Blake2\((\w+).+" -or '$1' "$TESTTMP/gitimport_output")
+  echo "REPO_B_BONSAI: $REPO_B_BONSAI"
+  # GIT_REPO_B_HEAD: 3cd7a66e604714b2b96af41e9c595be692f1f5f0713af3f7b2dc3426b05407bd
+
+  REPO_B_GIT_COMMIT_HASH=$(mononoke_newadmin convert --repo-id "$REPO_B_ID" -f bonsai -t git "$REPO_B_BONSAI")
+  echo "REPO_B_GIT_COMMIT_HASH: $REPO_B_GIT_COMMIT_HASH"
+  # REPO_B_GIT_HASH: e412b2106ae18eab108f1f8d7ed6e4527d0296cc
+}
+
+# Create a commit in repo_b and update its submodule pointer from the large repo
+function update_repo_b_submodule_pointer_in_large_repo {
+  create_repo_b_commits_for_submodule_pointer_update;
+
+  cd "$TESTTMP/$LARGE_REPO_NAME" || exit
+  echo "new file abc" > smallrepofolder1/git-repo-b/abc
+  printf "%s" "$REPO_B_GIT_COMMIT_HASH" > smallrepofolder1/.x-repo-submodule-git-repo-b
+  hg commit -Aq -m "Valid repo_b submodule version bump from large repo"
+  hg cloud backup -q
+}
+
+# Create a commit in repo_a.
+function create_repo_a_commit {
+  export REPO_A_GIT_HASH;
+
+  cd "$GIT_REPO_A" || exit
+  date >> file_in_a
+  git add .
+  git commit -q -am "A commit in repo_a"
+  cd "$TESTTMP" || exit
+
+  # Import this commit to repo_a mononoke mirror
+  REPOID="$SUBMODULE_REPO_ID" with_stripped_logs gitimport "$GIT_REPO_A" --bypass-derived-data-backfilling  \
+    --bypass-readonly --generate-bookmarks full-repo > "$TESTTMP/gitimport_repo_a_output"
+
+  GIT_REPO_A_HEAD=$(rg ".*Ref: \"refs/heads/master\": Some\(ChangesetId\(Blake2\((\w+).+" -or '$1' "$TESTTMP/gitimport_repo_a_output")
+  echo "GIT_REPO_A_HEAD: $GIT_REPO_A_HEAD"
+
+  REPO_A_GIT_HASH=$(mononoke_newadmin convert --repo-id "$SUBMODULE_REPO_ID" -f bonsai -t git "$GIT_REPO_A_HEAD")
+  echo "REPO_A_GIT_HASH: $REPO_A_GIT_HASH"
+}
+
+# Create commits in repo_c and repo_b that can be used to update their submodule
+# pointers from the large repo
+
+# Create a commit in repo_c that can be used to update its submodule pointer
+# from the large repo
+function create_repo_c_commit {
+  export REPO_C_GIT_HASH;
+
+  #  Create a commit in repo_b to update its repo_a pointer from the large repo
+  cd "$GIT_REPO_C" || exit
+  echo "new file in repo_c" > file_in_c
+  git add .
+  git commit -q -am "Add file in repo_c"
+  cd "$TESTTMP" || exit
+
+  # Import this commit to repo_c mononoke mirror
+  REPOID="$REPO_C_ID" with_stripped_logs gitimport "$GIT_REPO_C" --bypass-derived-data-backfilling  \
+    --bypass-readonly --generate-bookmarks full-repo > "$TESTTMP/gitimport_repo_c_output"
+
+  GIT_REPO_C_HEAD=$(rg ".*Ref: \"refs/heads/master\": Some\(ChangesetId\(Blake2\((\w+).+" -or '$1' "$TESTTMP/gitimport_repo_c_output")
+  echo "GIT_REPO_C_HEAD: $GIT_REPO_C_HEAD"
+
+  REPO_C_GIT_HASH=$(mononoke_newadmin convert --repo-id "$REPO_C_ID" -f bonsai -t git "$GIT_REPO_C_HEAD")
+  echo "REPO_C_GIT_HASH: $REPO_C_GIT_HASH"
+}
+
+# Create commits in repo_c and repo_b that can be used to update their submodule
+# pointers from the large repo
+function create_repo_c_and_repo_b_commits_for_submodule_pointer_update {
+  export REPO_B_GIT_COMMIT_HASH;
+  export REPO_C_SUBMODULE_GIT_HASH;
+
+
+  print_section "Create a commit in repo_c and update its pointer in repo_b"
+  create_repo_c_commit;
+  REPO_C_SUBMODULE_GIT_HASH="$REPO_C_GIT_HASH";
+
+  print_section "Update repo_c submodule in git repo_b"
+  cd "$GIT_REPO_B" || exit
+  git submodule update --remote
+  git add .
+  git commit -q -am "Update submodule C in repo B"
+
+  # Import this commit to repo_b mononoke mirror
+  REPOID="$REPO_B_ID" with_stripped_logs gitimport "$GIT_REPO_B" --bypass-derived-data-backfilling  \
+    --bypass-readonly --generate-bookmarks full-repo > "$TESTTMP/gitimport_output"
+
+  GIT_REPO_B_HEAD=$(rg ".*Ref: \"refs/heads/master\": Some\(ChangesetId\(Blake2\((\w+).+" -or '$1' "$TESTTMP/gitimport_output")
+  echo "GIT_REPO_B_HEAD: $GIT_REPO_B_HEAD"
+
+  REPO_B_GIT_COMMIT_HASH=$(mononoke_newadmin convert --repo-id "$REPO_B_ID" -f bonsai -t git "$GIT_REPO_B_HEAD")
+  echo "REPO_B_GIT_COMMIT_HASH: $REPO_B_GIT_COMMIT_HASH"
+
+}
+
+# Create a commit in repo_b and repo_c, then update its submodule pointers from
+# the large repo to test recursive submodule updates from the large repo
+function update_repo_c_submodule_pointer_in_large_repo {
+  create_repo_c_and_repo_b_commits_for_submodule_pointer_update;
+
+  cd "$TESTTMP/$LARGE_REPO_NAME" || exit
+
+  # Update repo_c working copy in repo_b submodule metadata file
+  echo "new file in repo_c" > smallrepofolder1/git-repo-b/git-repo-c/file_in_c
+
+  echo "Updating repo_b/repo_c submodule pointer to: $REPO_C_SUBMODULE_GIT_HASH"
+  # Update repo_c submodule metadata file
+  printf "%s" "$REPO_C_SUBMODULE_GIT_HASH" > smallrepofolder1/git-repo-b/.x-repo-submodule-git-repo-c
+
+  echo "Updating repo_b submodule pointer to: $REPO_B_GIT_COMMIT_HASH"
+
+  # Update repo_b submodule metadata file
+  printf "%s" "$REPO_B_GIT_COMMIT_HASH" > smallrepofolder1/.x-repo-submodule-git-repo-b
+
+  hg commit -Aq -m "Valid repo_b and repo_c recursive submodule version bump from large repo"
+  hg cloud backup -q
+}
+
+function switch_source_of_truth_to_large_repo {
+  export LARGE_REPO_BOOKMARK_UPDATE_LOG_ID;
+  local small_repo=$1
+  local large_repo=$2
+
+  # Kill forward syncer job
+  killandwait "$XREPOSYNC_PID"
+
+  # Enable pushredirection for small repo, i.e. switch the source of truth to large repo
+  print_section "Enable push redirection for small repo"
+  enable_pushredirect "$small_repo" false true
+
+  print_section "Get current large repo bookmark update log id to set the backsyncer counter"
+  LARGE_REPO_BOOKMARK_UPDATE_LOG_ID=$(mononoke_newadmin bookmarks \
+    --repo-id "$large_repo" log "$MASTER_BOOKMARK_NAME" -S bonsai,hg -l1 \
+    | cut -d " " -f1)
+
+  echo "LARGE_REPO_BOOKMARK_UPDATE_LOG_ID: $LARGE_REPO_BOOKMARK_UPDATE_LOG_ID"
+
+  # Delete the forward syncer counter
+  print_section "Delete forward syncer counter and set backsyncer counter"
+  sqlite3 "$TESTTMP/monsql/sqlite_dbs" \
+    "DELETE FROM mutable_counters WHERE name = 'xreposync_from_$SUBMODULE_REPO_ID'";
+  sqlite3 "$TESTTMP/monsql/sqlite_dbs" \
+    "INSERT INTO mutable_counters (repo_id, name, value) \
+    VALUES ($small_repo, 'backsync_from_$LARGE_REPO_ID', $LARGE_REPO_BOOKMARK_UPDATE_LOG_ID)";
+
+  BACKSYNC_COUNTER=$(sqlite3 "$TESTTMP/monsql/sqlite_dbs" \
+    "SELECT value FROM mutable_counters WHERE name = 'backsync_from_$LARGE_REPO_ID';")
+  echo "BACKSYNC_COUNTER: $BACKSYNC_COUNTER"
+}

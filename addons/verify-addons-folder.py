@@ -23,6 +23,7 @@ Verifies the contents of this folder by running tests and linters.
 Requirements:
 - `node` and `yarn` are on the `$PATH`
 - `yarn install` has already been run in the addons/ folder
+- `sl` required to be on the PATH for isl integration tests
 """,
         formatter_class=RawTextHelpFormatter,
     )
@@ -31,16 +32,22 @@ Requirements:
         help=("No-op. Provided for compatibility."),
         action="store_true",
     )
+    parser.add_argument(
+        "--skip-integration-tests",
+        help=("Don't run isl integrations tests"),
+        action="store_true",
+    )
     args = parser.parse_args()
-    asyncio.run(verify())
+    asyncio.run(verify(args))
 
 
-async def verify():
+async def verify(args):
     await asyncio.gather(
         verify_prettier(),
         verify_shared(),
+        verify_components(),
         verify_textmate(),
-        verify_isl(),
+        verify_isl(args),
     )
 
 
@@ -57,6 +64,13 @@ async def verify_shared():
     timer.report(ok("shared/"))
 
 
+async def verify_components():
+    timer = Timer("verifying components/")
+    components = addons / "components"
+    await lint_and_test(components)
+    timer.report(ok("components/"))
+
+
 async def verify_textmate():
     timer = Timer("verifying textmate/")
     textmate = addons / "textmate"
@@ -67,7 +81,7 @@ async def verify_textmate():
     timer.report(ok("textmate/"))
 
 
-async def verify_isl():
+async def verify_isl(args):
     """Verifies isl/ and isl-server/ and vscode/ as the builds are interdependent"""
     timer = Timer("verifying ISL")
     isl = addons / "isl"
@@ -88,8 +102,10 @@ async def verify_isl():
         lint_and_test(isl_server),
         lint_and_test(vscode),
     )
-    # run integration tests separately to reduce flakiness from CPU contention with normal unit tests
-    await run_isl_integration_tests()
+    if not args.skip_integration_tests:
+        timer.report("running isl integration tests")
+        # run integration tests separately to reduce flakiness from CPU contention with normal unit tests
+        await run_isl_integration_tests()
     timer.report(ok("ISL"))
 
 
@@ -100,6 +116,7 @@ async def run_isl_integration_tests():
 async def lint_and_test(cwd: Path):
     await asyncio.gather(
         run(["yarn", "run", "eslint"], cwd=cwd),
+        run(["yarn", "run", "tsc", "--noEmit"], cwd=cwd),
         run(["yarn", "test", "--watchAll=false"], cwd=cwd),
     )
 

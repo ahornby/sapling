@@ -5,9 +5,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-import {spacing} from './tokens.stylex';
+import {spacing} from '../../components/theme/tokens.stylex';
 import * as stylex from '@stylexjs/stylex';
-import {Icon} from 'shared/Icon';
+import {Icon} from 'isl-components/Icon';
 import {notEmpty} from 'shared/utils';
 
 import './ComponentUtils.css';
@@ -44,8 +44,13 @@ export function LargeSpinner() {
 }
 
 export function Center(props: ContainerProps) {
-  const {className, ...rest} = props;
-  return <div {...stylexPropsWithClassName(styles.center, className)} {...rest} />;
+  const {className, xstyle, ...rest} = props;
+  return (
+    <div
+      {...stylexPropsWithClassName([styles.center, xstyle].filter(notEmpty), className)}
+      {...rest}
+    />
+  );
 }
 
 /** Flexbox container with horizontal children. */

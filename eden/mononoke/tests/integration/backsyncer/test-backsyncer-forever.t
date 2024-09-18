@@ -11,22 +11,15 @@
 
 We use multiplex blobstore here as this one provides logging that we test later.
   $ export MULTIPLEXED=1
-  $ setup_configerator_configs
-  $ cat > "$PUSHREDIRECT_CONF/enable" <<EOF
-  > {
-  > "per_repo": {
-  >   "1": {
-  >      "draft_push": false,
-  >      "public_push": true
-  >    }
-  >   }
-  > }
-  > EOF
 
 -- Init Mononoke thingies
-  $ PUSHREBASE_REWRITE_DATES=1 init_large_small_repo
+  $ PUSHREBASE_REWRITE_DATES=1 create_large_small_repo
   Adding synced mapping entry
+  $ setup_configerator_configs
+  $ enable_pushredirect 1
+  $ start_large_small_repo
   Starting Mononoke server
+  $ init_local_large_small_clones
 
 -- Start up the backsyncer in the background
   $ backsync_large_to_small_forever
@@ -34,13 +27,13 @@ We use multiplex blobstore here as this one provides logging that we test later.
 Before config change
 -- push to a large repo
   $ cd "$TESTTMP"/large-hg-client
-  $ REPONAME=large-mon hgmn up -q master_bookmark
+  $ hg up -q master_bookmark
 
   $ mkdir -p smallrepofolder
   $ echo bla > smallrepofolder/bla
   $ hg ci -Aqm "before config change"
   $ PREV_BOOK_VALUE=$(get_bookmark_value_edenapi small-mon master_bookmark)
-  $ REPONAME=large-mon hgmn push -r . --to master_bookmark -q
+  $ hg push -r . --to master_bookmark -q
   $ log -r master_bookmark
   o  before config change [public;rev=4;*] default/master_bookmark (glob)
   │
@@ -51,8 +44,8 @@ Before config change
 
 -- check the same commit in the small repo
   $ cd "$TESTTMP/small-hg-client"
-  $ REPONAME=small-mon hgmn pull -q
-  $ REPONAME=small-mon hgmn up -q master_bookmark
+  $ hg pull -q
+  $ hg up -q master_bookmark
   $ log -r master_bookmark
   @  before config change [public;rev=2;*] default/master_bookmark (glob)
   │
@@ -66,12 +59,12 @@ Config change
   $ force_update_configerator
 
   $ cd "$TESTTMP"/large-hg-client
-  $ REPONAME=large-mon hgmn up master_bookmark -q
+  $ hg up master_bookmark -q
   $ echo 1 >> 1 && hg add 1 && hg ci -m 'change of mapping'
   $ hg revert -r .^ 1
   $ hg commit --amend
   $ PREV_BOOK_VALUE=$(get_bookmark_value_edenapi small-mon master_bookmark)
-  $ REPONAME=large-mon hgmn push -r . --to master_bookmark -q
+  $ hg push -r . --to master_bookmark -q
 
 -- wait a second to give backsyncer some time to catch up
   $ wait_for_bookmark_move_away_edenapi small-mon master_bookmark  "$PREV_BOOK_VALUE"
@@ -79,15 +72,19 @@ Config change
   $ SMALL_MASTER_BONSAI=$(mononoke_newadmin bookmarks --repo-id $REPOIDSMALL get master_bookmark)
   $ update_mapping_version "$REPOIDSMALL" "$SMALL_MASTER_BONSAI" "$REPOIDLARGE" "$LARGE_MASTER_BONSAI" "new_version"
 
+-- restart the backsyncer to empty the synced commit mapping cache
+  $ killandwait $BACKSYNCER_PID
+  $ backsync_large_to_small_forever
+
 -- push to a large repo, using new path mapping
   $ cd "$TESTTMP"/large-hg-client
-  $ REPONAME=large-mon hgmn up -q master_bookmark
+  $ hg up -q master_bookmark
 
   $ mkdir -p smallrepofolder_after
   $ echo baz > smallrepofolder_after/baz
   $ hg ci -Aqm "after config change"
   $ PREV_BOOK_VALUE=$(get_bookmark_value_edenapi small-mon master_bookmark)
-  $ REPONAME=large-mon hgmn push -r . --to master_bookmark -q
+  $ hg push -r . --to master_bookmark -q
   $ log -r master_bookmark
   o  after config change [public;rev=*;*] default/master_bookmark (glob)
   │
@@ -98,8 +95,8 @@ Config change
 
 -- check the same commit in the small repo
   $ cd "$TESTTMP/small-hg-client"
-  $ REPONAME=small-mon hgmn pull -q
-  $ REPONAME=small-mon hgmn up -q master_bookmark
+  $ hg pull -q
+  $ hg up -q master_bookmark
   $ log -r master_bookmark
   @  after config change [public;rev=*;*] default/master_bookmark (glob)
   │

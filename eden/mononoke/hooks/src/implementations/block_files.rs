@@ -17,8 +17,8 @@ use serde::Deserialize;
 use crate::CrossRepoPushSource;
 use crate::FileHook;
 use crate::HookExecution;
-use crate::HookFileContentProvider;
 use crate::HookRejectionInfo;
+use crate::HookStateProvider;
 use crate::PushAuthoredBy;
 
 #[derive(Deserialize, Clone, Debug)]
@@ -51,7 +51,7 @@ impl FileHook for BlockFilesHook {
     async fn run<'this: 'change, 'ctx: 'this, 'change, 'fetcher: 'change, 'path: 'change>(
         &'this self,
         _ctx: &'ctx CoreContext,
-        _content_manager: &'fetcher dyn HookFileContentProvider,
+        _content_manager: &'fetcher dyn HookStateProvider,
         change: Option<&'change BasicFileChange>,
         path: &'path NonRootMPath,
         cross_repo_push_source: CrossRepoPushSource,
@@ -106,7 +106,9 @@ fn block_unacceptable_patterns<'a, 'b>(
 
 #[cfg(test)]
 mod test {
+    use mononoke_macros::mononoke;
     use mononoke_types::FileType;
+    use mononoke_types::GitLfs;
     use mononoke_types_mocks::contentid::TWOS_CTID;
 
     use super::*;
@@ -121,14 +123,14 @@ mod test {
     }
 
     fn basic_change() -> BasicFileChange {
-        BasicFileChange::new(TWOS_CTID, FileType::Regular, 10)
+        BasicFileChange::new(TWOS_CTID, FileType::Regular, 10, GitLfs::FullContent)
     }
 
     fn mpath(s: &str) -> NonRootMPath {
         NonRootMPath::new(s).unwrap()
     }
 
-    #[test]
+    #[mononoke::test]
     fn test_blocked_in_any_push() {
         let config = setup_config();
         let mp = mpath("all/1");
@@ -151,7 +153,7 @@ mod test {
         assert!(matches!(r, HookExecution::Rejected(_)));
     }
 
-    #[test]
+    #[mononoke::test]
     fn test_denied_only_in_native_push() {
         let config = setup_config();
         let mp = mpath("native/1");
@@ -174,7 +176,7 @@ mod test {
         assert!(matches!(r, HookExecution::Accepted));
     }
 
-    #[test]
+    #[mononoke::test]
     fn test_remove_denied_only_in_native_push() {
         let config = setup_config();
         let mp = mpath("native/1");
@@ -193,7 +195,7 @@ mod test {
         assert!(matches!(r, HookExecution::Accepted));
     }
 
-    #[test]
+    #[mononoke::test]
     fn test_allowed_in_any_push() {
         let config = setup_config();
         let mp = mpath("ababagalamaga");

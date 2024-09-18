@@ -25,10 +25,13 @@ use edenapi::SaplingRemoteApi;
 use edenapi_ext::check_files;
 use edenapi_ext::download_files;
 use edenapi_ext::upload_snapshot;
+use edenapi_types::cloud::SmartlogDataResponse;
 use edenapi_types::AlterSnapshotRequest;
 use edenapi_types::AlterSnapshotResponse;
 use edenapi_types::AnyFileContentId;
 use edenapi_types::BlameResult;
+use edenapi_types::CloudShareWorkspaceRequest;
+use edenapi_types::CloudShareWorkspaceResponse;
 use edenapi_types::CommitGraphEntry;
 use edenapi_types::CommitGraphSegmentsEntry;
 use edenapi_types::CommitHashLookupResponse;
@@ -46,21 +49,30 @@ use edenapi_types::FileResponse;
 use edenapi_types::FileSpec;
 use edenapi_types::FileType;
 use edenapi_types::GetReferencesParams;
+use edenapi_types::GetSmartlogByVersionParams;
+use edenapi_types::GetSmartlogParams;
 use edenapi_types::HgChangesetContent;
 use edenapi_types::HgMutationEntryContent;
+use edenapi_types::HistoricalVersionsParams;
+use edenapi_types::HistoricalVersionsResponse;
 use edenapi_types::HistoryEntry;
 use edenapi_types::Key;
 use edenapi_types::LandStackResponse;
-use edenapi_types::ReferencesData;
+use edenapi_types::ReferencesDataResponse;
+use edenapi_types::RenameWorkspaceRequest;
+use edenapi_types::RenameWorkspaceResponse;
 use edenapi_types::SetBookmarkResponse;
 use edenapi_types::SnapshotRawData;
 use edenapi_types::SuffixQueryResponse;
 use edenapi_types::TreeAttributes;
 use edenapi_types::TreeEntry;
+use edenapi_types::UpdateArchiveParams;
+use edenapi_types::UpdateArchiveResponse;
 use edenapi_types::UpdateReferencesParams;
 use edenapi_types::UploadSnapshotResponse;
 use edenapi_types::UploadToken;
-use edenapi_types::WorkspaceData;
+use edenapi_types::WorkspaceDataResponse;
+use edenapi_types::WorkspacesDataResponse;
 use futures::TryStreamExt;
 use minibytes::Bytes;
 use pyconfigloader::config;
@@ -87,8 +99,20 @@ py_class!(pub class client |py| {
         _cls,
         config: config,
         reponame: Option<String> = None,
+        path: Option<String> = None,
     ) -> PyResult<client> {
-        let config = config.get_cfg(py);
+        let mut config = config.get_cfg(py);
+        let mut reponame = reponame;
+
+        if let Some(path) = path {
+            if reponame.is_none() {
+                // This sets reponame properly for mononoke:// URLs.
+                reponame = repourl::repo_name_from_url(&config, &path);
+            }
+            // This is required for eager:// URLs.
+            config.set("paths", "default", Some(path), &"pyedenapi".into());
+        }
+
         let inner = Builder::from_config(&config)
             .map_pyerr(py)?
             .repo_name(reponame)
@@ -536,20 +560,28 @@ py_class!(pub class client |py| {
     }
 
     def cloudworkspace(&self, workspace: String, reponame : String)
-        -> PyResult<Serde<WorkspaceData>>
+        -> PyResult<Serde<WorkspaceDataResponse>>
     {
         self.inner(py).as_ref().cloud_workspace_py(workspace,reponame, py)
+    }
+
+    def cloudworkspaces(&self, prefix: String, reponame : String)
+        -> PyResult<Serde<WorkspacesDataResponse>>
+    {
+        self.inner(py).as_ref().cloud_workspaces_py(prefix,reponame, py)
     }
 
     def suffix_query(
         &self,
         commit: Serde<CommitId>,
         suffixes: Serde<Vec<String>>,
+        prefixes: Serde<Option<Vec<String>>>,
     ) -> PyResult<TStream<anyhow::Result<Serde<SuffixQueryResponse>>>> {
         let api = self.inner(py).as_ref();
         let suffix_query_response = py.allow_threads(|| block_unless_interrupted(api.suffix_query(
             commit.0,
-            suffixes.0)))
+            suffixes.0,
+            prefixes.0)))
             .map_pyerr(py)?
             .map_pyerr(py)?
             .entries;
@@ -557,15 +589,49 @@ py_class!(pub class client |py| {
     }
 
     def cloudreferences(&self, data: Serde<GetReferencesParams>)
-        -> PyResult<Serde<ReferencesData>>
+        -> PyResult<Serde<ReferencesDataResponse>>
     {
         self.inner(py).as_ref().cloud_references_py(data, py)
     }
 
     def cloudupdatereferences(&self, data: Serde<UpdateReferencesParams>)
-        -> PyResult<Serde<ReferencesData>>
+        -> PyResult<Serde<ReferencesDataResponse>>
     {
         self.inner(py).as_ref().cloud_update_references_py(data, py)
+    }
+
+    def cloudsmartlog(&self, data: Serde<GetSmartlogParams>)
+    -> PyResult<Serde<SmartlogDataResponse>>
+    {
+        self.inner(py).as_ref().cloud_smartlog_py(data, py)
+    }
+
+    def cloudshareworkspace(&self, data: Serde<CloudShareWorkspaceRequest>)
+    -> PyResult<Serde<CloudShareWorkspaceResponse>>
+    {
+        self.inner(py).as_ref().cloud_share_workspace_py(data, py)
+    }
+
+    def cloudupdatearchive(&self, data: Serde<UpdateArchiveParams>)
+    -> PyResult<Serde<UpdateArchiveResponse>>
+    {
+        self.inner(py).as_ref().cloud_update_archive_py(data, py)
+    }
+
+    def cloudrenameworkspace(&self, data: Serde<RenameWorkspaceRequest>) -> PyResult<Serde<RenameWorkspaceResponse>> {
+        self.inner(py).as_ref().cloud_rename_workspace_py(data, py)
+    }
+
+    def cloudsmartlogbyversion(&self, data: Serde<GetSmartlogByVersionParams>)
+    -> PyResult<Serde<SmartlogDataResponse>>
+    {
+        self.inner(py).as_ref().cloud_smartlog_by_version_py(data, py)
+    }
+
+    def cloudhistoricalversions(&self, data: Serde<HistoricalVersionsParams>)
+    -> PyResult<Serde<HistoricalVersionsResponse>>
+    {
+        self.inner(py).as_ref().cloud_historical_versions_py(data, py)
     }
 });
 

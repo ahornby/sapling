@@ -10,6 +10,7 @@ use std::collections::BTreeSet;
 use std::collections::HashSet;
 
 use async_trait::async_trait;
+use commit_cloud_types::WorkspaceData;
 use futures::future::try_join_all;
 use futures::try_join;
 use itertools::Itertools;
@@ -29,6 +30,7 @@ use mononoke_api::MetadataDiffFileInfo;
 use mononoke_api::MetadataDiffLinesCount;
 use mononoke_api::MononokeError;
 use mononoke_api::PushrebaseOutcome;
+use mononoke_api::Repo;
 use mononoke_api::RepoContext;
 use mononoke_api::TreeEntry;
 use mononoke_api::TreeId;
@@ -276,8 +278,27 @@ impl IntoResponse<thrift::Diff> for HeaderlessUnifiedDiff {
     }
 }
 
+impl IntoResponse<thrift::WorkspaceInfo> for WorkspaceData {
+    fn into_response(self) -> thrift::WorkspaceInfo {
+        thrift::WorkspaceInfo {
+            specifier: thrift::WorkspaceSpecifier {
+                name: self.name,
+                repo: thrift::RepoSpecifier {
+                    name: self.reponame,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            is_archived: self.archived,
+            latest_version: self.version as i64,
+            latest_timestamp: self.timestamp,
+            ..Default::default()
+        }
+    }
+}
+
 #[async_trait]
-impl AsyncIntoResponse<thrift::FilePathInfo> for &ChangesetPathContentContext {
+impl AsyncIntoResponse<thrift::FilePathInfo> for &ChangesetPathContentContext<Repo> {
     async fn into_response(self) -> Result<thrift::FilePathInfo, errors::ServiceError> {
         let (meta, type_) = try_join!(
             async {
@@ -307,7 +328,7 @@ impl AsyncIntoResponse<thrift::FilePathInfo> for &ChangesetPathContentContext {
 }
 
 #[async_trait]
-impl AsyncIntoResponse<thrift::TreePathInfo> for &ChangesetPathContentContext {
+impl AsyncIntoResponse<thrift::TreePathInfo> for &ChangesetPathContentContext<Repo> {
     async fn into_response(self) -> Result<thrift::TreePathInfo, errors::ServiceError> {
         let tree = self
             .tree()
@@ -324,7 +345,7 @@ impl AsyncIntoResponse<thrift::TreePathInfo> for &ChangesetPathContentContext {
 }
 
 #[async_trait]
-impl AsyncIntoResponseWith<thrift::CommitInfo> for ChangesetContext {
+impl AsyncIntoResponseWith<thrift::CommitInfo> for ChangesetContext<Repo> {
     /// The additional data is the set of commit identity schemes to be
     /// returned in the response.
     type Additional = BTreeSet<thrift::CommitIdentityScheme>;
@@ -334,13 +355,14 @@ impl AsyncIntoResponseWith<thrift::CommitInfo> for ChangesetContext {
         identity_schemes: &BTreeSet<thrift::CommitIdentityScheme>,
     ) -> Result<thrift::CommitInfo, errors::ServiceError> {
         async fn map_parent_identities(
-            changeset: &ChangesetContext,
+            changeset: &ChangesetContext<Repo>,
             identity_schemes: &BTreeSet<thrift::CommitIdentityScheme>,
         ) -> Result<Vec<BTreeMap<thrift::CommitIdentityScheme, thrift::CommitId>>, MononokeError>
         {
             let parents = changeset.parents().await?;
             let parent_id_mapping =
-                map_commit_identities(changeset.repo(), parents.clone(), identity_schemes).await?;
+                map_commit_identities(changeset.repo_ctx(), parents.clone(), identity_schemes)
+                    .await?;
             Ok(parents
                 .iter()
                 .map(|parent_id| {
@@ -363,6 +385,7 @@ impl AsyncIntoResponseWith<thrift::CommitInfo> for ChangesetContext {
             generation,
             committer_date,
             committer,
+            linear_depth,
         ) = try_join!(
             map_commit_identity(&self, identity_schemes),
             self.message(),
@@ -374,6 +397,7 @@ impl AsyncIntoResponseWith<thrift::CommitInfo> for ChangesetContext {
             self.generation(),
             self.committer_date(),
             self.committer(),
+            self.linear_depth(),
         )?;
         Ok(thrift::CommitInfo {
             ids,
@@ -392,6 +416,7 @@ impl AsyncIntoResponseWith<thrift::CommitInfo> for ChangesetContext {
             generation: generation.value() as i64,
             committer_date: committer_date.map(|date| date.timestamp()),
             committer,
+            linear_depth: Some(linear_depth as i64),
             ..Default::default()
         })
     }
@@ -399,7 +424,7 @@ impl AsyncIntoResponseWith<thrift::CommitInfo> for ChangesetContext {
 
 #[async_trait]
 impl AsyncIntoResponseWith<Vec<BTreeMap<thrift::CommitIdentityScheme, thrift::CommitId>>>
-    for Vec<ChangesetContext>
+    for Vec<ChangesetContext<Repo>>
 {
     /// The additional data is the set of commit identity schemes to be
     /// returned in the response.
@@ -413,7 +438,7 @@ impl AsyncIntoResponseWith<Vec<BTreeMap<thrift::CommitIdentityScheme, thrift::Co
         let res = try_join_all({
             let changesets_grouped_by_repo = self
                 .into_iter()
-                .map(|c| c.into_repo_and_id())
+                .map(|c| c.into_repo_ctx_and_id())
                 .into_group_map();
 
             changesets_grouped_by_repo
@@ -457,7 +482,7 @@ impl AsyncIntoResponseWith<thrift::PushrebaseOutcome> for PushrebaseOutcome {
     /// schemes to be returned in the response, and optionally a different set
     /// of commit identity schemes to use for the old commit ids.
     type Additional = (
-        RepoContext,
+        RepoContext<Repo>,
         BTreeSet<thrift::CommitIdentityScheme>,
         Option<BTreeSet<thrift::CommitIdentityScheme>>,
     );
@@ -527,7 +552,7 @@ impl AsyncIntoResponseWith<thrift::PushrebaseOutcome> for PushrebaseOutcome {
 }
 
 #[async_trait]
-impl AsyncIntoResponseWith<thrift::BookmarkInfo> for BookmarkInfo {
+impl AsyncIntoResponseWith<thrift::BookmarkInfo> for BookmarkInfo<Repo> {
     /// The additional data is the set of commit identity schemes to be
     /// returned in the response.
     type Additional = BTreeSet<thrift::CommitIdentityScheme>;

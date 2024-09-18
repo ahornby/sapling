@@ -11,11 +11,6 @@ import serverAPI from './ClientToServerAPI';
 import {Commit} from './Commit';
 import {FlexSpacer} from './ComponentUtils';
 import {EducationInfoTip} from './Education';
-import {ErrorNotice, InlineErrorBadge} from './ErrorNotice';
-import {Subtle} from './Subtle';
-import {Tooltip} from './Tooltip';
-import {Dropdown} from './components/Dropdown';
-import {TextField} from './components/TextField';
 import {T, t} from './i18n';
 import {writeAtom} from './jotaiUtils';
 import {CommitCloudChangeWorkspaceOperation} from './operations/CommitCloudChangeWorkspaceOperation';
@@ -26,10 +21,15 @@ import {CommitPreview, dagWithPreviews, useMostRecentPendingOperation} from './p
 import {RelativeDate} from './relativeDate';
 import {CommitCloudBackupStatus} from './types';
 import {registerDisposable} from './utils';
-import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
+import {Button} from 'isl-components/Button';
+import {Dropdown} from 'isl-components/Dropdown';
+import {ErrorNotice, InlineErrorBadge} from 'isl-components/ErrorNotice';
+import {Icon} from 'isl-components/Icon';
+import {Subtle} from 'isl-components/Subtle';
+import {TextField} from 'isl-components/TextField';
+import {Tooltip} from 'isl-components/Tooltip';
 import {atom, useAtom, useAtomValue} from 'jotai';
 import {useCallback, useEffect, useRef, useState} from 'react';
-import {Icon} from 'shared/Icon';
 import {notEmpty} from 'shared/utils';
 
 import './CommitCloud.css';
@@ -134,21 +134,21 @@ export function CommitCloudInfo() {
               </T>
             </Subtle>
             <FlexSpacer />
-            <VSCodeButton
+            <Button
               onClick={() => {
                 runOperation(new CommitCloudSyncOperation()).then(() => {
                   refreshCommitCloudStatus();
                 });
               }}
               disabled={isRunningSync}
-              appearance="icon">
+              icon>
               {isRunningSync ? (
                 <Icon icon="loading" slot="start" />
               ) : (
                 <Icon icon="sync" slot="start" />
               )}
               <T>Sync now</T>
-            </VSCodeButton>
+            </Button>
           </>
         )}
       </div>
@@ -185,8 +185,8 @@ export function CommitCloudInfo() {
                 options={cloudSyncState?.value.workspaceChoices ?? []}
               />
               {enteredWorkspaceName == null ? (
-                <VSCodeButton
-                  appearance="icon"
+                <Button
+                  icon
                   onClick={e => {
                     setEnteredWorkspaceName('');
                     e.preventDefault();
@@ -194,7 +194,7 @@ export function CommitCloudInfo() {
                   }}>
                   <Icon icon="plus" slot="start" />
                   <T>Add Workspace</T>
-                </VSCodeButton>
+                </Button>
               ) : (
                 <div className="commit-cloud-new-workspace-input">
                   <TextField
@@ -202,17 +202,16 @@ export function CommitCloudInfo() {
                     onInput={e => setEnteredWorkspaceName((e.target as HTMLInputElement).value)}>
                     <T>New Workspace Name</T>
                   </TextField>
-                  <VSCodeButton
-                    appearance="secondary"
+                  <Button
                     onClick={e => {
                       setEnteredWorkspaceName(null);
                       e.preventDefault();
                       e.stopPropagation();
                     }}>
                     <T>Cancel</T>
-                  </VSCodeButton>
-                  <VSCodeButton
-                    appearance="primary"
+                  </Button>
+                  <Button
+                    primary
                     disabled={!enteredWorkspaceName}
                     onClick={e => {
                       if (!enteredWorkspaceName) {
@@ -239,7 +238,7 @@ export function CommitCloudInfo() {
                       e.stopPropagation();
                     }}>
                     <T>Create</T>
-                  </VSCodeButton>
+                  </Button>
                 </div>
               )}
             </div>

@@ -5,8 +5,10 @@
  * GNU General Public License version 2.
  */
 
-use edenapi_types::HgId;
+use clientinfo::ClientRequestInfo;
+use commit_cloud_types::WorkspaceSnapshot;
 use mercurial_types::HgChangesetId;
+use sql::Transaction;
 
 use crate::sql::ops::Delete;
 use crate::sql::ops::Insert;
@@ -14,45 +16,40 @@ use crate::sql::snapshots_ops::DeleteArgs;
 use crate::CommitCloudContext;
 use crate::SqlCommitCloud;
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct WorkspaceSnapshot {
-    pub commit: HgChangesetId,
-}
-
 pub async fn update_snapshots(
     sql_commit_cloud: &SqlCommitCloud,
-    ctx: CommitCloudContext,
-    new_snapshots: Vec<HgId>,
-    removed_snapshots: Vec<HgId>,
-) -> anyhow::Result<()> {
+    mut txn: Transaction,
+    cri: Option<&ClientRequestInfo>,
+    ctx: &CommitCloudContext,
+    new_snapshots: Vec<HgChangesetId>,
+    removed_snapshots: Vec<HgChangesetId>,
+) -> anyhow::Result<Transaction> {
     if !removed_snapshots.is_empty() {
         let delete_args = DeleteArgs {
-            removed_commits: removed_snapshots
-                .into_iter()
-                .map(|id| id.into())
-                .collect::<Vec<HgChangesetId>>(),
+            removed_commits: removed_snapshots,
         };
 
-        Delete::<WorkspaceSnapshot>::delete(
+        txn = Delete::<WorkspaceSnapshot>::delete(
             sql_commit_cloud,
+            txn,
+            cri,
             ctx.reponame.clone(),
             ctx.workspace.clone(),
             delete_args,
         )
         .await?;
     }
-
     for snapshot in new_snapshots {
-        Insert::<WorkspaceSnapshot>::insert(
+        txn = Insert::<WorkspaceSnapshot>::insert(
             sql_commit_cloud,
+            txn,
+            cri,
             ctx.reponame.clone(),
             ctx.workspace.clone(),
-            WorkspaceSnapshot {
-                commit: snapshot.into(),
-            },
+            WorkspaceSnapshot { commit: snapshot },
         )
         .await?;
     }
 
-    Ok(())
+    Ok(txn)
 }

@@ -15,7 +15,7 @@
 #include <string_view>
 
 #include "eden/fs/store/ObjectFetchContext.h"
-#include "eden/scm/lib/backingstore/src/ffi.rs.h" // @manual
+#include "eden/scm/lib/backingstore/src/ffi.rs.h"
 
 namespace folly {
 class IOBuf;
@@ -84,6 +84,16 @@ class SaplingNativeBackingStore {
       folly::FunctionRef<void(size_t, folly::Try<std::shared_ptr<Tree>>)>
           resolve);
 
+  folly::Try<std::shared_ptr<TreeAuxData>> getTreeMetadata(
+      NodeId node,
+      bool local);
+
+  void getTreeMetadataBatch(
+      SaplingRequestRange requests,
+      sapling::FetchMode fetch_mode,
+      folly::FunctionRef<void(size_t, folly::Try<std::shared_ptr<TreeAuxData>>)>
+          resolve);
+
   folly::Try<std::unique_ptr<folly::IOBuf>> getBlob(
       NodeId node,
       sapling::FetchMode fetchMode);
@@ -103,6 +113,10 @@ class SaplingNativeBackingStore {
       sapling::FetchMode fetch_mode,
       folly::FunctionRef<void(size_t, folly::Try<std::shared_ptr<FileAuxData>>)>
           resolve);
+
+  folly::Try<std::shared_ptr<GlobFilesResponse>> getGlobFiles(
+      std::string_view commit_id,
+      const std::vector<std::string>& suffixes);
 
   void flush();
 

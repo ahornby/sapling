@@ -12,28 +12,30 @@ use megarepo_config::MononokeMegarepoConfigs;
 use megarepo_config::SyncTargetConfig;
 use megarepo_config::Target;
 use megarepo_error::MegarepoError;
+use metaconfig_types::RepoConfigArc;
 use mononoke_api::Mononoke;
+use mononoke_api::MononokeRepo;
 use mononoke_types::ChangesetId;
 
 use crate::common::find_target_sync_config;
 use crate::common::MegarepoOp;
 
 // Create a new sync target
-pub struct AddBranchingSyncTarget<'a> {
+pub struct AddBranchingSyncTarget<'a, R> {
     pub megarepo_configs: &'a Arc<dyn MononokeMegarepoConfigs>,
-    pub mononoke: &'a Arc<Mononoke>,
+    pub mononoke: &'a Arc<Mononoke<R>>,
 }
 
-impl<'a> MegarepoOp for AddBranchingSyncTarget<'a> {
-    fn mononoke(&self) -> &Arc<Mononoke> {
+impl<'a, R> MegarepoOp<R> for AddBranchingSyncTarget<'a, R> {
+    fn mononoke(&self) -> &Arc<Mononoke<R>> {
         self.mononoke
     }
 }
 
-impl<'a> AddBranchingSyncTarget<'a> {
+impl<'a, R: MononokeRepo> AddBranchingSyncTarget<'a, R> {
     pub fn new(
         megarepo_configs: &'a Arc<dyn MononokeMegarepoConfigs>,
-        mononoke: &'a Arc<Mononoke>,
+        mononoke: &'a Arc<Mononoke<R>>,
     ) -> Self {
         Self {
             megarepo_configs,
@@ -50,12 +52,13 @@ impl<'a> AddBranchingSyncTarget<'a> {
         let repo = self
             .find_repo_by_id(ctx, sync_target_config.target.repo_id)
             .await?;
+        let repo_config = repo.repo().repo_config_arc();
         let bookmark = sync_target_config.target.bookmark.clone();
 
         self.megarepo_configs
-            .add_config_version(ctx.clone(), sync_target_config)
+            .add_config_version(ctx.clone(), repo_config, sync_target_config)
             .await?;
-        self.create_bookmark(ctx, repo.inner_repo(), bookmark, branching_point)
+        self.create_bookmark(ctx, repo.repo(), bookmark, branching_point)
             .await?;
         Ok(branching_point)
     }
@@ -71,7 +74,7 @@ impl<'a> AddBranchingSyncTarget<'a> {
 
         let (_, sync_target_config) = find_target_sync_config(
             ctx,
-            repo.inner_repo(),
+            repo.repo(),
             branching_point,
             &source_target,
             self.megarepo_configs,

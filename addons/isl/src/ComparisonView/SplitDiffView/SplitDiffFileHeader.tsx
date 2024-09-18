@@ -9,12 +9,12 @@ import type {EnsureAssignedTogether} from 'shared/EnsureAssignedTogether';
 import type {DiffType} from 'shared/patch/parse';
 import type {RepoPath} from 'shared/types/common';
 
-import {Tooltip} from '../../Tooltip';
 import {t} from '../../i18n';
 import platform from '../../platform';
-import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
+import {Button} from 'isl-components/Button';
+import {Icon} from 'isl-components/Icon';
+import {Tooltip} from 'isl-components/Tooltip';
 import React from 'react';
-import {Icon} from 'shared/Icon';
 
 import './SplitDiffHunk.css';
 
@@ -128,13 +128,13 @@ export function FileHeader({
       className={`split-diff-view-file-header file-header-${open ? 'open' : 'collapsed'}`}
       style={{color}}>
       {onChangeOpen && (
-        <VSCodeButton
-          appearance="icon"
+        <Button
+          icon
           className="split-diff-view-file-header-open-button"
           data-testid={`split-diff-view-file-header-${open ? 'collapse' : 'expand'}-button`}
           onClick={() => onChangeOpen(!open)}>
           <Icon icon={open ? 'chevron-down' : 'chevron-right'} />
-        </VSCodeButton>
+        </Button>
       )}
       {iconType !== undefined && (
         <Tooltip title={iconTypeToTooltip[iconType]}>

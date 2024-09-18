@@ -72,6 +72,11 @@ cpp_binary(
             "/STACK:2097152",  # This was picked arbitrarily as 2 MB
         ],
     }),
+    metadata = {
+        "buck.cfg_modifiers": [
+            "fbcode//eden/scm/lib/backingstore:edenfs-include-cas",
+        ],
+    },
     os_deps = [
         (
             "linux",
@@ -96,6 +101,7 @@ cpp_binary(
         "//blake3:blake3-constants-cpp2-types",
         "//common/base:build_info",
         "//common/fbwhoami:fb_who_am_i",
+        "//common/init:light",
         "//common/network:hostname",
         "//common/services/cpp:build_values",
         "//eden/fs/config:config",
@@ -210,54 +216,15 @@ cpp_library(
 )
 
 cpp_library(
-    name = "edenfs_smartplatform_service",
-    srcs = [
-        "facebook/EdenFSSmartPlatformServiceEndpoint.cpp",
-    ],
-    headers = [
-        "facebook/EdenFSSmartPlatformServiceEndpoint.h",
-    ],
-    os_deps = [
-        (
-            "linux",
-            [
-                "//servicerouter/client/cpp2:cpp2",
-                "//smart/edenfs/edenfs_service:service-if-cpp2-clients",
-            ],
-        ),
-        (
-            "macos",
-            [
-                "//c2p/secure_thrift/cpp/client:secure_thrift",
-                "//smart/edenfs/edenfs_service:service-if-cpp2-clients",
-            ],
-        ),
-        (
-            "windows",
-            [
-                "//eden/fs/prjfs:prjfs",
-            ],
-        ),
-    ],
-    deps = [
-        "//eden/common/utils:utils",
-        "//eden/fs/config:config",
-        "//folly/logging:logging",
-    ],
-    exported_deps = [
-        ":usage_service",
-        "//eden/fs:config",
-        "//folly/futures:core",
-    ],
-)
-
-cpp_library(
     name = "startup_logger",
     srcs = [
         "StartupLogger.cpp",
     ],
     headers = [
         "StartupLogger.h",
+    ],
+    compiler_flags = [
+        "-D_GNU_SOURCE",
     ],
     deps = [
         ":init",
@@ -352,18 +319,22 @@ cpp_library(
         (
             "linux",
             [
-                ":edenfs_smartplatform_service",
+                "//eden/fs/service/facebook:edenfs_smartplatform_service",
+                "//eden/fs/service/facebook:server_observer",
             ],
         ),
         (
             "macos",
             [
-                ":edenfs_smartplatform_service",
+                "//eden/fs/service/facebook:edenfs_smartplatform_service",
+                "//eden/fs/service/facebook:server_observer",
             ],
         ),
         (
             "windows",
             [
+                "//eden/fs/service/facebook:edenfs_smartplatform_service",
+                "//eden/fs/service/facebook:server_observer",
                 "//eden/fs/notifications:windows_notifier",
             ],
         ),
@@ -382,6 +353,7 @@ cpp_library(
         "//eden/common/telemetry:log_info",
         "//eden/common/telemetry:structured_logger_factory",
         "//eden/common/utils:enum",
+        "//eden/common/utils:fault_injector",
         "//eden/common/utils:file_utils",
         "//eden/common/utils:process_info_cache",
         "//eden/common/utils:string",
@@ -424,16 +396,22 @@ cpp_library(
         "//folly:stop_watch",
         "//folly:string",
         "//folly/chrono:conv",
+        "//folly/executors:cpu_thread_pool_executor",
         "//folly/executors:serial_executor",
+        "//folly/executors/thread_factory:named_thread_factory",
         "//folly/futures:core",
         "//folly/io/async:async_signal_handler",
         "//folly/logging:logging",
         "//folly/portability:gflags",
+        "//folly/portability:sys_types",
         "//thrift/lib/cpp/concurrency:thread_manager",
         "//thrift/lib/cpp/util:enum_utils",
         "//thrift/lib/cpp2:server",
         "//thrift/lib/cpp2/async:server_stream",
         "//thrift/lib/cpp2/server:cpp2_conn_context",
+        "//thrift/lib/cpp2/server:parallel_concurrency_controller",
+        "//thrift/lib/cpp2/server:round_robin_request_pile",
+        "//thrift/lib/cpp2/server:separallel_concurrency_controller",
     ],
     exported_deps = [
         ":thrift-cpp2-types",
@@ -557,7 +535,7 @@ cpp_library(
     deps = [
         ":thrift-cpp2-types",
         "//eden/common/utils:utils",
-        "//eden/fs/inodes:inodes",
+        "//eden/fs/config:config",
         "//eden/fs/model:model",
         "//eden/fs/store:context",
         "//eden/fs/store:store",
@@ -568,6 +546,7 @@ cpp_library(
     exported_deps = [
         "//eden/common/utils:immediate_future",
         "//eden/common/utils:ref_ptr",
+        "//eden/fs/inodes:inodes",
         "//eden/fs/utils:glob",
         "//folly:range",
     ],

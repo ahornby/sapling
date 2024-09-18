@@ -6,6 +6,7 @@
  */
 
 use std::iter::Iterator;
+use std::sync::Arc;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -13,24 +14,23 @@ use async_trait::async_trait;
 use blobstore::Blobstore;
 use blobstore::Loadable;
 use bytes::Bytes;
-use bytes::BytesMut;
 use context::CoreContext;
-use futures::Stream;
+use futures::stream::BoxStream;
+use futures::StreamExt;
 use futures::TryStreamExt;
 use gix_hash::ObjectId;
 use metaconfig_types::GitDeltaManifestVersion;
+use mononoke_types::hash::GitSha1;
 use mononoke_types::hash::RichGitSha1;
 use mononoke_types::path::MPath;
 use mononoke_types::ChangesetId;
 use repo_derived_data::RepoDerivedData;
 
-use crate::delta::DeltaInstructionChunkIdPrefix;
-use crate::delta_manifest::GitDeltaManifest;
-use crate::delta_manifest::ObjectKind;
-use crate::fetch_delta_instructions;
-use crate::GitDeltaManifestEntry;
-use crate::ObjectDelta;
-use crate::RootGitDeltaManifestId;
+use crate::delta_manifest_v2::GDMV2DeltaEntry;
+use crate::delta_manifest_v2::GDMV2Entry;
+use crate::delta_manifest_v2::GitDeltaManifestV2;
+use crate::delta_manifest_v2::ObjectKind;
+use crate::RootGitDeltaManifestV2Id;
 
 /// Fetches GitDeltaManifest for a given changeset with the given version.
 /// Derives the GitDeltaManifest if not present.
@@ -40,65 +40,65 @@ pub async fn fetch_git_delta_manifest(
     blobstore: &impl Blobstore,
     git_delta_manifest_version: GitDeltaManifestVersion,
     cs_id: ChangesetId,
-) -> Result<impl GitDeltaManifestOps + Send + Sync> {
+) -> Result<Box<dyn GitDeltaManifestOps + Send + Sync>> {
     match git_delta_manifest_version {
-        GitDeltaManifestVersion::V1 => {
+        GitDeltaManifestVersion::V2 => {
             let root_mf_id = derived_data
-                .derive::<RootGitDeltaManifestId>(ctx, cs_id)
+                .derive::<RootGitDeltaManifestV2Id>(ctx, cs_id)
                 .await
                 .with_context(|| {
                     format!(
-                        "Error in deriving RootGitDeltaManifestId for changeset {:?}",
+                        "Error in deriving RootGitDeltaManifestV2Id for changeset {:?}",
                         cs_id
                     )
                 })?;
 
-            Ok(root_mf_id
-                .manifest_id()
-                .load(ctx, blobstore)
-                .await
-                .with_context(|| {
-                    format!(
-                        "Error in loading Git Delta Manifest from root id {:?}",
-                        root_mf_id
-                    )
-                })?)
+            Ok(Box::new(
+                root_mf_id
+                    .manifest_id()
+                    .load(ctx, blobstore)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Error in loading GitDeltaManifestV2 from root id {:?}",
+                            root_mf_id
+                        )
+                    })?,
+            ))
         }
     }
 }
 
 /// Trait representing a version of GitDeltaManifest.
 pub trait GitDeltaManifestOps {
-    /// The type of the subentries of the GitDeltaManifest.
-    type GitDeltaManifestEntryType: GitDeltaManifestEntryOps + Send + Sync;
-
-    /// Returns a stream of the subentries of the GitDeltaManifest. There should
+    /// Returns a stream of the entries of the GitDeltaManifest. There should
     /// be an entry for each object at a path that differs from the corresponding
     /// object at the same path in one of the parents.
-    fn into_subentries<'a>(
-        self,
+    fn into_entries<'a>(
+        self: Box<Self>,
         ctx: &'a CoreContext,
-        blobstore: &'a impl Blobstore,
-    ) -> impl Stream<Item = Result<(MPath, Self::GitDeltaManifestEntryType)>> + Send + 'a;
+        blobstore: &'a Arc<dyn Blobstore>,
+    ) -> BoxStream<'a, Result<(MPath, Box<dyn GitDeltaManifestEntryOps + Send>)>>;
 }
 
-impl GitDeltaManifestOps for GitDeltaManifest {
-    type GitDeltaManifestEntryType = GitDeltaManifestEntry;
-
-    fn into_subentries<'a>(
-        self,
+impl GitDeltaManifestOps for GitDeltaManifestV2 {
+    fn into_entries<'a>(
+        self: Box<Self>,
         ctx: &'a CoreContext,
-        blobstore: &'a impl Blobstore,
-    ) -> impl Stream<Item = Result<(MPath, GitDeltaManifestEntry)>> + Send + 'a {
-        GitDeltaManifest::into_subentries(self, ctx, blobstore)
+        blobstore: &'a Arc<dyn Blobstore>,
+    ) -> BoxStream<'a, Result<(MPath, Box<dyn GitDeltaManifestEntryOps + Send>)>> {
+        GitDeltaManifestV2::into_entries(*self, ctx, blobstore)
+            .map_ok(
+                |(path, entry)| -> (_, Box<dyn GitDeltaManifestEntryOps + Send>) {
+                    (path, Box::new(entry))
+                },
+            )
+            .boxed()
     }
 }
 
 /// Trait representing a subentry of a GitDeltaManifest.
 pub trait GitDeltaManifestEntryOps {
-    /// The type of the deltas of the subentry.
-    type ObjectDeltaType: ObjectDeltaOps + Clone + Send + Sync;
-
     /// Returns the size of the full object.
     fn full_object_size(&self) -> u64;
 
@@ -109,33 +109,44 @@ pub trait GitDeltaManifestEntryOps {
     fn full_object_kind(&self) -> ObjectKind;
 
     /// Returns the RichGitSha1 of the full object.
-    fn full_object_rich_git_sha1(&self) -> Result<RichGitSha1>;
+    fn full_object_rich_git_sha1(&self) -> Result<RichGitSha1> {
+        let sha1 = GitSha1::from_bytes(self.full_object_oid().as_bytes())?;
+        let ty = match self.full_object_kind() {
+            ObjectKind::Blob => "blob",
+            ObjectKind::Tree => "tree",
+        };
+        Ok(RichGitSha1::from_sha1(sha1, ty, self.full_object_size()))
+    }
+
+    fn full_object_inlined_bytes(&self) -> Option<Bytes>;
 
     /// Returns an iterator over the deltas of the subentry.
-    fn deltas(&self) -> impl Iterator<Item = &Self::ObjectDeltaType>;
+    fn deltas(&self) -> Box<dyn Iterator<Item = &(dyn ObjectDeltaOps + Sync)> + '_>;
 }
 
-impl GitDeltaManifestEntryOps for GitDeltaManifestEntry {
-    type ObjectDeltaType = ObjectDelta;
-
+impl GitDeltaManifestEntryOps for GDMV2Entry {
     fn full_object_size(&self) -> u64 {
-        self.full.size
+        self.full_object.size
     }
 
     fn full_object_oid(&self) -> ObjectId {
-        self.full.oid
+        self.full_object.oid
     }
 
     fn full_object_kind(&self) -> ObjectKind {
-        self.full.kind
+        self.full_object.kind
     }
 
-    fn full_object_rich_git_sha1(&self) -> Result<RichGitSha1> {
-        self.full.as_rich_git_sha1()
+    fn full_object_inlined_bytes(&self) -> Option<Bytes> {
+        self.full_object.inlined_bytes.clone()
     }
 
-    fn deltas(&self) -> impl Iterator<Item = &ObjectDelta> {
-        self.deltas.iter()
+    fn deltas(&self) -> Box<dyn Iterator<Item = &(dyn ObjectDeltaOps + Sync)> + '_> {
+        Box::new(
+            self.deltas
+                .iter()
+                .map(|delta| delta as &(dyn ObjectDeltaOps + Sync)),
+        )
     }
 }
 
@@ -164,64 +175,49 @@ pub trait ObjectDeltaOps {
     async fn instruction_bytes(
         &self,
         ctx: &CoreContext,
-        blobstore: &impl Blobstore,
+        blobstore: &Arc<dyn Blobstore>,
         cs_id: ChangesetId,
         path: MPath,
     ) -> Result<Bytes>;
 }
 
 #[async_trait]
-impl ObjectDeltaOps for ObjectDelta {
+impl ObjectDeltaOps for GDMV2DeltaEntry {
     fn instructions_uncompressed_size(&self) -> u64 {
-        self.instructions_uncompressed_size
+        self.instructions.uncompressed_size
     }
 
     fn instructions_compressed_size(&self) -> u64 {
-        self.instructions_compressed_size
+        self.instructions.compressed_size
     }
 
     fn base_object_oid(&self) -> ObjectId {
-        self.base.oid
+        self.base_object.oid
     }
 
     fn base_object_path(&self) -> &MPath {
-        &self.base.path
+        &self.base_object_path
     }
 
     fn base_object_kind(&self) -> ObjectKind {
-        self.base.kind
+        self.base_object.kind
     }
 
     fn base_object_size(&self) -> u64 {
-        self.base.size
+        self.base_object.size
     }
 
     async fn instruction_bytes(
         &self,
         ctx: &CoreContext,
-        blobstore: &impl Blobstore,
-        cs_id: ChangesetId,
-        path: MPath,
+        blobstore: &Arc<dyn Blobstore>,
+        _cs_id: ChangesetId,
+        _path: MPath,
     ) -> Result<Bytes> {
-        let chunk_id_prefix =
-            DeltaInstructionChunkIdPrefix::new(cs_id, path.clone(), self.origin, path);
-        let bytes = fetch_delta_instructions(
-            ctx,
-            blobstore,
-            &chunk_id_prefix,
-            self.instructions_chunk_count,
-        )
-        .try_fold(
-            BytesMut::with_capacity(self.instructions_compressed_size as usize),
-            |mut acc, bytes| async move {
-                acc.extend_from_slice(bytes.as_ref());
-                anyhow::Ok(acc)
-            },
-        )
-        .await
-        .context("Error in fetching delta instruction bytes from byte stream")?
-        .freeze();
-
-        Ok(bytes)
+        self.instructions
+            .instruction_bytes
+            .clone()
+            .into_raw_bytes(ctx, blobstore)
+            .await
     }
 }

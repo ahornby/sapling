@@ -16,13 +16,13 @@ setup configuration
 setup repo
   $ start_and_wait_for_mononoke_server
   $ cd $TESTTMP
-  $ hgmn_init repo
+  $ hg clone -q mono:repo repo
   $ cd repo
   $ echo B > B
   $ hg add B
   $ hg ci -m 'B'
-  $ hgmn push -r . --to master_bookmark --create
-  pushing rev c0e1f5917744 to destination mononoke://$LOCALIP:$LOCAL_PORT/repo bookmark master_bookmark
+  $ hg push -r . --to master_bookmark --create
+  pushing rev c0e1f5917744 to destination mono:repo bookmark master_bookmark
   searching for changes
   exporting bookmark master_bookmark
 
@@ -55,6 +55,7 @@ upload C as it wasn't imported
   >         "inner": {
   >           "content_id": "2b574f3e5fdc3151a85d8982a46b82d91fa0ef0bb15224fac5a25488b69d38eb",
   >           "file_type": "Regular",
+  >           "git_lfs": "FullContent",
   >           "size": 2
   >         },
   >         "copy_from": null
@@ -65,6 +66,7 @@ upload C as it wasn't imported
   >         "inner": {
   >           "content_id": "122e93be74ea1962717796ad5b1f4a428f431d4d4f9674846443f1e91a690b14",
   >           "file_type": "Regular",
+  >           "git_lfs": "FullContent",
   >           "size": 2
   >         },
   >         "copy_from": null

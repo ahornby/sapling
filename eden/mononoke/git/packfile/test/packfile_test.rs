@@ -14,12 +14,11 @@ use flate2::write::ZlibDecoder;
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use futures::stream;
-use git_types::DeltaInstructions;
-use gix_diff::blob::Algorithm;
 use gix_hash::ObjectId;
 use gix_object::Object;
 use gix_object::ObjectRef;
 use gix_object::Tag;
+use mononoke_macros::mononoke;
 use packfile::bundle::BundleWriter;
 use packfile::pack::DeltaForm;
 use packfile::pack::PackfileWriter;
@@ -48,7 +47,7 @@ async fn get_objects_stream(
     }))?);
     let tree_bytes = Bytes::from(to_vec_bytes(&gix_object::Object::Tree(gix_object::Tree {
         entries: vec![gix_object::tree::Entry {
-            mode: gix_object::tree::EntryMode::Blob,
+            mode: gix_object::tree::EntryKind::Blob.into(),
             filename: "JustAFile.txt".into(),
             oid: ObjectId::empty_blob(gix_hash::Kind::Sha1),
         }],
@@ -71,10 +70,8 @@ async fn get_objects_stream(
             .hash()
             .to_owned();
         let tag_hash = BaseObject::new(tag_bytes.clone())?.hash().to_owned();
-        let delta_instructions =
-            DeltaInstructions::generate(tag_bytes, another_tag_bytes, Algorithm::Myers)?;
-        let mut raw_instructions = Vec::new();
-        delta_instructions.write(&mut raw_instructions).await?;
+
+        let raw_instructions = git_delta::git_delta(&tag_bytes, &another_tag_bytes, 1_000_000)?;
         let decompressed_size = raw_instructions.len() as u64;
         let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
         encoder.write_all(&raw_instructions)?;
@@ -91,7 +88,7 @@ async fn get_objects_stream(
     Ok(objects_stream)
 }
 
-#[test]
+#[mononoke::test]
 fn validate_packitem_creation() -> anyhow::Result<()> {
     // Create a Git object
     let tag = Tag {
@@ -110,7 +107,7 @@ fn validate_packitem_creation() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[test]
+#[mononoke::test]
 fn validate_packfile_item_encoding() -> anyhow::Result<()> {
     // Create a Git object
     let tag = Tag {
@@ -142,7 +139,7 @@ fn validate_packfile_item_encoding() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn validate_basic_packfile_generation() -> anyhow::Result<()> {
     let objects_stream = get_objects_stream(false).await?;
     let concurrency = 100;
@@ -159,7 +156,7 @@ async fn validate_basic_packfile_generation() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn validate_packfile_generation_format() -> anyhow::Result<()> {
     // Create a few Git objects
     let objects_stream = get_objects_stream(false).await?;
@@ -194,14 +191,17 @@ async fn validate_packfile_generation_format() -> anyhow::Result<()> {
     assert_eq!(opened_packfile.data_len(), size as usize);
     // Verify the checksum of the packfile
     let checksum_from_file = opened_packfile
-        .verify_checksum(gix_features::progress::Discard, &AtomicBool::new(false))
+        .verify_checksum(
+            &mut gix_features::progress::Discard,
+            &AtomicBool::new(false),
+        )
         .expect("Expected successful checksum computation");
     // Verify the checksum matches the hash generated when computing the packfile
     assert_eq!(checksum, checksum_from_file);
     Ok(())
 }
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn validate_staggered_packfile_generation() -> anyhow::Result<()> {
     let concurrency = 100;
     let mut packfile_writer =
@@ -230,7 +230,7 @@ async fn validate_staggered_packfile_generation() -> anyhow::Result<()> {
         .expect("Expected successful write of object to packfile");
     let tree_bytes = Bytes::from(to_vec_bytes(&gix_object::Object::Tree(gix_object::Tree {
         entries: vec![gix_object::tree::Entry {
-            mode: gix_object::tree::EntryMode::Blob,
+            mode: gix_object::tree::EntryKind::Blob.into(),
             filename: "JustAFile.txt".into(),
             oid: ObjectId::empty_blob(gix_hash::Kind::Sha1),
         }],
@@ -264,14 +264,17 @@ async fn validate_staggered_packfile_generation() -> anyhow::Result<()> {
     assert_eq!(opened_packfile.data_len(), size as usize);
     // Verify the checksum of the packfile
     let checksum_from_file = opened_packfile
-        .verify_checksum(gix_features::progress::Discard, &AtomicBool::new(false))
+        .verify_checksum(
+            &mut gix_features::progress::Discard,
+            &AtomicBool::new(false),
+        )
         .expect("Expected successful checksum computation");
     // Verify the checksum matches the hash generated when computing the packfile
     assert_eq!(checksum, checksum_from_file);
     Ok(())
 }
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn validate_roundtrip_packfile_generation() -> anyhow::Result<()> {
     // Create a few Git objects
     let objects_stream = get_objects_stream(false).await?;
@@ -311,7 +314,7 @@ async fn validate_roundtrip_packfile_generation() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn validate_delta_packfile_generation() -> anyhow::Result<()> {
     // Create a few Git objects along with delta variants
     let objects_stream = get_objects_stream(true).await?;
@@ -349,7 +352,7 @@ async fn validate_delta_packfile_generation() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn validate_basic_bundle_generation() -> anyhow::Result<()> {
     // Create a few Git objects
     let objects_stream = get_objects_stream(false).await?;
@@ -382,7 +385,7 @@ async fn validate_basic_bundle_generation() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[fbinit::test]
+#[mononoke::fbinit_test]
 async fn validate_staggered_bundle_generation() -> anyhow::Result<()> {
     let refs = vec![(
         "HEAD".to_owned(),

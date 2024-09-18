@@ -18,6 +18,8 @@ from typing import Dict, List, Optional, Pattern, Tuple, Union
 
 from facebook.eden.ttypes import (
     Blake3OrError,
+    DigestHashOrError,
+    DigestSizeOrError,
     DirListAttributeDataOrError,
     EdenError,
     EdenErrorType,
@@ -55,6 +57,8 @@ ALL_ATTRIBUTES = (
     | FileAttributes.SOURCE_CONTROL_TYPE
     | FileAttributes.OBJECT_ID
     | FileAttributes.BLAKE3_HASH
+    | FileAttributes.DIGEST_SIZE
+    | FileAttributes.DIGEST_HASH
 )
 
 
@@ -68,20 +72,21 @@ class RawObjectId:
 
 
 @testcase.eden_repo_test
-# pyre-fixme[13]: Attribute `commit1` is never initialized.
-# pyre-fixme[13]: Attribute `commit2` is never initialized.
-# pyre-fixme[13]: Attribute `commit3` is never initialized.
 class ReaddirTest(testcase.EdenRepoTest):
-    commit1: str
-    commit2: str
-    commit3: str
+    commit1: str = ""
+    commit2: str = ""
+    commit3: str = ""
 
-    adir_file_id: bytes
-    bdir_file_id: bytes
-    hello_id: bytes
-    slink_id: bytes
-    adir_id: bytes
-    cdir_subdir_id: bytes
+    adir_file_id: bytes = b""
+    bdir_file_id: bytes = b""
+    hello_id: bytes = b""
+    slink_id: bytes = b""
+    adir_id: bytes = b""
+    adir_digest_size_result: DigestSizeOrError = DigestSizeOrError()
+    adir_digest_hash_result: DigestHashOrError = DigestHashOrError()
+    cdir_subdir_id: bytes = b""
+    cdir_subdir_digest_size_result: DigestSizeOrError = DigestSizeOrError()
+    cdir_subdir_digest_hash_result: DigestHashOrError = DigestHashOrError()
 
     def setup_eden_test(self) -> None:
         self.enable_windows_symlinks = True
@@ -169,6 +174,11 @@ class ReaddirTest(testcase.EdenRepoTest):
         self.repo.write_file("bdir/file", "bar!\n")
         self.commit3 = self.repo.commit("Commit 3.")
 
+        # Eagerepo requires commits to be pushed to the server so that
+        # aux data can be derived for trees
+        if self.repo_type in ["hg", "filteredhg"]:
+            self.repo.push(rev=".", target="master", create=True)
+
         self.adir_file_id = {
             "hg": self.convert_raw_oid_to_foid(
                 RawObjectId(
@@ -219,6 +229,32 @@ class ReaddirTest(testcase.EdenRepoTest):
             "git": b"aa0e79d49fe12527662d2d73ea839691eb472c9a",
         }[self.repo_type]
 
+        # There is no easy way to compute the blake3/size of a directory on the fly (in Python)
+        # Since these hashes/sizes should stay constant, we can just hardcode the expected result
+        adir_digest_size = 207
+        adir_blake3 = b"\x73\xf0\xc6\xe3\x6b\x3c\xb9\xfc\x64\xa8\xa3\x39\x24\x57\xd3\xc9\xd0\x2d\x11\xfd\x22\xe5\x36\x71\x94\x5d\x95\x3f\xfa\xc3\x8c\x92"
+        self.adir_digest_size_result = {
+            "hg": DigestSizeOrError(adir_digest_size),
+            "filteredhg": DigestSizeOrError(adir_digest_size),
+            "git": DigestSizeOrError(
+                error=EdenError(
+                    message="std::domain_error: getTreeMetadata is not implemented for GitBackingStores",
+                    errorType=EdenErrorType.GENERIC_ERROR,
+                )
+            ),
+        }[self.repo_type]
+
+        self.adir_digest_hash_result = {
+            "hg": DigestHashOrError(adir_blake3),
+            "filteredhg": DigestHashOrError(adir_blake3),
+            "git": DigestHashOrError(
+                error=EdenError(
+                    message="std::domain_error: getTreeMetadata is not implemented for GitBackingStores",
+                    errorType=EdenErrorType.GENERIC_ERROR,
+                )
+            ),
+        }[self.repo_type]
+
         self.cdir_subdir_id = {
             "hg": self.convert_raw_oid_to_foid(
                 RawObjectId(
@@ -227,6 +263,32 @@ class ReaddirTest(testcase.EdenRepoTest):
                 )
             ),
             "git": b"f5497927ddcc19b41c4ca57e01ff99339f93db13",
+        }[self.repo_type]
+
+        # There is no easy way to compute the blake3/size of a directory on the fly (in Python)
+        # Since these hashes/sizes should stay constant, we can just hardcode the expected result
+        cdir_subdir_digest_size = 211
+        cdir_subdir_blake3 = b"\x2f\xe0\x36\xd6\xf0\x6a\xf6\xb5\x60\xe7\xe1\xf4\x95\x1c\x9c\xd7\xf1\x62\x08\x32\xa2\xee\xb8\x42\x16\x9b\xd4\xe7\x7b\x83\x0a\x94"
+        self.cdir_subdir_digest_size_result = {
+            "hg": DigestSizeOrError(cdir_subdir_digest_size),
+            "filteredhg": DigestSizeOrError(cdir_subdir_digest_size),
+            "git": DigestSizeOrError(
+                error=EdenError(
+                    message="std::domain_error: getTreeMetadata is not implemented for GitBackingStores",
+                    errorType=EdenErrorType.GENERIC_ERROR,
+                )
+            ),
+        }[self.repo_type]
+
+        self.cdir_subdir_digest_hash_result = {
+            "hg": DigestHashOrError(cdir_subdir_blake3),
+            "filteredhg": DigestHashOrError(cdir_subdir_blake3),
+            "git": DigestHashOrError(
+                error=EdenError(
+                    message="std::domain_error: getTreeMetadata is not implemented for GitBackingStores",
+                    errorType=EdenErrorType.GENERIC_ERROR,
+                )
+            ),
         }[self.repo_type]
 
     def assert_eden_error(
@@ -277,6 +339,8 @@ class ReaddirTest(testcase.EdenRepoTest):
             Optional[SourceControlType],
             Optional[bytes],
             Optional[bytes],
+            Optional[int],
+            Optional[bytes],
         ],
     ) -> Tuple[FileAttributeDataOrError, FileAttributeDataOrErrorV2]:
         (
@@ -285,6 +349,8 @@ class ReaddirTest(testcase.EdenRepoTest):
             raw_type,
             raw_object_id,
             raw_blake3,
+            digest_size,
+            digest_hash,
         ) = raw_attributes
         data = FileAttributeData()
         data_v2 = FileAttributeDataV2()
@@ -306,6 +372,12 @@ class ReaddirTest(testcase.EdenRepoTest):
 
         if raw_object_id is not None:
             data_v2.objectId = ObjectIdOrError(raw_object_id)
+
+        if digest_size is not None:
+            data_v2.digestSize = DigestSizeOrError(digest_size)
+
+        if digest_hash is not None:
+            data_v2.digestHash = DigestHashOrError(digest_hash)
 
         return (
             FileAttributeDataOrError(data),
@@ -343,12 +415,18 @@ class ReaddirTest(testcase.EdenRepoTest):
             expected_hello_result,
             expected_hello_result_v2,
         ) = self.wrap_expected_attributes(
-            self.get_expected_file_attributes("hello", self.hello_id)
+            self.get_expected_file_attributes(
+                "hello",
+                self.hello_id,
+            )
         )
 
         # expected results for file "adir/file"
         (expected_adir_result, expected_adir_result_v2) = self.wrap_expected_attributes(
-            self.get_expected_file_attributes("adir/file", self.adir_file_id)
+            self.get_expected_file_attributes(
+                "adir/file",
+                self.adir_file_id,
+            )
         )
 
         # list of expected_results
@@ -375,7 +453,9 @@ class ReaddirTest(testcase.EdenRepoTest):
         (
             expected_hello_result,
             expected_hello_result_v2,
-        ) = self.wrap_expected_attributes((None, expected_hello_size, None, None, None))
+        ) = self.wrap_expected_attributes(
+            (None, expected_hello_size, None, None, None, None, None)
+        )
 
         # create result object for "hello"
         expected_result = GetAttributesFromFilesResult(
@@ -399,7 +479,9 @@ class ReaddirTest(testcase.EdenRepoTest):
         (
             expected_hello_result,
             expected_hello_result_v2,
-        ) = self.wrap_expected_attributes((None, None, expected_hello_type, None, None))
+        ) = self.wrap_expected_attributes(
+            (None, None, expected_hello_type, None, None, None, None)
+        )
 
         # create result object for "hello"
         expected_result = GetAttributesFromFilesResult(
@@ -439,7 +521,9 @@ class ReaddirTest(testcase.EdenRepoTest):
         (
             expected_hello_result,
             expected_hello_result_v2,
-        ) = self.wrap_expected_attributes((expected_hello_sha1, None, None, None, None))
+        ) = self.wrap_expected_attributes(
+            (expected_hello_sha1, None, None, None, None, None, None)
+        )
 
         # create result object for "hello"
         expected_result = GetAttributesFromFilesResult(
@@ -462,12 +546,12 @@ class ReaddirTest(testcase.EdenRepoTest):
 
     def test_get_blake3_only(self) -> None:
         # expected blake3 result for file
-        expected_hello_blake3 = self.get_expected_file_attributes("hello", None)[-1]
+        expected_hello_blake3 = self.get_expected_file_attributes("hello", None)[4]
         (
             expected_hello_result,
             expected_hello_result_v2,
         ) = self.wrap_expected_attributes(
-            (None, None, None, None, expected_hello_blake3)
+            (None, None, None, None, expected_hello_blake3, None, None)
         )
 
         # create result object for "hello"
@@ -538,13 +622,15 @@ class ReaddirTest(testcase.EdenRepoTest):
                 ),
                 SourceControlTypeOrError(SourceControlType.TREE),
                 ObjectIdOrError(self.adir_id),
-                blake3=Blake3OrError(
+                Blake3OrError(
                     error=EdenError(
                         message="adir: Is a directory",
                         errorCode=21,
                         errorType=EdenErrorType.POSIX_ERROR,
                     )
                 ),
+                self.adir_digest_size_result,
+                self.adir_digest_hash_result,
             )
         )
 
@@ -599,6 +685,20 @@ class ReaddirTest(testcase.EdenRepoTest):
                             errorType=EdenErrorType.POSIX_ERROR,
                         )
                     ),
+                    digestSize=DigestSizeOrError(
+                        error=EdenError(
+                            message="adir/asock: file is a non-source-control type: 12: Invalid argument",
+                            errorCode=22,
+                            errorType=EdenErrorType.POSIX_ERROR,
+                        )
+                    ),
+                    digestHash=DigestHashOrError(
+                        error=EdenError(
+                            message="adir/asock: file is a non-source-control type: 12: Invalid argument",
+                            errorCode=22,
+                            errorType=EdenErrorType.POSIX_ERROR,
+                        )
+                    ),
                 )
             )
 
@@ -638,6 +738,20 @@ class ReaddirTest(testcase.EdenRepoTest):
                 SourceControlTypeOrError(SourceControlType.SYMLINK),
                 ObjectIdOrError(self.slink_id),
                 blake3=Blake3OrError(
+                    error=EdenError(
+                        message="slink: file is a symlink: Invalid argument",
+                        errorCode=22,
+                        errorType=EdenErrorType.POSIX_ERROR,
+                    )
+                ),
+                digestSize=DigestSizeOrError(
+                    error=EdenError(
+                        message="slink: file is a symlink: Invalid argument",
+                        errorCode=22,
+                        errorType=EdenErrorType.POSIX_ERROR,
+                    )
+                ),
+                digestHash=DigestHashOrError(
                     error=EdenError(
                         message="slink: file is a symlink: Invalid argument",
                         errorCode=22,
@@ -716,7 +830,15 @@ class ReaddirTest(testcase.EdenRepoTest):
         self,
         path: str,
         object_id: Optional[bytes],
-    ) -> Tuple[bytes, int, SourceControlType, Optional[bytes], bytes]:
+    ) -> Tuple[
+        bytes,
+        int,
+        SourceControlType,
+        Optional[bytes],
+        bytes,
+        int,
+        bytes,
+    ]:
         """Get attributes for the file with the specified path inside
         the eden repository. For now, just sha1 and file size.
         """
@@ -730,6 +852,8 @@ class ReaddirTest(testcase.EdenRepoTest):
                 SourceControlType.TREE,
                 object_id,
                 (0).to_bytes(32, byteorder="big"),
+                0,
+                (0).to_bytes(32, byteorder="big"),
             )
         if stat.S_ISLNK(file_stat.st_mode):
             return (
@@ -737,6 +861,8 @@ class ReaddirTest(testcase.EdenRepoTest):
                 0,
                 SourceControlType.SYMLINK,
                 object_id,
+                (0).to_bytes(32, byteorder="big"),
+                0,
                 (0).to_bytes(32, byteorder="big"),
             )
         if not stat.S_ISREG(file_stat.st_mode):
@@ -746,6 +872,8 @@ class ReaddirTest(testcase.EdenRepoTest):
                 SourceControlType.UNKNOWN,
                 object_id,
                 (0).to_bytes(32, byteorder="big"),
+                0,
+                (0).to_bytes(32, byteorder="big"),
             )
         if stat.S_IXUSR & file_stat.st_mode:
             file_type = SourceControlType.EXECUTABLE_FILE
@@ -754,13 +882,16 @@ class ReaddirTest(testcase.EdenRepoTest):
         file_contents = ifile.read()
         sha1_hash = hashlib.sha1(file_contents).digest()
         ifile.close()
+        blake3 = self.blake3_hash(fullpath)
 
         return (
             sha1_hash,
             file_size,
             file_type,
             object_id,
-            self.blake3_hash(fullpath),
+            blake3,
+            file_size,
+            blake3,
         )
 
     def get_counter(self, name: str) -> float:
@@ -769,7 +900,13 @@ class ReaddirTest(testcase.EdenRepoTest):
     def constructReaddirResult(
         self,
         expected_attributes: Tuple[
-            bytes, int, SourceControlType, Optional[bytes], Optional[bytes]
+            bytes,
+            int,
+            SourceControlType,
+            Optional[bytes],
+            Optional[bytes],
+            int,
+            Optional[bytes],
         ],
         req_attr: int = ALL_ATTRIBUTES,
     ) -> FileAttributeDataOrErrorV2:
@@ -797,6 +934,16 @@ class ReaddirTest(testcase.EdenRepoTest):
         ] is not None:
             blake3 = Blake3OrError(blake3=expected_attributes[4])
 
+        digestSize = None
+        if (req_attr & FileAttributes.DIGEST_SIZE) and expected_attributes[5]:
+            digestSize = DigestSizeOrError(digestSize=expected_attributes[5])
+
+        digestHash = None
+        if (req_attr & FileAttributes.DIGEST_HASH) and expected_attributes[
+            6
+        ] is not None:
+            digestHash = DigestHashOrError(expected_attributes[6])
+
         return FileAttributeDataOrErrorV2(
             fileAttributeData=FileAttributeDataV2(
                 sha1=sha1,
@@ -804,6 +951,8 @@ class ReaddirTest(testcase.EdenRepoTest):
                 sourceControlType=sourceControlType,
                 objectId=objectId,
                 blake3=blake3,
+                digestSize=digestSize,
+                digestHash=digestHash,
             )
         )
 
@@ -817,7 +966,8 @@ class ReaddirTest(testcase.EdenRepoTest):
                 dirListAttributeData={
                     b"file": self.constructReaddirResult(
                         self.get_expected_file_attributes(
-                            "adir/file", self.adir_file_id
+                            "adir/file",
+                            self.adir_file_id,
                         )
                     )
                 }
@@ -826,7 +976,8 @@ class ReaddirTest(testcase.EdenRepoTest):
                 dirListAttributeData={
                     b"file": self.constructReaddirResult(
                         self.get_expected_file_attributes(
-                            "bdir/file", self.bdir_file_id
+                            "bdir/file",
+                            self.bdir_file_id,
                         )
                     )
                 }
@@ -841,6 +992,8 @@ class ReaddirTest(testcase.EdenRepoTest):
                     sync=SyncBehavior(),
                 )
             )
+            print(f"expected: \n{expected}")
+            print(f"actual: \n{actual_result}")
             self.assertEqual(
                 expected,
                 actual_result,
@@ -863,6 +1016,8 @@ class ReaddirTest(testcase.EdenRepoTest):
                     sync=SyncBehavior(),
                 )
             )
+            print(f"expected: \n{expected}")
+            print(f"actual: \n{actual}")
             self.assertEqual(expected, actual)
 
             # non existent directory
@@ -884,6 +1039,8 @@ class ReaddirTest(testcase.EdenRepoTest):
                     sync=SyncBehavior(),
                 )
             )
+            print(f"expected: \n{expected}")
+            print(f"actual: \n{actual}")
             self.assertEqual(expected, actual)
 
             # file
@@ -905,6 +1062,8 @@ class ReaddirTest(testcase.EdenRepoTest):
                     sync=SyncBehavior(),
                 )
             )
+            print(f"expected: \n{expected}")
+            print(f"actual: \n{actual}")
             self.assertEqual(expected, actual)
 
             # empty string
@@ -954,8 +1113,8 @@ class ReaddirTest(testcase.EdenRepoTest):
                     sync=SyncBehavior(),
                 )
             )
-            print(expected)
-            print(actual_result)
+            print(f"expected: \n{expected}")
+            print(f"actual: \n{actual_result}")
 
             self.assertEqual(
                 expected,
@@ -975,41 +1134,28 @@ class ReaddirTest(testcase.EdenRepoTest):
         self,
         parent_name: bytes,
         entry_name: bytes,
-        error_message: str,
-        error_code: int,
         source_control_type: SourceControlType,
+        sha1_result: Sha1OrError,
+        blake3_result: Blake3OrError,
+        size_result: SizeOrError,
         object_id: Optional[bytes],
+        digest_size_result: DigestSizeOrError,
+        digest_hash_result: DigestHashOrError,
     ) -> None:
         with self.get_thrift_client_legacy() as client:
             expected = FileAttributeDataOrErrorV2(
                 fileAttributeData=FileAttributeDataV2(
-                    sha1=Sha1OrError(
-                        error=EdenError(
-                            message=error_message,
-                            errorCode=error_code,
-                            errorType=EdenErrorType.POSIX_ERROR,
-                        )
-                    ),
-                    size=SizeOrError(
-                        error=EdenError(
-                            message=error_message,
-                            errorCode=error_code,
-                            errorType=EdenErrorType.POSIX_ERROR,
-                        )
-                    ),
+                    sha1=sha1_result,
+                    size=size_result,
                     sourceControlType=SourceControlTypeOrError(
                         sourceControlType=source_control_type
                     ),
                     objectId=ObjectIdOrError(
                         objectId=object_id,
                     ),
-                    blake3=Blake3OrError(
-                        error=EdenError(
-                            message=error_message,
-                            errorCode=error_code,
-                            errorType=EdenErrorType.POSIX_ERROR,
-                        )
-                    ),
+                    blake3=blake3_result,
+                    digestSize=digest_size_result,
+                    digestHash=digest_hash_result,
                 )
             )
 
@@ -1021,8 +1167,8 @@ class ReaddirTest(testcase.EdenRepoTest):
                     sync=SyncBehavior(),
                 )
             )
-            print(expected)
-            print(actual)
+            print(f"expected: \n{expected}")
+            print(f"actual: \n{actual}")
 
             self.assertEqual(
                 expected,
@@ -1037,6 +1183,8 @@ class ReaddirTest(testcase.EdenRepoTest):
                         sourceControlType=source_control_type,
                     ),
                     blake3=None,
+                    digestSize=None,
+                    digestHash=None,
                 )
             )
 
@@ -1048,8 +1196,8 @@ class ReaddirTest(testcase.EdenRepoTest):
                     sync=SyncBehavior(),
                 )
             )
-            print(expected)
-            print(actual)
+            print(f"expected: \n{expected}")
+            print(f"actual: \n{actual}")
             self.assertEqual(
                 expected,
                 actual.dirLists[0].get_dirListAttributeData()[entry_name],
@@ -1059,13 +1207,41 @@ class ReaddirTest(testcase.EdenRepoTest):
         self.readdir_no_size_or_sha1(
             parent_name=b"cdir",
             entry_name=b"subdir",
-            error_message="cdir/subdir: Is a directory",
-            error_code=21,
             source_control_type=SourceControlType.TREE,
+            sha1_result=Sha1OrError(
+                error=EdenError(
+                    message="cdir/subdir: Is a directory",
+                    errorCode=21,
+                    errorType=EdenErrorType.POSIX_ERROR,
+                )
+            ),
+            blake3_result=Blake3OrError(
+                error=EdenError(
+                    message="cdir/subdir: Is a directory",
+                    errorCode=21,
+                    errorType=EdenErrorType.POSIX_ERROR,
+                )
+            ),
+            size_result=SizeOrError(
+                error=EdenError(
+                    message="cdir/subdir: Is a directory",
+                    errorCode=21,
+                    errorType=EdenErrorType.POSIX_ERROR,
+                )
+            ),
             object_id=self.cdir_subdir_id,
+            digest_size_result=self.cdir_subdir_digest_size_result,
+            digest_hash_result=self.cdir_subdir_digest_hash_result,
         )
+
         if sys.platform != "win32":
             sockpath = self.get_path("adir/asock")
+            sock_error = EdenError(
+                message="adir/asock: file is a non-source-control type: 12: Invalid argument",
+                errorCode=22,
+                errorType=EdenErrorType.POSIX_ERROR,
+            )
+
             # UDS are not supported in python on Win until 3.9:
             # https://bugs.python.org/issue33408
             with socket.socket(socket.AF_UNIX) as sock:
@@ -1073,19 +1249,47 @@ class ReaddirTest(testcase.EdenRepoTest):
                 self.readdir_no_size_or_sha1(
                     parent_name=b"adir",
                     entry_name=b"asock",
-                    error_message="adir/asock: file is a non-source-control type: 12: Invalid argument",
-                    error_code=22,
                     source_control_type=SourceControlType.UNKNOWN,
+                    sha1_result=Sha1OrError(error=sock_error),
+                    blake3_result=Blake3OrError(
+                        error=sock_error,
+                    ),
+                    size_result=SizeOrError(
+                        error=sock_error,
+                    ),
                     object_id=None,
+                    digest_size_result=DigestSizeOrError(
+                        error=sock_error,
+                    ),
+                    digest_hash_result=DigestHashOrError(
+                        error=sock_error,
+                    ),
                 )
+
+        slink_error = EdenError(
+            message="slink: file is a symlink: Invalid argument",
+            errorCode=22,
+            errorType=EdenErrorType.POSIX_ERROR,
+        )
 
         self.readdir_no_size_or_sha1(
             parent_name=b"",
             entry_name=b"slink",
-            error_message="slink: file is a symlink: Invalid argument",
-            error_code=22,
             source_control_type=SourceControlType.SYMLINK,
+            sha1_result=Sha1OrError(error=slink_error),
+            blake3_result=Blake3OrError(
+                error=slink_error,
+            ),
+            size_result=SizeOrError(
+                error=slink_error,
+            ),
             object_id=self.slink_id,
+            digest_size_result=DigestSizeOrError(
+                error=slink_error,
+            ),
+            digest_hash_result=DigestHashOrError(
+                error=slink_error,
+            ),
         )
 
     def test_materialized_files_return_no_object_id(self) -> None:

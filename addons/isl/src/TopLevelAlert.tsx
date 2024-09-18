@@ -8,21 +8,21 @@
 import type {Alert, AlertSeverity} from './types';
 import type {ReactNode} from 'react';
 
-import {Banner, BannerKind} from './Banner';
+import {colors, font, radius, spacing} from '../../components/theme/tokens.stylex';
 import serverAPI from './ClientToServerAPI';
 import {Link} from './Link';
-import {Subtle} from './Subtle';
 import {tracker} from './analytics';
 import {T} from './i18n';
 import {localStorageBackedAtom, writeAtom} from './jotaiUtils';
 import {applicationinfo} from './serverAPIState';
 import {layout} from './stylexUtils';
-import {colors, font, radius, spacing} from './tokens.stylex';
 import * as stylex from '@stylexjs/stylex';
-import {VSCodeButton} from '@vscode/webview-ui-toolkit/react';
+import {Banner, BannerKind} from 'isl-components/Banner';
+import {Button} from 'isl-components/Button';
+import {Icon} from 'isl-components/Icon';
+import {Subtle} from 'isl-components/Subtle';
 import {atom, useAtom, useAtomValue} from 'jotai';
 import {useEffect} from 'react';
-import {Icon} from 'shared/Icon';
 
 const dismissedAlerts = localStorageBackedAtom<{[key: string]: boolean}>(
   'isl.dismissed-alerts',
@@ -133,9 +133,9 @@ function TopLevelAlert({alert, onDismiss}: {alert: Alert; onDismiss: () => unkno
       <Banner kind={BannerKind.default} icon={<Icon icon="flame" size="M" color="red" />}>
         <div {...stylex.props(layout.flexCol, styles.alert)}>
           <div {...stylex.props(styles.dismissX)}>
-            <VSCodeButton appearance="icon" onClick={onDismiss} data-testid="dismiss-alert">
+            <Button onClick={onDismiss} data-testid="dismiss-alert">
               <Icon icon="x" />
-            </VSCodeButton>
+            </Button>
           </div>
           <b>
             <T>Ongoing Issue</T>

@@ -14,7 +14,7 @@
 
 mod bubble;
 mod builder;
-mod changesets;
+mod commit_graph;
 mod error;
 mod file;
 mod handle;
@@ -25,7 +25,7 @@ pub use crate::bubble::Bubble;
 pub use crate::bubble::BubbleId;
 pub use crate::bubble::StorageLocation;
 pub use crate::builder::RepoEphemeralStoreBuilder;
-pub use crate::changesets::EphemeralChangesets;
+pub use crate::commit_graph::EphemeralOnlyChangesetStorage;
 pub use crate::error::EphemeralBlobstoreError;
 pub use crate::handle::EphemeralHandle;
 pub use crate::store::ArcRepoEphemeralStore;

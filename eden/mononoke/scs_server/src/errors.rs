@@ -8,6 +8,7 @@
 use std::backtrace::BacktraceStatus;
 use std::error::Error as StdError;
 
+use async_requests::AsyncRequestsError;
 use derived_data_manager::DerivationError;
 use git_types::GitError;
 use megarepo_error::MegarepoError;
@@ -15,6 +16,7 @@ use mononoke_api::MononokeError;
 use source_control as thrift;
 use source_control_services::errors::source_control_service as service;
 
+#[derive(Debug)]
 pub(crate) enum ServiceError {
     Request(thrift::RequestError),
     Internal(thrift::InternalError),
@@ -153,6 +155,38 @@ impl From<MegarepoError> for ServiceError {
     }
 }
 
+impl From<AsyncRequestsError> for ServiceError {
+    fn from(e: AsyncRequestsError) -> Self {
+        match e {
+            AsyncRequestsError::RequestError(e) => Self::Request(thrift::RequestError {
+                kind: thrift::RequestErrorKind::INVALID_REQUEST,
+                reason: format!("{}", e),
+                ..Default::default()
+            }),
+            AsyncRequestsError::InternalError(error) => {
+                let reason = error.to_string();
+                let backtrace = match error.backtrace().status() {
+                    BacktraceStatus::Captured => Some(error.backtrace().to_string()),
+                    _ => None,
+                };
+                let mut source_chain = Vec::new();
+                let mut error: &dyn StdError = &error;
+                while let Some(source) = error.source() {
+                    source_chain.push(source.to_string());
+                    error = source;
+                }
+
+                Self::Internal(thrift::InternalError {
+                    reason,
+                    backtrace,
+                    source_chain,
+                    ..Default::default()
+                })
+            }
+        }
+    }
+}
+
 impl From<MononokeError> for ServiceError {
     fn from(e: MononokeError) -> Self {
         match e {
@@ -188,6 +222,13 @@ impl From<MononokeError> for ServiceError {
                 reason: error.to_string(),
                 ..Default::default()
             }),
+            error @ MononokeError::NonFastForwardMove { .. } => {
+                Self::Request(thrift::RequestError {
+                    kind: thrift::RequestErrorKind::INVALID_REQUEST,
+                    reason: error.to_string(),
+                    ..Default::default()
+                })
+            }
             error @ MononokeError::PushrebaseConflicts(_) => Self::Request(thrift::RequestError {
                 kind: thrift::RequestErrorKind::INVALID_REQUEST,
                 reason: error.to_string(),
@@ -263,6 +304,7 @@ impl_into_thrift_error!(service::CommitCompareExn);
 impl_into_thrift_error!(service::CommitIsAncestorOfExn);
 impl_into_thrift_error!(service::CommitFindFilesExn);
 impl_into_thrift_error!(service::CommitHistoryExn);
+impl_into_thrift_error!(service::CommitLinearHistoryExn);
 impl_into_thrift_error!(service::CommitListDescendantBookmarksExn);
 impl_into_thrift_error!(service::CommitRunHooksExn);
 impl_into_thrift_error!(service::CommitPathExistsExn);
@@ -281,6 +323,8 @@ impl_into_thrift_error!(service::FileInfoExn);
 impl_into_thrift_error!(service::FileContentChunkExn);
 impl_into_thrift_error!(service::FileDiffExn);
 impl_into_thrift_error!(service::CommitLookupXrepoExn);
+impl_into_thrift_error!(service::CreateReposExn);
+impl_into_thrift_error!(service::CreateReposPollExn);
 impl_into_thrift_error!(service::MegarepoAddSyncTargetConfigExn);
 impl_into_thrift_error!(service::MegarepoReadTargetConfigExn);
 impl_into_thrift_error!(service::MegarepoAddSyncTargetExn);
@@ -293,10 +337,14 @@ impl_into_thrift_error!(service::MegarepoSyncChangesetExn);
 impl_into_thrift_error!(service::MegarepoSyncChangesetPollExn);
 impl_into_thrift_error!(service::MegarepoRemergeSourceExn);
 impl_into_thrift_error!(service::MegarepoRemergeSourcePollExn);
+impl_into_thrift_error!(service::RepoUpdateSubmoduleExpansionExn);
 impl_into_thrift_error!(service::RepoUploadNonBlobGitObjectExn);
 impl_into_thrift_error!(service::RepoUploadPackfileBaseItemExn);
 impl_into_thrift_error!(service::CreateGitTreeExn);
 impl_into_thrift_error!(service::CreateGitTagExn);
+impl_into_thrift_error!(service::CloudWorkspaceInfoExn);
+impl_into_thrift_error!(service::CloudUserWorkspacesExn);
+impl_into_thrift_error!(service::CloudWorkspaceSmartlogExn);
 
 pub(crate) fn invalid_request(reason: impl ToString) -> thrift::RequestError {
     thrift::RequestError {

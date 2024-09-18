@@ -18,15 +18,15 @@ setup configuration
 
   $ setup_mononoke_config
   $ cd $TESTTMP
-  $ blobimport repo-hg/.hg repo --commits-limit 2
-  $ blobimport --log repo-hg/.hg repo --find-already-imported-rev-only
+  $ blobimport repo/.hg repo --commits-limit 2
+  $ blobimport --log repo/.hg repo --find-already-imported-rev-only
   * using repo "repo" repoid RepositoryId(0) (glob)
   * latest imported revision 1 (glob)
   $ sqlite3 "$TESTTMP/monsql/sqlite_dbs" "select * from mutable_counters";
   0|highest-imported-gen-num|2
 
   $ REPONAME=backup REPOID=2 setup_mononoke_config
-  $ cd $TESTTMP/repo-hg
+  $ cd $TESTTMP/repo
 
   $ hg up master_bookmark
   3 files updated, 0 files merged, 0 files removed, 0 files unresolved
@@ -57,7 +57,8 @@ setup configuration
   >         "inner": {
   >           "content_id": "896ad5879a5df0403bfc93fc96507ad9c93b31b11f3d0fa05445da7918241e5d",
   >           "file_type": "Regular",
-  >           "size": 1
+  >           "size": 1,
+  >           "git_lfs": "FullContent"
   >         },
   >         "copy_from": null
   >       }
@@ -67,7 +68,8 @@ setup configuration
   >         "inner": {
   >           "content_id": "55662471e2a28db8257939b2f9a2d24e65b46a758bac12914a58f17dcde6905f",
   >           "file_type": "Regular",
-  >           "size": 1
+  >           "size": 1,
+  >           "git_lfs": "FullContent"
   >         },
   >         "copy_from": null
   >       }
@@ -82,7 +84,7 @@ setup configuration
   $ mononoke_newadmin bookmarks -R repo list
   4b71c845e8783e58fce825fa80254840eba291d323a5d69218ad927fc801153c master_bookmark
 
-  $ REPOID=2 blobimport repo-hg/.hg backup --backup-from-repo-name repo
+  $ REPOID=2 blobimport repo/.hg backup --backup-from-repo-name repo
   $ sqlite3 "$TESTTMP/monsql/sqlite_dbs" "select * from mutable_counters";
   0|highest-imported-gen-num|2
   2|highest-imported-gen-num|3

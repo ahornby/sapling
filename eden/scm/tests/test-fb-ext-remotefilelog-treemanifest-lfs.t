@@ -5,12 +5,11 @@
 
   $ . "$TESTDIR/library.sh"
 
-  $ enable lfs treemanifest pushrebase
-  $ hginit master --config extensions.treemanifest=$TESTDIR/../sapling/ext/treemanifestserver.py
+  $ enable lfs pushrebase
+  $ hginit master
 
   $ cd master
-  $ setconfig remotefilelog.server=True treemanifest.server=True remotefilelog.shallowtrees=True
-  $ setconfig extensions.treemanifest=$TESTDIR/../sapling/ext/treemanifestserver.py
+  $ setconfig remotefilelog.server=True remotefilelog.shallowtrees=True
   $ mkdir dir
   $ echo x > dir/x
   $ hg commit -qAm x1
@@ -27,10 +26,6 @@
   adding file changes
   updating to branch default
   1 files fetched over 1 fetches - (1 misses, 0.00% hit ratio) over * (glob) (?)
-  fetching tree '' 287ee6e53d4fbc5fab2157eb0383fdff1c3277c8
-  1 trees fetched over 0.00s
-  fetching tree 'dir' bc0c2c938b929f98b1c31a8c5994396ebb096bf0
-  1 trees fetched over 0.00s
   1 files updated, 0 files merged, 0 files removed, 0 files unresolved
 
   $ cd shallow

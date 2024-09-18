@@ -8,12 +8,14 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::time::Instant;
 
 use anyhow::anyhow;
 use anyhow::Result;
 use async_runtime::block_on;
 use async_runtime::spawn_blocking;
 use async_runtime::stream_to_iter;
+use cas_client::CasClient;
 use clientinfo::get_client_request_info_thread_local;
 use clientinfo_async::with_client_request_info_scope;
 use crossbeam::channel::Sender;
@@ -27,19 +29,17 @@ use tracing::debug;
 use tracing::field;
 use types::errors::NetworkError;
 use types::fetch_mode::FetchMode;
+use types::CasDigest;
+use types::CasDigestType;
 use types::Key;
 use types::Sha256;
 
-use crate::datastore::HgIdDataStore;
-use crate::datastore::RemoteDataStore;
 use crate::error::ClonableError;
-use crate::fetch_logger::FetchLogger;
 use crate::indexedlogauxstore::AuxStore;
 use crate::indexedlogdatastore::Entry;
 use crate::indexedlogdatastore::IndexedLogHgIdDataStore;
-use crate::indexedlogutil::StoreType;
 use crate::lfs::LfsPointersEntry;
-use crate::lfs::LfsRemoteInner;
+use crate::lfs::LfsRemote;
 use crate::lfs::LfsStore;
 use crate::lfs::LfsStoreEntry;
 use crate::scmstore::attrs::StoreAttrs;
@@ -48,6 +48,7 @@ use crate::scmstore::fetch::FetchErrors;
 use crate::scmstore::fetch::KeyFetchError;
 use crate::scmstore::file::metrics::FileStoreFetchMetrics;
 use crate::scmstore::file::LazyFile;
+use crate::scmstore::metrics::StoreLocation;
 use crate::scmstore::value::StoreValue;
 use crate::scmstore::FileAttributes;
 use crate::scmstore::FileAuxData;
@@ -55,7 +56,6 @@ use crate::scmstore::FileStore;
 use crate::scmstore::StoreFile;
 use crate::util;
 use crate::ContentHash;
-use crate::ContentStore;
 use crate::ExtStoredPolicy;
 use crate::Metadata;
 use crate::SaplingRemoteApiFileStore;
@@ -69,9 +69,6 @@ pub struct FetchState {
 
     /// LFS pointers we've discovered corresponding to a request Key.
     lfs_pointers: HashMap<Key, (LfsPointersEntry, bool)>,
-
-    /// Tracks remote fetches which match a specific regex
-    fetch_logger: Option<Arc<FetchLogger>>,
 
     lfs_progress: Arc<AggregatingProgressBar>,
 
@@ -103,7 +100,6 @@ impl FetchState {
 
             lfs_pointers: HashMap::new(),
 
-            fetch_logger: file_store.fetch_logger.clone(),
             extstored_policy: file_store.extstored_policy,
             compute_aux_data: file_store.compute_aux_data,
             lfs_progress: file_store.lfs_progress.clone(),
@@ -215,7 +211,7 @@ impl FetchState {
         &mut self,
         store: &IndexedLogHgIdDataStore,
         lfs_store: Option<&LfsStore>,
-        typ: StoreType,
+        loc: StoreLocation,
     ) {
         let pending = self.pending_nonlfs(FileAttributes::CONTENT);
         if pending.is_empty() {
@@ -226,9 +222,9 @@ impl FetchState {
 
         debug!(
             "Checking store Indexedlog ({cache}) for {key}{more}",
-            cache = match typ {
-                StoreType::Shared => "cache",
-                StoreType::Local => "local",
+            cache = match loc {
+                StoreLocation::Cache => "cache",
+                StoreLocation::Local => "local",
             },
             key = pending[0],
             more = if pending.len() > 1 {
@@ -244,7 +240,7 @@ impl FetchState {
         let mut error: Option<String> = None;
         let mut lfs_pointers_to_upgrade = Vec::new();
 
-        self.metrics.indexedlog.store(typ).fetch(pending.len());
+        self.metrics.indexedlog.store(loc).fetch(pending.len());
 
         self.common
             .iter_pending(FileAttributes::CONTENT, self.compute_aux_data, |key| {
@@ -265,7 +261,7 @@ impl FetchState {
 
                 match res {
                     Ok(Some(entry)) => {
-                        self.metrics.indexedlog.store(typ).hit(1);
+                        self.metrics.indexedlog.store(loc).hit(1);
                         found += 1;
 
                         if entry.metadata().is_lfs() && self.lfs_enabled {
@@ -281,10 +277,10 @@ impl FetchState {
                         }
                     }
                     Ok(None) => {
-                        self.metrics.indexedlog.store(typ).miss(1);
+                        self.metrics.indexedlog.store(loc).miss(1);
                     }
                     Err(err) => {
-                        self.metrics.indexedlog.store(typ).err(1);
+                        self.metrics.indexedlog.store(loc).err(1);
                         errors += 1;
                         if error.is_none() {
                             error.replace(format!("{}: {}", key, err));
@@ -300,7 +296,7 @@ impl FetchState {
 
         self.metrics
             .indexedlog
-            .store(typ)
+            .store(loc)
             .time_from_duration(fetch_start.elapsed())
             .ok();
 
@@ -320,19 +316,33 @@ impl FetchState {
         }
     }
 
-    pub(crate) fn fetch_aux_indexedlog(&mut self, store: &AuxStore, typ: StoreType) {
+    pub(crate) fn fetch_aux_indexedlog(
+        &mut self,
+        store: &AuxStore,
+        loc: StoreLocation,
+        have_cas: bool,
+    ) {
         let fetch_start = std::time::Instant::now();
 
         let mut found = 0;
         let mut errors = 0;
         let mut count = 0;
         let mut error: Option<String> = None;
+        let ignore_results = self.fetch_mode.ignore_result() && !have_cas;
+
+        let mut wants_aux = FileAttributes::AUX;
+        if have_cas && loc == StoreLocation::Cache {
+            // Also fetch AUX data if we are going to try fetching from CAS. This does two things:
+            // 1. Fetches hash and size info needed to query CAS for file contents.
+            // 2. Fetches hg content header, which is not available from CAS.
+            wants_aux |= FileAttributes::PURE_CONTENT;
+        }
 
         self.common
-            .iter_pending(FileAttributes::AUX, self.compute_aux_data, |key| {
+            .iter_pending(wants_aux, self.compute_aux_data, |key| {
                 count += 1;
 
-                let res = if self.fetch_mode.ignore_result() {
+                let res = if ignore_results {
                     store.contains(key.hgid).map(|contains| {
                         if contains {
                             // Insert a stub entry if caller is ignoring the results.
@@ -346,15 +356,21 @@ impl FetchState {
                 };
                 match res {
                     Ok(Some(aux)) => {
-                        self.metrics.aux.store(typ).hit(1);
+                        if have_cas {
+                            tracing::trace!(target: "cas", ?key, ?aux, "found file aux data");
+                        }
+                        self.metrics.aux.store(loc).hit(1);
                         found += 1;
                         return Some(aux.into());
                     }
                     Ok(None) => {
-                        self.metrics.aux.store(typ).miss(1);
+                        if have_cas {
+                            tracing::trace!(target: "cas", ?key, "no file aux data");
+                        }
+                        self.metrics.aux.store(loc).miss(1);
                     }
                     Err(err) => {
-                        self.metrics.aux.store(typ).err(1);
+                        self.metrics.aux.store(loc).err(1);
                         errors += 1;
                         if error.is_none() {
                             error.replace(format!("{}: {}", key, err));
@@ -372,17 +388,17 @@ impl FetchState {
 
         debug!(
             "Checking store AUX ({cache}) - Count = {count}",
-            cache = match typ {
-                StoreType::Shared => "cache",
-                StoreType::Local => "local",
+            cache = match loc {
+                StoreLocation::Cache => "cache",
+                StoreLocation::Local => "local",
             },
         );
 
-        self.metrics.aux.store(typ).fetch(count);
+        self.metrics.aux.store(loc).fetch(count);
 
         self.metrics
             .aux
-            .store(typ)
+            .store(loc)
             .time_from_duration(fetch_start.elapsed())
             .ok();
 
@@ -407,7 +423,7 @@ impl FetchState {
         }
     }
 
-    pub(crate) fn fetch_lfs(&mut self, store: &LfsStore, typ: StoreType) {
+    pub(crate) fn fetch_lfs(&mut self, store: &LfsStore, loc: StoreLocation) {
         let pending = self.pending_storekey(FileAttributes::CONTENT);
         if pending.is_empty() {
             return;
@@ -417,9 +433,9 @@ impl FetchState {
 
         debug!(
             "Checking store LFS ({cache}) - Count = {count}",
-            cache = match typ {
-                StoreType::Shared => "cache",
-                StoreType::Local => "local",
+            cache = match loc {
+                StoreLocation::Cache => "cache",
+                StoreLocation::Local => "local",
             },
             count = pending.len()
         );
@@ -429,7 +445,7 @@ impl FetchState {
         let mut errors = 0;
         let mut error: Option<String> = None;
 
-        self.metrics.lfs.store(typ).fetch(pending.len());
+        self.metrics.lfs.store(loc).fetch(pending.len());
         for store_key in pending.into_iter() {
             let key = store_key.clone().maybe_into_key().expect(
                 "no Key present in StoreKey, even though this should be guaranteed by pending_all",
@@ -437,7 +453,7 @@ impl FetchState {
             match store.fetch_available(&store_key, self.fetch_mode.ignore_result()) {
                 Ok(Some(entry)) => {
                     // TODO(meyer): Make found behavior w/r/t LFS pointers and content consistent
-                    self.metrics.lfs.store(typ).hit(1);
+                    self.metrics.lfs.store(loc).hit(1);
                     if let LfsStoreEntry::PointerOnly(_) = &entry {
                         found_pointers += 1;
                     } else {
@@ -446,10 +462,10 @@ impl FetchState {
                     self.found_lfs(key, entry)
                 }
                 Ok(None) => {
-                    self.metrics.lfs.store(typ).miss(1);
+                    self.metrics.lfs.store(loc).miss(1);
                 }
                 Err(err) => {
-                    self.metrics.lfs.store(typ).err(1);
+                    self.metrics.lfs.store(loc).err(1);
                     errors += 1;
                     if error.is_none() {
                         error.replace(format!("{}: {}", key, err));
@@ -461,7 +477,7 @@ impl FetchState {
 
         self.metrics
             .lfs
-            .store(typ)
+            .store(loc)
             .time_from_duration(fetch_start.elapsed())
             .ok();
 
@@ -496,7 +512,7 @@ impl FetchState {
         let mut lfsptr = None;
 
         if let Some(aux_data) = entry.aux_data() {
-            let aux_data: FileAuxData = FileAuxData::try_from(aux_data.clone())?;
+            let aux_data = aux_data.clone();
             if let Some(aux_cache) = aux_cache.as_ref() {
                 aux_cache.put(key.hgid, &aux_data)?;
             }
@@ -547,10 +563,6 @@ impl FetchState {
         let mut found_pointers = 0;
         let mut errors = 0;
         let mut error: Option<String> = None;
-
-        if let Some(fl) = self.fetch_logger.as_ref() {
-            fl.report_keys(pending.iter())
-        }
 
         // TODO(meyer): Iterators or otherwise clean this up
         let pending_attrs: Vec<_> = pending
@@ -708,9 +720,131 @@ impl FetchState {
         self.metrics.edenapi.hit(found);
     }
 
+    pub(crate) fn fetch_cas(&mut self, cas_client: &dyn CasClient) {
+        let span = tracing::info_span!(
+            "fetch_cas",
+            keys = field::Empty,
+            hits = field::Empty,
+            requests = field::Empty,
+            time = field::Empty,
+        );
+        let _enter = span.enter();
+
+        let fetchable = FileAttributes::PURE_CONTENT;
+
+        let mut digest_to_key: HashMap<CasDigest, Key> = self
+            // TODO: fetch LFS files
+            .pending_nonlfs(fetchable)
+            .into_iter()
+            // Get AUX data from "pending" (assuming we previously fetched it).
+            .filter_map(|key| {
+                // TODO: fetch aux data from edenapi on-demand?
+
+                let store_file = self.common.pending.get(&key)?;
+
+                let aux_data = match store_file.aux_data.as_ref() {
+                    Some(aux_data) => {
+                        tracing::trace!(target: "cas", ?key, ?aux_data, "found aux data for file digest");
+                        aux_data
+                    }
+                    None => {
+                        tracing::trace!(target: "cas", ?key, "no aux data for file digest");
+                        return None;
+                    }
+                };
+
+                if self.common.request_attrs.content_header && !store_file.attrs().content_header {
+                    // If the caller wants hg content header but the aux data didn't have it,
+                    // we won't find it in CAS, so don't bother fetching content from CAS.
+                    tracing::trace!(target: "cas", ?key, "no content header in AUX data");
+                    None
+                } else {
+                    Some((
+                        CasDigest {
+                            hash: aux_data.blake3,
+                            size: aux_data.total_size,
+                        },
+                        key,
+                    ))
+                }
+            })
+            .collect();
+
+        if digest_to_key.is_empty() {
+            return;
+        }
+
+        let digests: Vec<CasDigest> = digest_to_key.keys().cloned().collect();
+
+        span.record("keys", digests.len());
+
+        let mut found = 0;
+        let mut error = 0;
+        let mut reqs = 0;
+
+        // TODO: configure
+        let max_batch_size = 1000;
+        let start_time = Instant::now();
+
+        for chunk in digests.chunks(max_batch_size) {
+            reqs += 1;
+
+            // TODO: should we fan out here into multiple requests?
+            match block_on(cas_client.fetch(chunk, CasDigestType::File)) {
+                Ok(results) => {
+                    for (digest, data) in results {
+                        let Some(key) = digest_to_key.remove(&digest) else {
+                            tracing::error!("got CAS result for unrequested digest {:?}", digest);
+                            continue;
+                        };
+
+                        match data {
+                            Err(err) => {
+                                tracing::error!(?err, ?key, ?digest, "CAS fetch error");
+                                tracing::error!(target: "cas", ?err, ?key, ?digest, "file fetch error");
+                                error += 1;
+                                self.errors.keyed_error(key, err);
+                            }
+                            Ok(None) => {
+                                tracing::trace!(target: "cas", ?key, ?digest, "file not in cas");
+                                // miss
+                            }
+                            Ok(Some(data)) => {
+                                found += 1;
+                                tracing::trace!(target: "cas", ?key, ?digest, "file found in cas");
+                                self.found_attributes(
+                                    key,
+                                    StoreFile {
+                                        content: Some(LazyFile::Cas(data.into())),
+                                        aux_data: None,
+                                    },
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::error!(?err, "overall CAS error");
+
+                    // Don't propagate CAS error - we want to fall back to SLAPI.
+                    error += 1;
+                }
+            }
+        }
+
+        span.record("hits", found);
+        span.record("requests", reqs);
+        span.record("time", start_time.elapsed().as_millis() as u64);
+
+        let _ = self.metrics.cas.time_from_duration(start_time.elapsed());
+        self.metrics.cas.fetch(digests.len());
+        self.metrics.cas.err(error);
+        self.metrics.cas.hit(found);
+    }
+
     pub(crate) fn fetch_lfs_remote(
         &mut self,
-        store: &LfsRemoteInner,
+        store: &LfsRemote,
         _local: Option<Arc<LfsStore>>,
         cache: Option<Arc<LfsStore>>,
     ) {
@@ -741,10 +875,6 @@ impl FetchState {
         }
 
         debug!("Fetching LFS - Count = {count}", count = pending.len());
-
-        if let Some(fl) = self.fetch_logger.as_ref() {
-            fl.report_keys(self.lfs_pointers.keys())
-        }
 
         let prog = self.lfs_progress.create_or_extend(pending.len() as u64);
 
@@ -803,117 +933,6 @@ impl FetchState {
         }
     }
 
-    fn found_contentstore(&mut self, key: Key, bytes: Vec<u8>, meta: Metadata) {
-        if meta.is_lfs() {
-            self.metrics.contentstore.hit_lfsptr(1);
-            // Do nothing. We're trying to avoid exposing LFS pointers to the consumer of this API.
-            // We very well may need to expose LFS Pointers to the caller in the end (to match ContentStore's
-            // ExtStoredPolicy behavior), but hopefully not, and if so we'll need to make it type safe.
-            tracing::warn!("contentstore fallback returned serialized lfs pointer");
-        } else {
-            tracing::warn!(
-                "contentstore fetched a file scmstore couldn't, \
-                this indicates a bug or unsupported configuration: \
-                fetched key '{}', found {} bytes of content with metadata {:?}.",
-                key,
-                bytes.len(),
-                meta,
-            );
-            self.metrics.contentstore.hit(1);
-            self.found_attributes(key, LazyFile::ContentStore(bytes.into(), meta).into())
-        }
-    }
-
-    fn fetch_contentstore_inner(
-        &mut self,
-        store: &ContentStore,
-        pending: &mut Vec<StoreKey>,
-    ) -> Result<()> {
-        let fetch_start = std::time::Instant::now();
-
-        debug!(
-            "ContentStore Fallback  - Count = {count}",
-            count = pending.len()
-        );
-        let mut found = 0;
-        let mut errors = 0;
-        let mut error: Option<String> = None;
-
-        store.prefetch(pending)?;
-
-        for store_key in pending.drain(..) {
-            let key = store_key.clone().maybe_into_key().expect(
-                "no Key present in StoreKey, even though this should be guaranteed by pending_storekey",
-            );
-            // Using the ContentStore API, fetch the hg file blob, then, if it's found, also fetch the file metadata.
-            // Returns the requested file as Result<(Option<Vec<u8>>, Option<Metadata>)>
-            // Produces a Result::Err if either the blob or metadata get returned an error
-            let res = store
-                .get(store_key.clone())
-                .map(|store_result| store_result.into())
-                .and_then({
-                    let store_key = store_key.clone();
-                    |maybe_blob| {
-                        Ok((
-                            maybe_blob,
-                            store
-                                .get_meta(store_key)
-                                .map(|store_result| store_result.into())?,
-                        ))
-                    }
-                });
-
-            match res {
-                Ok((Some(blob), Some(meta))) => {
-                    found += 1;
-                    self.found_contentstore(key, blob, meta)
-                }
-                Err(err) => {
-                    self.metrics.contentstore.err(1);
-                    errors += 1;
-                    if error.is_none() {
-                        error.replace(format!("{}: {}", key, err));
-                    }
-                    self.errors.keyed_error(key, err)
-                }
-                _ => {
-                    self.metrics.contentstore.miss(1);
-                }
-            }
-        }
-
-        self.metrics
-            .contentstore
-            .time_from_duration(fetch_start.elapsed())
-            .ok();
-
-        if found != 0 {
-            debug!("    Found = {found}", found = found);
-        }
-        if errors != 0 {
-            debug!(
-                "    Errors = {errors}, Error = {error:?}",
-                errors = errors,
-                error = error
-            );
-        }
-
-        Ok(())
-    }
-
-    pub(crate) fn fetch_contentstore(&mut self, store: &ContentStore) {
-        let mut pending = self.pending_storekey(FileAttributes::CONTENT);
-        if pending.is_empty() {
-            return;
-        }
-        self.metrics.contentstore.fetch(pending.len());
-        if let Err(err) = self.fetch_contentstore_inner(store, &mut pending) {
-            debug!("ContentStore upper error - Error = {err:?}", err = err);
-            self.errors.other_error(err);
-            self.metrics.contentstore.err(pending.len());
-        }
-    }
-
     // TODO(meyer): Improve how local caching works. At the very least do this in the background.
     // TODO(meyer): Log errors here instead of just ignoring.
     pub(crate) fn derive_computable(&mut self, aux_cache: Option<&AuxStore>) {
@@ -947,11 +966,11 @@ impl FetchState {
                     if new.attrs().has(self.common.request_attrs) {
                         tracing::debug!("marking complete");
 
-                        self.metrics.aux.store(StoreType::Shared).computed(1);
+                        self.metrics.aux.store(StoreLocation::Cache).computed(1);
 
                         if let Some(aux_cache) = aux_cache {
-                            if let Some(aux_data) = new.aux_data {
-                                let _ = aux_cache.put(key.hgid, &aux_data);
+                            if let Some(ref aux_data) = new.aux_data {
+                                let _ = aux_cache.put(key.hgid, aux_data);
                             }
                         }
 

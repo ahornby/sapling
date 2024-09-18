@@ -1582,6 +1582,14 @@ class ui:
 
         self._logsample(service, *origmsg, **opts)
 
+    def log_exception(self, *msg, **opts):
+        """A wrapper around log() that automatically adds common fields for exceptions metrics"""
+        common_fields = {
+            "client_correlator": bindings.clientinfo.get_client_correlator().decode(),
+        }
+        opts.update(common_fields)
+        self.log("exceptions", *msg, **opts)
+
     def deprecate(
         self, name, message, maxlevel=deprecationlevel.Log, startstr=None, endstr=None
     ):
@@ -2055,7 +2063,7 @@ class path:
         # Now process the sub-options. If a sub-option is registered, its
         # attribute will always be present. The value will be None if there
         # was no valid sub-option.
-        for suboption, (attr, func) in pycompat.iteritems(_pathsuboptions):
+        for suboption, (attr, func) in _pathsuboptions.items():
             if suboption not in suboptions:
                 setattr(self, attr, None)
                 continue
@@ -2081,7 +2089,7 @@ class path:
         This is intended to be used for presentation purposes.
         """
         d = {}
-        for subopt, (attr, _func) in pycompat.iteritems(_pathsuboptions):
+        for subopt, (attr, _func) in _pathsuboptions.items():
             value = getattr(self, attr)
             if value is not None:
                 d[subopt] = value

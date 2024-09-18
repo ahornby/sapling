@@ -31,6 +31,7 @@ use futures::channel::oneshot;
 use futures::stream;
 use futures::stream::StreamExt;
 use futures::stream::TryStreamExt;
+use metaconfig_types::RepoConfigRef;
 use metaconfig_types::ShardedService;
 use mononoke_api::CoreContext;
 use mononoke_api::Repo;
@@ -47,11 +48,13 @@ use mononoke_app::MononokeApp;
 use mononoke_app::MononokeAppBuilder;
 use mononoke_app::MononokeReposManager;
 use openssl::ssl::AlpnError;
+use repo_identity::RepoIdentityRef;
 use scuba_ext::MononokeScubaSampleBuilder;
 use sharding_ext::RepoShard;
 use slog::error;
 use slog::info;
 use slog::o;
+use slog::warn;
 use slog::Logger;
 
 const SM_CLEANUP_TIMEOUT_SECS: u64 = 120;
@@ -78,19 +81,7 @@ struct MononokeServerArgs {
     thrift_port: Option<String>,
     /// TLS parameters for this service
     #[clap(flatten)]
-    tls_args: Option<TLSArgs>,
-    /// Path to a file with server certificate
-    #[clap(long)]
-    cert: Option<String>,
-    /// Path to a file with server private key
-    #[clap(long)]
-    private_key: Option<String>,
-    /// Path to a file with CA certificate
-    #[clap(long)]
-    ca_pem: Option<String>,
-    /// Path to a file with encryption keys for SSL tickets
-    #[clap(long)]
-    ssl_ticket_seeds: Option<String>,
+    tls_args: TLSArgs,
     /// Top level Mononoke tier where CSLB publishes routing table
     #[clap(long)]
     cslb_config: Option<String>,
@@ -138,13 +129,12 @@ impl MononokeServerProcess {
         if self.repos_mgr.repos().get_by_name(repo_name).is_none() {
             // The input repo is a deep-sharded repo, so it needs to be added now.
             let repo = self.repos_mgr.add_repo(repo_name).await?;
-            let blob_repo = repo.blob_repo().clone();
-            let cache_warmup_params = repo.config().cache_warmup.clone();
+            let cache_warmup_params = repo.repo_config().cache_warmup.clone();
             let ctx =
                 CoreContext::new_with_logger_and_scuba(self.fb, logger.clone(), scuba.clone());
             cache_warmup(
                 &ctx,
-                &blob_repo,
+                &repo,
                 cache_warmup_params,
                 CacheWarmupKind::MononokeServer,
             )
@@ -263,8 +253,6 @@ fn main(fb: FacebookInit) -> Result<()> {
     let cslb_config = args.cslb_config.clone();
     info!(root_log, "Starting up");
 
-    let (ca_pem, cert, private_key, ssl_ticket_seeds) = extract_tls_values(app.args()?)?;
-
     #[cfg(fbcode_build)]
     if let (Some(land_service_cert_path), Some(land_service_key_path)) = (
         &args.land_service_client_cert,
@@ -273,23 +261,32 @@ fn main(fb: FacebookInit) -> Result<()> {
         pushrebase_client::land_service_override_certificate_paths(
             land_service_cert_path,
             land_service_key_path,
-            &ca_pem,
+            &args.tls_args.tls_ca,
         );
     }
 
     let configs = app.repo_configs();
 
     let acceptor = {
-        let mut builder =
-            secure_utils::SslConfig::new(&ca_pem, cert, private_key, ssl_ticket_seeds)
-                .tls_acceptor_builder(root_log.clone())
-                .context("Failed to instantiate TLS Acceptor builder")?;
+        let mut builder = secure_utils::SslConfig::new(
+            &args.tls_args.tls_ca,
+            &args.tls_args.tls_certificate,
+            &args.tls_args.tls_private_key,
+            args.tls_args.tls_ticket_seeds,
+        )
+        .tls_acceptor_builder(root_log.clone())
+        .context("Failed to instantiate TLS Acceptor builder")?;
 
         builder.set_alpn_protos(ALPN_MONONOKE_PROTOS_OFFERS)?;
         builder.set_alpn_select_callback(|_, list| {
             openssl::ssl::select_next_proto(ALPN_MONONOKE_PROTOS_OFFERS, list)
                 .ok_or(AlpnError::NOACK)
         });
+
+        if args.tls_args.disable_mtls {
+            warn!(root_log, "MTLS has been disabled!");
+            builder.set_verify(openssl::ssl::SslVerifyMode::NONE)
+        }
 
         builder.build()
     };
@@ -320,24 +317,23 @@ fn main(fb: FacebookInit) -> Result<()> {
         cloned!(root_log, will_exit, env, runtime, service_name);
         move |app: MononokeApp| async move {
             let common = configs.common.clone();
-            let repos_mgr = app.open_managed_repos(service_name).await?;
+            let repos_mgr = app.open_managed_repos::<Repo>(service_name).await?;
             let mononoke = Arc::new(repos_mgr.make_mononoke_api()?);
             info!(&root_log, "Built Mononoke");
 
             info!(&root_log, "Warming up cache");
             stream::iter(mononoke.repos())
                 .map(|repo| {
-                    let repo_name = repo.name().to_string();
-                    let blob_repo = repo.blob_repo().clone();
+                    let repo_name = repo.repo_identity().name().to_string();
                     let root_log = root_log.clone();
-                    let cache_warmup_params = repo.config().cache_warmup.clone();
+                    let cache_warmup_params = repo.repo_config().cache_warmup.clone();
                     cloned!(scuba);
                     async move {
                         let logger = root_log.new(o!("repo" => repo_name.clone()));
                         let ctx = CoreContext::new_with_logger_and_scuba(fb, logger, scuba);
                         cache_warmup(
                             &ctx,
-                            &blob_repo,
+                            &repo,
                             cache_warmup_params,
                             CacheWarmupKind::MononokeServer,
                         )
@@ -389,6 +385,7 @@ fn main(fb: FacebookInit) -> Result<()> {
                 bound_addr_file,
                 env.acl_provider.as_ref(),
                 args.readonly.readonly,
+                args.tls_args.disable_mtls,
             )
             .await
         }
@@ -406,24 +403,4 @@ fn main(fb: FacebookInit) -> Result<()> {
         },
         args.shutdown_timeout_args.shutdown_timeout,
     )
-}
-
-fn extract_tls_values(
-    args: MononokeServerArgs,
-) -> Result<(String, String, String, Option<String>)> {
-    match args.tls_args {
-        Some(tls_args) => Ok((
-            tls_args.tls_ca,
-            tls_args.tls_certificate,
-            tls_args.tls_private_key,
-            tls_args.tls_ticket_seeds.clone(),
-        )),
-
-        None => Ok((
-            args.ca_pem.unwrap_or_default(),
-            args.cert.unwrap_or_default(),
-            args.private_key.unwrap_or_default(),
-            args.ssl_ticket_seeds.clone(),
-        )),
-    }
 }

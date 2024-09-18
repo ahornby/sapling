@@ -171,7 +171,7 @@ fn memcache_deserialize(bytes: Bytes) -> McResult<BonsaiHgMappingCacheEntry> {
 }
 
 fn memcache_serialize(entry: &BonsaiHgMappingCacheEntry) -> Bytes {
-    compact_protocol::serialize(&entry.clone().into_thrift())
+    compact_protocol::serialize(entry.clone().into_thrift())
 }
 
 const CHUNK_SIZE: usize = 1000;
@@ -243,7 +243,10 @@ impl BonsaiHgMapping for CachingBonsaiHgMapping {
 }
 
 fn get_cache_key(repo_id: RepositoryId, cs: &BonsaiOrHgChangesetId) -> String {
-    format!("{}.{:?}", repo_id.prefix(), cs)
+    match cs {
+        BonsaiOrHgChangesetId::Bonsai(id) => format!("{}.B.{}", repo_id.prefix(), id),
+        BonsaiOrHgChangesetId::Hg(id) => format!("{}.H.{}", repo_id.prefix(), id),
+    }
 }
 
 impl MemcacheEntity for BonsaiHgMappingCacheEntry {

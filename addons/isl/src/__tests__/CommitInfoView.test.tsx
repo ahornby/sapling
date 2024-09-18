@@ -5,12 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-import type {MutAtom} from '../jotaiUtils';
-
 import App from '../App';
-import {Internal} from '../Internal';
-import {featureFlag} from '../featureFlags';
-import {writeAtom} from '../jotaiUtils';
 import platform from '../platform';
 import {CommitInfoTestUtils, CommitTreeListTestUtils, ignoreRTL} from '../testQueries';
 import {
@@ -23,7 +18,6 @@ import {
   simulateMessageFromServer,
   openCommitInfoSidebar,
   waitForWithTick,
-  getLastMessagesSentToServer,
 } from '../testUtils';
 import {CommandRunner, succeedableRevset} from '../types';
 import {fireEvent, render, screen, waitFor, within, act} from '@testing-library/react';
@@ -139,94 +133,6 @@ describe('CommitInfoView', () => {
       it('shows uncommitted changes for head commit', () => {
         expect(withinCommitInfo().queryByText(ignoreRTL('file1.js'))).toBeInTheDocument();
         expect(withinCommitInfo().queryByText(ignoreRTL('file2.js'))).toBeInTheDocument();
-      });
-
-      it('shows diff stats on uncommitted changes', async () => {
-        act(() => {
-          writeAtom(
-            featureFlag(Internal.featureFlags?.ShowSplitSuggestion) as MutAtom<boolean>,
-            true,
-          );
-        });
-
-        expectMessageSentToServer({
-          type: 'fetchPendingSignificantLinesOfCode',
-          hash: 'b',
-          includedFiles: ['src/file1.js', 'src/file2.js'],
-          requestId: expect.anything(),
-        });
-
-        const [json] = getLastMessagesSentToServer(2);
-        const msg = JSON.parse(json as string) as {requestId: number};
-        let {requestId} = msg;
-
-        act(() => {
-          simulateMessageFromServer({
-            type: 'fetchedPendingSignificantLinesOfCode',
-            requestId,
-            hash: 'b',
-            linesOfCode: {value: 123},
-          });
-        });
-        let diffStats = await screen.findByText(/123 lines/);
-        expect(diffStats).toBeInTheDocument();
-        fireEvent.click(withinCommitInfo().getByRole('checkbox', {name: /unselect src\/file1/i}));
-
-        requestId += 1;
-        expectMessageSentToServer({
-          type: 'fetchPendingSignificantLinesOfCode',
-          hash: 'b',
-          includedFiles: ['src/file2.js'],
-          requestId,
-        });
-        act(() => {
-          simulateMessageFromServer({
-            type: 'fetchedPendingSignificantLinesOfCode',
-            requestId,
-            hash: 'b',
-            linesOfCode: {value: 48},
-          });
-        });
-
-        diffStats = await screen.findByText(/48 lines/);
-        expect(diffStats).toBeInTheDocument();
-
-        //testing that quick and slow requests are handled correctly
-        fireEvent.click(withinCommitInfo().getByRole('checkbox', {name: /select src\/file1/i}));
-        fireEvent.click(withinCommitInfo().getByRole('checkbox', {name: /unselect src\/file1/i}));
-
-        const slowRequestId = requestId + 1;
-        expectMessageSentToServer({
-          type: 'fetchPendingSignificantLinesOfCode',
-          hash: 'b',
-          includedFiles: ['src/file1.js', 'src/file2.js'],
-          requestId: slowRequestId,
-        });
-
-        const fastRequestId = requestId + 2;
-        expectMessageSentToServer({
-          type: 'fetchPendingSignificantLinesOfCode',
-          hash: 'b',
-          includedFiles: ['src/file2.js'],
-          requestId: fastRequestId,
-        });
-        act(() => {
-          simulateMessageFromServer({
-            type: 'fetchedPendingSignificantLinesOfCode',
-            requestId: fastRequestId,
-            hash: 'b',
-            linesOfCode: {value: 55},
-          });
-          simulateMessageFromServer({
-            type: 'fetchedPendingSignificantLinesOfCode',
-            requestId: slowRequestId,
-            hash: 'b',
-            linesOfCode: {value: 66}, // the slow one should never be rendered
-          });
-        });
-
-        diffStats = await screen.findByText(/55 lines/);
-        expect(diffStats).toBeInTheDocument();
       });
 
       it('shows file actions on uncommitted changes in commit info view', () => {
@@ -553,8 +459,10 @@ describe('CommitInfoView', () => {
         });
 
         it('focuses topmost edited field when loading from saved state', async () => {
-          clickToEditTitle();
-          clickToEditDescription();
+          act(() => {
+            clickToEditTitle();
+            clickToEditDescription();
+          });
           {
             act(() => {
               userEvent.type(getTitleEditor(), ' hello new title');
@@ -622,15 +530,19 @@ describe('CommitInfoView', () => {
           it('enables metaedit button if fields are edited', () => {
             clickToSelectCommit('a');
 
-            clickToEditTitle();
-            clickToEditDescription();
+            act(() => {
+              clickToEditTitle();
+              clickToEditDescription();
+            });
           });
 
           it('runs metaedit', async () => {
             clickToSelectCommit('a');
 
-            clickToEditTitle();
-            clickToEditDescription();
+            act(() => {
+              clickToEditTitle();
+              clickToEditDescription();
+            });
 
             {
               act(() => {
@@ -655,7 +567,7 @@ describe('CommitInfoView', () => {
                     succeedableRevset('a'),
                     '--message',
                     expect.stringMatching(
-                      /^My Commit hello new title\n+Summary: First commit in the stack\nhello new text/,
+                      /^My Commit hello new title\n+(Summary:\s+)?First commit in the stack\nhello new text/,
                     ),
                   ],
                   id: expect.anything(),
@@ -669,8 +581,10 @@ describe('CommitInfoView', () => {
           it('disables metaedit button with spinner while running', async () => {
             clickToSelectCommit('a');
 
-            clickToEditTitle();
-            clickToEditDescription();
+            act(() => {
+              clickToEditTitle();
+              clickToEditDescription();
+            });
             {
               act(() => {
                 userEvent.type(getTitleEditor(), ' hello new title');
@@ -699,8 +613,10 @@ describe('CommitInfoView', () => {
               }),
             );
 
-            clickToEditTitle();
-            clickToEditDescription();
+            act(() => {
+              clickToEditTitle();
+              clickToEditDescription();
+            });
 
             {
               act(() => {
@@ -721,7 +637,7 @@ describe('CommitInfoView', () => {
                     '--addremove',
                     '--message',
                     expect.stringMatching(
-                      /^Head Commit hello new title\n+Summary: stacked commit\nhello new text/,
+                      /^Head Commit hello new title\n+(Summary:\s+)?stacked commit\nhello new text/,
                     ),
                   ],
                   id: expect.anything(),
@@ -834,8 +750,10 @@ describe('CommitInfoView', () => {
               within(screen.getByTestId('commit-info-actions-bar')).queryByText('Amend'),
             ).toBeInTheDocument();
 
-            clickToEditTitle();
-            clickToEditDescription();
+            act(() => {
+              clickToEditTitle();
+              clickToEditDescription();
+            });
 
             // no uncommitted changes, and message is being changed
             expect(
@@ -954,7 +872,7 @@ describe('CommitInfoView', () => {
                   'commit',
                   '--addremove',
                   '--message',
-                  expect.stringMatching(/^new commit title\n+(Summary: )?my description/),
+                  expect.stringMatching(/^new commit title\n+(Summary:\s+)?my description/),
                 ],
                 id: expect.anything(),
                 runner: CommandRunner.Sapling,
@@ -1008,8 +926,10 @@ describe('CommitInfoView', () => {
 
       describe('edited messages indicator', () => {
         it('does not show edited message indicator when fields are not actually changed', () => {
-          clickToEditTitle();
-          clickToEditDescription();
+          act(() => {
+            clickToEditTitle();
+            clickToEditDescription();
+          });
           expectIsEditingTitle();
           expectIsEditingDescription();
 
@@ -1027,8 +947,10 @@ describe('CommitInfoView', () => {
         });
 
         it('shows edited message indicator when title changed', () => {
-          clickToEditTitle();
-          clickToEditDescription();
+          act(() => {
+            clickToEditTitle();
+            clickToEditDescription();
+          });
 
           expect(screen.queryByTestId('unsaved-message-indicator')).not.toBeInTheDocument();
 
@@ -1045,8 +967,10 @@ describe('CommitInfoView', () => {
         });
 
         it('shows edited message indicator when description changed', () => {
-          clickToEditTitle();
-          clickToEditDescription();
+          act(() => {
+            clickToEditTitle();
+            clickToEditDescription();
+          });
 
           expect(screen.queryByTestId('unsaved-message-indicator')).not.toBeInTheDocument();
 
@@ -1065,8 +989,10 @@ describe('CommitInfoView', () => {
         it('appears for other commits', () => {
           clickToSelectCommit('a');
 
-          clickToEditTitle();
-          clickToEditDescription();
+          act(() => {
+            clickToEditTitle();
+            clickToEditDescription();
+          });
 
           expect(screen.queryByTestId('unsaved-message-indicator')).not.toBeInTheDocument();
 
@@ -1180,8 +1106,10 @@ describe('CommitInfoView', () => {
         });
 
         it('does not cancel if you do not confirm', async () => {
-          clickToEditTitle();
-          clickToEditDescription();
+          act(() => {
+            clickToEditTitle();
+            clickToEditDescription();
+          });
           const confirmSpy = jest
             .spyOn(platform, 'confirm')
             .mockImplementation(() => Promise.resolve(false));
@@ -1249,8 +1177,10 @@ describe('CommitInfoView', () => {
         it('renders metaedit operation smoothly', async () => {
           clickToSelectCommit('a');
 
-          clickToEditTitle();
-          clickToEditDescription();
+          act(() => {
+            clickToEditTitle();
+            clickToEditDescription();
+          });
           act(() => {
             userEvent.type(getTitleEditor(), ' with change!');
             userEvent.type(getDescriptionEditor(), '\nmore stuff!');
@@ -1363,8 +1293,10 @@ describe('CommitInfoView', () => {
             });
           });
 
-          clickToEditTitle();
-          clickToEditDescription();
+          act(() => {
+            clickToEditTitle();
+            clickToEditDescription();
+          });
           // now you can edit just fine
           expectIsEditingTitle();
           expectIsEditingDescription();
@@ -1377,8 +1309,10 @@ describe('CommitInfoView', () => {
             }),
           );
 
-          clickToEditTitle();
-          clickToEditDescription();
+          act(() => {
+            clickToEditTitle();
+            clickToEditDescription();
+          });
           act(() => {
             userEvent.type(getTitleEditor(), ' Hey');
             userEvent.type(getDescriptionEditor(), '\nHello');
