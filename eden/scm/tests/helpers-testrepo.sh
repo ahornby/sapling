@@ -13,6 +13,7 @@
 # Revert the environment so that running "hg" runs the system hg
 # rather than the test hg installation.
 syshgenv () {
+    # shellcheck disable=SC1090
     . "$HGTEST_RESTOREENV"
     HGPLAIN=1
     export HGPLAIN
@@ -36,11 +37,23 @@ cat >> "$HGRCPATH" << EOF
 evolution = createmarkers
 EOF
 
-# Unconditionally use the system hg to avoid auto migration logic from
-# the in-repo hg.
-testrepohgenv () {
-    syshgenv
-}
+
+SYSTEM_HG_VER=$(syshgenv; hg --version -q 2>/dev/null)
+case "$SYSTEM_HG_VER" in
+    Sapling*)
+        # Use the system hg environment if it has a has a chance 
+        # of reading a sapling repo
+        testrepohgenv () {
+            syshgenv
+        }
+        ;;
+    *)
+        testrepohgenv () {
+            # no suitable system hg, stick current.
+            :
+        }
+        ;;
+esac
 
 testrepohg () {
     (

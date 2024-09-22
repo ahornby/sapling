@@ -185,6 +185,6 @@ jobs:
         name: sapling
         path: _artifacts
     - name: Test sapling
-      run: python3 build/fbcode_builder/getdeps.py --allow-system-packages test --src-dir=. sapling  --project-install-prefix sapling:/
+      run: python3 build/fbcode_builder/getdeps.py --allow-system-packages test --num-jobs 16 --src-dir=. sapling  --project-install-prefix sapling:/
     - name: Show disk space at end
       run: df -h
