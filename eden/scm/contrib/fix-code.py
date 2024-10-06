@@ -21,6 +21,7 @@ import glob
 import os
 import re
 import sys
+import setuptools
 from distutils.version import LooseVersion
 
 

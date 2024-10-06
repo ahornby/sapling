@@ -28,7 +28,15 @@ from typing import Dict, List, Optional, Set, Tuple, Type
 
 import thrift.transport
 
-from cli.py import par_telemetry
+try:
+    from cli.py import par_telemetry
+except ImportError:
+    # in OSS define a stub
+    class ParTelemetryStub:
+        def set_sample_rate(self, automation):
+            pass
+    par_telemetry = ParTelemetryStub()
+
 from eden.fs.cli.buck import get_buck_command, run_buck_command
 from eden.fs.cli.config import HG_REPO_TYPES
 from eden.fs.cli.telemetry import TelemetrySample
