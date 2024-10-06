@@ -218,6 +218,14 @@ GETDEPS_TEST_EXCLUSION_LIST := test-cats.t \
 	test-rust-checkout.t \
 	test-smartlog-interactive.t \
 	test-smartlog-interactive-highlighting.t
+
+ifeq ($(PYTHON_MINOR_VERSION),12)
+# output differs for these on 3.12 in ways that are hard to match for 3.10 and 3.12 simultaneously
+GETDEPS_TEST_EXCLUSION_LIST := $(GETDEPS_TEST_EXCLUSION_LIST) \
+	test-eager-exchange.t \
+	test-git-bundle.t \
+	test-mergedriver2.t
+endif
 	
 # convert to a sed expression
 GETDEPS_TEST_EXCLUSIONS := $(subst $() $(),|,$(GETDEPS_TEST_EXCLUSION_LIST))

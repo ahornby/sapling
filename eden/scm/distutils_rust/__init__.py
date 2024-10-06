@@ -7,14 +7,18 @@
 
 from __future__ import absolute_import
 
+import logging
+log = logging.getLogger()
+
 import contextlib
-import distutils
-import distutils.command.build
-import distutils.command.install
-import distutils.command.install_scripts
-import distutils.core
-import distutils.errors
-import distutils.util
+from setuptools import Command
+from distutils.command.build import build
+from distutils.command.install import install
+from distutils.command.install_scripts import install_scripts
+import setuptools.errors
+from distutils.dist import Distribution
+
+from sysconfig import get_platform
 import errno
 import io
 import os
@@ -79,7 +83,7 @@ class RustExtension:
 
     @property
     def dstnametmp(self):
-        platform = distutils.util.get_platform()
+        platform = get_platform()
         if platform.startswith("win"):
             name = self.name + ".dll"
         elif platform.startswith("macosx"):
@@ -90,7 +94,7 @@ class RustExtension:
 
     @property
     def dstname(self):
-        platform = distutils.util.get_platform()
+        platform = get_platform()
         if platform.startswith("win"):
             name = self.name + ".pyd"
         else:
@@ -128,7 +132,7 @@ class RustBinary:
 
     @property
     def dstnametmp(self):
-        platform = distutils.util.get_platform()
+        platform = get_platform()
         if platform.startswith("win"):
             return self.name + ".exe"
         else:
@@ -136,14 +140,14 @@ class RustBinary:
 
     @property
     def dstname(self):
-        platform = distutils.util.get_platform()
+        platform = get_platform()
         if platform.startswith("win"):
             return self.final_name + ".exe"
         else:
             return self.final_name
 
 
-class BuildRustExt(distutils.core.Command):
+class BuildRustExt(Command):
 
     description = "build Rust extensions (compile/link to build directory)"
 
@@ -230,7 +234,7 @@ class BuildRustExt(distutils.core.Command):
         elif target.type == "binary":
             return os.path.join(self.build_exe, target.dstname)
         else:
-            raise distutils.errors.CompileError("Unknown Rust target type")
+            raise setuptools.errors.CompileError("Unknown Rust target type")
 
     def write_cargo_config(self):
         config = """
@@ -336,7 +340,7 @@ replace-with = "vendored-sources"
 
         rc = _callretry(cmd, env=env)
         if rc:
-            raise distutils.errors.CompileError(
+            raise setuptools.errors.CompileError(
                 "compilation of Rust target '%s' failed" % target.name
             )
 
@@ -344,7 +348,7 @@ replace-with = "vendored-sources"
 
         if (
             target.type == "binary"
-            and distutils.util.get_platform().startswith("win")
+            and get_platform().startswith("win")
             and self.long_paths_support
         ):
             retry = 0
@@ -358,7 +362,7 @@ replace-with = "vendored-sources"
                     if retry > 5:
                         raise
                     else:
-                        distutils.log.warn("Retrying setting long path on %s" % src)
+                        log.warning("Retrying setting long path on %s" % src)
                         continue
                 else:
                     break
@@ -379,9 +383,9 @@ replace-with = "vendored-sources"
             shutil.copy(pdbsrc, pdbdest)
 
     def set_long_paths_manifest(self, fname):
-        if not distutils.util.get_platform().startswith("win"):
+        if not get_platform().startswith("win"):
             # This only makes sense on Windows
-            distutils.log.info(
+            log.info(
                 "skipping set_long_paths_manifest call for %s "
                 "as the plaform in not Windows",
                 fname,
@@ -389,7 +393,7 @@ replace-with = "vendored-sources"
             return
         if not fname.endswith(".exe"):
             # we only care about executables
-            distutils.log.info(
+            log.info(
                 "skipping set_long_paths_manifest call for %s "
                 "as the file extension is not exe",
                 fname,
@@ -400,7 +404,7 @@ replace-with = "vendored-sources"
         os.close(fdauto)
         with open(manfname, "w") as f:
             f.write(LONG_PATHS_MANIFEST)
-        distutils.log.debug(
+        log.debug(
             "LongPathsAware manifest written into tempfile: %s", manfname
         )
         inputresource = "-inputresource:%s;#1" % fname
@@ -414,23 +418,23 @@ replace-with = "vendored-sources"
             inputresource,
         ]
         try:
-            distutils.log.debug(
+            log.debug(
                 "Trying to merge LongPathsAware manifest with the existing "
                 "manifest of the binary %s",
                 fname,
             )
             subprocess.check_output(command)
-            distutils.log.debug(
+            log.debug(
                 "LongPathsAware manifest successfully merged into %s", fname
             )
         except subprocess.CalledProcessError as e:
             no_resource_err = b"c101008c"
             if no_resource_err not in e.output.lower():
-                distutils.log.error(
+                log.error(
                     "Setting LongPathsAware manifest failed: %r", e.output
                 )
                 raise
-            distutils.log.debug(
+            log.debug(
                 "The binary %s does not have an existing manifest. Writing "
                 "a LongPathsAware one",
                 fname,
@@ -439,18 +443,18 @@ replace-with = "vendored-sources"
             # but rather just write one.
             command.remove(inputresource)
             subprocess.check_output(command)
-            distutils.log.debug(
+            log.debug(
                 "LongPathsAware manifest successfully written into %s", fname
             )
         finally:
             os.remove(manfname)
 
     def build_binary(self, target):
-        distutils.log.info("building '%s' binary", target.name)
+        log.info("building '%s' binary", target.name)
         self.build_target(target)
 
     def build_library(self, target):
-        distutils.log.info("building '%s' library extension", target.name)
+        log.info("building '%s' library extension", target.name)
         self.build_target(target)
 
     try:
@@ -471,7 +475,7 @@ replace-with = "vendored-sources"
             return env
 
 
-class InstallRustExt(distutils.command.install_scripts.install_scripts):
+class InstallRustExt(install_scripts):
     description = "install Rust extensions and binaries"
 
     def run(self):
@@ -512,7 +516,7 @@ def _callattempt(cmd, env=None, retry=3):
     if retry > 0 and returncode != 0:
         stderr = sio.getvalue()
         if _isflaky(stderr):
-            distutils.log.warn("retrying %r on flaky error" % (cmd,))
+            log.warning("retrying %r on flaky error" % (cmd,))
             return _callattempt(cmd, env=env, retry=retry - 1)
     return returncode
 
@@ -528,16 +532,16 @@ def _isflaky(stderr):
     return False
 
 
-distutils.dist.Distribution.rust_ext_modules = ()
-distutils.dist.Distribution.rust_ext_binaries = ()
-distutils.command.build.build.sub_commands.append(
+Distribution.rust_ext_modules = ()
+Distribution.rust_ext_binaries = ()
+build.sub_commands.append(
     (
         "build_rust_ext",
         lambda self: bool(self.distribution.rust_ext_modules)
         or bool(self.distribution.rust_ext_binaries),
     )
 )
-distutils.command.install.install.sub_commands.append(
+install.sub_commands.append(
     (
         "install_rust_ext",
         lambda self: bool(self.distribution.rust_ext_modules)
