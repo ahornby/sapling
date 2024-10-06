@@ -1149,9 +1149,14 @@ jobs:
                             # Its in the same repo, so src-dir is also .
                             src_dir_arg = "--src-dir=. "
                             has_same_repo_dep = True
+                        extra_cmake_defines=""
+                        builder_name = m.get("build", "builder", ctx=ctx)
+                        if args.extra_cmake_defines and builder_name == "cmake":
+                            arg_json = json.dumps(args.extra_cmake_defines)
+                            extra_cmake_defines = f"--cmake-extra-defines={arg_json} "
                         out.write("    - name: Build %s\n" % m.name)
                         out.write(
-                            f"      run: {getdepscmd}{allow_sys_arg} build {build_type_arg}{src_dir_arg}{free_up_disk}--no-tests {m.name}\n"
+                            f"      run: {getdepscmd}{allow_sys_arg} build {build_type_arg}{src_dir_arg}{free_up_disk}{extra_cmake_defines}--no-tests {m.name}\n"
                         )
 
             out.write("    - name: Build %s\n" % manifest.name)
