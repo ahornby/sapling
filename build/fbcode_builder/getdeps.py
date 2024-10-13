@@ -1081,38 +1081,34 @@ jobs:
                 free_up_disk = ""
 
             allow_sys_arg = ""
-            if run_tests:
-                sudo_arg = "sudo "
-                allow_sys_arg = " --allow-system-packages"
-                if build_opts.host_type.get_package_manager() == "deb":
-                    out.write("    - name: Update system package info\n")
-                    out.write(f"      run: {sudo_arg}apt-get update\n")
+            sudo_arg = "sudo "
+            allow_sys_arg = " --allow-system-packages"
+            if build_opts.host_type.get_package_manager() == "deb":
+                out.write("    - name: Update system package info\n")
+                out.write(f"      run: {sudo_arg}apt-get update\n")
 
-                out.write("    - name: Install system deps\n")
-                if build_opts.is_darwin():
-                    # brew is installed as regular user
-                    sudo_arg = ""
+            out.write("    - name: Install system deps\n")
+            if build_opts.is_darwin():
+                # brew is installed as regular user
+                sudo_arg = ""
+            out.write(
+                f"      run: {sudo_arg}python3 build/fbcode_builder/getdeps.py --allow-system-packages install-system-deps --recursive {manifest.name}\n"
+            )
+            if build_opts.is_linux() or build_opts.is_freebsd():
+                out.write("    - name: Install packaging system deps\n")
                 out.write(
-                    f"      run: {sudo_arg}python3 build/fbcode_builder/getdeps.py --allow-system-packages install-system-deps --recursive {manifest.name}\n"
+                    f"      run: {sudo_arg}python3 build/fbcode_builder/getdeps.py --allow-system-packages install-system-deps --recursive patchelf\n"
                 )
-                if build_opts.is_linux() or build_opts.is_freebsd():
-                    out.write("    - name: Install packaging system deps\n")
-                    out.write(
-                        f"      run: {sudo_arg}python3 build/fbcode_builder/getdeps.py --allow-system-packages install-system-deps --recursive patchelf\n"
-                    )
-                required_locales = manifest.get(
-                    "github.actions", "required_locales", ctx=manifest_ctx
-                )
-                if (
-                    build_opts.host_type.get_package_manager() == "deb"
-                    and required_locales
-                ):
-                    # ubuntu doesn't include this by default
-                    out.write("    - name: Install locale-gen\n")
-                    out.write(f"      run: {sudo_arg}apt-get install locales\n")
-                    for loc in required_locales.split():
-                        out.write(f"    - name: Ensure {loc} locale present\n")
-                        out.write(f"      run: {sudo_arg}locale-gen {loc}\n")
+            required_locales = manifest.get(
+                "github.actions", "required_locales", ctx=manifest_ctx
+            )
+            if build_opts.host_type.get_package_manager() == "deb" and required_locales:
+                # ubuntu doesn't include this by default
+                out.write("    - name: Install locale-gen\n")
+                out.write(f"      run: {sudo_arg}apt-get install locales\n")
+                for loc in required_locales.split():
+                    out.write(f"    - name: Ensure {loc} locale present\n")
+                    out.write(f"      run: {sudo_arg}locale-gen {loc}\n")
 
             projects = loader.manifests_in_dependency_order()
 
