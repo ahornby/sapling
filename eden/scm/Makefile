@@ -68,7 +68,7 @@ COMPILERFLAG_tmp_${COMPILER} ?= -c $(COMPILER)
 COMPILERFLAG=${COMPILERFLAG_tmp_${COMPILER}}
 
 MAKE_PID := $(shell echo $$PPID)
-JOBS := $(shell ps T | sed -n 's%.*$(MAKE_PID).*$(MAKE).* \(-j\|--jobs=\) *\([0-9][0-9]*\).*%\2%p')
+JOBS := $(shell ps T | sed -n -Ee 's%.*$(MAKE_PID).*$(MAKE).* (-j|--jobs=) *([0-9][0-9]*).*%\2%p')
 
 # Mac Big Sur doesn't find the standard library without this.
 export SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk
@@ -259,7 +259,6 @@ test-getdeps:
 		fi; \
 		$$PYTHON_SYS_EXECUTABLE run-tests.py -j $(JOBS) --getdeps-build --with-hg="$(PREFIX)/bin/$(HGNAME)" $$GETDEPS_TEST_FILTER; \
 		status=$$?; \
-		# stop if all good \
 		if [ $$status = 0 ]; then echo "passed on try $$try"; exit 0; fi; \
 	done; \
 	exit $$status
