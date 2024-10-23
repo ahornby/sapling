@@ -132,6 +132,8 @@ def prepare_manifest_deps(install_dir, mononoke_repo_root):
         + open(manifest_deps_path, "r").read()
     )
 
+    py3exe = os.environ.get("PYTHON_SYS_EXECUTABLE", "python3")
+
     MANIFEST_DEPS = {}
     for k, v in OSS_DEPS.items():  # noqa: F821
         if v.startswith("//"):
@@ -140,6 +142,8 @@ def prepare_manifest_deps(install_dir, mononoke_repo_root):
             installdep = join(install_dir, v[1:])
             print(f"Adding install dependency {installdep}")
             MANIFEST_DEPS[k] = installdep
+        elif k == "BINARY_HGPYTHON":
+             MANIFEST_DEPS[k] = py3exe
         else:
             MANIFEST_DEPS[k] = v
     for k, v in MONONOKE_BINS.items():  # noqa: F821
@@ -175,8 +179,6 @@ def get_test_groups():
         TestGroup.BROKEN: {
             # no live config reload in OSS
             "cross_repo/test-cross-repo-commit-sync-live-via-extra.t",
-            # missing b0bf2974fb9bfd512e54939869465847f49f9131 Change submodule repo from large repo
-            "cross_repo/test-cross-repo-mononoke-git-sot-switch.t",
             # mononoke_hg_sync_loop fails with exit status 1, differs on: -  * successful sync of entries [6]* (glob)
             "mononoke_hg_sync/test-mononoke-hg-sync-job.t",
             # differs on: warning: remote HEAD refers to nonexistent ref, unable to checkout
@@ -250,34 +252,6 @@ def get_tests_to_run(tests, groups_to_run, rerun_failed, test_flag_root):
 
     return tests_to_run
 
-
-def get_pythonpath(getdeps_install_dir):
-    paths = [join(getdeps_install_dir, "sapling/lib/python3/site-packages")]
-
-    _, installed, _ = next(os.walk(getdeps_install_dir))
-
-    packages = ["click"]
-
-    for package in packages:
-        candidates = [i for i in installed if i.startswith(f"python-{package}-")]
-        if len(candidates) == 0:
-            raise Exception(
-                f"Failed to find 'python-{package}' in installed directory,"
-                " did you run getdeps?"
-            )
-        if len(candidates) > 1:
-            raise Exception(
-                f"Found more than one 'python-{package}' package in installed"
-                "directory, try cleaning the install dir and rerunning getdeps"
-            )
-        paths.append(
-            join(getdeps_install_dir, candidates[0], f"lib/fb-py-libs/python-{package}")
-        )
-
-    pythonpath = os.environ.get("PYTHONPATH")
-    return ":".join(paths) + (":{}".format(pythonpath) if pythonpath else "")
-
-
 def run_tests(args, manifest_json_dir):
     manifest_json_path = join(manifest_json_dir, "manifest.json")
     with open(manifest_json_path) as json_file:
@@ -290,7 +264,6 @@ def run_tests(args, manifest_json_dir):
 
     env = dict(os.environ.items())
     env["NO_LOCAL_PATHS"] = "1"
-    env["PYTHONPATH"] = get_pythonpath(args.getdeps_install_dir)
 
     if args.dry_run:
         print("\n".join(tests_to_run))
