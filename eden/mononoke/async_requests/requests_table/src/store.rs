@@ -1044,7 +1044,7 @@ mod test {
             )
             .await?;
 
-        let stats = queue.get_queue_stats(&ctx, None).await?;
+        let stats = queue.get_queue_stats(&ctx, Some(&[repo_id])).await?;
         assert_eq!(stats.queue_length_by_status.len(), 1);
         assert_eq!(
             stats
@@ -1061,13 +1061,13 @@ mod test {
         // This claims new request from queue and makes it inprogress
         let now = Timestamp::now();
         let req = queue
-            .claim_and_get_new_request(&ctx, &ClaimedBy("me".to_string()), None)
+            .claim_and_get_new_request(&ctx, &ClaimedBy("me".to_string()), Some(&[repo_id]))
             .await?;
         assert!(req.is_some());
 
         tokio::time::sleep(Duration::from_secs(3)).await;
 
-        let stats = queue.get_queue_stats(&ctx, None).await?;
+        let stats = queue.get_queue_stats(&ctx, Some(&[repo_id])).await?;
         assert_eq!(stats.queue_length_by_status.len(), 1);
         assert_eq!(
             stats
