@@ -1034,13 +1034,12 @@ mod test {
     async fn test_get_stats(fb: FacebookInit) -> Result<()> {
         let ctx = CoreContext::test_mock(fb);
         let queue = SqlLongRunningRequestsQueue::with_sqlite_in_memory()?;
-        let repo_id = RepositoryId::new(0);
         let now = Timestamp::now();
         let _ = queue
             .add_request(
                 &ctx,
                 &RequestType("type".to_string()),
-                Some(&repo_id),
+                None,
                 &BlobstoreKey("key".to_string()),
             )
             .await?;
