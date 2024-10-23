@@ -909,7 +909,7 @@ mod test {
 
         // This claims new request from queue and makes it inprogress
         let req = queue
-            .claim_and_get_new_request(&ctx, &ClaimedBy("me".to_string()), None)
+            .claim_and_get_new_request(&ctx, &ClaimedBy("me".to_string()), Some(&[repo_id]))
             .await?;
         assert!(req.is_some());
 
@@ -1004,7 +1004,7 @@ mod test {
 
         // This claims new request from queue and makes it inprogress
         let req = queue
-            .claim_and_get_new_request(&ctx, &ClaimedBy("me".to_string()), None)
+            .claim_and_get_new_request(&ctx, &ClaimedBy("me".to_string()), Some(&[repo_id]))
             .await?;
         assert!(req.is_some());
 
@@ -1034,13 +1034,12 @@ mod test {
     async fn test_get_stats(fb: FacebookInit) -> Result<()> {
         let ctx = CoreContext::test_mock(fb);
         let queue = SqlLongRunningRequestsQueue::with_sqlite_in_memory()?;
-        let repo_id = RepositoryId::new(0);
         let now = Timestamp::now();
         let _ = queue
             .add_request(
                 &ctx,
                 &RequestType("type".to_string()),
-                Some(&repo_id),
+                None,
                 &BlobstoreKey("key".to_string()),
             )
             .await?;
