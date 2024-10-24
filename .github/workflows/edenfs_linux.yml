@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
     - uses: actions/checkout@v4
     - name: Show disk space at start
@@ -27,9 +27,9 @@ jobs:
     - name: Update system package info
       run: sudo apt-get update
     - name: Install system deps
-      run: sudo python3 build/fbcode_builder/getdeps.py --allow-system-packages install-system-deps --no-tests --recursive eden
+      run: sudo python3 build/fbcode_builder/getdeps.py --allow-system-packages install-system-deps --recursive eden
     - name: Install packaging system deps
-      run: sudo python3 build/fbcode_builder/getdeps.py --allow-system-packages install-system-deps --no-tests --recursive patchelf
+      run: sudo python3 build/fbcode_builder/getdeps.py --allow-system-packages install-system-deps --recursive patchelf
     - name: Install Rust Stable
       uses: dtolnay/rust-toolchain@stable
     - name: Fetch lmdb
@@ -84,6 +84,8 @@ jobs:
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages fetch --no-tests re2
     - name: Fetch rocksdb
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages fetch --no-tests rocksdb
+    - name: Fetch python-setuptools
+      run: python3 build/fbcode_builder/getdeps.py --allow-system-packages fetch --no-tests python-setuptools
     - name: Fetch sqlite3
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages fetch --no-tests sqlite3
     - name: Fetch zlib
@@ -184,6 +186,8 @@ jobs:
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages build --free-up-disk --no-tests re2
     - name: Build rocksdb
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages build --free-up-disk --no-tests rocksdb
+    - name: Build python-setuptools
+      run: python3 build/fbcode_builder/getdeps.py --allow-system-packages build --free-up-disk --no-tests python-setuptools
     - name: Build sqlite3
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages build --free-up-disk --no-tests sqlite3
     - name: Build zlib
@@ -230,16 +234,20 @@ jobs:
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages build --free-up-disk --no-tests fb303
     - name: Build rust-shed
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages build --free-up-disk --no-tests rust-shed
+    - name: Build sapling
+      run: python3 build/fbcode_builder/getdeps.py --allow-system-packages build --src-dir=. --free-up-disk --no-tests sapling
     - name: Build edencommon
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages build --free-up-disk --no-tests edencommon
     - name: Build eden
-      run: python3 build/fbcode_builder/getdeps.py --allow-system-packages build --no-tests --src-dir=. eden  --project-install-prefix eden:/usr/local
+      run: python3 build/fbcode_builder/getdeps.py --allow-system-packages build --no-deps --src-dir=. eden  --project-install-prefix eden:/usr/local
     - name: Copy artifacts
       run: python3 build/fbcode_builder/getdeps.py --allow-system-packages fixup-dyn-deps --strip --src-dir=. eden _artifacts/linux  --project-install-prefix eden:/usr/local --final-install-prefix /usr/local
     - uses: actions/upload-artifact@v4
       with:
         name: eden
         path: _artifacts
+    - name: Test eden
+      run: python3 build/fbcode_builder/getdeps.py --allow-system-packages test --num-jobs 16 --src-dir=. eden  --project-install-prefix eden:/usr/local
     - name: Show disk space at end
       if: always()
       run: df -h
