@@ -16,7 +16,7 @@ async-stream = "0.3"
 async-trait = "0.1.71"
 base64 = "0.21"
 bitflags = { version = "2.6", features = ["serde"] }
-blake3 = { version = "=1.5.0", features = ["traits-preview"] }
+blake3 = { version = "=1.5.0", features = ["rayon", "traits-preview"] }
 blobstore = { version = "0.1.0", path = "../../blobstore" }
 bytes = { version = "1.6.0", features = ["serde"] }
 cloned = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
@@ -42,7 +42,7 @@ sorted_vector_map = { version = "0.2.0", git = "https://github.com/facebookexper
 sql = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 stats = { version = "0.1.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 thiserror = "1.0.64"
-tokio = { version = "1.37.0", features = ["full", "test-util", "tracing"] }
+tokio = { version = "1.41.0", features = ["full", "test-util", "tracing"] }
 types = { version = "0.1.0", path = "../../../scm/lib/types" }
 
 [dev-dependencies]

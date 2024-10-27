@@ -7,6 +7,7 @@ from __future__ import absolute_import
 
 import time
 import weakref
+from functools import partial
 from typing import IO, Optional, Union
 
 import bindings
@@ -26,7 +27,12 @@ from . import (
     vfs as vfsmod,
     visibility,
 )
-from .changelog import changelogrevision, gitcommittext, hgcommittext
+from .changelog import (
+    changelogrevision,
+    changelogrevision2,
+    gitcommittext,
+    hgcommittext,
+)
 from .i18n import _
 from .node import bin, hex, nullid, nullrev, wdirid, wdirrev
 
@@ -57,6 +63,19 @@ class changelog:
         # Number of commit texts to buffer. Useful for bounding memory usage.
         self._groupbuffersize = uiconfig.configint("pull", "buffer-commit-count")
         self._reporef = weakref.ref(repo)
+        # Rollout control
+        self._use_rust_hg_unparse = uiconfig.configbool(
+            "experimental", "use-rust-hg-unparse", True
+        )
+        if self._isgit or uiconfig.configbool(
+            "experimental", "use-rust-hg-parse", True
+        ):
+            # NOTE: The git commits layer right now translates commit text to hg format.
+            # So we need to parse them as hg.
+            format = "hg"
+            self._changelogrevision_ctor = partial(changelogrevision2, format=format)
+        else:
+            self._changelogrevision_ctor = changelogrevision
 
     @util.propertycache
     def _visibleheads(self):
@@ -311,12 +330,12 @@ class changelog:
         ``changelogrevision`` instead, as it is faster for partial object
         access.
         """
-        c = changelogrevision(self.revision(node))
+        c = self._changelogrevision_ctor(self.revision(node))
         return (c.manifest, c.user, c.date, c.files, c.description, c.extra)
 
     def changelogrevision(self, nodeorrev):
         """Obtain a ``changelogrevision`` for a node or revision."""
-        return changelogrevision(self.revision(nodeorrev))
+        return self._changelogrevision_ctor(self.revision(nodeorrev))
 
     def readfiles(self, node):
         """
@@ -325,7 +344,7 @@ class changelog:
         # For performance we skip verifying the commit hash, which can trigger
         # remote lookups of the parent hashes. A real-world example is:
         # log -r " reverse(master~1000::master) & not(file(r're:.*'))"
-        c = changelogrevision(self.revision(node, verify=False))
+        c = self._changelogrevision_ctor(self.revision(node, verify=False))
         return c.files
 
     def add(
@@ -349,7 +368,15 @@ class changelog:
             )
             node = git.hashobj(b"commit", text)
         else:
-            text = hgcommittext(manifest, files, desc, user, date, extra)
+            text = hgcommittext(
+                manifest,
+                files,
+                desc,
+                user,
+                date,
+                extra,
+                use_rust=self._use_rust_hg_unparse,
+            )
             node = revlog.hash(text, p1, p2)
 
         # Avoid updating "tip" if node is known locally.
@@ -378,7 +405,9 @@ class changelog:
             basetext = textmap.get(deltabase) or self.revision(deltabase)
             rawtext = bytes(mdiff.patch(basetext, delta))
             if b"stepparents:" in rawtext:
-                parents += parse_stepparents(changelogrevision(rawtext).extra)
+                parents += parse_stepparents(
+                    self._changelogrevision_ctor(rawtext).extra
+                )
             textmap[node] = rawtext
             commits.append((node, parents, rawtext))
             # Attempt to make memory usage bound for large pulls.

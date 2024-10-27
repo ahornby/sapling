@@ -13,7 +13,7 @@ categories = ["command-line-utilities", "text-processing"]
 [dependencies]
 bit-set = "0.5"
 dirs = "2.0"
-enum_dispatch = "0.3.5"
+enum_dispatch = "0.3.13"
 indexmap = { version = "2.2.6", features = ["arbitrary", "rayon", "serde"] }
 lazy_static = "1.4"
 lru = "0.12.3"
@@ -28,5 +28,5 @@ termwiz = { version = "0.22", features = ["widgets"] }
 thiserror = "1.0.64"
 toml = "0.8.4"
 unicode-segmentation = "1.6.0"
-unicode-width = "0.1"
+unicode-width = "=0.1.12"
 vec_map = "0.8"
