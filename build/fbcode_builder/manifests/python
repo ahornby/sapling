@@ -2,7 +2,9 @@
 name = python
 
 [homebrew]
-python@3.8
+# python 3.12 on brew doesn't install all the symlinks. 
+# 3.13 does but our pyo3 is too old for it
+python@3.11
 
 [rpms]
 python3
