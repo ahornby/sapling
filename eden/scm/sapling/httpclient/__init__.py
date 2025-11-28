@@ -461,7 +461,7 @@ class HTTPConnection:
         if ssl_wrap_socket is not None:
             _wrap_socket = ssl_wrap_socket
         else:
-            _wrap_socket = ssl.wrap_socket
+            _wrap_socket = ssl.SSLContext.wrap_socket
         call_wrap_socket = None
         handlesubar = _handlesarg(_wrap_socket, "server_hostname")
         if handlesubar is True:
@@ -470,7 +470,7 @@ class HTTPConnection:
         handlesnobar = _handlesarg(_wrap_socket, "serverhostname")
         if handlesnobar is True and handlesubar is not True:
             # supports serverhostname
-            def call_wrap_socket(sock, server_hostname=None, **ssl_opts):
+            def call_wrap_socket(sock, server_hostname=None, **ssl_opts):  # noqa: F811
                 return _wrap_socket(sock, serverhostname=server_hostname, **ssl_opts)
 
         if handlesubar is False and handlesnobar is False:
