@@ -22,7 +22,7 @@ import subprocess
 import tempfile
 import typing
 from enum import Enum
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import bindings
 from bindings import renderdag
@@ -67,7 +67,7 @@ from . import (
 )
 from .i18n import _, _x
 from .node import bin, hex, nullid, nullrev, short
-from .utils import pathaclutil, subtreeutil
+from .utils import iterutil, pathaclutil, subtreeutil
 
 if typing.TYPE_CHECKING:
     from .ui import ui
@@ -3360,13 +3360,16 @@ def displaygraph(
     repo,
     dag,
     displayer,
-    getrenamed=None,
-    filematcher=None,
+    repogetrenamed=None,
+    repofilematcher=None,
     props=None,
     reserved=None,
     out=None,
     on_output=None,
+    graphnodeid_to_rev=None,
 ):
+    repogetrenamed = repogetrenamed or {}
+    repofilematcher = repofilematcher or {}
     props = props or {}
     formatnode = _graphnodeformatter(ui, displayer)
     if ui.plain("graph"):
@@ -3399,12 +3402,24 @@ def displaygraph(
     renderer = renderer(minheight)
 
     if reserved:
-        for rev in reserved:
-            renderer.reserve(rev)
+        for graphnodeid in reserved:
+            renderer.reserve(graphnodeid)
+
+    getrenamed = repogetrenamed.get(repo.root)
+    filematcher = repofilematcher.get(repo.root)
+    prev_repo = repo
+    xreponame = None
 
     show_abbreviated_ancestors = ShowAbbreviatedAncestorsWhen.load_from_config(repo.ui)
-    for rev, _type, ctx, parents in dag:
-        char = formatnode(repo, ctx)
+    for graphnodeid, _type, ctx, parents in dag:
+        curr_repo = ctx.repo()
+        if curr_repo.root != prev_repo.root:
+            getrenamed = repogetrenamed.get(curr_repo.root)
+            filematcher = repofilematcher.get(curr_repo.root)
+            xreponame = curr_repo.ui.config("remotefilelog", "reponame", "unknown")
+            prev_repo = curr_repo
+
+        char = formatnode(curr_repo, ctx)
         copies = None
         if getrenamed and ctx.rev():
             copies = []
@@ -3420,23 +3435,30 @@ def displaygraph(
                 parents = []
         elif show_abbreviated_ancestors is ShowAbbreviatedAncestorsWhen.NEVER:
             parents = [p for p in parents if p[0] != graphmod.MISSINGPARENT]
-        gprevs = [p[1] for p in parents if p[0] == graphmod.GRANDPARENT]
+
+        gprevs = [
+            graphnodeid_to_rev(p[1]) if graphnodeid_to_rev else p[1]
+            for p in parents
+            if p[0] == graphmod.GRANDPARENT
+        ]
         if all(isinstance(gp, bytes) for gp in gprevs):
             # parents are already nodes (when called from ext/commitcloud/commands.py)
             gpnodes = gprevs
         else:
-            gpnodes = repo.changelog.tonodes(gprevs)
+            gpnodes = curr_repo.changelog.tonodes(gprevs)
         revcache = {"copies": copies, "gpnodes": gpnodes}
-        width = renderer.width(rev, parents)
+        if xreponame:
+            revcache["xreponame"] = xreponame
+        width = renderer.width(graphnodeid, parents)
         displayer.show(
             ctx, revcache=revcache, matchfn=revmatchfn, _graphwidth=width, **props
         )
         # The Rust graph renderer works with unicode.
         msg = "".join(
             s if isinstance(s, str) else s.decode(errors="replace")
-            for s in displayer.hunk.pop(rev)
+            for s in displayer.hunk.pop(ctx.rev())
         )
-        nextrow = renderer.nextrow(rev, parents, char, msg)
+        nextrow = renderer.nextrow(graphnodeid, parents, char, msg)
         if out is not None:
             out(nextrow)
         else:
@@ -3481,11 +3503,33 @@ class ShowAbbreviatedAncestorsWhen(Enum):
         )
 
 
-def graphlog(ui, repo, pats, opts):
+def graphlog(ui, repo, pats: Tuple[str, ...], opts: Dict[str, Any]):
     # Parameters are identical to log command ones
+    repogetrenamed, repofilematcher, repoids = {}, {}, {}
+    revdag = _logdagwalker(repo, pats, opts, repogetrenamed, repofilematcher, repoids)
+
+    ui.pager("log")
+    displayer = show_changeset(ui, repo, opts, buffered=True)
+    graphnodeid_to_rev = lambda graphnodeid: graphnodeid[1]
+    displaygraph(
+        ui,
+        repo,
+        revdag,
+        displayer,
+        repogetrenamed,
+        repofilematcher,
+        graphnodeid_to_rev=graphnodeid_to_rev,
+    )
+
+
+def _logdagwalker(repo, pats, opts, repogetrenamed, repofilematcher, repoids):
     revs, expr, filematcher = getgraphlogrevs(repo, pats, opts)
     template = opts.get("template") or ""
-    revdag = graphmod.dagwalker(repo, revs, template)
+    if repo.root not in repoids:
+        repoids[repo.root] = len(repoids)
+    rid = repoids[repo.root]
+    rev_to_graphnodeid = lambda rev: (rid, rev)
+    revdag = graphmod.dagwalker(repo, revs, template, idfunc=rev_to_graphnodeid)
 
     getrenamed = None
     if opts.get("copies"):
@@ -3494,9 +3538,76 @@ def graphlog(ui, repo, pats, opts):
             endrev = scmutil.revrange(repo, opts.get("rev")).max() + 1
         getrenamed = templatekw.getrenamedfn(repo, endrev=endrev)
 
-    ui.pager("log")
-    displayer = show_changeset(ui, repo, opts, buffered=True)
-    displaygraph(ui, repo, revdag, displayer, getrenamed, filematcher)
+    repogetrenamed[repo.root] = getrenamed
+    repofilematcher[repo.root] = filematcher
+    return _dagfollowxrepo(
+        repo, pats, opts, revdag, repogetrenamed, repofilematcher, repoids
+    )
+
+
+def _dagfollowxrepo(repo, pats, opts, revdag, repogetrenamed, repofilematcher, repoids):
+    for item, is_last in iterutil.mark_last(revdag):
+        # It currently doesn't handle multiple imports/merges. In those cases, the
+        # xrepo operation can appear in the middle of the dag.
+        if is_last:
+            xrepoinfo = xrepologinfo(repo, pats, opts, item[2])
+            if not xrepoinfo:
+                yield item
+                break
+
+            from_repo, from_commit, from_path = xrepoinfo
+            pats = [os.path.join(from_repo.root, from_path)]
+            opts = opts.copy()
+            opts["rev"] = [f"reverse(::{from_commit})"]
+            for from_item, is_first in iterutil.mark_first(
+                _logdagwalker(
+                    from_repo,
+                    pats,
+                    opts,
+                    repogetrenamed,
+                    repofilematcher,
+                    repoids,
+                )
+            ):
+                if is_first:
+                    # clear the in-repo missing parents and add cross-repo parents
+                    item[3].clear()
+                    item[3].append((graphmod.XREPOPARENT, from_item[0]))
+                    yield item
+                yield from_item
+        else:
+            yield item
+
+
+def xrepologinfo(curr_repo, curr_pats, curr_opts, lastctx):
+    if not curr_repo.ui.configbool("log", "follow-xrepo", True):
+        return None
+
+    # XXX: currently supports only one path
+    if lastctx is None or len(curr_pats) != 1:
+        return None
+    match, pats = scmutil.matchandpats(curr_repo[None], curr_pats, curr_opts)
+    if len(match.files()) != 1:
+        return None
+
+    curr_path = match.files()[0]
+    subtree_import = subtreeutil.find_subtree_import(
+        curr_repo, lastctx.node(), curr_path
+    )
+    if not subtree_import:
+        return None
+
+    from_url, from_commit, from_path = subtree_import
+    # XXX: currently only support import from git repo
+    git_url = git.maybegiturl(from_url)
+    if not git_url:
+        return None
+
+    with curr_repo.ui.configoverride({("ui", "quiet"): True}):
+        from_repo = subtreeutil.get_or_clone_git_repo(
+            curr_repo.ui, git_url, from_commit
+        )
+    return from_repo, from_commit, from_path
 
 
 def checkunsupportedgraphflags(pats, opts):
@@ -3505,14 +3616,6 @@ def checkunsupportedgraphflags(pats, opts):
             raise error.Abort(
                 _("-G/--graph option is incompatible with --%s") % op.replace("_", "-")
             )
-
-
-def graphrevs(repo, nodes, opts):
-    limit = loglimit(opts)
-    nodes.reverse()
-    if limit is not None:
-        nodes = nodes[:limit]
-    return graphmod.nodes(repo, nodes)
 
 
 def add(ui, repo, match, prefix, explicitonly, **opts):

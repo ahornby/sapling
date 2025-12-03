@@ -53,8 +53,16 @@ impl<'a> FromPyObject<'a> for PyNode {
         } else if let Ok(rev) = obj.extract::<i64>(py) {
             let slice: [u8; 8] = rev.to_be_bytes();
             Ok(PyNode(Bytes::copy_from_slice(&slice)))
+        } else if let Ok(tuple) = obj.extract::<(u8, i64)>(py) {
+            let mut bytes = Vec::with_capacity(9);
+            bytes.extend_from_slice(&tuple.0.to_be_bytes());
+            bytes.extend_from_slice(&tuple.1.to_be_bytes());
+            Ok(PyNode(Bytes::from(bytes)))
         } else {
-            Err(PyErr::new::<exc::TypeError, _>(py, "expect bytes or int"))
+            Err(PyErr::new::<exc::TypeError, _>(
+                py,
+                "expect bytes, int or (u8, i64) tuple",
+            ))
         }
     }
 }
@@ -65,6 +73,7 @@ fn convert_parents(py: Python, parents: Vec<(String, PyNode)>) -> PyResult<Vec<A
         .map(|(kind, parent)| match kind.as_str() {
             "P" => Ok(Ancestor::Parent(parent.into())),
             "G" => Ok(Ancestor::Ancestor(parent.into())),
+            "X" => Ok(Ancestor::Ancestor(parent.into())),
             "M" => Ok(Ancestor::Anonymous),
             _ => Err(PyErr::new::<exc::ValueError, _>(
                 py,
